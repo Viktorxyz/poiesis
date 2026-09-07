@@ -79,7 +79,7 @@ describe("deterministic Git lifecycle", () => {
         body: "body",
         proof: proofShell(accepted.sha, treeA),
       }),
-    ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_EXISTS" });
+    ).resolves.toMatchObject({ action: "updated" });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const preview = await delivery.preview({ sha: accepted.sha, candidateTree: treeA, proof: proofShell(accepted.sha, treeA) });
@@ -196,5 +196,97 @@ describe("deterministic Git lifecycle", () => {
         authorAcceptance: "accepted",
       }),
     ).rejects.toMatchObject({ code: "STALE_INTEGRATION_BASE" });
+  }, 30_000);
+
+  it("accepts fast-forward republish of the same change branch and refuses divergence", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const workspace = await workspacePrepare({
+      cwd: repository.root,
+      remote: "origin",
+      integrationBranch: "main",
+      branch: "poiesis/spec-2",
+      workspacePath: join(repository.parent, "spec-2-workspace"),
+      specId: "spec-2",
+    });
+    await writeFile(join(workspace.path, "feature.txt"), "feature v1\n");
+    const acceptedV1 = await checkpoint({
+      cwd: workspace.path,
+      paths: ["feature.txt"],
+      message: "ticket v1",
+      review: { verdict: "PASS", reviewerIdentity: "review", evidence: "pass" },
+    });
+    const treeV1 = await candidateTree(repository, acceptedV1.sha);
+    const first = await publish({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: acceptedV1.sha,
+      candidateTree: treeV1,
+      provider: "fixture",
+      project: repository.fixtures,
+      title: "Spec 2 v1",
+      body: "body",
+      proof: proofShell(acceptedV1.sha, treeV1),
+    });
+    expect(first.action).toBe("pushed");
+
+    await writeFile(join(workspace.path, "feature.txt"), "feature v2\n");
+    const acceptedV2 = await checkpoint({
+      cwd: workspace.path,
+      paths: ["feature.txt"],
+      message: "ticket v2",
+      review: { verdict: "PASS", reviewerIdentity: "review", evidence: "pass" },
+    });
+    const treeV2 = await candidateTree(repository, acceptedV2.sha);
+    const fastForward = await publish({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: acceptedV2.sha,
+      candidateTree: treeV2,
+      provider: "fixture",
+      project: repository.fixtures,
+      title: "Spec 2 v2",
+      body: "body",
+      proof: proofShell(acceptedV2.sha, treeV2),
+    });
+    expect(fastForward.action).toBe("updated");
+
+    const divergenceWorkspacePath = join(repository.parent, "spec-2-divergence-workspace");
+    const divergenceWorkspace = await workspacePrepare({
+      cwd: repository.root,
+      remote: "origin",
+      integrationBranch: "main",
+      branch: "poiesis/spec-2-divergence",
+      workspacePath: divergenceWorkspacePath,
+      specId: "spec-2-divergence",
+    });
+    await run("git", ["fetch", "--quiet", "origin", acceptedV2.sha], { cwd: divergenceWorkspace.path });
+    await run("git", ["reset", "--hard", acceptedV2.sha], { cwd: divergenceWorkspace.path, allowFailure: true });
+    await writeFile(join(divergenceWorkspace.path, "feature.txt"), "foreign edit on remote\n");
+    await run("git", ["add", "feature.txt"], { cwd: divergenceWorkspace.path });
+    await run("git", ["commit", "--quiet", "-m", "foreign edit"], { cwd: divergenceWorkspace.path });
+    const divergenceHead = (await run("git", ["rev-parse", "HEAD"], { cwd: divergenceWorkspace.path })).stdout;
+    await run("git", ["push", "--quiet", "origin", `${divergenceHead}:refs/heads/poiesis/spec-2`], {
+      cwd: divergenceWorkspace.path,
+    });
+    await expect(
+      publish({
+        cwd: workspace.path,
+        ownershipId: workspace.ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        candidateSha: acceptedV2.sha,
+        candidateTree: treeV2,
+        provider: "fixture",
+        project: repository.fixtures,
+        title: "Spec 2 rerun",
+        body: "body",
+        proof: proofShell(acceptedV2.sha, treeV2),
+      }),
+    ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
   }, 30_000);
 });

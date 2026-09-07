@@ -23,8 +23,8 @@ export interface StagingEvidence {
 }
 
 export interface IntegrationEvidence {
+  candidateSha: string;
   candidateTree: string;
-  candidateSha?: string;
   integrationSha: string;
   integrationTree: string;
   contentMatchesCandidate: true;
@@ -57,7 +57,13 @@ export function validateStagingEvidence(staging: StagingEvidence, candidateSha: 
   invariant(staging.artifactIdentity.trim().length > 0, "STAGING_IDENTITY_MISSING", "Staging artifact identity is required");
 }
 
-export function validateIntegrationEvidence(integration: IntegrationEvidence, acceptedCandidateTree: string): void {
+export function validateIntegrationEvidence(integration: IntegrationEvidence, acceptedCandidateSha: string, acceptedCandidateTree: string): void {
+  invariant(
+    integration.candidateSha === acceptedCandidateSha,
+    "INTEGRATION_IDENTITY_MISMATCH",
+    "Integration evidence belongs to a different candidate",
+    { expected: acceptedCandidateSha, actual: integration.candidateSha },
+  );
   invariant(
     integration.candidateTree === acceptedCandidateTree,
     "INTEGRATED_CONTENT_MISMATCH",

@@ -79,10 +79,12 @@ describe("evidence validation", () => {
   });
 
   it("rejects Integration evidence that does not prove content equality", () => {
+    const candidateSha = "a".repeat(40);
     const candidateTree = "a".repeat(40);
-    expect(() => validateIntegrationEvidence({ candidateTree: "b".repeat(40), integrationSha: "c".repeat(40), integrationTree: "b".repeat(40), contentMatchesCandidate: true }, candidateTree)).toThrow(/does not match the accepted candidate tree/);
-    expect(() => validateIntegrationEvidence({ candidateTree: candidateTree, integrationSha: "not-a-sha", integrationTree: candidateTree, contentMatchesCandidate: true }, candidateTree)).toThrow(/Exact integrated revision is required/);
-    expect(() => validateIntegrationEvidence({ candidateTree: candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: false } as never, candidateTree)).toThrow(/Integrated content has not been proven/);
+    expect(() => validateIntegrationEvidence({ candidateSha, candidateTree: "b".repeat(40), integrationSha: "c".repeat(40), integrationTree: "b".repeat(40), contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/does not match the accepted candidate tree/);
+    expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "not-a-sha", integrationTree: candidateTree, contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/Exact integrated revision is required/);
+    expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: false } as never, candidateSha, candidateTree)).toThrow(/Integrated content has not been proven/);
+    expect(() => validateIntegrationEvidence({ candidateSha: "z".repeat(40), candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/different candidate/);
   });
 });
 

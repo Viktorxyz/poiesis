@@ -663,14 +663,15 @@ export function createTrackerAdapter(
   config: TrackerConfig | PoiesisConfig["tracker"],
   root = process.cwd(),
 ): TrackerAdapter {
-  requiredText(config.project, "tracker project");
+  const project = config.project ?? "";
+  requiredText(project, "tracker project");
   switch (config.provider) {
     case "github":
-      return new GitHubTrackerAdapter(config.project, root);
+      return new GitHubTrackerAdapter(project, root);
     case "gitlab":
-      return new GitLabTrackerAdapter(config.project, root);
+      return new GitLabTrackerAdapter(project, root);
     case "fixture":
-      return new FixtureTrackerAdapter(config.project, root);
+      return new FixtureTrackerAdapter(project, root);
   }
 }
 
@@ -817,7 +818,7 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
       validateProofEvidence(proof, sha);
       const staging: StagingEvidence = { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree };
       validateStagingEvidence(staging, sha);
-      validateIntegrationEvidence(input.integration, input.candidateTree);
+      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
     }
     return this.execute(sha, input.target, identity);
   }
@@ -942,7 +943,7 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
         { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree },
         sha,
       );
-      validateIntegrationEvidence(input.integration, input.candidateTree);
+      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
       recordedSourceIdentity = identity;
       result = {
         sha,

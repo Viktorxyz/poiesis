@@ -62,7 +62,7 @@ describe("tracker and delivery adapters", () => {
         productionAuthorization: "Author said yes",
         proof: proofShell(sha, tree),
         staging: { artifactIdentity: "staging-artifact", verified: true, candidateTree: tree },
-        integration: { candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
+        integration: { candidateSha: sha, candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
       }),
     ).rejects.toMatchObject({ code: "PRODUCTION_STAGING_IDENTITY_MISMATCH" });
     const production = await adapter.promote({
@@ -73,7 +73,7 @@ describe("tracker and delivery adapters", () => {
       productionAuthorization: "Author said yes",
       proof: proofShell(sha, tree),
       staging: stagingShell(sha, tree),
-      integration: { candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
+      integration: { candidateSha: sha, candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
     });
     expect(production.sha).toBe(sha);
   });

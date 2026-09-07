@@ -18,14 +18,16 @@ export const configSchema = z.strictObject({
       execution: z.string().regex(/^[^/]+\/.+$/, "must use provider/model format"),
       roles: z.record(z.string(), z.string()).optional(),
     }),
-  repository: z.strictObject({
-    remote: z.string().min(1),
-    integrationBranch: z.string().min(1),
-  }),
+  repository: z
+    .strictObject({
+      remote: z.string().optional(),
+      integrationBranch: z.string().optional(),
+    })
+    .optional(),
   tracker: z
     .object({
       provider: z.enum(["github", "gitlab", "fixture"]),
-      project: z.string().min(1),
+      project: z.string().optional(),
     })
     .loose(),
   delivery: z.strictObject({
@@ -35,13 +37,21 @@ export const configSchema = z.strictObject({
   }),
   verification: z
     .strictObject({
-      commands: z.array(z.string().min(1)).min(1),
+      commands: z.array(z.string().min(1)).optional(),
       postIntegrationCommands: z.array(z.string().min(1)).optional(),
     })
     .optional(),
 });
 
 export type PoiesisConfig = z.infer<typeof configSchema>;
+export type ResolvedPoiesisConfig = {
+  schema: 1;
+  models: { reasoning: string; execution: string; roles?: Record<string, string> };
+  repository: { remote: string; integrationBranch: string };
+  tracker: { provider: "github" | "gitlab" | "fixture"; project: string };
+  delivery: PoiesisConfig["delivery"];
+  verification: { commands: string[]; postIntegrationCommands?: string[] };
+};
 
 export function parseJsonc<T>(content: string, source: string): T {
   const errors: ParseError[] = [];

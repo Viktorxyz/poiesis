@@ -2,7 +2,14 @@ import { isDeepStrictEqual } from "node:util";
 import { lstat, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
-import { loadConfig, parseJsonc, serializeConfig, validateConfig, type PoiesisConfig } from "./config.js";
+import {
+  loadConfig,
+  parseJsonc,
+  serializeConfig,
+  validateConfig,
+  type PoiesisConfig,
+  type ResolvedPoiesisConfig,
+} from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicWrite, exists, readUtf8 } from "./fs.js";
 import { hashContent, hashDirectory, hashFile } from "./hash.js";
@@ -31,7 +38,13 @@ import {
   removeOwnedSkills,
   skillPath,
 } from "./skills.js";
-import { readTemplate, templateMappings } from "./templates.js";
+import {
+  POIESIS_DURABLE_PATHS,
+  POIESIS_LOCAL_STATE_PATHS,
+  ensureGitignore,
+  readTemplate,
+  templateMappings,
+} from "./templates.js";
 import { createDeliveryAdapter } from "./adapters.js";
 
 export interface MaintenanceOptions {
@@ -153,6 +166,152 @@ async function packageVersion(): Promise<string> {
   return value.version;
 }
 
+async function autoResolveConfigDefaults(
+  root: string,
+  config: PoiesisConfig,
+): Promise<{ config: ResolvedPoiesisConfig; discovered: { remote: boolean; integrationBranch: boolean; verificationCommands: boolean; tracker: boolean } }> {
+  let remote = config.repository?.remote;
+  let integrationBranch = config.repository?.integrationBranch;
+  let discoveredRemote = false;
+  let discoveredBranch = false;
+
+  const remoteList = await run("git", ["remote"], { cwd: root, allowFailure: true });
+  const remoteNames = remoteList.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+  if ((remote === undefined || remote === "origin") && remoteNames.includes("origin")) {
+    remote = "origin";
+    discoveredRemote = true;
+  } else if ((remote === undefined || remote === "") && remoteNames.length === 1) {
+    remote = remoteNames[0]!;
+    discoveredRemote = true;
+  } else if ((remote === undefined || remote === "") && remoteNames.length === 0) {
+    throw new PoiesisError("GIT_REMOTE_UNAVAILABLE", "Cannot discover a Git remote in this repository", { root });
+  }
+
+  const integrationBranchIsDefault = integrationBranch === undefined || integrationBranch === "" || integrationBranch === "main";
+  if (integrationBranchIsDefault && remote !== undefined) {
+    const branchList = await run("git", ["branch", "--format=%(refname:short)"], { cwd: root, allowFailure: true });
+    const localBranches = branchList.stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+    if ((integrationBranch === undefined || integrationBranch === "") && localBranches.includes("main")) {
+      integrationBranch = "main";
+      discoveredBranch = true;
+    } else if (integrationBranch === "main" && !localBranches.includes("main")) {
+      const fetched = await run(
+        "git",
+        ["ls-remote", "--exit-code", "--heads", remote, "refs/heads/main"],
+        { cwd: root, allowFailure: true },
+      );
+      if (fetched.exitCode !== 0) {
+        throw new PoiesisError(
+          "INTEGRATION_BRANCH_UNAVAILABLE",
+          "Configured integration branch 'main' is not present locally or on the remote",
+          { remote, integrationBranch },
+        );
+      }
+      discoveredBranch = false;
+    } else if (integrationBranch === undefined || integrationBranch === "") {
+      throw new PoiesisError(
+        "INTEGRATION_BRANCH_UNAVAILABLE",
+        "Cannot discover an integration branch; please set repository.integrationBranch in the config",
+      );
+    }
+  }
+
+  let discoveredVerification = false;
+  let verificationCommands = config.verification?.commands ?? [];
+  if (verificationCommands.length === 0) {
+    const discovered = await discoverVerificationCommands(root);
+    if (discovered.length > 0) {
+      verificationCommands = discovered;
+      discoveredVerification = true;
+    }
+  }
+  if (verificationCommands.length === 0) {
+    throw new PoiesisError(
+      "NO_VERIFICATION_COMMANDS",
+      "Poiesis requires at least one verification command; configure verification.commands or ensure the project exposes a test script",
+    );
+  }
+
+  let discoveredTracker = false;
+  let trackerProvider = config.tracker.provider;
+  let trackerProject = config.tracker.project ?? "";
+  if (trackerProvider === "github" && trackerProject.trim().length === 0 && remote !== undefined) {
+    const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
+    const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+    if (url !== undefined) {
+      const parsed = parseGitHubProject(url);
+      if (parsed !== null) {
+        trackerProject = parsed;
+        discoveredTracker = true;
+      }
+    }
+  }
+  if (trackerProject.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "Cannot resolve tracker project; please set tracker.project in the config or configure a recognized Git remote",
+      { provider: trackerProvider },
+    );
+  }
+
+  const resolved: ResolvedPoiesisConfig = {
+    schema: 1,
+    models: { reasoning: config.models.reasoning, execution: config.models.execution, ...(config.models.roles === undefined ? {} : { roles: config.models.roles }) },
+    repository: { remote: remote!, integrationBranch: integrationBranch! },
+    tracker: { provider: trackerProvider, project: trackerProject },
+    delivery: config.delivery,
+    verification: {
+      commands: verificationCommands,
+      ...(config.verification?.postIntegrationCommands === undefined
+        ? {}
+        : { postIntegrationCommands: config.verification.postIntegrationCommands }),
+    },
+  };
+  return {
+    config: resolved,
+    discovered: {
+      remote: discoveredRemote,
+      integrationBranch: discoveredBranch,
+      verificationCommands: discoveredVerification,
+      tracker: discoveredTracker,
+    },
+  };
+}
+
+async function discoverVerificationCommands(root: string): Promise<string[]> {
+  const packageJsonPath = join(root, "package.json");
+  if (!(await exists(packageJsonPath))) return [];
+  let value: unknown;
+  try {
+    value = JSON.parse(await readUtf8(packageJsonPath));
+  } catch {
+    return [];
+  }
+  if (typeof value !== "object" || value === null) return [];
+  const scripts = (value as Record<string, unknown>).scripts;
+  if (typeof scripts !== "object" || scripts === null) return [];
+  const out: string[] = [];
+  const scriptRecord = scripts as Record<string, unknown>;
+  for (const name of ["test", "lint", "typecheck", "build"]) {
+    const script = scriptRecord[name];
+    if (typeof script === "string" && script.length > 0) out.push(script);
+  }
+  return out;
+}
+
+function parseGitHubProject(url: string): string | null {
+  const trimmed = url.trim();
+  const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
+  if (sshMatch !== null && sshMatch[1] !== undefined && sshMatch[2] !== undefined) {
+    return `${sshMatch[1]}/${sshMatch[2]}`;
+  }
+  const httpsMatch = trimmed.match(/^https?:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/);
+  if (httpsMatch !== null && httpsMatch[1] !== undefined && httpsMatch[2] !== undefined) {
+    return `${httpsMatch[1]}/${httpsMatch[2]}`;
+  }
+  return null;
+}
+
 async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile[]> {
   const templates = await Promise.all(
     templateMappings.map(async (mapping) => ({
@@ -167,7 +326,7 @@ async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile
   ];
 }
 
-async function verifyGitRepository(root: string, config?: PoiesisConfig): Promise<void> {
+async function verifyGitRepository(root: string, config?: ResolvedPoiesisConfig): Promise<void> {
   const version = await run("git", ["--version"], { cwd: root, allowFailure: true });
   if (version.exitCode !== 0 || !/^git version \d+\.\d+/.test(version.stdout)) {
     throw new PoiesisError("GIT_UNAVAILABLE", "Git is not available", { stderr: version.stderr });
@@ -225,7 +384,7 @@ async function verifyGitRepository(root: string, config?: PoiesisConfig): Promis
   }
 }
 
-async function verifyModels(root: string, config: PoiesisConfig): Promise<void> {
+async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promise<void> {
   const result = await run("opencode", ["models"], { cwd: root, allowFailure: true });
   if (result.exitCode !== 0) {
     throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {
@@ -239,7 +398,7 @@ async function verifyModels(root: string, config: PoiesisConfig): Promise<void> 
   }
 }
 
-async function verifyTracker(root: string, config: PoiesisConfig): Promise<"verified" | "fixture"> {
+async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
@@ -251,7 +410,7 @@ async function verifyTracker(root: string, config: PoiesisConfig): Promise<"veri
   return "verified";
 }
 
-function verifyDeliveryConfiguration(root: string, config: PoiesisConfig): "verified" | "fixture" {
+function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
   let fixture = false;
   for (const target of ["preview", "staging", "production"] as const) {
     const adapter = createDeliveryAdapter(config.delivery[target], root);
@@ -317,12 +476,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
   assertResolvedConfig(resolvedConfig);
-  const files = await materializeFiles(resolvedConfig);
-  await verifyGitRepository(resolvedRoot, resolvedConfig);
+  const resolved = await autoResolveConfigDefaults(resolvedRoot, resolvedConfig);
+  const resolvedConfigWithDefaults = resolved.config;
+  const files = await materializeFiles(resolvedConfigWithDefaults);
+  await verifyGitRepository(resolvedRoot, resolvedConfigWithDefaults);
   await verifyOpenCodeVersion(resolvedRoot);
-  await verifyModels(resolvedRoot, resolvedConfig);
-  const trackerMode = await verifyTracker(resolvedRoot, resolvedConfig);
-  const deliveryMode = verifyDeliveryConfiguration(resolvedRoot, resolvedConfig);
+  await verifyModels(resolvedRoot, resolvedConfigWithDefaults);
+  const trackerMode = await verifyTracker(resolvedRoot, resolvedConfigWithDefaults);
+  const deliveryMode = verifyDeliveryConfiguration(resolvedRoot, resolvedConfigWithDefaults);
   if ((trackerMode === "fixture" || deliveryMode === "fixture") && !options.allowFixtureAdapters) {
     throw new PoiesisError(
       "FIXTURE_ADAPTER_NOT_AUTHORIZED",
@@ -330,6 +491,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     );
   }
   await assertInitDestinationsAbsent(resolvedRoot, files);
+
+  await ensureGitignore(resolvedRoot, [
+    `# Hide local Poiesis ownership snapshot`,
+    ...POIESIS_LOCAL_STATE_PATHS,
+    `# Allow durable Poiesis project files to be tracked`,
+    ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
+    `!${".poiesis"}/`,
+  ]);
 
   const openCodeConfigPath = await detectOpenCodeConfig(resolvedRoot);
   await assertSafeParents(resolvedRoot, openCodeConfigPath);
@@ -349,10 +518,17 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     for (const file of files) {
       const destination = join(resolvedRoot, file.path);
       await atomicWrite(destination, file.content);
-      managedFiles.push({ path: file.path, kind: file.kind, hash: hashContent(file.content), owned: true });
+      const template = templateMappings.find((mapping) => mapping.destination === file.path);
+      managedFiles.push({
+        path: file.path,
+        kind: file.kind,
+        hash: hashContent(file.content),
+        owned: true,
+        ...(template?.trackInProject === true ? { durable: true } : {}),
+      });
     }
 
-    configPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfig);
+    configPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults);
     await validateOpenCodeConfig(resolvedRoot);
     if (openCodeConfigCreated) {
       managedFiles.push({
@@ -522,15 +698,35 @@ function manifestConsistency(manifest: Manifest): string[] {
   return problems;
 }
 
+export async function resolveConfigForRoot(root: string, draft?: PoiesisConfig): Promise<ResolvedPoiesisConfig> {
+  const raw = draft ?? (await loadConfig(root));
+  assertResolvedConfig(raw);
+  const entry = await autoResolveConfigDefaults(resolve(root), raw);
+  return entry.config;
+}
+
+export async function resolveConfigRoot(cwd: string): Promise<string> {
+  const commonDirResult = await run("git", ["rev-parse", "--git-common-dir"], { cwd, allowFailure: true });
+  const resolvedCommonDir = commonDirResult.exitCode === 0
+    ? resolve(isAbsolute(commonDirResult.stdout) ? commonDirResult.stdout : resolve(cwd, commonDirResult.stdout))
+    : resolve(cwd);
+  const parent = resolvedCommonDir.replace(/\/$/, "").replace(/\/[^/]+$/, "");
+  if (parent === "" || parent === resolvedCommonDir) return resolve(cwd);
+  const configPath = join(parent, ".poiesis", "config.jsonc");
+  if (await exists(configPath)) return parent;
+  return resolve(cwd);
+}
+
 export async function doctor(root: string): Promise<DoctorReport> {
   const resolvedRoot = resolve(root);
   const checks: DoctorCheck[] = [];
-  let config: PoiesisConfig | undefined;
+  let config: ResolvedPoiesisConfig | undefined;
   let manifest: Manifest | undefined;
 
   try {
-    config = await loadConfig(resolvedRoot);
-    assertResolvedConfig(config);
+    const rawConfig = await loadConfig(resolvedRoot);
+    assertResolvedConfig(rawConfig);
+    config = await resolveConfigForRoot(resolvedRoot, rawConfig);
     checks.push({ id: "config", status: "pass", message: "Poiesis config is valid" });
   } catch (error) {
     checks.push({ id: "config", status: "fail", message: "Poiesis config is invalid or missing", details: errorDetails(error) });
@@ -750,8 +946,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
       problems: manifestProblems,
     });
   }
-  const config = await loadConfig(resolvedRoot);
-  assertResolvedConfig(config);
+  const config = await resolveConfigForRoot(resolvedRoot);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -779,18 +974,25 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     ? manifest.skills
     : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
 
-  const nextFiles = [...manifest.files];
-  const fileSnapshots = new Map<string, Buffer>();
-  for (const file of materialized) {
-    const path = join(resolvedRoot, file.path);
-    if (await exists(path)) {
-      const bytes = await readFile(path);
-      fileSnapshots.set(file.path, bytes);
+    const nextFiles = [...manifest.files];
+    const fileSnapshots = new Map<string, Buffer>();
+    for (const file of materialized) {
+      const path = join(resolvedRoot, file.path);
+      if (await exists(path)) {
+        const bytes = await readFile(path);
+        fileSnapshots.set(file.path, bytes);
+      }
+      await atomicWrite(path, file.content);
+      const index = nextFiles.findIndex((record) => record.path === file.path);
+      const template = templateMappings.find((mapping) => mapping.destination === file.path);
+      nextFiles[index] = {
+        path: file.path,
+        kind: file.kind,
+        hash: hashContent(file.content),
+        owned: true,
+        ...(template?.trackInProject === true ? { durable: true } : {}),
+      };
     }
-    await atomicWrite(path, file.content);
-    const index = nextFiles.findIndex((record) => record.path === file.path);
-    nextFiles[index] = { path: file.path, kind: file.kind, hash: hashContent(file.content), owned: true };
-  }
 
   const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
   if (managedConfigFiles.length !== 1) {
@@ -968,6 +1170,10 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     const path = ownedPath(resolvedRoot, file.path);
     if (!(await exists(path))) {
       result.removed.push(file.path);
+      continue;
+    }
+    if (file.durable === true) {
+      result.preserved.push({ path: file.path, reason: "durable project-tracked file; ownership released but file retained" });
       continue;
     }
     if (configPatchFiles.has(file.path)) {

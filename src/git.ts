@@ -121,7 +121,7 @@ export interface VerifyOptions {
 
 export interface VerifyCommandResult {
   command: string;
-  exitCode: number;
+  exitCode: number | null;
   stdout: string;
   stderr: string;
 }
@@ -562,12 +562,20 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
 
   const remoteRef = `refs/heads/${branch}`;
   const expectedRemote = await lsRemoteHead(owned.root, options.remote, branch);
-  invariant(
-    expectedRemote === null,
-    "PUBLISHED_BRANCH_EXISTS",
-    "Refusing to push: remote change branch already exists; do not rewrite history",
-    { remote: options.remote, branch, expectedRemote, candidateSha },
-  );
+  if (expectedRemote !== null) {
+    const localIsAncestor = await run(
+      "git",
+      ["merge-base", "--is-ancestor", expectedRemote, candidateSha],
+      { cwd: owned.root, allowFailure: true },
+    );
+    if (localIsAncestor.exitCode !== 0) {
+      throw new PoiesisError(
+        "PUBLISHED_BRANCH_DIVERGED",
+        "Remote change branch contains work that is not an ancestor of the local candidate; refusing to overwrite",
+        { remote: options.remote, branch, remoteHead: expectedRemote, candidateSha },
+      );
+    }
+  }
   await run("git", ["push", "--porcelain", options.remote, `${candidateSha}:${remoteRef}`], { cwd: owned.root });
   const publishedSha = await lsRemoteHead(owned.root, options.remote, branch);
   invariant(publishedSha === candidateSha, "PUBLISHED_SHA_MISMATCH", "Remote branch does not identify the exact candidate", {
@@ -584,12 +592,12 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       remoteRef,
       requestId: null,
       requestUrl: null,
-      action: "pushed",
+      action: expectedRemote === null ? "pushed" : "updated",
     };
   }
   return options.provider === "github"
-    ? publishGitHub(options, branch, candidateSha, remoteRef, owned.root)
-    : publishGitLab(options, branch, candidateSha, remoteRef, owned.root);
+    ? publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null)
+    : publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
 }
 
 export async function integrate(options: IntegrateOptions): Promise<IntegrateResult> {
@@ -689,12 +697,13 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   await assertExactClean(owned.root, candidateSha);
 
   const integration: IntegrationEvidence = {
+    candidateSha,
     candidateTree,
     integrationSha: integratedSha,
     integrationTree: integratedTree,
     contentMatchesCandidate: true,
   };
-  validateIntegrationEvidence(integration, candidateTree);
+  validateIntegrationEvidence(integration, candidateSha, candidateTree);
 
   return {
     baseSha: expectedBaseSha,
@@ -789,6 +798,7 @@ async function publishGitHub(
   candidateSha: string,
   remoteRef: string,
   cwd: string,
+  _expectedBranchWasMissing: boolean,
 ): Promise<PublishResult> {
   const listed = await run(
     "gh",
@@ -892,6 +902,7 @@ async function publishGitLab(
   candidateSha: string,
   remoteRef: string,
   cwd: string,
+  _expectedBranchWasMissing: boolean,
 ): Promise<PublishResult> {
   const listed = await run(
     "glab",

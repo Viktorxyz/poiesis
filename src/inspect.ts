@@ -1,10 +1,11 @@
 import { join } from "node:path";
 import { exists, readUtf8 } from "./fs.js";
 import { inspect as inspectGit, type InspectResult } from "./git.js";
-import { loadConfig } from "./config.js";
+import { loadConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { loadManifest } from "./manifest.js";
 import { PoiesisError } from "./errors.js";
 import { resolveGitRoot } from "./paths.js";
+import { resolveConfigForRoot } from "./maintenance.js";
 
 export interface ProjectInspection {
   git: InspectResult;
@@ -22,11 +23,12 @@ export interface ProjectInspection {
 
 export async function inspectProject(cwd: string): Promise<ProjectInspection> {
   const root = await resolveGitRoot(cwd);
-  let config;
+  let config: ResolvedPoiesisConfig | undefined;
   let manifest;
   try {
-    config = await loadConfig(root);
+    const rawConfig = await loadConfig(root);
     manifest = await loadManifest(root);
+    config = await resolveConfigForRoot(root, rawConfig);
   } catch (error) {
     if (!(error instanceof Error && /ENOENT/.test(error.message))) {
       if (await exists(join(root, ".poiesis"))) throw error;

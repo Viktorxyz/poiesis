@@ -1,7 +1,7 @@
 import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { init, uninstall, update } from "../src/maintenance.js";
+import { init, uninstall, update, resolveConfigForRoot } from "../src/maintenance.js";
 import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { atomicWrite, exists } from "../src/fs.js";
 import { hashDirectory } from "../src/hash.js";
@@ -63,4 +63,27 @@ describe("maintenance ownership", () => {
     expect(config).toContain('"share": "disabled"');
     expect(config).not.toContain("default_agent");
   }, 30_000);
+
+  it("discovers remote, integration branch, and verification commands from the Git repository", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const draft: Parameters<typeof resolveConfigForRoot>[1] = {
+      schema: 1,
+      models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      tracker: { provider: "fixture", project: repository.fixtures },
+      delivery: {
+        preview: { adapter: "command", command: ["echo", "{sha}"] },
+        staging: { adapter: "command", command: ["echo", "{sha}"] },
+        production: { adapter: "command", command: ["echo", "{sha}"] },
+      },
+    };
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true" } }),
+    );
+    const resolved = await resolveConfigForRoot(repository.root, draft);
+    expect(resolved.repository.remote).toBe("origin");
+    expect(resolved.repository.integrationBranch).toBe("main");
+    expect(resolved.verification.commands).toEqual(["true"]);
+  });
 });

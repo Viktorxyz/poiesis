@@ -9,6 +9,8 @@ const managedFileSchema = z.strictObject({
   kind: z.enum(["generated", "canonical"]),
   hash: z.string().regex(/^[a-f0-9]{64}$/),
   owned: z.literal(true),
+  /** Durable project-tracked files remain tracked in the consumer repository. */
+  durable: z.boolean().optional(),
 });
 
 const skillSchema = z.strictObject({

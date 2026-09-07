@@ -2,10 +2,10 @@
 import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { readUtf8 } from "./fs.js";
-import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig } from "./config.js";
+import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot } from "./maintenance.js";
 import { installCapability } from "./skills.js";
 import {
   checkpoint,
@@ -174,7 +174,7 @@ async function commandWorkspace(args: string[]): Promise<void> {
       cwd: { type: "string" },
     });
     const root = await resolveGitRoot(cwdOf(values));
-    const config = await loadConfig(root);
+    const config = await resolveConfigForRoot(root);
     writeSuccess(
       "workspace.prepare",
       await workspacePrepare({
@@ -239,11 +239,12 @@ async function commandVerify(args: string[]): Promise<void> {
     sha: { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
-  const commands = config.verification?.commands;
-  if (commands === undefined) throw new PoiesisError("NO_VERIFICATION_COMMANDS", "No verification commands were supplied or configured");
-  writeSuccess("verify", await verify({ cwd: root, candidateSha: required(values, "sha"), commands }));
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
+  const commands = config.verification.commands;
+  writeSuccess("verify", await verify({ cwd: repoRoot, candidateSha: required(values, "sha"), commands }));
 }
 
 async function commandPublish(args: string[]): Promise<void> {
@@ -256,12 +257,14 @@ async function commandPublish(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
   writeSuccess(
     "publish",
     await publish({
-      cwd: root,
+      cwd: repoRoot,
       remote: config.repository.remote,
       integrationBranch: config.repository.integrationBranch,
       candidateSha: required(values, "sha"),
@@ -283,8 +286,10 @@ async function commandPreview(args: string[]): Promise<void> {
     proof: { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
   writeSuccess(
     "preview",
     await previewDelivery(
@@ -294,7 +299,7 @@ async function commandPreview(args: string[]): Promise<void> {
         candidateTree: required(values, "candidate-tree"),
         proof: json<ProofPayload>(required(values, "proof"), "proof"),
       },
-      root,
+      repoRoot,
     ),
   );
 }
@@ -311,13 +316,15 @@ async function commandIntegrate(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
-  const postIntegrationCommands = config.verification?.postIntegrationCommands ?? config.verification?.commands;
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
+  const postIntegrationCommands = config.verification.postIntegrationCommands ?? config.verification.commands;
   writeSuccess(
     "integrate",
     await integrate({
-      cwd: root,
+      cwd: repoRoot,
       remote: config.repository.remote,
       integrationBranch: config.repository.integrationBranch,
       expectedBaseSha: required(values, "base"),
@@ -345,8 +352,10 @@ async function commandPromote(args: string[]): Promise<void> {
     proof: { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
   const target = required(values, "target");
   if (target !== "staging" && target !== "production") {
     throw new PoiesisError("INVALID_DELIVERY_TARGET", "Promotion target must be staging or production", { target });
@@ -372,7 +381,7 @@ async function commandPromote(args: string[]): Promise<void> {
         staging: json<StagingPayload>(required(values, "staging"), "staging"),
         integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
       } as const;
-  writeSuccess("promote", await promoteDelivery(config.delivery[target], input, root));
+  writeSuccess("promote", await promoteDelivery(config.delivery[target], input, repoRoot));
 }
 
 async function commandTracker(args: string[]): Promise<void> {
@@ -391,9 +400,11 @@ async function commandTracker(args: string[]): Promise<void> {
     replacement: { type: "string", multiple: true },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  const config = await loadConfig(root);
-  const adapter = createTrackerAdapter(config.tracker, root);
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveConfigRoot(repoRoot);
+  const config = await resolveConfigForRoot(configRoot);
+  const adapter = createTrackerAdapter(config.tracker, repoRoot);
   const id = () => required(values, "id");
   let result: unknown;
   if (kind === "spec") {

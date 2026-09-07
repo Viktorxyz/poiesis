@@ -1,6 +1,6 @@
 {
   "name": "poiesis-cli",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Poiesis — A deterministic runtime for turning human intent into working, proven software.",
   "type": "module",
   "bin": {
@@ -11,18 +11,30 @@
   },
   "files": [
     "dist",
-    "POIESIS_*.md",
-    "POIESIS_*.json",
-    "POIESIS_*.jsonc",
-    "OPENCODE_AGENT_*.md",
-    "COMPATIBILITY.md"
+    "POIESIS_PHILOSOPHY.md",
+    "POIESIS_METHOD.md",
+    "POIESIS_CONFIG_TEMPLATE.jsonc",
+    "POIESIS_SKILLS.json",
+    "POIESIS_ROLE_POIESIS.md",
+    "POIESIS_ROLE_PLANNER.md",
+    "POIESIS_ROLE_WORKER.md",
+    "POIESIS_ROLE_RESEARCH.md",
+    "POIESIS_ROLE_REVIEWER.md",
+    "OPENCODE_AGENT_POIESIS.md",
+    "OPENCODE_AGENT_PLANNER.md",
+    "OPENCODE_AGENT_WORKER.md",
+    "OPENCODE_AGENT_RESEARCH.md",
+    "OPENCODE_AGENT_REVIEWER.md",
+    "OPENCODE_AGENT_FINAL_REVIEWER.md",
+    "COMPATIBILITY.md",
+    "README.md"
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/viktorxyz/poiesis.git"
+    "url": "https://github.com/Viktorxyz/poiesis.git"
   },
-  "homepage": "https://github.com/viktorxyz/poiesis",
-  "bugs": "https://github.com/viktorxyz/poiesis/issues",
+  "homepage": "https://github.com/Viktorxyz/poiesis",
+  "bugs": "https://github.com/Viktorxyz/poiesis/issues",
   "scripts": {
     "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
     "check": "tsc --noEmit",
