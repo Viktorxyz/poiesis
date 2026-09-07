@@ -1,0 +1,43 @@
+{
+  // Canonical project-level Poiesis configuration.
+  // The installer resolves real values during `poiesis init`.
+  "schema": 1,
+
+  "models": {
+    "reasoning": "<provider/model>",
+    "execution": "<provider/model>"
+    // Optional advanced overrides may be supported later under "roles".
+  },
+
+  "repository": {
+    "remote": "origin",
+    "integrationBranch": "main"
+  },
+
+  "tracker": {
+    "provider": "<supported-tracker-adapter>",
+    "project": "<provider-specific-project-reference>"
+  },
+
+  "delivery": {
+    "preview": {
+      "adapter": "command",
+      "command": ["<delivery-executable>", "preview", "{sha}"]
+    },
+    "staging": {
+      "adapter": "command",
+      "command": ["<delivery-executable>", "staging", "{sha}"]
+    },
+    "production": {
+      "adapter": "command",
+      "command": ["<delivery-executable>", "production", "{sha}"]
+    }
+  },
+
+  // Commands run against exact clean candidate revisions. Staging and
+  // Production delivery commands must also perform health verification and
+  // return JSON containing `verified: true`.
+  "verification": {
+    "commands": ["<authoritative-project-check-command>"]
+  }
+}

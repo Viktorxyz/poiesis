@@ -1,0 +1,32 @@
+{
+  "schema": 1,
+  "poiesisVersion": "<installed-version>",
+  "adapter": {
+    "harness": "opencode",
+    "adapterVersion": "<adapter-version>"
+  },
+  "files": [
+    {
+      "path": "<managed-path>",
+      "kind": "generated|canonical|config-patch",
+      "hash": "<sha256>",
+      "owned": true
+    }
+  ],
+  "skills": [
+    {
+      "source": "<upstream-source>",
+      "name": "<skill-name>",
+      "preexisting": false,
+      "installedRevision": "<revision-or-version>"
+    }
+  ],
+  "configPatches": [
+    {
+      "file": "<config-path>",
+      "path": "<json-path>",
+      "previous": "<previous-value-or-null>",
+      "installed": "<poiesis-value>"
+    }
+  ]
+}

@@ -1,0 +1,132 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Merge these fields into the project's current OpenCode V2 config.
+  // Do not overwrite unrelated user/project configuration.
+  "default_agent": "poiesis",
+
+  "agents": {
+
+    "explore": {
+      // Keep OpenCode's native Explore behavior, but route it through Poiesis' execution model.
+      "model": "<execution-model>"
+    },
+
+    "poiesis": {
+      "model": "<reasoning-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "grilling", "effect": "allow" },
+        { "action": "skill", "resource": "grill-with-docs", "effect": "allow" },
+        { "action": "skill", "resource": "domain-modeling", "effect": "allow" },
+        { "action": "skill", "resource": "to-spec", "effect": "allow" },
+        { "action": "skill", "resource": "to-tickets", "effect": "allow" },
+        { "action": "skill", "resource": "verification-before-completion", "effect": "allow" },
+
+        { "action": "subagent", "resource": "explore", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-planner", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-worker", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-research", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-reviewer", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-final-reviewer", "effect": "allow" },
+
+        { "action": "shell", "resource": "poiesis *", "effect": "allow" },
+        { "action": "shell", "resource": "pnpm exec poiesis *", "effect": "allow" },
+        { "action": "shell", "resource": "npx poiesis *", "effect": "allow" }
+      ]
+    },
+
+    "poiesis-planner": {
+      "model": "<reasoning-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "codebase-design", "effect": "allow" },
+
+        { "action": "subagent", "resource": "explore", "effect": "allow" },
+        { "action": "subagent", "resource": "poiesis-research", "effect": "allow" }
+      ]
+    },
+
+    "poiesis-worker": {
+      "model": "<execution-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+        { "action": "edit", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "test-driven-development", "effect": "allow" },
+        { "action": "skill", "resource": "diagnosing-bugs", "effect": "allow" },
+
+        { "action": "subagent", "resource": "explore", "effect": "allow" },
+
+        { "action": "shell", "resource": "*", "effect": "allow" },
+        { "action": "shell", "resource": "git *", "effect": "deny" },
+        { "action": "shell", "resource": "poiesis *", "effect": "deny" },
+        { "action": "shell", "resource": "pnpm exec poiesis *", "effect": "deny" },
+        { "action": "shell", "resource": "npx poiesis *", "effect": "deny" }
+      ]
+    },
+
+    "poiesis-research": {
+      "model": "<execution-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "webfetch", "resource": "*", "effect": "allow" },
+        { "action": "websearch", "resource": "*", "effect": "allow" },
+        { "action": "read", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "research", "effect": "allow" }
+      ]
+    },
+
+    "poiesis-reviewer": {
+      "model": "<execution-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "code-review", "effect": "allow" },
+
+        { "action": "subagent", "resource": "explore", "effect": "allow" }
+      ]
+    },
+
+
+    "poiesis-final-reviewer": {
+      "model": "<reasoning-model>",
+      "permissions": [
+        { "action": "*", "resource": "*", "effect": "deny" },
+
+        { "action": "read", "resource": "*", "effect": "allow" },
+        { "action": "glob", "resource": "*", "effect": "allow" },
+        { "action": "grep", "resource": "*", "effect": "allow" },
+        { "action": "list", "resource": "*", "effect": "allow" },
+
+        { "action": "skill", "resource": "code-review", "effect": "allow" },
+
+        { "action": "subagent", "resource": "explore", "effect": "allow" }
+      ]
+    }
+  }
+}

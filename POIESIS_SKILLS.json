@@ -1,0 +1,66 @@
+{
+  "schema": 1,
+  "defaults": [
+    {
+      "source": "mattpocock/skills",
+      "name": "grilling"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "grill-with-docs"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "domain-modeling"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "research"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "codebase-design"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "to-spec"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "to-tickets"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "code-review"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "diagnosing-bugs"
+    },
+    {
+      "source": "obra/superpowers",
+      "name": "test-driven-development"
+    },
+    {
+      "source": "obra/superpowers",
+      "name": "verification-before-completion"
+    }
+  ],
+  "notDefault": [
+    {
+      "source": "obra/superpowers",
+      "name": "writing-plans",
+      "reason": "Primary v1 is tracker-first and does not keep a second durable plan."
+    },
+    {
+      "source": "obra/superpowers",
+      "name": "systematic-debugging",
+      "reason": "Retained for dogfood comparison with diagnosing-bugs."
+    },
+    {
+      "source": "saydequaresma/caveman-skill",
+      "name": "caveman/cavecrew",
+      "reason": "Deferred dogfood experiment. V1 uses compact role return contracts without adding permanent skill prompt overhead."
+    }
+  ]
+}

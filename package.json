@@ -1,0 +1,55 @@
+{
+  "name": "poiesis-cli",
+  "version": "0.1.0",
+  "description": "Poiesis — A deterministic runtime for turning human intent into working, proven software.",
+  "type": "module",
+  "bin": {
+    "poiesis": "dist/cli.js"
+  },
+  "exports": {
+    ".": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "POIESIS_*.md",
+    "POIESIS_*.json",
+    "POIESIS_*.jsonc",
+    "OPENCODE_AGENT_*.md",
+    "COMPATIBILITY.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/viktorxyz/poiesis.git"
+  },
+  "homepage": "https://github.com/viktorxyz/poiesis",
+  "bugs": "https://github.com/viktorxyz/poiesis/issues",
+  "scripts": {
+    "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "prepack": "pnpm build"
+  },
+  "engines": {
+    "node": ">=22.20.0"
+  },
+  "keywords": [
+    "poiesis",
+    "opencode",
+    "method",
+    "deterministic",
+    "ai",
+    "software-development"
+  ],
+  "dependencies": {
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.1",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "license": "MIT"
+}
