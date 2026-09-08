@@ -32,7 +32,12 @@ export interface IntegrationEvidence {
 }
 
 export interface ProductionAuthorization {
-  productionAuthorization: string;
+  candidateSha: string;
+  candidateTree: string;
+  stagingArtifactIdentity: string;
+  integrationSha: string;
+  authorIdentity: string;
+  approved: true;
 }
 
 export function validateProofEvidence(proof: ProofEvidence, candidateSha: string, candidateTree: string): void {
@@ -76,6 +81,7 @@ export function validateStagingEvidence(staging: StagingEvidence, candidateSha: 
 }
 
 export function validateIntegrationEvidence(integration: IntegrationEvidence, acceptedCandidateSha: string, acceptedCandidateTree: string): void {
+  invariant(isRecord(integration), "INVALID_INTEGRATION_EVIDENCE", "Integration evidence must be an object");
   invariant(
     integration.candidateSha === acceptedCandidateSha,
     "INTEGRATION_IDENTITY_MISMATCH",
@@ -100,6 +106,42 @@ export function validateIntegrationEvidence(integration: IntegrationEvidence, ac
     integration.contentMatchesCandidate === true,
     "INTEGRATED_TREE_MISMATCH",
     "Integrated content has not been proven equal to the accepted candidate",
+  );
+}
+
+export function validateProductionAuthorization(
+  authorization: ProductionAuthorization,
+  candidateSha: string,
+  candidateTree: string,
+  staging: StagingEvidence,
+  integration: IntegrationEvidence,
+): void {
+  invariant(
+    authorization !== undefined && authorization !== null,
+    "PRODUCTION_AUTHORIZATION_REQUIRED",
+    "Production requires explicit Author authorization",
+  );
+  invariant(isRecord(authorization), "INVALID_PRODUCTION_AUTHORIZATION", "Production authorization must be an object");
+  invariant(authorization.approved === true, "PRODUCTION_AUTHORIZATION_REQUIRED", "Production requires explicit Author approval");
+  invariant(
+    typeof authorization.authorIdentity === "string" && authorization.authorIdentity.trim().length > 0,
+    "PRODUCTION_AUTHOR_IDENTITY_MISSING",
+    "Production authorization requires an Author identity",
+  );
+  invariant(
+    authorization.candidateSha === candidateSha && authorization.candidateTree === candidateTree,
+    "PRODUCTION_AUTHORIZATION_CANDIDATE_MISMATCH",
+    "Production authorization belongs to a different candidate",
+  );
+  invariant(
+    authorization.stagingArtifactIdentity === staging.artifactIdentity,
+    "PRODUCTION_AUTHORIZATION_STAGING_MISMATCH",
+    "Production authorization belongs to a different Staging artifact",
+  );
+  invariant(
+    authorization.integrationSha === integration.integrationSha,
+    "PRODUCTION_AUTHORIZATION_INTEGRATION_MISMATCH",
+    "Production authorization belongs to a different integration revision",
   );
 }
 

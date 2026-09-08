@@ -8,9 +8,11 @@ import { atomicWrite, exists, readUtf8 } from "./fs.js";
 import { run } from "./process.js";
 import {
   validateIntegrationEvidence,
+  validateProductionAuthorization,
   validateProofEvidence,
   validateStagingEvidence,
   type IntegrationEvidence,
+  type ProductionAuthorization,
   type ProofEvidence,
   type StagingEvidence,
 } from "./evidence.js";
@@ -731,7 +733,9 @@ export interface ProductionPromotionInput {
   target: "production";
   candidateTree: string;
   identity: DeliveryIdentity;
-  productionAuthorization: string;
+  productionAuthorization: ProductionAuthorization;
+  integrationRemote: string;
+  integrationBranch: string;
   proof: ProofPayload;
   integration: IntegrationEvidence;
 }
@@ -809,10 +813,11 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
       return this.execute(sha, candidateTree, input.target, identity);
     }
     const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "staging");
-    assertProductionAuthorization(input);
     validateProofEvidence(input.proof, sha, candidateTree);
     validateStagingEvidence(identity, sha, candidateTree);
     validateIntegrationEvidence(input.integration, sha, candidateTree);
+    await validateCanonicalIntegration(this.cwd, input.integrationRemote, input.integrationBranch, input.integration);
+    validateProductionAuthorization(input.productionAuthorization, sha, candidateTree, identity, input.integration);
     return this.execute(sha, candidateTree, input.target, identity);
   }
 
@@ -958,10 +963,11 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
       };
     } else {
       const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "staging");
-      assertProductionAuthorization(input);
       validateProofEvidence(input.proof, sha, candidateTree);
       validateStagingEvidence(identity, sha, candidateTree);
       validateIntegrationEvidence(input.integration, sha, candidateTree);
+      await validateCanonicalIntegration(this.root, input.integrationRemote, input.integrationBranch, input.integration);
+      validateProductionAuthorization(input.productionAuthorization, sha, candidateTree, identity, input.integration);
       recordedSourceIdentity = identity;
       result = {
         sha,
@@ -1013,19 +1019,49 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
   }
 }
 
-function assertProductionAuthorization(input: PromoteDeliveryInput): void {
-  if (input.target !== "production") return;
-  invariant(
-    typeof input.productionAuthorization === "string" && input.productionAuthorization.trim().length > 0,
-    "PRODUCTION_AUTHORIZATION_REQUIRED",
-    "Production promotion requires explicit Author authorization evidence",
-  );
-}
-
 function exactSha(sha: string): string {
   requiredText(sha, "candidate sha");
   invariant(sha === sha.trim() && !sha.includes("\0"), "INVALID_DELIVERY_IDENTITY", "Candidate sha is not exact text", { sha });
   return sha;
+}
+
+async function validateCanonicalIntegration(
+  root: string,
+  remote: string,
+  branch: string,
+  integration: IntegrationEvidence,
+): Promise<void> {
+  requiredText(remote, "integration remote");
+  requiredText(branch, "integration branch");
+  invariant(!remote.startsWith("-") && !remote.includes("\0"), "INVALID_REMOTE_NAME", "Configured integration remote is invalid", {
+    remote,
+  });
+  const remotes = (await run("git", ["remote"], { cwd: root })).stdout.split("\n").filter(Boolean);
+  invariant(remotes.includes(remote), "GIT_REMOTE_UNAVAILABLE", "Configured integration remote is unavailable", { remote });
+  const branchCheck = await run("git", ["check-ref-format", "--branch", branch], { cwd: root, allowFailure: true });
+  invariant(branchCheck.exitCode === 0, "INVALID_BRANCH_NAME", "Configured integration branch is invalid", { branch });
+  const fetched = await run("git", ["fetch", "--quiet", "--no-tags", "--", remote, `refs/heads/${branch}`], {
+    cwd: root,
+    allowFailure: true,
+  });
+  invariant(fetched.exitCode === 0, "INTEGRATION_BRANCH_UNAVAILABLE", "Canonical integration branch could not be fetched", {
+    remote,
+    branch,
+  });
+  const head = await run("git", ["rev-parse", "--verify", "FETCH_HEAD^{commit}"], { cwd: root });
+  invariant(
+    head.stdout === integration.integrationSha,
+    "PRODUCTION_INTEGRATION_HEAD_MISMATCH",
+    "Integration evidence is not the canonical remote integration head",
+    { expected: head.stdout, actual: integration.integrationSha, remote, branch },
+  );
+  const tree = await run("git", ["rev-parse", "--verify", `${integration.integrationSha}^{tree}`], { cwd: root });
+  invariant(
+    tree.stdout === integration.integrationTree,
+    "PRODUCTION_INTEGRATION_TREE_MISMATCH",
+    "Integration evidence tree does not match the repository",
+    { expected: tree.stdout, actual: integration.integrationTree },
+  );
 }
 
 async function resolveCandidateTree(root: string, sha: string): Promise<string> {

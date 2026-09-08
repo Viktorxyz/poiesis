@@ -105,6 +105,8 @@ The delivery adapter is a deterministic command. The command must:
 
 Preview returns a candidate-bound receipt. Staging consumes that Preview receipt and returns a new Staging receipt; callers do not predeclare Staging success. Integration consumes the Staging receipt directly and returns its complete Integration evidence. Production accepts only a Staging-target receipt, preventing a Preview identity from being relabeled as Staging.
 
+Production authorization is a structured JSON envelope binding explicit Author approval and identity to the candidate SHA/tree, Staging artifact identity, and integration SHA. Before invoking Production, Poiesis fetches the configured remote integration branch and requires that exact integration SHA to be its head with content equal to the accepted candidate tree. The orchestration layer remains responsible for asking the Author; the runtime prevents stale or cross-candidate authorization replay.
+
 For projects with no existing preview/staging infrastructure, Poiesis uses a fixture adapter (`adapter: "fixture"` plus an external path) that is test-only and requires `--allow-fixtures`.
 
 ## Operations
@@ -136,7 +138,7 @@ Every command emits structured JSON. Run `poiesis help` for command syntax.
 - `doctor` is read-only.
 - Failed implementation attempts are never checkpointed.
 - History rewriting is refused: `publish` only accepts non-forcing fast-forward updates of the Poiesis-owned remote change branch.
-- Production promotion requires separate explicit Author authorization evidence plus the operation-produced Staging receipt and content-equal Integration evidence.
+- Production promotion requires separate candidate-bound Author authorization plus the operation-produced Staging receipt and the verified canonical Integration evidence.
 - Fixture tracker and delivery adapters exist only for disposable integration tests and bootstrap dogfood; they are not supported production infrastructure.
 
 ## Development

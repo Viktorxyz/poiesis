@@ -25,7 +25,7 @@ import {
 } from "./adapters.js";
 import { cleanupOpenCodeSession } from "./session.js";
 import { PoiesisError } from "./errors.js";
-import type { IntegrationEvidence, ProofEvidence, StagingEvidence } from "./evidence.js";
+import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, StagingEvidence } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
 type Values = Record<string, string | boolean | string[] | undefined>;
@@ -46,7 +46,8 @@ Usage:
   poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>
   poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
-  poiesis promote --sha <sha> --candidate-tree <tree> --target <staging|production> --identity <json> [--authorization <text>]
+  poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
+  poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
 
@@ -376,7 +377,9 @@ async function commandPromote(args: string[]): Promise<void> {
     target,
     candidateTree,
     identity,
-    productionAuthorization: required(values, "authorization"),
+    productionAuthorization: json<ProductionAuthorization>(required(values, "authorization"), "authorization"),
+    integrationRemote: config.repository.remote,
+    integrationBranch: config.repository.integrationBranch,
     proof: json<ProofPayload>(required(values, "proof"), "proof"),
     integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
   }, repoRoot));

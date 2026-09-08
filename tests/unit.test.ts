@@ -1,10 +1,11 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { inspectProject } from "../src/inspect.js";
 import {
   validateIntegrationEvidence,
+  validateProductionAuthorization,
   validateProofEvidence,
   validateStagingEvidence,
   type ProofEvidence,
@@ -91,6 +92,27 @@ describe("evidence validation", () => {
     expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: "d".repeat(40), contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/Integrated tree does not match/);
     expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: false } as never, candidateSha, candidateTree)).toThrow(/Integrated content has not been proven/);
     expect(() => validateIntegrationEvidence({ candidateSha: "z".repeat(40), candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/different candidate/);
+    expect(() => validateIntegrationEvidence(null as never, candidateSha, candidateTree)).toThrow(/must be an object/);
+  });
+
+  it("binds Production authorization to candidate, Staging, and integration identities", () => {
+    const candidateSha = "a".repeat(40);
+    const candidateTree = "b".repeat(40);
+    const staging = { candidateSha, candidateTree, target: "staging" as const, artifactIdentity: "artifact", verified: true as const };
+    const integration = { candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: true as const };
+    const authorization = {
+      candidateSha,
+      candidateTree,
+      stagingArtifactIdentity: staging.artifactIdentity,
+      integrationSha: integration.integrationSha,
+      authorIdentity: "author-session",
+      approved: true as const,
+    };
+    expect(() => validateProductionAuthorization(authorization, candidateSha, candidateTree, staging, integration)).not.toThrow();
+    expect(() => validateProductionAuthorization({ ...authorization, candidateSha: "d".repeat(40) }, candidateSha, candidateTree, staging, integration)).toThrow(/different candidate/);
+    expect(() => validateProductionAuthorization({ ...authorization, stagingArtifactIdentity: "other" }, candidateSha, candidateTree, staging, integration)).toThrow(/different Staging artifact/);
+    expect(() => validateProductionAuthorization({ ...authorization, integrationSha: "e".repeat(40) }, candidateSha, candidateTree, staging, integration)).toThrow(/different integration revision/);
+    expect(() => validateProductionAuthorization({ ...authorization, authorIdentity: " " }, candidateSha, candidateTree, staging, integration)).toThrow(/Author identity/);
   });
 });
 
@@ -135,5 +157,69 @@ describe("CommandDeliveryAdapter", () => {
     await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({
       code: "DELIVERY_ARTIFACT_IDENTITY_MISMATCH",
     });
+  });
+
+  it("never invokes the Production command for invalid authorization or integration evidence", async () => {
+    const repository = await createTestRepository();
+    fixtures.push(repository.parent);
+    const sha = repository.baseSha;
+    const tree = await resolveTree(repository.root, sha);
+    const sentinel = join(repository.parent, "production-invoked");
+    const command = join(repository.parent, "production-command.sh");
+    await writeFile(command, `#!/bin/sh\ntouch "${sentinel}"\nexit 70\n`);
+    await chmod(command, 0o755);
+    const adapter = createCommandDeliveryAdapter({ adapter: "command", command: [command, "{target}", "{sha}"] }, repository.root);
+    const staging = {
+      sha,
+      candidateSha: sha,
+      candidateTree: tree,
+      target: "staging" as const,
+      artifactIdentity: "staging-artifact",
+      verified: true as const,
+      id: "staging-artifact",
+    };
+    const integration = { candidateSha: sha, candidateTree: tree, integrationSha: sha, integrationTree: tree, contentMatchesCandidate: true as const };
+    const authorization = {
+      candidateSha: sha,
+      candidateTree: tree,
+      stagingArtifactIdentity: staging.artifactIdentity,
+      integrationSha: sha,
+      authorIdentity: "author-session",
+      approved: true as const,
+    };
+    const valid = {
+      sha,
+      target: "production" as const,
+      candidateTree: tree,
+      identity: staging,
+      productionAuthorization: authorization,
+      integrationRemote: "origin",
+      integrationBranch: "main",
+      proof: proofShell(sha, tree),
+      integration,
+    };
+
+    await expect(adapter.promote({ ...valid, productionAuthorization: undefined as never })).rejects.toMatchObject({ code: "PRODUCTION_AUTHORIZATION_REQUIRED" });
+    await expect(adapter.promote({ ...valid, integrationRemote: "--append" })).rejects.toMatchObject({ code: "INVALID_REMOTE_NAME" });
+    await expect(adapter.promote({ ...valid, integrationBranch: "--bad" })).rejects.toMatchObject({ code: "INVALID_BRANCH_NAME" });
+    await run("git", ["commit", "--quiet", "--allow-empty", "-m", "same tree"], { cwd: repository.root });
+    const staleIntegrationSha = (await run("git", ["rev-parse", "HEAD"], { cwd: repository.root })).stdout;
+    await expect(adapter.promote({
+      ...valid,
+      integration: { ...integration, integrationSha: staleIntegrationSha },
+      productionAuthorization: { ...authorization, integrationSha: staleIntegrationSha },
+    })).rejects.toMatchObject({ code: "PRODUCTION_INTEGRATION_HEAD_MISMATCH" });
+
+    await writeFile(join(repository.root, "README.md"), "different integration tree\n");
+    await run("git", ["add", "README.md"], { cwd: repository.root });
+    await run("git", ["commit", "--quiet", "-m", "different integration tree"], { cwd: repository.root });
+    await run("git", ["push", "--quiet", "origin", "main"], { cwd: repository.root });
+    const differentTreeSha = (await run("git", ["rev-parse", "HEAD"], { cwd: repository.root })).stdout;
+    await expect(adapter.promote({
+      ...valid,
+      integration: { ...integration, integrationSha: differentTreeSha },
+      productionAuthorization: { ...authorization, integrationSha: differentTreeSha },
+    })).rejects.toMatchObject({ code: "PRODUCTION_INTEGRATION_TREE_MISMATCH" });
+    await expect(access(sentinel)).rejects.toThrow();
   });
 });
