@@ -183,6 +183,7 @@ export interface IntegrateResult {
   integratedTree: string;
   remoteRef: string;
   postIntegrationVerification: VerifyResult | null;
+  integration: IntegrationEvidence;
 }
 
 export interface WorkspaceCleanupOptions {
@@ -708,6 +709,7 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     integratedTree,
     remoteRef,
     postIntegrationVerification,
+    integration,
   };
 }
 

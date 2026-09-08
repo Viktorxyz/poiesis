@@ -18,6 +18,7 @@ export interface ProofEvidence {
 export interface StagingEvidence {
   candidateSha: string;
   candidateTree: string;
+  target: "staging";
   artifactIdentity: string;
   verified: true;
 }
@@ -65,6 +66,7 @@ export function validateStagingEvidence(staging: StagingEvidence, candidateSha: 
     "Staging evidence belongs to a different candidate tree",
     { expected: candidateTree, actual: staging.candidateTree },
   );
+  invariant(staging.target === "staging", "STAGING_TARGET_MISMATCH", "Staging evidence must come from the Staging target");
   invariant(staging.verified === true, "STAGING_NOT_VERIFIED", "Staging verification has not passed");
   invariant(
     typeof staging.artifactIdentity === "string" && staging.artifactIdentity.trim().length > 0,

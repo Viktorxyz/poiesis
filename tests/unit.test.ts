@@ -77,10 +77,10 @@ describe("evidence validation", () => {
 
   it("rejects Staging identity mismatch and unverified staging", () => {
     const sha = "a".repeat(40);
-    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: true, artifactIdentity: "" } satisfies StagingEvidence, sha, tree)).toThrow(/Staging artifact identity is required/);
-    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: false, artifactIdentity: "x" } as unknown as StagingEvidence, sha, tree)).toThrow(/verification has not passed/);
-    expect(() => validateStagingEvidence({ candidateSha: "c".repeat(40), candidateTree: tree, verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate/);
-    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: "c".repeat(40), verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate tree/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, target: "staging", verified: true, artifactIdentity: "" } satisfies StagingEvidence, sha, tree)).toThrow(/Staging artifact identity is required/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, target: "staging", verified: false, artifactIdentity: "x" } as unknown as StagingEvidence, sha, tree)).toThrow(/verification has not passed/);
+    expect(() => validateStagingEvidence({ candidateSha: "c".repeat(40), candidateTree: tree, target: "staging", verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: "c".repeat(40), target: "staging", verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate tree/);
   });
 
   it("rejects Integration evidence that does not prove content equality", () => {
@@ -103,7 +103,7 @@ describe("CommandDeliveryAdapter", () => {
     const sha = repository.baseSha;
     const tree = await resolveTree(root, sha);
     const receiptScript = join(parent, "delivery-receipt.sh");
-    await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"status\":\"created\",\"url\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"id\":\"sha-$POIESIS_CANDIDATE_SHA-target-$POIESIS_DELIVERY_TARGET\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
+    await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"status\":\"created\",\"url\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"candidateTree\":\"$POIESIS_CANDIDATE_TREE\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
     await chmod(receiptScript, 0o755);
     const adapter = createCommandDeliveryAdapter(
       { adapter: "command", command: [receiptScript, "deploy", "{target}", "{sha}"] },
@@ -111,6 +111,29 @@ describe("CommandDeliveryAdapter", () => {
     );
     const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
     expect(preview.url).toBe(`https://example.com/preview/${sha}`);
-    expect(preview.id).toContain(sha);
+    expect(preview.artifactIdentity).toBe(preview.url);
+  });
+
+  it("rejects incomplete or inconsistent command receipts", async () => {
+    const repository = await createTestRepository();
+    fixtures.push(repository.parent);
+    const sha = repository.baseSha;
+    const tree = await resolveTree(repository.root, sha);
+    const receiptScript = join(repository.parent, "incomplete-delivery-receipt.sh");
+    await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"id\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
+    await chmod(receiptScript, 0o755);
+    const adapter = createCommandDeliveryAdapter(
+      { adapter: "command", command: [receiptScript, "{target}", "{sha}"] },
+      repository.root,
+    );
+
+    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({
+      code: "DELIVERY_TREE_MISMATCH",
+    });
+
+    await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"id\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"different-artifact\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"candidateTree\":\"$POIESIS_CANDIDATE_TREE\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
+    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({
+      code: "DELIVERY_ARTIFACT_IDENTITY_MISMATCH",
+    });
   });
 });

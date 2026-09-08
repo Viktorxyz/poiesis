@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, workspacePrepare } from "../src/git.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, stagingShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
   return resolveTree(repository.root, sha);
@@ -88,7 +88,6 @@ describe("deterministic Git lifecycle", () => {
       target: "staging",
       candidateTree: treeA,
       identity: preview,
-      staging: stagingShell(accepted.sha, treeA),
     });
     await expect(
       integrate({
@@ -101,7 +100,7 @@ describe("deterministic Git lifecycle", () => {
         candidateTree: treeA,
         message: "Spec 1: stale staging",
         proof: proofShell(accepted.sha, treeA),
-        staging: { ...stagingShell(workspace.baseSha, treeA), artifactIdentity: staging.id! },
+        staging: { ...staging, candidateSha: workspace.baseSha },
         authorAcceptance: "Yes, this is what I wanted.",
       }),
     ).rejects.toMatchObject({ code: "STAGING_IDENTITY_MISMATCH" });
@@ -115,12 +114,19 @@ describe("deterministic Git lifecycle", () => {
       candidateTree: treeA,
       message: "Spec 1: accepted feature",
       proof: proofShell(accepted.sha, treeA),
-      staging: { ...stagingShell(accepted.sha, treeA), verified: true, artifactIdentity: staging.id! },
+      staging,
       authorAcceptance: "Yes, this is what I wanted.",
       postIntegrationCommands: ["test -f feature.txt"],
     });
     expect(integrated.integratedSha).not.toBe(accepted.sha);
     expect(integrated.integratedTree).toBe(integrated.candidateTree);
+    expect(integrated.integration).toEqual({
+      candidateSha: accepted.sha,
+      candidateTree: treeA,
+      integrationSha: integrated.integratedSha,
+      integrationTree: integrated.integratedTree,
+      contentMatchesCandidate: true,
+    });
     const parents = (await run("git", ["rev-list", "--parents", "-n", "1", integrated.integratedSha], { cwd: workspace.path })).stdout.split(" ");
     expect(parents).toHaveLength(2);
 
@@ -232,6 +238,10 @@ describe("deterministic Git lifecycle", () => {
       proof: proofShell(candidate.sha, treeB),
     });
 
+    const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
+    const preview = await delivery.preview({ sha: candidate.sha, candidateTree: treeB, proof: proofShell(candidate.sha, treeB) });
+    const staging = await delivery.promote({ sha: candidate.sha, target: "staging", candidateTree: treeB, identity: preview });
+
     await writeFile(join(repository.root, "base-change.txt"), "new base\n");
     await run("git", ["add", "base-change.txt"], { cwd: repository.root });
     await run("git", ["commit", "--quiet", "-m", "advance base"], { cwd: repository.root });
@@ -247,7 +257,7 @@ describe("deterministic Git lifecycle", () => {
         candidateTree: treeB,
         message: "stale",
         proof: proofShell(candidate.sha, treeB),
-        staging: { ...stagingShell(candidate.sha, treeB), verified: true },
+        staging,
         authorAcceptance: "accepted",
       }),
     ).rejects.toMatchObject({ code: "STALE_INTEGRATION_BASE" });

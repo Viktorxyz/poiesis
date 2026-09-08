@@ -34,9 +34,9 @@
     }
   },
 
-  // Commands run against exact clean candidate revisions. Staging and
-  // Production delivery commands must also perform health verification and
-  // return JSON containing `verified: true`.
+  // Commands receive POIESIS_CANDIDATE_TREE and, during promotion,
+  // POIESIS_DELIVERY_IDENTITY. They must return exact sha, candidateTree,
+  // target, verified: true, and an artifactIdentity matching id/url/artifact.
   "verification": {
     "commands": ["<authoritative-project-check-command>"]
   }

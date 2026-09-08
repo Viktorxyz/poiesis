@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createFixtureDeliveryAdapter, createFixtureTrackerAdapter } from "../src/adapters.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, stagingShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
 
 describe("tracker and delivery adapters", () => {
   const repositories: TestRepository[] = [];
@@ -54,9 +54,9 @@ describe("tracker and delivery adapters", () => {
       target: "staging",
       candidateTree: tree,
       identity: preview,
-      staging: stagingShell(sha, tree),
     });
-    expect(staging.id).toBe(`artifact:${sha}`);
+    expect(staging.id).toBe(`fixture:staging:${sha}`);
+    expect(staging).toMatchObject({ candidateSha: sha, candidateTree: tree, target: "staging", verified: true });
     await expect(
       adapter.promote({ sha, target: "production", identity: staging, candidateTree: tree } as never),
     ).rejects.toMatchObject({ code: "PRODUCTION_AUTHORIZATION_REQUIRED" });
@@ -68,10 +68,9 @@ describe("tracker and delivery adapters", () => {
         identity: preview,
         productionAuthorization: "Author said yes",
         proof: proofShell(sha, tree),
-        staging: { candidateSha: sha, candidateTree: tree, artifactIdentity: "staging-artifact", verified: true },
-        integration: { candidateSha: sha, candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
+        integration: { candidateSha: sha, candidateTree: tree, integrationSha: sha, integrationTree: tree, contentMatchesCandidate: true },
       }),
-    ).rejects.toMatchObject({ code: "PRODUCTION_STAGING_IDENTITY_MISMATCH" });
+    ).rejects.toMatchObject({ code: "DELIVERY_SOURCE_TARGET_MISMATCH" });
     const production = await adapter.promote({
       sha,
       target: "production",
@@ -79,8 +78,7 @@ describe("tracker and delivery adapters", () => {
       identity: staging,
       productionAuthorization: "Author said yes",
       proof: proofShell(sha, tree),
-      staging: stagingShell(sha, tree),
-      integration: { candidateSha: sha, candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
+      integration: { candidateSha: sha, candidateTree: tree, integrationSha: sha, integrationTree: tree, contentMatchesCandidate: true },
     });
     expect(production.sha).toBe(sha);
   });

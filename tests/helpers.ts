@@ -66,13 +66,6 @@ export const proofShell = (sha: string, tree: string) => ({
   standardsReview: { verdict: "PASS" as const, reviewerIdentity: "standards-review-session" },
 });
 
-export const stagingShell = (sha: string, tree: string) => ({
-  candidateSha: sha,
-  candidateTree: tree,
-  artifactIdentity: `artifact:${sha}`,
-  verified: true as const,
-});
-
 export const integration = (candidateTree: string, integrationSha: string, integrationTree: string) => ({
   candidateTree,
   integrationSha,

@@ -43,10 +43,10 @@ Usage:
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --proof <json> --title <text> --body <text>
-  poiesis preview --sha <sha> --proof <json>
-  poiesis integrate --sha <sha> --base <sha> --proof <json> --staging <json> --acceptance <text> --message <text>
-  poiesis promote --sha <sha> --target <staging|production> --identity <json> [--authorization <text>]
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>
+  poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
+  poiesis promote --sha <sha> --candidate-tree <tree> --target <staging|production> --identity <json> [--authorization <text>]
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
 
@@ -347,7 +347,6 @@ async function commandPromote(args: string[]): Promise<void> {
     target: { type: "string" },
     identity: { type: "string" },
     authorization: { type: "string" },
-    staging: { type: "string" },
     integration: { type: "string" },
     proof: { type: "string" },
     cwd: { type: "string" },
@@ -363,25 +362,24 @@ async function commandPromote(args: string[]): Promise<void> {
   const identity = json<DeliveryIdentity>(required(values, "identity"), "identity");
   const sha = required(values, "sha");
   const candidateTree = required(values, "candidate-tree");
-  const input = target === "staging"
-    ? {
-        sha,
-        target,
-        candidateTree,
-        identity,
-        staging: json<StagingPayload>(required(values, "staging"), "staging"),
-      } as const
-    : {
-        sha,
-        target,
-        candidateTree,
-        identity,
-        productionAuthorization: required(values, "authorization"),
-        proof: json<ProofPayload>(required(values, "proof"), "proof"),
-        staging: json<StagingPayload>(required(values, "staging"), "staging"),
-        integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
-      } as const;
-  writeSuccess("promote", await promoteDelivery(config.delivery[target], input, repoRoot));
+  if (target === "staging") {
+    writeSuccess("promote", await promoteDelivery(config.delivery.staging, {
+      sha,
+      target,
+      candidateTree,
+      identity,
+    }, repoRoot));
+    return;
+  }
+  writeSuccess("promote", await promoteDelivery(config.delivery.production, {
+    sha,
+    target,
+    candidateTree,
+    identity,
+    productionAuthorization: required(values, "authorization"),
+    proof: json<ProofPayload>(required(values, "proof"), "proof"),
+    integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
+  }, repoRoot));
 }
 
 async function commandTracker(args: string[]): Promise<void> {
