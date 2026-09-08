@@ -11,8 +11,9 @@ import {
   type StagingEvidence,
 } from "../src/evidence.js";
 import { createCommandDeliveryAdapter } from "../src/adapters.js";
+import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { proofShell } from "./helpers.js";
+import { createTestRepository, proofShell } from "./helpers.js";
 
 const fixtures: string[] = [];
 afterEach(async () => {
@@ -64,18 +65,22 @@ describe("evidence validation", () => {
   });
 
   it("rejects Proof belonging to a different candidate", () => {
-    expect(() => validateProofEvidence(proof("a".repeat(40)), "b".repeat(40))).toThrow(/different candidate/);
+    expect(() => validateProofEvidence(proof("a".repeat(40)), "b".repeat(40), tree)).toThrow(/different candidate/);
+    expect(() => validateProofEvidence(proof("a".repeat(40)), "a".repeat(40), "c".repeat(40))).toThrow(/different candidate tree/);
   });
 
   it("rejects incomplete Proof and missing reviewer identity", () => {
-    expect(() => validateProofEvidence({ ...proof("a".repeat(40)), verified: false } as unknown as ProofEvidence, "a".repeat(40))).toThrow(/verification has not passed/);
-    expect(() => validateProofEvidence({ ...proof("a".repeat(40)), specReview: { verdict: "PASS", reviewerIdentity: " " } }, "a".repeat(40))).toThrow(/identity is required/);
+    expect(() => validateProofEvidence({ ...proof("a".repeat(40)), verified: false } as unknown as ProofEvidence, "a".repeat(40), tree)).toThrow(/verification has not passed/);
+    expect(() => validateProofEvidence({ ...proof("a".repeat(40)), specReview: { verdict: "PASS", reviewerIdentity: " " } }, "a".repeat(40), tree)).toThrow(/identity is required/);
+    expect(() => validateProofEvidence(null as unknown as ProofEvidence, "a".repeat(40), tree)).toThrow(/must be an object/);
   });
 
   it("rejects Staging identity mismatch and unverified staging", () => {
     const sha = "a".repeat(40);
-    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: true, artifactIdentity: "" } satisfies StagingEvidence, sha)).toThrow(/Staging artifact identity is required/);
-    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: false, artifactIdentity: "x" } as unknown as StagingEvidence, sha)).toThrow(/verification has not passed/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: true, artifactIdentity: "" } satisfies StagingEvidence, sha, tree)).toThrow(/Staging artifact identity is required/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: tree, verified: false, artifactIdentity: "x" } as unknown as StagingEvidence, sha, tree)).toThrow(/verification has not passed/);
+    expect(() => validateStagingEvidence({ candidateSha: "c".repeat(40), candidateTree: tree, verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate/);
+    expect(() => validateStagingEvidence({ candidateSha: sha, candidateTree: "c".repeat(40), verified: true, artifactIdentity: "x" }, sha, tree)).toThrow(/different candidate tree/);
   });
 
   it("rejects Integration evidence that does not prove content equality", () => {
@@ -83,6 +88,7 @@ describe("evidence validation", () => {
     const candidateTree = "a".repeat(40);
     expect(() => validateIntegrationEvidence({ candidateSha, candidateTree: "b".repeat(40), integrationSha: "c".repeat(40), integrationTree: "b".repeat(40), contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/does not match the accepted candidate tree/);
     expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "not-a-sha", integrationTree: candidateTree, contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/Exact integrated revision is required/);
+    expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: "d".repeat(40), contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/Integrated tree does not match/);
     expect(() => validateIntegrationEvidence({ candidateSha, candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: false } as never, candidateSha, candidateTree)).toThrow(/Integrated content has not been proven/);
     expect(() => validateIntegrationEvidence({ candidateSha: "z".repeat(40), candidateTree, integrationSha: "c".repeat(40), integrationTree: candidateTree, contentMatchesCandidate: true }, candidateSha, candidateTree)).toThrow(/different candidate/);
   });
@@ -90,11 +96,12 @@ describe("evidence validation", () => {
 
 describe("CommandDeliveryAdapter", () => {
   it("substitutes {sha} and {target} and forwards candidate identity to the delivery command", async () => {
-    const parent = await mkdtemp(join(tmpdir(), "poiesis-delivery-"));
-    fixtures.push(parent);
-    const root = join(parent, "repo");
-    await mkdir(root, { recursive: true });
-    const sha = "d".repeat(40);
+    const repository = await createTestRepository();
+    fixtures.push(repository.parent);
+    const parent = repository.parent;
+    const root = repository.root;
+    const sha = repository.baseSha;
+    const tree = await resolveTree(root, sha);
     const receiptScript = join(parent, "delivery-receipt.sh");
     await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"status\":\"created\",\"url\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"id\":\"sha-$POIESIS_CANDIDATE_SHA-target-$POIESIS_DELIVERY_TARGET\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
     await chmod(receiptScript, 0o755);
@@ -102,7 +109,7 @@ describe("CommandDeliveryAdapter", () => {
       { adapter: "command", command: [receiptScript, "deploy", "{target}", "{sha}"] },
       root,
     );
-    const preview = await adapter.preview({ sha, candidateTree: sha, proof: proofShell(sha, sha) });
+    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
     expect(preview.url).toBe(`https://example.com/preview/${sha}`);
     expect(preview.id).toContain(sha);
   });

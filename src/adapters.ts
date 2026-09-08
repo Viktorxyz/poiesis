@@ -702,18 +702,9 @@ export interface DeliveryResult extends DeliveryIdentity {
   verified: true;
 }
 
-export interface ProofPayload {
-  verified: true;
-  specReview: { verdict: "PASS"; reviewerIdentity: string };
-  standardsReview: { verdict: "PASS"; reviewerIdentity: string };
-  candidateTree?: string;
-}
+export type ProofPayload = ProofEvidence;
 
-export interface StagingPayload {
-  artifactIdentity: string;
-  verified: true;
-  candidateTree?: string;
-}
+export type StagingPayload = StagingEvidence;
 
 export interface PreviewDeliveryInput {
   sha: string;
@@ -793,32 +784,26 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
     this.env = config.env;
   }
 
-  preview(input: PreviewDeliveryInput): Promise<DeliveryResult> {
+  async preview(input: PreviewDeliveryInput): Promise<DeliveryResult> {
     const sha = exactSha(input.sha);
-    const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-    validateProofEvidence(proof, sha);
-    invariant(
-      !input.proof.candidateTree || input.proof.candidateTree === input.candidateTree,
-      "PROOF_TREE_MISMATCH",
-      "Preview tree must match the proof's recorded candidate tree",
-      { expected: input.candidateTree, proof: input.proof.candidateTree },
-    );
+    const candidateTree = await resolveCandidateTree(this.cwd, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
+    validateProofEvidence(input.proof, sha, candidateTree);
     return this.execute(sha, "preview");
   }
 
-  promote(input: PromoteDeliveryInput): Promise<DeliveryResult> {
+  async promote(input: PromoteDeliveryInput): Promise<DeliveryResult> {
     const sha = exactSha(input.sha);
+    const candidateTree = await resolveCandidateTree(this.cwd, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
     const identity = normalizeDeliveryIdentity(input.identity, sha);
     assertProductionAuthorization(input);
     if (input.target === "staging") {
-      const staging: StagingEvidence = { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree };
-      validateStagingEvidence(staging, sha);
+      validateStagingEvidence(input.staging, sha, candidateTree);
     } else {
-      const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-      validateProofEvidence(proof, sha);
-      const staging: StagingEvidence = { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree };
-      validateStagingEvidence(staging, sha);
-      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
+      validateProofEvidence(input.proof, sha, candidateTree);
+      validateStagingEvidence(input.staging, sha, candidateTree);
+      validateIntegrationEvidence(input.integration, sha, candidateTree);
     }
     return this.execute(sha, input.target, identity);
   }
@@ -891,22 +876,19 @@ interface FixtureDeliveryRecord {
 class FixtureDeliveryAdapter implements DeliveryAdapter {
   readonly kind = "fixture" as const;
   private readonly fixturePath: string;
+  private readonly root: string;
 
   constructor(config: FixtureDeliveryConfig, root: string) {
+    this.root = resolve(root);
     this.fixturePath = resolveConfiguredPath(root, requiredText(config.path, "delivery fixture path"));
     assertExternalFixturePath(root, this.fixturePath, "delivery");
   }
 
   async preview(input: PreviewDeliveryInput): Promise<DeliveryResult> {
     const sha = exactSha(input.sha);
-    const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-    validateProofEvidence(proof, sha);
-    invariant(
-      !input.proof.candidateTree || input.proof.candidateTree === input.candidateTree,
-      "PROOF_TREE_MISMATCH",
-      "Preview tree must match the proof's recorded candidate tree",
-      { expected: input.candidateTree, proof: input.proof.candidateTree },
-    );
+    const candidateTree = await resolveCandidateTree(this.root, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
+    validateProofEvidence(input.proof, sha, candidateTree);
     const result: DeliveryResult = {
       sha,
       target: "preview",
@@ -920,15 +902,14 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
 
   async promote(input: PromoteDeliveryInput): Promise<DeliveryResult> {
     const sha = exactSha(input.sha);
+    const candidateTree = await resolveCandidateTree(this.root, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
     const identity = normalizeDeliveryIdentity(input.identity, sha);
     assertProductionAuthorization(input);
     let result: DeliveryResult;
     let recordedSourceIdentity: DeliveryIdentity;
     if (input.target === "staging") {
-      validateStagingEvidence(
-        { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree },
-        sha,
-      );
+      validateStagingEvidence(input.staging, sha, candidateTree);
       recordedSourceIdentity = { sha, id: input.staging.artifactIdentity };
       result = {
         sha,
@@ -938,12 +919,9 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
         id: input.staging.artifactIdentity,
       };
     } else {
-      validateProofEvidence({ ...input.proof, candidateSha: sha, candidateTree: input.candidateTree }, sha);
-      validateStagingEvidence(
-        { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree },
-        sha,
-      );
-      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
+      validateProofEvidence(input.proof, sha, candidateTree);
+      validateStagingEvidence(input.staging, sha, candidateTree);
+      validateIntegrationEvidence(input.integration, sha, candidateTree);
       recordedSourceIdentity = identity;
       result = {
         sha,
@@ -1014,6 +992,28 @@ function exactSha(sha: string): string {
   requiredText(sha, "candidate sha");
   invariant(sha === sha.trim() && !sha.includes("\0"), "INVALID_DELIVERY_IDENTITY", "Candidate sha is not exact text", { sha });
   return sha;
+}
+
+async function resolveCandidateTree(root: string, sha: string): Promise<string> {
+  const commit = await run("git", ["rev-parse", "--verify", `${sha}^{commit}`], { cwd: root, allowFailure: true });
+  invariant(
+    commit.exitCode === 0 && commit.stdout === sha,
+    "DELIVERY_CANDIDATE_NOT_FOUND",
+    "Delivery candidate must be an exact commit in the repository",
+    { candidateSha: sha },
+  );
+  const tree = await run("git", ["rev-parse", "--verify", `${sha}^{tree}`], { cwd: root, allowFailure: true });
+  invariant(tree.exitCode === 0, "DELIVERY_CANDIDATE_TREE_MISSING", "Delivery candidate tree could not be resolved", {
+    candidateSha: sha,
+  });
+  return tree.stdout;
+}
+
+function validateCandidateTree(provided: string, actual: string): void {
+  invariant(provided === actual, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
+    expected: actual,
+    provided,
+  });
 }
 
 function normalizeDeliveryIdentity(identity: DeliveryIdentity | string, sha: string): DeliveryIdentity {

@@ -1,6 +1,8 @@
 import { rm } from "node:fs/promises";
 import { afterEach, describe, expect, it } from "vitest";
 import { createFixtureDeliveryAdapter, createFixtureTrackerAdapter } from "../src/adapters.js";
+import { resolveTree } from "../src/git.js";
+import { run } from "../src/process.js";
 import { createTestRepository, proofShell, stagingShell, type TestRepository } from "./helpers.js";
 
 describe("tracker and delivery adapters", () => {
@@ -38,9 +40,14 @@ describe("tracker and delivery adapters", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const sha = "a".repeat(40);
-    const tree = "b".repeat(40);
+    const sha = repository.baseSha;
+    const tree = await resolveTree(repository.root, sha);
+    await expect(adapter.preview({ sha: "a".repeat(40), candidateTree: tree, proof: proofShell("a".repeat(40), tree) })).rejects.toMatchObject({ code: "DELIVERY_CANDIDATE_NOT_FOUND" });
+    await expect(adapter.preview({ sha, candidateTree: "c".repeat(40), proof: proofShell(sha, "c".repeat(40)) })).rejects.toMatchObject({ code: "CANDIDATE_TREE_MISMATCH" });
     await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, "c".repeat(40)) })).rejects.toThrow();
+    await run("git", ["commit", "--quiet", "--allow-empty", "-m", "same tree"], { cwd: repository.root });
+    const sameTreeSha = (await run("git", ["rev-parse", "HEAD"], { cwd: repository.root })).stdout;
+    await expect(adapter.preview({ sha: sameTreeSha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
     const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
     const staging = await adapter.promote({
       sha,
@@ -61,7 +68,7 @@ describe("tracker and delivery adapters", () => {
         identity: preview,
         productionAuthorization: "Author said yes",
         proof: proofShell(sha, tree),
-        staging: { artifactIdentity: "staging-artifact", verified: true, candidateTree: tree },
+        staging: { candidateSha: sha, candidateTree: tree, artifactIdentity: "staging-artifact", verified: true },
         integration: { candidateSha: sha, candidateTree: tree, integrationSha: "c".repeat(40), integrationTree: tree, contentMatchesCandidate: true },
       }),
     ).rejects.toMatchObject({ code: "PRODUCTION_STAGING_IDENTITY_MISMATCH" });
