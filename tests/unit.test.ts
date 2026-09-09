@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -12,6 +12,8 @@ import {
 } from "../src/evidence.js";
 import { createCommandDeliveryAdapter } from "../src/adapters.js";
 import { run } from "../src/process.js";
+import { atomicCreate } from "../src/fs.js";
+import { ensureGitignore } from "../src/templates.js";
 import { proofShell } from "./helpers.js";
 
 const fixtures: string[] = [];
@@ -50,6 +52,52 @@ describe("inspect", () => {
     expect(inspection.frameworks).toContain("hono");
     expect(inspection.scripts.test).toBe("true");
     expect(inspection.poiesis.installed).toBe(false);
+  });
+});
+
+describe("filesystem ownership receipts", () => {
+  it("does not report a no-op Git ignore update as authored", async () => {
+    const root = await mkdtemp(join(tmpdir(), "poiesis-gitignore-"));
+    fixtures.push(root);
+    const path = join(root, ".gitignore");
+    const snapshot = Buffer.from("present\n");
+    await writeFile(path, snapshot);
+
+    expect(await ensureGitignore(root, ["present"], snapshot)).toBeUndefined();
+    expect(await readFile(path)).toEqual(snapshot);
+  });
+
+  it("removes its temporary file when no-replace publication fails", async () => {
+    const root = await mkdtemp(join(tmpdir(), "poiesis-atomic-create-"));
+    fixtures.push(root);
+    const path = join(root, "owned.txt");
+    await writeFile(path, "foreign\n");
+
+    await expect(atomicCreate(path, "managed\n")).rejects.toMatchObject({ code: "EEXIST" });
+    expect(await readFile(path, "utf8")).toBe("foreign\n");
+    expect(await readdir(root)).toEqual(["owned.txt"]);
+  });
+});
+
+describe("skill directory publication", () => {
+  it("copies into a missing destination and refuses a preexisting directory", async () => {
+    const { cp } = await import("node:fs/promises");
+    const root = await mkdtemp(join(tmpdir(), "poiesis-skill-cp-"));
+    fixtures.push(root);
+    const source = join(root, "source");
+    const missing = join(root, "missing");
+    const existing = join(root, "existing");
+    await mkdir(source);
+    await writeFile(join(source, "SKILL.md"), "owned\n");
+    await mkdir(existing);
+    await writeFile(join(existing, "foreign.md"), "keep\n");
+
+    await cp(source, missing, { recursive: true, errorOnExist: true, force: false });
+    expect(await readFile(join(missing, "SKILL.md"), "utf8")).toBe("owned\n");
+    await expect(cp(source, existing, { recursive: true, errorOnExist: true, force: false })).rejects.toMatchObject({
+      code: "ERR_FS_CP_EEXIST",
+    });
+    expect(await readFile(join(existing, "foreign.md"), "utf8")).toBe("keep\n");
   });
 });
 

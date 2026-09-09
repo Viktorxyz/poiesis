@@ -1,5 +1,7 @@
 import { join } from "node:path";
-import { readUtf8 } from "./fs.js";
+import { readFile } from "node:fs/promises";
+import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
+import { PoiesisError } from "./errors.js";
 import { packageRoot } from "./paths.js";
 
 export interface TemplateMapping {
@@ -37,24 +39,36 @@ export const POIESIS_DURABLE_PATHS: readonly string[] = templateMappings
 
 export const POIESIS_LOCAL_STATE_PATHS: readonly string[] = [".poiesis/manifest.json"];
 
-export function ensureGitignore(root: string, lines: string[]): Promise<void> {
-  return import("./fs.js").then(({ exists, readUtf8, atomicWrite }) => {
-    const gitignorePath = join(root, ".gitignore");
-    return exists(gitignorePath).then(async (present) => {
-      const existing = present ? await readUtf8(gitignorePath) : "";
-      const entries = existing.split(/\r?\n/);
-      const additions: string[] = [];
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.length === 0) continue;
-        if (entries.some((entry) => entry.trim() === trimmed)) continue;
-        additions.push(line);
-      }
-      if (additions.length === 0) return;
-      const block = ["", "# Poiesis-managed ignore rules (added by `poiesis init`)"].concat(additions).join("\n");
-      await atomicWrite(gitignorePath, `${existing.replace(/\n*$/, "\n")}${block}\n`);
+export async function ensureGitignore(root: string, lines: string[], expected?: Buffer | null): Promise<string | undefined> {
+  const gitignorePath = join(root, ".gitignore");
+  const present = await exists(gitignorePath);
+  const existingBytes = present ? await readFile(gitignorePath) : null;
+  if (
+    expected !== undefined &&
+    (expected === null ? existingBytes !== null : existingBytes === null || !expected.equals(existingBytes))
+  ) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "Git ignore changed during initialization", {
+      path: ".gitignore",
     });
-  });
+  }
+  const existing = existingBytes?.toString("utf8") ?? "";
+  if (existingBytes !== null && !Buffer.from(existing, "utf8").equals(existingBytes)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "Git ignore is not valid UTF-8", { path: ".gitignore" });
+  }
+  const entries = existing.split(/\r?\n/);
+  const additions: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed.length === 0) continue;
+    if (entries.some((entry) => entry.trim() === trimmed)) continue;
+    additions.push(line);
+  }
+  if (additions.length === 0) return undefined;
+  const block = ["", "# Poiesis-managed ignore rules (added by `poiesis init`)"].concat(additions).join("\n");
+  const content = `${existing.replace(/\n*$/, "\n")}${block}\n`;
+  if (present) await atomicWrite(gitignorePath, content);
+  else await atomicCreate(gitignorePath, content);
+  return content;
 }
 
 export async function readTemplate(source: string): Promise<string> {
