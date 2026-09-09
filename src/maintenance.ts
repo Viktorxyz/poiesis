@@ -1201,18 +1201,31 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   }
   await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
 
-  const skills = options.skipSkills
-    ? manifest.skills
-    : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
+  const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
+  if (managedConfigFiles.length !== 1) {
+    throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
+      files: managedConfigFiles,
+    });
+  }
+  const openCodeConfig = managedConfigFiles[0]!;
+  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
+  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
+  const fileSnapshots = new Map<string, Buffer>();
+  for (const file of materialized) {
+    const path = join(resolvedRoot, file.path);
+    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
+  }
 
-    const fileSnapshots = new Map<string, Buffer>();
+  let manifestPath: string | undefined;
+  let manifestBackup: Buffer | null = null;
+  let nextReceipt: OwnershipReceipt | undefined;
+  let skills = manifest.skills;
+  try {
+    skills = options.skipSkills
+      ? manifest.skills
+      : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
     for (const file of materialized) {
-      const path = join(resolvedRoot, file.path);
-      if (await exists(path)) {
-        const bytes = await readFile(path);
-        fileSnapshots.set(file.path, bytes);
-      }
-      await atomicWrite(path, file.content);
+      await atomicWrite(join(resolvedRoot, file.path), file.content);
     }
     const nextFiles = nextAdapterFiles(
       manifest,
@@ -1223,21 +1236,6 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
         durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
       })),
     );
-
-  const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
-  if (managedConfigFiles.length !== 1) {
-    throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
-      files: managedConfigFiles,
-    });
-  }
-  const openCodeConfig = managedConfigFiles[0]!;
-  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-
-  let manifestPath: string | undefined;
-  let manifestBackup: Buffer | null = null;
-  let nextReceipt: OwnershipReceipt | undefined;
-  try {
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
     if (openCodeConfigSnapshot !== null) {
@@ -1404,6 +1402,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   }
 
   const configPatchFiles = new Set(manifest.configPatches.map((patch) => patch.file));
+  const releasedDurable = new Set<string>();
   for (const file of manifest.files) {
     const path = ownedPath(resolvedRoot, file.path);
     if (!(await exists(path))) {
@@ -1411,7 +1410,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
       continue;
     }
     if (file.durable === true) {
-      result.preserved.push({ path: file.path, reason: "durable project-tracked file; ownership released but file retained" });
+      releasedDurable.add(file.path);
       continue;
     }
     if (configPatchFiles.has(file.path)) {
@@ -1449,6 +1448,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     );
     for (const path of remaining) {
       const details = await lstat(join(resolvedRoot, path));
+      if (releasedDurable.has(path)) continue;
       if (!known.has(path) || !details.isDirectory()) {
         result.preserved.push({ path, reason: "content appeared during uninstall" });
       }
@@ -1474,7 +1474,9 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     const changedConfigFiles = new Set(configResult.reverted.map((patch) => patch.file));
     const retained: Manifest = {
       ...manifest,
-      files: manifest.files.filter((file) => !removed.has(file.path) && !changedConfigFiles.has(file.path)),
+      files: manifest.files.filter(
+        (file) => !removed.has(file.path) && !changedConfigFiles.has(file.path) && !releasedDurable.has(file.path),
+      ),
       skills: manifest.skills.filter((skill) => !removed.has(skill.path)),
       configPatches: configResult.preserved,
     };

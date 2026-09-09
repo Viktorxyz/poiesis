@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { doctor, init, uninstall, update } from "../src/maintenance.js";
 import { loadManifest, serializeManifest } from "../src/manifest.js";
-import { ownershipReceiptLocation, readOwnershipReceipt, removeOwnershipReceipt } from "../src/receipt.js";
+import { ownershipReceiptLocation, readOwnershipReceipt } from "../src/receipt.js";
 import { exists } from "../src/fs.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
@@ -28,7 +28,10 @@ describe("ownership receipts", () => {
     expect(updated.installationId).toBe(created.installationId);
     expect(updated.generation).toBe(2);
 
-    await removeOwnershipReceipt(repository.root);
+    const removed = await uninstall(repository.root);
+    expect(removed.complete).toBe(true);
+    expect(removed.manifestRemoved).toBe(true);
+    expect(await exists(join(repository.root, ".poiesis", "roles", "worker.md"))).toBe(true);
     expect(await exists(await ownershipReceiptLocation(repository.root))).toBe(false);
   }, 30_000);
 

@@ -1,6 +1,8 @@
 import { rm } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { doctor, init, uninstall } from "../src/maintenance.js";
+import { exists } from "../src/fs.js";
 import { createTestRepository, testConfig } from "./helpers.js";
 
 describe("real upstream skill integration", () => {
@@ -16,8 +18,9 @@ describe("real upstream skill integration", () => {
         expect(report.ok).toBe(true);
         expect(report.checks.find((check) => check.id === "skills")?.status).toBe("pass");
         const removed = await uninstall(repository.root);
-        expect(removed.manifestRemoved).toBe(false);
-        expect(removed.preserved.some((entry) => entry.reason.includes("durable"))).toBe(true);
+        expect(removed.complete).toBe(true);
+        expect(removed.manifestRemoved).toBe(true);
+        expect(await exists(join(repository.root, ".poiesis", "roles", "worker.md"))).toBe(true);
       } finally {
         await rm(repository.parent, { recursive: true, force: true });
       }
