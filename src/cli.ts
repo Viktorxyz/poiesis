@@ -34,7 +34,7 @@ const HELP = `Poiesis deterministic runtime
 Usage:
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
-  poiesis update
+  poiesis update [--bootstrap-legacy-ownership]
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
@@ -129,9 +129,19 @@ async function commandDoctor(args: string[]): Promise<void> {
 }
 
 async function commandUpdate(args: string[]): Promise<void> {
-  const values = options(args, { "skip-skills": { type: "boolean" }, cwd: { type: "string" } });
+  const values = options(args, {
+    "skip-skills": { type: "boolean" },
+    "bootstrap-legacy-ownership": { type: "boolean" },
+    cwd: { type: "string" },
+  });
   const root = await resolveGitRoot(cwdOf(values));
-  writeSuccess("update", await update(root, { skipSkills: boolean(values, "skip-skills") }));
+  writeSuccess(
+    "update",
+    await update(root, {
+      skipSkills: boolean(values, "skip-skills"),
+      bootstrapLegacyOwnership: boolean(values, "bootstrap-legacy-ownership"),
+    }),
+  );
 }
 
 async function commandUninstall(args: string[]): Promise<void> {

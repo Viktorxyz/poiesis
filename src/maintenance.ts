@@ -13,11 +13,12 @@ import {
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
-import { hashContent, hashFile } from "./hash.js";
+import { hashContent, hashDirectory, hashFile } from "./hash.js";
 import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import {
   assertOwnershipReceipt,
   createOwnershipReceipt,
+  ownershipReceiptExists,
   removeOwnershipReceipt,
   replaceOwnershipReceipt,
   restoreOwnershipReceipt,
@@ -65,6 +66,7 @@ import { createDeliveryAdapter } from "./adapters.js";
 export interface MaintenanceOptions {
   skipSkills?: boolean;
   allowFixtureAdapters?: boolean;
+  bootstrapLegacyOwnership?: boolean;
 }
 
 export type DoctorCheckStatus = "pass" | "fail" | "warn";
@@ -1179,7 +1181,139 @@ async function requireOwnedManagedFile(root: string, record: ManagedFile): Promi
   }
 }
 
+async function validateLegacySkillIdentity(root: string, skill: Manifest["skills"][number]): Promise<string> {
+  const destination = ownedPath(root, skill.path);
+  if (skill.preexisting) return hashOwnedSkillDirectory(destination);
+  if (skill.hash === undefined) {
+    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill is missing a hash", { path: skill.path });
+  }
+  const legacyHash = await hashDirectory(destination);
+  if (legacyHash !== skill.hash) {
+    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill content does not match the 1.0.0 manifest", {
+      path: skill.path,
+      expected: skill.hash,
+      actual: legacyHash,
+    });
+  }
+  return hashOwnedSkillDirectory(destination);
+}
+
+async function validateLegacyInstallation(root: string, manifest: Manifest, config: ResolvedPoiesisConfig): Promise<void> {
+  if (manifest.poiesisVersion !== "1.0.0") {
+    throw new PoiesisError("LEGACY_BOOTSTRAP_UNSUPPORTED", "Legacy bootstrap only accepts public Poiesis 1.0.0 installations", {
+      poiesisVersion: manifest.poiesisVersion,
+    });
+  }
+  await assertManifestAuthority(root, manifest, config);
+  for (const file of manifest.files) {
+    const path = ownedPath(root, file.path);
+    if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
+      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file is missing or not a regular file", {
+        path: file.path,
+      });
+    }
+    const actual = await hashFile(path);
+    if (actual !== file.hash) {
+      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file does not match the 1.0.0 manifest", {
+        path: file.path,
+        expected: file.hash,
+        actual,
+      });
+    }
+  }
+  const defaults = await loadDefaultSkills();
+  const defaultNames = new Set(defaults.map((skill) => skill.name));
+  for (const skill of manifest.skills) {
+    if (!defaultNames.has(skill.name) && !skill.preexisting) {
+      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest claims an unknown owned skill", {
+        name: skill.name,
+      });
+    }
+    await validateLegacySkillIdentity(root, skill);
+  }
+}
+
+async function bootstrapLegacyOwnership(root: string, options: MaintenanceOptions): Promise<UpdateResult> {
+  const resolvedRoot = resolve(root);
+  if (await ownershipReceiptExists(resolvedRoot)) {
+    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Refusing to bootstrap over an existing ownership receipt");
+  }
+  const manifest = await loadManifest(resolvedRoot);
+  const config = await resolveConfigForRoot(resolvedRoot);
+  await validateLegacyInstallation(resolvedRoot, manifest, config);
+  await verifyGitRepository(resolvedRoot, config);
+  await verifyOpenCodeVersion(resolvedRoot);
+
+  const nextSkills = await Promise.all(
+    manifest.skills.map(async (skill) => ({
+      ...skill,
+      hash: await validateLegacySkillIdentity(resolvedRoot, skill),
+    })),
+  );
+  const materialized = await materializeFiles(config);
+  const fileSnapshots = new Map<string, Buffer>();
+  for (const file of materialized) {
+    const path = join(resolvedRoot, file.path);
+    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
+  }
+  const openCodeConfig = manifest.configPatches[0]?.file;
+  if (openCodeConfig === undefined) {
+    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest does not identify an OpenCode config");
+  }
+  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
+  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
+  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+  const manifestBackup = await snapshotFile(manifestPath);
+  try {
+    const skills = options.skipSkills
+      ? nextSkills
+      : await installDefaultSkills(resolvedRoot, nextSkills, { replaceOwned: true });
+    for (const file of materialized) await atomicWrite(join(resolvedRoot, file.path), file.content);
+    const nextFiles = nextAdapterFiles(
+      manifest,
+      materialized.map((file) => ({
+        path: file.path,
+        kind: file.kind,
+        hash: hashContent(file.content),
+        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
+      })),
+    );
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
+    const configPatches = nextAdapterPatches(manifest, appliedPatches);
+    if (openCodeConfigSnapshot !== null) {
+      const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
+      if (nextRecord >= 0) nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: await hashFile(openCodeConfigPath) };
+    }
+    const next: Manifest = {
+      schema: 1,
+      poiesisVersion: await packageVersion(),
+      adapter: {
+        harness: "opencode",
+        adapterVersion: OPENCODE_ADAPTER_VERSION,
+        supportedVersion: SUPPORTED_OPENCODE_VERSION,
+      },
+      files: nextFiles,
+      skills,
+      configPatches,
+    };
+    await atomicWrite(manifestPath, serializeManifest(next));
+    await createOwnershipReceipt(resolvedRoot, next);
+    const report = await doctor(resolvedRoot);
+    if (!options.skipSkills && !report.ok) {
+      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Legacy ownership bootstrap did not pass doctor", { report });
+    }
+    return { manifest: next, doctor: report };
+  } catch (error) {
+    await restoreManifest(manifestPath, manifestBackup);
+    await removeOwnershipReceipt(resolvedRoot);
+    await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
+    await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
+    throw error;
+  }
+}
+
 export async function update(root: string, options: MaintenanceOptions = {}): Promise<UpdateResult> {
+  if (options.bootstrapLegacyOwnership) return bootstrapLegacyOwnership(root, options);
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);

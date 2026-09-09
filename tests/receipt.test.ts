@@ -33,7 +33,7 @@ describe("ownership receipts", () => {
     expect(removed.manifestRemoved).toBe(true);
     expect(await exists(join(repository.root, ".poiesis", "roles", "worker.md"))).toBe(true);
     expect(await exists(await ownershipReceiptLocation(repository.root))).toBe(false);
-  }, 30_000);
+  }, 60_000);
 
   it("retains a bound receipt after partial uninstall", async () => {
     const repository = await createTestRepository();

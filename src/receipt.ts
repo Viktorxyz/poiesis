@@ -67,6 +67,11 @@ function parseReceipt(value: unknown, path: string): OwnershipReceipt {
   return value as OwnershipReceipt;
 }
 
+export async function ownershipReceiptExists(root: string): Promise<boolean> {
+  const { path } = await receiptPath(root);
+  return exists(path);
+}
+
 export async function readOwnershipReceipt(root: string): Promise<OwnershipReceipt> {
   const { path } = await receiptPath(root);
   if (!(await exists(path))) {
