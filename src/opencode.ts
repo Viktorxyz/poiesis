@@ -140,13 +140,15 @@ export function desiredOpenCodePatches(config: PoiesisConfig): Array<{ path: str
   ];
 }
 
+export const OPENCODE_CONFIG_RELATIVE_PATHS = [
+  "opencode.jsonc",
+  "opencode.json",
+  ".opencode/opencode.jsonc",
+  ".opencode/opencode.json",
+] as const;
+
 function openCodeConfigCandidates(root: string): string[] {
-  return [
-    join(root, "opencode.jsonc"),
-    join(root, "opencode.json"),
-    join(root, ".opencode", "opencode.jsonc"),
-    join(root, ".opencode", "opencode.json"),
-  ];
+  return OPENCODE_CONFIG_RELATIVE_PATHS.map((path) => join(root, path));
 }
 
 async function pathEntryExists(path: string): Promise<boolean> {

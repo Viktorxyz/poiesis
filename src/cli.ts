@@ -5,8 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot } from "./maintenance.js";
-import { installCapability } from "./skills.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -156,7 +155,7 @@ async function commandCapability(args: string[]): Promise<void> {
   const root = await resolveGitRoot(cwdOf(values));
   writeSuccess(
     "capability.install",
-    await installCapability(root, {
+    await installAuthorizedCapability(root, {
       source: required(values, "source"),
       name: required(values, "name"),
       revision: required(values, "revision"),

@@ -14,6 +14,7 @@ import {
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { hashContent, hashFile } from "./hash.js";
+import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import {
   loadManifest,
   serializeManifest,
@@ -37,10 +38,12 @@ import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
   assertDefaultSkillDestinationsAvailable,
+  installCapability,
   installDefaultSkills,
   loadDefaultSkills,
   removeOwnedSkills,
   skillPath,
+  type CapabilityInstallInput,
 } from "./skills.js";
 import {
   POIESIS_DURABLE_PATHS,
@@ -916,29 +919,7 @@ function groupPatchesByFile(patches: ConfigPatch[]): Map<string, ConfigPatch[]> 
   return grouped;
 }
 
-function manifestConsistency(manifest: Manifest): string[] {
-  const problems: string[] = [];
-  const filePaths = new Set<string>();
-  for (const file of manifest.files) {
-    if (!isSafeRelativePath(file.path)) problems.push(`unsafe file path: ${file.path}`);
-    if (filePaths.has(file.path)) problems.push(`duplicate file path: ${file.path}`);
-    filePaths.add(file.path);
-  }
-  const skillNames = new Set<string>();
-  for (const skill of manifest.skills) {
-    if (!isSafeRelativePath(skill.path)) problems.push(`unsafe skill path: ${skill.path}`);
-    if (skillNames.has(skill.name)) problems.push(`duplicate skill: ${skill.name}`);
-    skillNames.add(skill.name);
-  }
-  const patchPaths = new Set<string>();
-  for (const patch of manifest.configPatches) {
-    if (!isSafeRelativePath(patch.file)) problems.push(`unsafe config path: ${patch.file}`);
-    const key = patchKey(patch);
-    if (patchPaths.has(key)) problems.push(`duplicate config patch: ${patch.file}:${patch.path.join(".")}`);
-    patchPaths.add(key);
-  }
-  return problems;
-}
+
 
 export async function resolveConfigForRoot(root: string, draft?: PoiesisConfig): Promise<ResolvedPoiesisConfig> {
   const raw = draft ?? (await loadConfig(root));
@@ -976,15 +957,13 @@ export async function doctor(root: string): Promise<DoctorReport> {
 
   try {
     manifest = await loadManifest(resolvedRoot);
-    const problems = manifestConsistency(manifest);
-    checks.push({
-      id: "manifest",
-      status: problems.length === 0 ? "pass" : "fail",
-      message: problems.length === 0 ? "Ownership manifest is valid" : "Ownership manifest is inconsistent",
-      ...(problems.length > 0 ? { details: { problems } } : {}),
-    });
+    if (config === undefined) {
+      throw new PoiesisError("MANIFEST_AUTHORITY_INVALID", "Manifest authority cannot be checked without valid Poiesis config");
+    }
+    await assertManifestAuthority(resolvedRoot, manifest, config);
+    checks.push({ id: "manifest", status: "pass", message: "Ownership manifest matches the installed adapter" });
   } catch (error) {
-    checks.push({ id: "manifest", status: "fail", message: "Ownership manifest is invalid or missing", details: errorDetails(error) });
+    checks.push({ id: "manifest", status: "fail", message: "Ownership manifest is invalid or unauthorized", details: errorDetails(error) });
   }
 
   if (manifest !== undefined) {
@@ -1182,13 +1161,8 @@ async function requireOwnedManagedFile(root: string, record: ManagedFile): Promi
 export async function update(root: string, options: MaintenanceOptions = {}): Promise<UpdateResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
-  const manifestProblems = manifestConsistency(manifest);
-  if (manifestProblems.length > 0) {
-    throw new PoiesisError("MANIFEST_OWNERSHIP_INVALID", "Refusing to update from an inconsistent manifest", {
-      problems: manifestProblems,
-    });
-  }
   const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -1204,19 +1178,11 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     await requireOwnedManagedFile(resolvedRoot, record);
   }
   await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
-  const desiredPatchKeys = new Set(desiredOpenCodePatches(config).map((patch) => patch.path.join("\0")));
-  const obsoletePatches = manifest.configPatches.filter((patch) => !desiredPatchKeys.has(patch.path.join("\0")));
-  if (obsoletePatches.length > 0) {
-    throw new PoiesisError("CONFIG_MIGRATION_REQUIRED", "Current adapter cannot safely remove obsolete config patches", {
-      paths: obsoletePatches.map((patch) => patch.path),
-    });
-  }
 
   const skills = options.skipSkills
     ? manifest.skills
     : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
 
-    const nextFiles = [...manifest.files];
     const fileSnapshots = new Map<string, Buffer>();
     for (const file of materialized) {
       const path = join(resolvedRoot, file.path);
@@ -1225,16 +1191,16 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
         fileSnapshots.set(file.path, bytes);
       }
       await atomicWrite(path, file.content);
-      const index = nextFiles.findIndex((record) => record.path === file.path);
-      const template = templateMappings.find((mapping) => mapping.destination === file.path);
-      nextFiles[index] = {
+    }
+    const nextFiles = nextAdapterFiles(
+      manifest,
+      materialized.map((file) => ({
         path: file.path,
         kind: file.kind,
         hash: hashContent(file.content),
-        owned: true,
-        ...(template?.trackInProject === true ? { durable: true } : {}),
-      };
-    }
+        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
+      })),
+    );
 
   const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
   if (managedConfigFiles.length !== 1) {
@@ -1250,19 +1216,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   let manifestBackup: Buffer | null = null;
   try {
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const priorPatches = new Map(manifest.configPatches.map((patch) => [patchKey(patch), patch]));
-    const configPatches = appliedPatches.map((patch) => {
-      const prior = priorPatches.get(patchKey(patch));
-      return prior === undefined
-        ? patch
-        : {
-            file: patch.file,
-            path: patch.path,
-            previousExists: prior.previousExists,
-            ...(prior.previousExists ? { previous: prior.previous } : {}),
-            installed: patch.installed,
-          };
-    });
+    const configPatches = nextAdapterPatches(manifest, appliedPatches);
     if (openCodeConfigSnapshot !== null) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
@@ -1369,15 +1323,19 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   return known;
 }
 
+export async function installAuthorizedCapability(root: string, input: CapabilityInstallInput) {
+  const resolvedRoot = resolve(root);
+  const manifest = await loadManifest(resolvedRoot);
+  const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
+  return installCapability(resolvedRoot, input);
+}
+
 export async function uninstall(root: string): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
-  const manifestProblems = manifestConsistency(manifest);
-  if (manifestProblems.length > 0) {
-    throw new PoiesisError("MANIFEST_OWNERSHIP_INVALID", "Refusing to uninstall from an inconsistent manifest", {
-      problems: manifestProblems,
-    });
-  }
+  const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
   const result: UninstallResult = {
     complete: false,
     manifestRemoved: false,

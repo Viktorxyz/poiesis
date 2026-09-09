@@ -41,6 +41,8 @@ The installer must:
 5. preserve all unrelated project/user config;
 6. record exact managed mutations in `.poiesis/manifest.json`.
 
+The generated manifest is valid only for the currently installed OpenCode adapter contract. `doctor`, `update`, `uninstall`, and capability installation share one authority validator: current schema and adapter versions, exact managed file paths/kinds/durable flags, exactly one recognized OpenCode config filename, exact desired patch paths and installed values keyed by file plus JSON path, and exact skill name/source/path relationships. Extra or unknown records, including README, `.git`, `package.json` patches, or unsupported versions, fail closed with an explicit migration requirement and must not be copied forward.
+
 ## Skills
 
 Install the curated skills through their current supported upstream mechanism.
