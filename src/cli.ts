@@ -5,7 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -35,6 +35,7 @@ Usage:
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
+  poiesis update --config <file>
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
@@ -128,13 +129,35 @@ async function commandDoctor(args: string[]): Promise<void> {
   if (!report.ok) process.exitCode = 1;
 }
 
-async function commandUpdate(args: string[]): Promise<void> {
+export async function commandUpdate(args: string[]): Promise<void> {
   const values = options(args, {
     "skip-skills": { type: "boolean" },
     "bootstrap-legacy-ownership": { type: "boolean" },
+    config: { type: "string" },
     cwd: { type: "string" },
   });
   const root = await resolveGitRoot(cwdOf(values));
+  const configPath = values.config;
+  if (typeof configPath === "string" && configPath.trim().length > 0) {
+    // CLI-level guard: `--config` is incompatible with the other update options
+    // even though `updateFromConfig` also rejects them. Failing here keeps the
+    // dispatch surface auditable and lets the rejection be tested directly.
+    if (values["skip-skills"] === true || values["bootstrap-legacy-ownership"] === true) {
+      throw new PoiesisError(
+        "INCOMPATIBLE_UPDATE_OPTIONS",
+        "poiesis update --config cannot combine with --skip-skills or --bootstrap-legacy-ownership",
+        {
+          skipSkills: values["skip-skills"] === true,
+          bootstrapLegacyOwnership: values["bootstrap-legacy-ownership"] === true,
+        },
+      );
+    }
+    writeSuccess("update", await updateFromConfig(root, resolve(cwdOf(values), configPath)));
+    return;
+  }
+  if (typeof configPath !== "undefined") {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required --config", { key: "config" });
+  }
   writeSuccess(
     "update",
     await update(root, {
@@ -531,4 +554,26 @@ function supersedeInput(values: Values): SupersedeInput {
   return { reason: required(values, "reason"), replacementIds: many(values, "replacement") ?? [] };
 }
 
-main(process.argv.slice(2)).catch(writeFailure);
+// Run `main` only when this module is the Node entry point. Tests import this
+// module for `commandUpdate` without intending to invoke `main`; without this
+// guard the CLI's bootstrap runs as soon as Vitest loads the module and emits
+// HELP/error JSON into the test output.
+import { fileURLToPath } from "node:url";
+import { resolve as resolvePath } from "node:path";
+const ENTRY_PATH = (() => {
+  try {
+    return process.argv[1] ? resolvePath(process.argv[1]) : "";
+  } catch {
+    return "";
+  }
+})();
+const IS_MAIN_MODULE = (() => {
+  try {
+    return fileURLToPath(import.meta.url) === ENTRY_PATH;
+  } catch {
+    return false;
+  }
+})();
+if (IS_MAIN_MODULE) {
+  main(process.argv.slice(2)).catch(writeFailure);
+}

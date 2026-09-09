@@ -1500,6 +1500,287 @@ export async function installAuthorizedCapability(root: string, input: Capabilit
   }
 }
 
+const POIESIS_CONFIG_RELATIVE_PATH = ".poiesis/config.jsonc";
+
+/**
+ * Test-only deterministic fault-injection hooks used by `updateFromConfig`. Each
+ * callback fires immediately BEFORE the corresponding write step in the
+ * transaction. Throwing simulates an I/O fault and exercises the rollback path.
+ *
+ * These hooks live behind the public options surface purely so tests can drive
+ * deterministic failures without monkey-patching internal modules. Production
+ * callers (CLI, library users) must leave them unset. The hooks do not change
+ * production behavior when omitted: `updateFromConfig` short-circuits each
+ * `?.()` call and writes via the real `atomicWrite` / `applyOpenCodeConfig` /
+ * `replaceOwnershipReceipt` paths.
+ */
+export interface UpdateWriterHooks {
+  /** Called immediately before atomic-writing the new `.poiesis/config.jsonc`. */
+  prePoiesisConfigWrite?: () => void | Promise<void>;
+  /** Called immediately before applying the OpenCode projection to the managed config. */
+  preOpenCodeApply?: () => void | Promise<void>;
+  /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
+  preManifestWrite?: () => void | Promise<void>;
+  /** Called immediately before `replaceOwnershipReceipt` advances generation. */
+  preReceiptReplace?: () => void | Promise<void>;
+}
+
+function assertCompatibleUpdateConfigOptions(options: UpdateConfigOptions): void {
+  const incompatible: Array<string> = [];
+  if (options.bootstrapLegacyOwnership === true) incompatible.push("bootstrapLegacyOwnership");
+  if (options.skipSkills === true) incompatible.push("skipSkills");
+  if (options.allowFixtureAdapters === true) incompatible.push("allowFixtureAdapters");
+  if (incompatible.length > 0) {
+    throw new PoiesisError("INCOMPATIBLE_UPDATE_OPTIONS", "update --config cannot combine with other update options", {
+      incompatible,
+    });
+  }
+}
+
+/**
+ * Options accepted by `updateFromConfig`. The `bootstrapLegacyOwnership`,
+ * `skipSkills`, and `allowFixtureAdapters` keys are FORBIDDEN because
+ * `poiesis update --config <path>` is a narrowly scoped transaction that does
+ * not bootstrap legacy ownership, skip skills, or accept fixture adapters;
+ * setting any of these to `true` throws `INCOMPATIBLE_UPDATE_OPTIONS` before
+ * any side effect.
+ *
+ * The optional `writerHooks` field is reserved for deterministic test
+ * fault injection and must remain unset in production.
+ */
+export interface UpdateConfigOptions {
+  bootstrapLegacyOwnership?: boolean;
+  skipSkills?: boolean;
+  allowFixtureAdapters?: boolean;
+  writerHooks?: UpdateWriterHooks;
+}
+
+async function assertPoiesisConfigOwnership(root: string, manifest: Manifest): Promise<{ content: Buffer; record: ManagedFile }> {
+  const record = manifest.files.find((file) => file.path === POIESIS_CONFIG_RELATIVE_PATH);
+  if (record === undefined) {
+    throw new PoiesisError("FILE_OWNERSHIP_UNKNOWN", "Manifest does not prove ownership of the Poiesis config", {
+      path: POIESIS_CONFIG_RELATIVE_PATH,
+    });
+  }
+  if (record.kind !== "generated") {
+    throw new PoiesisError("FILE_OWNERSHIP_INVALID", "Manifest Poiesis config record must be generated", {
+      path: POIESIS_CONFIG_RELATIVE_PATH,
+      kind: record.kind,
+    });
+  }
+  const path = join(root, POIESIS_CONFIG_RELATIVE_PATH);
+  if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
+    throw new PoiesisError("FILE_OWNERSHIP_LOST", "Poiesis config is missing or not a regular file", {
+      path: POIESIS_CONFIG_RELATIVE_PATH,
+    });
+  }
+  const content = await readFile(path);
+  if (hashContent(content) !== record.hash) {
+    throw new PoiesisError("FILE_OWNERSHIP_LOST", "Poiesis config has been modified since the last receipt", {
+      path: POIESIS_CONFIG_RELATIVE_PATH,
+      expected: record.hash,
+      actual: hashContent(content),
+    });
+  }
+  return { content, record };
+}
+
+async function identifyManagedOpenCodeConfig(manifest: Manifest): Promise<string> {
+  const files = [...new Set(manifest.configPatches.map((patch) => patch.file))];
+  if (files.length !== 1) {
+    throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
+      files,
+    });
+  }
+  return files[0]!;
+}
+
+export async function updateFromConfig(
+  root: string,
+  configPath: string,
+  options: UpdateConfigOptions = {},
+): Promise<UpdateResult> {
+  assertCompatibleUpdateConfigOptions(options);
+  const resolvedRoot = resolve(root);
+  const resolvedConfigPath = resolve(configPath);
+  const writerHooks = options.writerHooks;
+
+  // 1. Strictly parse, validate, and resolve the proposed config BEFORE any side effect.
+  const proposedConfigRaw = await readUtf8(resolvedConfigPath);
+  const proposedConfig = validateConfig(parseJsonc<unknown>(proposedConfigRaw, resolvedConfigPath), resolvedConfigPath);
+  assertResolvedConfig(proposedConfig);
+
+  // 1b. Pre-validate each delivery adapter so an unsupported adapter name fails
+  //     fast with `UNKNOWN_DELIVERY_ADAPTER` before any receipt or write work.
+  for (const target of ["preview", "staging", "production"] as const) {
+    createDeliveryAdapter(proposedConfig.delivery[target], resolvedRoot);
+  }
+
+  // 2. Authenticate the trusted receipt FIRST, before any other ownership check
+  //    consumes manifest records. This locks in the receipt's claim about the
+  //    trusted manifest digest; subsequent authority and Poiesis-config checks
+  //    operate against that trusted snapshot.
+  const manifest = await loadManifest(resolvedRoot);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
+  const currentConfig = await loadConfig(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, currentConfig);
+  const { content: currentConfigBytes, record: currentConfigRecord } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
+  await verifyGitRepository(resolvedRoot);
+  await verifyOpenCodeVersion(resolvedRoot);
+  const openCodeRelativePath = await identifyManagedOpenCodeConfig(manifest);
+  const openCodeConfigPath = join(resolvedRoot, openCodeRelativePath);
+  if (!(await exists(openCodeConfigPath)) || !(await isRegularManagedFile(resolvedRoot, openCodeConfigPath))) {
+    throw new PoiesisError("CONFIG_OWNERSHIP_LOST", "Managed OpenCode config is missing or not a regular file", {
+      file: openCodeRelativePath,
+    });
+  }
+  // Verify each recorded patch is owned by checking its installed value on disk BEFORE writing.
+  // `assertConfigPatchesOwned` also detects foreign tampering of the OpenCode config (unsafe/foreign
+  // collisions are caught via `CONFIG_OWNERSHIP_LOST`).
+  await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
+
+  // 3. Auto-discover default fields on the proposed config (without writing) so we can resolve fully.
+  await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+
+  // 4. Compute the new content + patch projection in memory for the no-op check.
+  const newConfigContent = serializeConfig(proposedConfig);
+  const newConfigHash = hashContent(newConfigContent);
+  const openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
+  const currentOpenCodeContentString = openCodeConfigCurrentBytes.toString("utf8");
+  const currentOpenCodeContentHash = hashContent(openCodeConfigCurrentBytes);
+  const currentOpenCodeJson = parseJsonc<JsonObject>(currentOpenCodeContentString, openCodeConfigPath);
+  const openCodeManifestRecord = manifest.files.find((file) => file.path === openCodeRelativePath);
+
+  // 5. No-op detection: comparing BYTE hashes of every state the transaction
+  //    would touch is sufficient — when the Poiesis config bytes AND the OpenCode
+  //    config bytes match their recorded manifest hashes, the proposed transaction
+  //    cannot observably change anything. Do NOT advance generation; return the
+  //    existing manifest unchanged.
+  const poiesisConfigBytesMatch = newConfigHash === currentConfigRecord.hash;
+  const openCodeBytesMatch =
+    openCodeManifestRecord === undefined
+      ? false
+      : currentOpenCodeContentHash === openCodeManifestRecord.hash;
+  if (poiesisConfigBytesMatch && openCodeBytesMatch) {
+    const report = await doctor(resolvedRoot);
+    return { manifest, doctor: report };
+  }
+
+  // 6. Snapshot everything we are about to mutate.
+  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+  const manifestBackup = await readFile(manifestPath);
+  let openCodeWrittenHash: string | undefined;
+  let poiesisConfigWrittenHash: string | undefined;
+  let nextReceipt: OwnershipReceipt | undefined;
+
+  try {
+    // 7. Write the new Poiesis config atomically.
+    await writerHooks?.prePoiesisConfigWrite?.();
+    await atomicWrite(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH), newConfigContent);
+    poiesisConfigWrittenHash = await hashFile(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH));
+    if (poiesisConfigWrittenHash !== newConfigHash) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "Poiesis config changed after write", {
+        path: POIESIS_CONFIG_RELATIVE_PATH,
+        expected: newConfigHash,
+        actual: poiesisConfigWrittenHash,
+      });
+    }
+
+    // 8. Apply the new OpenCode projection. We pass `requireAvailable: false` because
+    //    (a) every recorded patch is already asserted owned above via
+    //    `assertConfigPatchesOwned`, and (b) the desired patches only ever ADD or
+    //    REPLACE values that the manifest already proves we own. Passing
+    //    `requireAvailable: true` would re-run the reservation check used by
+    //    `init()` and incorrectly refuse the update whenever the OpenCode config
+    //    already contains a desired path. Concurrent writers between our
+    //    snapshot and the atomic write are caught via the
+    //    `expectedContent` snapshot that `applyOpenCodeConfig` enforces.
+    await writerHooks?.preOpenCodeApply?.();
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, proposedConfig, openCodeConfigPath, {
+      expectedContent: openCodeConfigCurrentBytes,
+      onWritten: (content) => {
+        openCodeWrittenHash = hashContent(content);
+      },
+    });
+    if (openCodeWrittenHash === undefined) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config write did not record a final hash", {
+        file: openCodeRelativePath,
+      });
+    }
+    const onDiskOpenCodeHash = await hashFile(openCodeConfigPath);
+    if (onDiskOpenCodeHash !== openCodeWrittenHash) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed after write", {
+        file: openCodeRelativePath,
+      });
+    }
+
+    // 9. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
+    //    values are preserved across updates.
+    const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
+
+    // 10. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
+    //     config hash is taken from the on-disk write; every other file keeps its prior hash.
+    const nextManifest: Manifest = {
+      schema: 1,
+      poiesisVersion: await packageVersion(),
+      adapter: {
+        harness: "opencode",
+        adapterVersion: OPENCODE_ADAPTER_VERSION,
+        supportedVersion: SUPPORTED_OPENCODE_VERSION,
+      },
+      files: manifest.files.map((file) => {
+        if (file.path === POIESIS_CONFIG_RELATIVE_PATH) {
+          return { path: POIESIS_CONFIG_RELATIVE_PATH, kind: "generated", hash: newConfigHash, owned: true };
+        }
+        if (file.path === openCodeRelativePath) {
+          return { ...file, hash: openCodeWrittenHash! };
+        }
+        return file;
+      }),
+      skills: manifest.skills,
+      configPatches: mergedPatches,
+    };
+    await writerHooks?.preManifestWrite?.();
+    await atomicWrite(manifestPath, serializeManifest(nextManifest));
+
+    // 11. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
+    await writerHooks?.preReceiptReplace?.();
+    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, nextManifest, receipt);
+
+    // 12. Doctor gate: pass or roll back everything. The transaction is config-only
+    //     so skills health is unrelated to the change under transaction; ignore
+    //     `skills` check failures that pre-date this transaction by inspecting
+    //     whether the manifest had a `skills` array that fully populated defaults.
+    const report = await doctor(resolvedRoot);
+    const skipSkillsGate = manifest.skills.length === 0;
+    const gateFailure = report.checks.find((check) => check.status === "fail" && !(skipSkillsGate && check.id === "skills"));
+    if (gateFailure !== undefined) {
+      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update --config did not pass doctor", { report });
+    }
+    return { manifest: nextManifest, doctor: report };
+  } catch (error) {
+    // 13. Exact rollback: restore each mutated artifact only if its post-write hash still matches what we wrote.
+    if ((await exists(openCodeConfigPath)) && openCodeWrittenHash !== undefined && (await hashFile(openCodeConfigPath)) === openCodeWrittenHash) {
+      const backup = openCodeConfigCurrentBytes.toString("utf8");
+      const normalized = backup.endsWith("\n") ? backup : `${backup}\n`;
+      await atomicWrite(openCodeConfigPath, normalized);
+    }
+    const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
+    if ((await exists(poiesisConfigPath)) && poiesisConfigWrittenHash !== undefined && (await hashFile(poiesisConfigPath)) === poiesisConfigWrittenHash) {
+      const normalized = currentConfigBytes.toString("utf8");
+      const endsWithNewline = normalized.endsWith("\n");
+      await atomicWrite(poiesisConfigPath, endsWithNewline ? normalized : `${normalized}\n`);
+    }
+    if ((await exists(manifestPath)) && hashContent(await readFile(manifestPath)) !== hashContent(manifestBackup)) {
+      const normalized = manifestBackup.toString("utf8");
+      const endsWithNewline = normalized.endsWith("\n");
+      await atomicWrite(manifestPath, endsWithNewline ? normalized : `${normalized}\n`);
+    }
+    await restoreOwnershipReceipt(resolvedRoot, receipt);
+    throw error;
+  }
+}
+
 export async function uninstall(root: string): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
