@@ -1,7 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
+import { lstat, readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { applyEdits, modify } from "jsonc-parser";
-import { atomicWrite, exists, readUtf8 } from "./fs.js";
+import { applyEdits, modify, parseTree, type Node as JsonNode } from "jsonc-parser";
+import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { parseJsonc, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import type { ConfigPatch } from "./manifest.js";
@@ -139,14 +140,43 @@ export function desiredOpenCodePatches(config: PoiesisConfig): Array<{ path: str
   ];
 }
 
+export const OPENCODE_CONFIG_RELATIVE_PATHS = [
+  "opencode.jsonc",
+  "opencode.json",
+  ".opencode/opencode.jsonc",
+  ".opencode/opencode.json",
+] as const;
+
+function openCodeConfigCandidates(root: string): string[] {
+  return OPENCODE_CONFIG_RELATIVE_PATHS.map((path) => join(root, path));
+}
+
+async function pathEntryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 export async function detectOpenCodeConfig(root: string): Promise<string> {
-  const candidates = [
-    join(root, "opencode.jsonc"),
-    join(root, "opencode.json"),
-    join(root, ".opencode", "opencode.jsonc"),
-    join(root, ".opencode", "opencode.json"),
-  ];
+  const candidates = openCodeConfigCandidates(root);
   for (const candidate of candidates) if (await exists(candidate)) return candidate;
+  return candidates[0]!;
+}
+
+export async function detectOpenCodeConfigForInit(root: string): Promise<string> {
+  const candidates = openCodeConfigCandidates(root);
+  const present: string[] = [];
+  for (const candidate of candidates) if (await pathEntryExists(candidate)) present.push(candidate);
+  if (present.length > 1) {
+    throw new PoiesisError("OPENCODE_CONFIG_AMBIGUOUS", "Multiple OpenCode config files are present", {
+      paths: present.map((path) => relative(root, path)),
+    });
+  }
+  if (present.length === 1) return present[0]!;
   return candidates[0]!;
 }
 
@@ -159,13 +189,121 @@ function getAtPath(value: unknown, path: string[]): { exists: boolean; value?: u
   return { exists: true, value: current };
 }
 
+function assertNoDuplicateProperties(content: string, configPath: string): void {
+  const root = parseTree(content);
+  function visit(node: JsonNode): void {
+    if (node.type === "object") {
+      const keys = new Set<string>();
+      for (const property of node.children ?? []) {
+        const key = property.children?.[0]?.value;
+        if (typeof key === "string") {
+          if (keys.has(key)) {
+            throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config contains duplicate properties", {
+              file: configPath,
+              property: key,
+            });
+          }
+          keys.add(key);
+        }
+        const value = property.children?.[1];
+        if (value !== undefined) visit(value);
+      }
+      return;
+    }
+    for (const child of node.children ?? []) visit(child);
+  }
+  if (root !== undefined) visit(root);
+}
+
+function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig): void {
+  if (typeof original !== "object" || original === null || Array.isArray(original)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config root must be an object");
+  }
+  for (const desired of desiredOpenCodePatches(config)) {
+    let current: unknown = original;
+    for (const [index, part] of desired.path.entries()) {
+      if (typeof current !== "object" || current === null || Array.isArray(current)) {
+        throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config contains an incompatible reserved path", {
+          path: desired.path.slice(0, index),
+        });
+      }
+      if (!Object.hasOwn(current, part)) break;
+      if (index === desired.path.length - 1) {
+        throw new PoiesisError("INSTALL_PATH_CONFLICT", "Refusing to overwrite a preexisting OpenCode config value", {
+          path: desired.path,
+        });
+      }
+      current = (current as JsonObject)[part];
+    }
+  }
+}
+
+function assertOpenCodeContentAvailable(content: string, configPath: string, config: PoiesisConfig): void {
+  assertNoDuplicateProperties(content, configPath);
+  assertDesiredOpenCodePathsAvailable(parseJsonc<unknown>(content, configPath), config);
+}
+
+async function readOpenCodeContent(configPath: string): Promise<string> {
+  const bytes = await readFile(configPath);
+  const content = bytes.toString("utf8");
+  if (!Buffer.from(content, "utf8").equals(bytes)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not valid UTF-8", {
+      path: configPath,
+    });
+  }
+  return content;
+}
+
+export async function assertOpenCodeConfigAvailable(
+  root: string,
+  configPath: string,
+  config: PoiesisConfig,
+): Promise<boolean> {
+  if (await pathEntryExists(configPath)) {
+    const details = await lstat(configPath);
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not a regular file", {
+        path: relative(root, configPath),
+      });
+    }
+    assertOpenCodeContentAvailable(await readOpenCodeContent(configPath), configPath, config);
+    return true;
+  }
+  return false;
+}
+
 export async function applyOpenCodeConfig(
   root: string,
   config: PoiesisConfig,
   managedConfigPath?: string,
+  options: {
+    requireAvailable?: boolean;
+    expectedContent?: Buffer | null;
+    onWritten?: (content: string) => void;
+  } = {},
 ): Promise<ConfigPatch[]> {
   const configPath = managedConfigPath ?? (await detectOpenCodeConfig(root));
-  let content = (await exists(configPath)) ? await readUtf8(configPath) : "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n";
+  const present = await pathEntryExists(configPath);
+  if (present) {
+    const details = await lstat(configPath);
+    if (!details.isFile() || details.isSymbolicLink()) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not a regular file", {
+        path: relative(root, configPath),
+      });
+    }
+  }
+  let content = present ? await readOpenCodeContent(configPath) : "{\n  \"$schema\": \"https://opencode.ai/config.json\"\n}\n";
+  if (
+    options.expectedContent !== undefined &&
+    (options.expectedContent === null
+      ? present
+      : !present || !options.expectedContent.equals(Buffer.from(content, "utf8")))
+  ) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed before installation", {
+      path: relative(root, configPath),
+    });
+  }
+  if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config);
   const original = parseJsonc<JsonObject>(content, configPath);
   const patches: ConfigPatch[] = [];
   for (const desired of desiredOpenCodePatches(config)) {
@@ -184,7 +322,10 @@ export async function applyOpenCodeConfig(
       }),
     );
   }
-  await atomicWrite(configPath, content.endsWith("\n") ? content : `${content}\n`);
+  const serialized = content.endsWith("\n") ? content : `${content}\n`;
+  if (present) await atomicWrite(configPath, serialized);
+  else await atomicCreate(configPath, serialized);
+  options.onWritten?.(serialized);
   return patches;
 }
 

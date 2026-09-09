@@ -5,8 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot } from "./maintenance.js";
-import { installCapability } from "./skills.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -25,7 +24,7 @@ import {
 } from "./adapters.js";
 import { cleanupOpenCodeSession } from "./session.js";
 import { PoiesisError } from "./errors.js";
-import type { IntegrationEvidence, ProofEvidence, StagingEvidence } from "./evidence.js";
+import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, StagingEvidence } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
 type Values = Record<string, string | boolean | string[] | undefined>;
@@ -43,10 +42,11 @@ Usage:
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --proof <json> --title <text> --body <text>
-  poiesis preview --sha <sha> --proof <json>
-  poiesis integrate --sha <sha> --base <sha> --proof <json> --staging <json> --acceptance <text> --message <text>
-  poiesis promote --sha <sha> --target <staging|production> --identity <json> [--authorization <text>]
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>
+  poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
+  poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
+  poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
 
@@ -156,7 +156,7 @@ async function commandCapability(args: string[]): Promise<void> {
   const root = await resolveGitRoot(cwdOf(values));
   writeSuccess(
     "capability.install",
-    await installCapability(root, {
+    await installAuthorizedCapability(root, {
       source: required(values, "source"),
       name: required(values, "name"),
       revision: required(values, "revision"),
@@ -347,7 +347,6 @@ async function commandPromote(args: string[]): Promise<void> {
     target: { type: "string" },
     identity: { type: "string" },
     authorization: { type: "string" },
-    staging: { type: "string" },
     integration: { type: "string" },
     proof: { type: "string" },
     cwd: { type: "string" },
@@ -363,25 +362,26 @@ async function commandPromote(args: string[]): Promise<void> {
   const identity = json<DeliveryIdentity>(required(values, "identity"), "identity");
   const sha = required(values, "sha");
   const candidateTree = required(values, "candidate-tree");
-  const input = target === "staging"
-    ? {
-        sha,
-        target,
-        candidateTree,
-        identity,
-        staging: json<StagingPayload>(required(values, "staging"), "staging"),
-      } as const
-    : {
-        sha,
-        target,
-        candidateTree,
-        identity,
-        productionAuthorization: required(values, "authorization"),
-        proof: json<ProofPayload>(required(values, "proof"), "proof"),
-        staging: json<StagingPayload>(required(values, "staging"), "staging"),
-        integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
-      } as const;
-  writeSuccess("promote", await promoteDelivery(config.delivery[target], input, repoRoot));
+  if (target === "staging") {
+    writeSuccess("promote", await promoteDelivery(config.delivery.staging, {
+      sha,
+      target,
+      candidateTree,
+      identity,
+    }, repoRoot));
+    return;
+  }
+  writeSuccess("promote", await promoteDelivery(config.delivery.production, {
+    sha,
+    target,
+    candidateTree,
+    identity,
+    productionAuthorization: json<ProductionAuthorization>(required(values, "authorization"), "authorization"),
+    integrationRemote: config.repository.remote,
+    integrationBranch: config.repository.integrationBranch,
+    proof: json<ProofPayload>(required(values, "proof"), "proof"),
+    integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
+  }, repoRoot));
 }
 
 async function commandTracker(args: string[]): Promise<void> {

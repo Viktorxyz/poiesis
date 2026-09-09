@@ -10,8 +10,6 @@ import {
   validateStagingEvidence,
   validateIntegrationEvidence,
   type IntegrationEvidence,
-  type ProofEvidence,
-  type StagingEvidence,
 } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
@@ -185,6 +183,7 @@ export interface IntegrateResult {
   integratedTree: string;
   remoteRef: string;
   postIntegrationVerification: VerifyResult | null;
+  integration: IntegrationEvidence;
 }
 
 export interface WorkspaceCleanupOptions {
@@ -557,8 +556,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     expected: candidateTree,
     provided: options.candidateTree,
   });
-  const proof: ProofEvidence = { ...options.proof, candidateSha: options.candidateSha, candidateTree };
-  validateProofEvidence(proof, options.candidateSha);
+  validateProofEvidence(options.proof, candidateSha, candidateTree);
 
   const remoteRef = `refs/heads/${branch}`;
   const expectedRemote = await lsRemoteHead(owned.root, options.remote, branch);
@@ -623,10 +621,8 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     expected: candidateTree,
     provided: options.candidateTree,
   });
-  const proof: ProofEvidence = { ...options.proof, candidateSha: options.candidateSha, candidateTree };
-  validateProofEvidence(proof, options.candidateSha);
-  const staging: StagingEvidence = { ...options.staging, candidateSha: options.candidateSha, candidateTree };
-  validateStagingEvidence(staging, options.candidateSha);
+  validateProofEvidence(options.proof, candidateSha, candidateTree);
+  validateStagingEvidence(options.staging, candidateSha, candidateTree);
 
   const fetchedBase = await fetchIntegrationBase(owned.root, options.remote, options.integrationBranch);
   invariant(fetchedBase === expectedBaseSha, "STALE_INTEGRATION_BASE", "Remote integration base changed", {
@@ -713,6 +709,7 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     integratedTree,
     remoteRef,
     postIntegrationVerification,
+    integration,
   };
 }
 

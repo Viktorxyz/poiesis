@@ -109,7 +109,9 @@ Production-capable tracker adapters:
 
 ### Delivery
 
-Delivery uses an argv-only command adapter. The command must consume the exact candidate SHA and return JSON. Staging and Production commands must include health verification and return `verified: true`.
+Delivery uses an argv-only command adapter. The command consumes the exact candidate SHA plus candidate tree and source receipt environment, and returns exact `sha`, `candidateTree`, `target`, `verified: true`, and an `artifactIdentity` matching a returned `id`, `url`, or `artifact`. Staging consumes an operation-produced Preview receipt and returns a directly consumable Staging receipt. This strict receipt schema intentionally rejects unbound 1.0.0 delivery JSON.
+
+Production authorization is JSON bound to the candidate SHA/tree, Staging artifact identity, integration SHA, explicit approval, and Author identity. Production fetches `repository.remote` / `repository.integrationBranch`, requires the integration SHA to be the exact remote head, and verifies its actual Git tree before invoking the delivery command.
 
 Fixture delivery is test-only, requires `--allow-fixtures`, and writes outside the repository root.
 

@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
-import { lstat, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
 import {
@@ -11,8 +12,17 @@ import {
   type ResolvedPoiesisConfig,
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
-import { atomicWrite, exists, readUtf8 } from "./fs.js";
-import { hashContent, hashDirectory, hashFile } from "./hash.js";
+import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
+import { hashContent, hashFile } from "./hash.js";
+import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
+import {
+  assertOwnershipReceipt,
+  createOwnershipReceipt,
+  removeOwnershipReceipt,
+  replaceOwnershipReceipt,
+  restoreOwnershipReceipt,
+  type OwnershipReceipt,
+} from "./receipt.js";
 import {
   loadManifest,
   serializeManifest,
@@ -22,8 +32,10 @@ import {
 } from "./manifest.js";
 import {
   applyOpenCodeConfig,
+  assertOpenCodeConfigAvailable,
   desiredOpenCodePatches,
   detectOpenCodeConfig,
+  detectOpenCodeConfigForInit,
   OPENCODE_ADAPTER_VERSION,
   SUPPORTED_OPENCODE_VERSION,
   validateOpenCodeConfig,
@@ -33,10 +45,13 @@ import { packageRoot, poiesisPath } from "./paths.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
+  assertDefaultSkillDestinationsAvailable,
+  installCapability,
   installDefaultSkills,
   loadDefaultSkills,
   removeOwnedSkills,
   skillPath,
+  type CapabilityInstallInput,
 } from "./skills.js";
 import {
   POIESIS_DURABLE_PATHS,
@@ -128,6 +143,16 @@ function ownedPath(root: string, path: string): string {
   return destination;
 }
 
+async function pathEntryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function isRegularFile(path: string): Promise<boolean> {
   const details = await lstat(path);
   return details.isFile() && !details.isSymbolicLink();
@@ -138,7 +163,7 @@ async function assertSafeParents(root: string, destination: string): Promise<voi
   let current = root;
   for (const part of parts) {
     current = join(current, part);
-    if ((await exists(current)) && (await lstat(current)).isSymbolicLink()) {
+    if ((await pathEntryExists(current)) && (await lstat(current)).isSymbolicLink()) {
       throw new PoiesisError("UNSAFE_MANAGED_PATH", "Refusing to traverse a symlinked managed parent", {
         path: relative(root, current),
       });
@@ -398,6 +423,26 @@ async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promis
   }
 }
 
+async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "poiesis-opencode-check-"));
+  try {
+    await verifyOpenCodeVersion(directory);
+    await verifyModels(directory, config);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+async function validateOpenCodeConfigPayload(content: string): Promise<void> {
+  const directory = await mkdtemp(join(tmpdir(), "poiesis-opencode-config-check-"));
+  try {
+    await atomicCreate(join(directory, "opencode.jsonc"), content);
+    await validateOpenCodeConfig(directory);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
   if (config.tracker.provider === "github") {
@@ -419,9 +464,9 @@ function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig
   return fixture ? "fixture" : "verified";
 }
 
-async function assertInitDestinationsAbsent(root: string, files: MaterializedFile[]): Promise<void> {
+async function assertInitDestinationsAbsent(root: string, files: Array<{ path: string }>): Promise<void> {
   const poiesisDirectory = poiesisPath(root);
-  if (await exists(poiesisDirectory)) {
+  if (await pathEntryExists(poiesisDirectory)) {
     throw new PoiesisError("INSTALL_PATH_CONFLICT", "Refusing to initialize over an unowned .poiesis path", {
       path: relative(root, poiesisDirectory),
     });
@@ -429,18 +474,34 @@ async function assertInitDestinationsAbsent(root: string, files: MaterializedFil
   for (const file of files) {
     const destination = join(root, file.path);
     await assertSafeParents(root, destination);
-    if (await exists(destination)) {
+    if (await pathEntryExists(destination)) {
       throw new PoiesisError("INSTALL_PATH_CONFLICT", "Refusing to overwrite a preexisting destination", {
         path: file.path,
       });
     }
   }
   const manifestPath = poiesisPath(root, "manifest.json");
-  if (await exists(manifestPath)) {
+  if (await pathEntryExists(manifestPath)) {
     throw new PoiesisError("INSTALL_PATH_CONFLICT", "A Poiesis manifest already exists", {
       path: relative(root, manifestPath),
     });
   }
+}
+
+async function assertGitignoreAvailable(root: string): Promise<boolean> {
+  const path = join(root, ".gitignore");
+  await assertSafeParents(root, path);
+  if (!(await pathEntryExists(path))) return false;
+  if (!(await isRegularFile(path))) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "Git ignore path is not a regular file", {
+      path: ".gitignore",
+    });
+  }
+  const bytes = await readFile(path);
+  if (!Buffer.from(bytes.toString("utf8"), "utf8").equals(bytes)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "Git ignore is not valid UTF-8", { path: ".gitignore" });
+  }
+  return true;
 }
 
 async function removeIfMatching(root: string, path: string, hash: string): Promise<boolean> {
@@ -450,38 +511,124 @@ async function removeIfMatching(root: string, path: string, hash: string): Promi
   return true;
 }
 
+async function rollbackStep(
+  failures: Array<Record<string, unknown>>,
+  step: string,
+  operation: () => Promise<void>,
+): Promise<void> {
+  try {
+    await operation();
+  } catch (error) {
+    failures.push({ step, ...errorDetails(error) });
+  }
+}
+
 async function rollbackInit(
   root: string,
   files: ManagedFile[],
   skills: Manifest["skills"],
-  patches: ConfigPatch[],
-  openCodeConfigCreated: boolean,
-): Promise<void> {
-  try {
-    const reversal = await reverseMatchingConfigPatches(root, patches);
-    if (openCodeConfigCreated && reversal.preserved.length === 0) {
-      const configPath = await detectOpenCodeConfig(root);
-      if (await exists(configPath)) await unlink(configPath);
+  configPath: string,
+  configSnapshot: Buffer | null | undefined,
+  writtenConfigHash?: string,
+): Promise<Array<Record<string, unknown>>> {
+  const failures: Array<Record<string, unknown>> = [];
+  await rollbackStep(failures, "OpenCode config", async () => {
+    if (
+      configSnapshot !== undefined &&
+      writtenConfigHash !== undefined &&
+      (await pathEntryExists(configPath)) &&
+      (await isRegularFile(configPath)) &&
+      (await hashFile(configPath)) === writtenConfigHash
+    ) {
+      if (configSnapshot === null) await unlink(configPath);
+      else await atomicWrite(configPath, configSnapshot.toString("utf8"));
     }
-  } catch {
-    // A concurrent config change is foreign state and must survive a failed init.
-  }
-  await removeOwnedSkills(root, skills);
+  });
+  await rollbackStep(failures, "skills", async () => {
+    const result = await removeOwnedSkills(root, skills);
+    if (result.preserved.length > 0) {
+      throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Some authored skills could not be removed", {
+        preserved: result.preserved,
+      });
+    }
+  });
   for (const file of [...files].reverse()) {
-    await removeIfMatching(root, ownedPath(root, file.path), file.hash);
+    await rollbackStep(failures, file.path, async () => {
+      await removeIfMatching(root, ownedPath(root, file.path), file.hash);
+    });
   }
+  return failures;
+}
+
+async function createInitFileParents(root: string, files: MaterializedFile[], created: Set<string>): Promise<void> {
+  const parents = new Set<string>();
+  for (const file of files) {
+    let parent = relative(root, join(root, file.path, ".."));
+    while (parent !== "" && parent !== ".") {
+      parents.add(parent);
+      parent = parent.includes(sep) ? parent.slice(0, parent.lastIndexOf(sep)) : "";
+    }
+  }
+  for (const path of [...parents].sort((left, right) => left.split(sep).length - right.split(sep).length)) {
+    const destination = join(root, path);
+    if (await pathEntryExists(destination)) {
+      const details = await lstat(destination);
+      if (!details.isDirectory() || details.isSymbolicLink()) {
+        throw new PoiesisError("INSTALL_PATH_CONFLICT", "Managed file parent is not a directory", { path });
+      }
+      continue;
+    }
+    await mkdir(destination);
+    created.add(path);
+  }
+}
+
+async function removeCreatedInitDirectories(root: string, created: ReadonlySet<string>): Promise<void> {
+  for (const path of [...created].sort((left, right) => right.split(sep).length - left.split(sep).length)) {
+    try {
+      await rmdir(join(root, path));
+    } catch {
+      // Only empty directories created during init are safe to remove.
+    }
+  }
+}
+
+async function rollbackInitGitignore(path: string, snapshot: Buffer | null | undefined, writtenHash?: string): Promise<void> {
+  if (snapshot === undefined || writtenHash === undefined || !(await pathEntryExists(path))) return;
+  if (!(await isRegularFile(path)) || (await hashFile(path)) !== writtenHash) return;
+  if (snapshot === null) await unlink(path);
+  else await atomicWrite(path, snapshot.toString("utf8"));
 }
 
 export async function init(root: string, config: PoiesisConfig, options: MaintenanceOptions = {}): Promise<Manifest> {
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
   assertResolvedConfig(resolvedConfig);
+  await assertInitDestinationsAbsent(
+    resolvedRoot,
+    templateMappings.map((mapping) => ({ path: mapping.destination })),
+  );
+
+  const openCodeConfigPath = await detectOpenCodeConfigForInit(resolvedRoot);
+  await assertSafeParents(resolvedRoot, openCodeConfigPath);
+  const openCodeConfigPresent = await assertOpenCodeConfigAvailable(
+    resolvedRoot,
+    openCodeConfigPath,
+    resolvedConfig,
+  );
+  const initialOpenCodeConfigSnapshot = await snapshotFile(openCodeConfigPath);
+  await assertGitignoreAvailable(resolvedRoot);
+  const initialGitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
+  const initialSkills = options.skipSkills
+    ? undefined
+    : await assertDefaultSkillDestinationsAvailable(resolvedRoot);
+
   const resolved = await autoResolveConfigDefaults(resolvedRoot, resolvedConfig);
   const resolvedConfigWithDefaults = resolved.config;
   const files = await materializeFiles(resolvedConfigWithDefaults);
+
   await verifyGitRepository(resolvedRoot, resolvedConfigWithDefaults);
-  await verifyOpenCodeVersion(resolvedRoot);
-  await verifyModels(resolvedRoot, resolvedConfigWithDefaults);
+  await verifyOpenCodeEnvironment(resolvedConfigWithDefaults);
   const trackerMode = await verifyTracker(resolvedRoot, resolvedConfigWithDefaults);
   const deliveryMode = verifyDeliveryConfiguration(resolvedRoot, resolvedConfigWithDefaults);
   if ((trackerMode === "fixture" || deliveryMode === "fixture") && !options.allowFixtureAdapters) {
@@ -490,34 +637,113 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       "Fixture adapters are test-only and require explicit allowFixtureAdapters authorization",
     );
   }
-  await assertInitDestinationsAbsent(resolvedRoot, files);
-
-  await ensureGitignore(resolvedRoot, [
-    `# Hide local Poiesis ownership snapshot`,
-    ...POIESIS_LOCAL_STATE_PATHS,
-    `# Allow durable Poiesis project files to be tracked`,
-    ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
-    `!${".poiesis"}/`,
-  ]);
-
-  const openCodeConfigPath = await detectOpenCodeConfig(resolvedRoot);
-  await assertSafeParents(resolvedRoot, openCodeConfigPath);
-  if ((await exists(openCodeConfigPath)) && !(await isRegularFile(openCodeConfigPath))) {
-    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not a regular file", {
-      path: relative(resolvedRoot, openCodeConfigPath),
-    });
-  }
-  const openCodeConfigCreated = !(await exists(openCodeConfigPath));
   const managedFiles: ManagedFile[] = [];
   let managedSkills: Manifest["skills"] = [];
   let configPatches: ConfigPatch[] = [];
   let writtenManifestHash: string | undefined;
+  const gitignorePath = join(resolvedRoot, ".gitignore");
+  let writtenGitignoreHash: string | undefined;
+  const createdInitDirectories = new Set<string>();
+  let writtenOpenCodeConfigHash: string | undefined;
+  let writtenOpenCodeConfigContent: string | undefined;
+  let installedSkillSnapshots: Map<string, string> | undefined;
 
   try {
-    if (!options.skipSkills) managedSkills = await installDefaultSkills(resolvedRoot);
+    await assertInitDestinationsAbsent(resolvedRoot, files);
+    await assertGitignoreAvailable(resolvedRoot);
+    const currentGitignoreSnapshot = await snapshotFile(gitignorePath);
+    const gitignoreUnchanged = initialGitignoreSnapshot === null
+      ? currentGitignoreSnapshot === null
+      : currentGitignoreSnapshot !== null && initialGitignoreSnapshot.equals(currentGitignoreSnapshot);
+    if (!gitignoreUnchanged) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "Git ignore changed during environment verification", {
+        path: ".gitignore",
+      });
+    }
+    if (!options.skipSkills) {
+      await assertDefaultSkillDestinationsAvailable(resolvedRoot, initialSkills);
+      managedSkills = await installDefaultSkills(resolvedRoot, [], {
+        expectedPreexisting: initialSkills!,
+        createdDirectories: createdInitDirectories,
+      });
+      installedSkillSnapshots = await assertDefaultSkillDestinationsAvailable(resolvedRoot);
+    }
+    await assertInitDestinationsAbsent(resolvedRoot, files);
+    const currentOpenCodeConfigPath = await detectOpenCodeConfigForInit(resolvedRoot);
+    if (currentOpenCodeConfigPath !== openCodeConfigPath) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config location changed during initialization", {
+        before: relative(resolvedRoot, openCodeConfigPath),
+        after: relative(resolvedRoot, currentOpenCodeConfigPath),
+      });
+    }
+    await assertSafeParents(resolvedRoot, openCodeConfigPath);
+    const currentlyPresent = await assertOpenCodeConfigAvailable(
+      resolvedRoot,
+      openCodeConfigPath,
+      resolvedConfigWithDefaults,
+    );
+    if (currentlyPresent !== openCodeConfigPresent) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config presence changed during initialization", {
+        path: relative(resolvedRoot, openCodeConfigPath),
+      });
+    }
+    const currentOpenCodeConfigSnapshot = await snapshotFile(openCodeConfigPath);
+    const openCodeConfigUnchanged = initialOpenCodeConfigSnapshot === null
+      ? currentOpenCodeConfigSnapshot === null
+      : currentOpenCodeConfigSnapshot !== null && initialOpenCodeConfigSnapshot.equals(currentOpenCodeConfigSnapshot);
+    if (!openCodeConfigUnchanged) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed during environment verification", {
+        path: relative(resolvedRoot, openCodeConfigPath),
+      });
+    }
+    configPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
+      requireAvailable: true,
+      expectedContent: initialOpenCodeConfigSnapshot,
+      onWritten: (content) => {
+        writtenOpenCodeConfigContent = content;
+        writtenOpenCodeConfigHash = hashContent(content);
+      },
+    });
+    if (writtenOpenCodeConfigContent === undefined || writtenOpenCodeConfigHash === undefined) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config write did not produce an ownership receipt", {
+        path: relative(resolvedRoot, openCodeConfigPath),
+      });
+    }
+    if ((await hashFile(openCodeConfigPath)) !== writtenOpenCodeConfigHash) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed after installation", {
+        path: relative(resolvedRoot, openCodeConfigPath),
+      });
+    }
+    await validateOpenCodeConfigPayload(writtenOpenCodeConfigContent);
+    if (installedSkillSnapshots !== undefined) {
+      await assertDefaultSkillDestinationsAvailable(resolvedRoot, installedSkillSnapshots);
+    }
+    if ((await hashFile(openCodeConfigPath)) !== writtenOpenCodeConfigHash) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed during validation", {
+        path: relative(resolvedRoot, openCodeConfigPath),
+      });
+    }
+    const currentOpenCodeConfig = await detectOpenCodeConfigForInit(resolvedRoot);
+    if (currentOpenCodeConfig !== openCodeConfigPath) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config became ambiguous during initialization", {
+        path: relative(resolvedRoot, currentOpenCodeConfig),
+      });
+    }
+    await assertGitignoreAvailable(resolvedRoot);
+    const writtenGitignore = await ensureGitignore(resolvedRoot, [
+      `# Hide local Poiesis ownership snapshot`,
+      ...POIESIS_LOCAL_STATE_PATHS,
+      `# Allow durable Poiesis project files to be tracked`,
+      ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
+      `!${".poiesis"}/`,
+    ], initialGitignoreSnapshot ?? null);
+    if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
+    await assertInitDestinationsAbsent(resolvedRoot, files);
+    await createInitFileParents(resolvedRoot, files, createdInitDirectories);
     for (const file of files) {
       const destination = join(resolvedRoot, file.path);
-      await atomicWrite(destination, file.content);
+      await assertSafeParents(resolvedRoot, destination);
+      await atomicCreate(destination, file.content);
       const template = templateMappings.find((mapping) => mapping.destination === file.path);
       managedFiles.push({
         path: file.path,
@@ -528,13 +754,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       });
     }
 
-    configPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults);
-    await validateOpenCodeConfig(resolvedRoot);
-    if (openCodeConfigCreated) {
+    if (!currentlyPresent) {
       managedFiles.push({
         path: relative(resolvedRoot, openCodeConfigPath),
         kind: "generated",
-        hash: await hashFile(openCodeConfigPath),
+        hash: writtenOpenCodeConfigHash,
         owned: true,
       });
     }
@@ -552,25 +776,58 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       configPatches,
     };
     const manifestContent = serializeManifest(manifest);
-    await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
+    await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
     writtenManifestHash = hashContent(manifestContent);
+    await createOwnershipReceipt(resolvedRoot, manifest);
     if (!options.skipSkills) {
       const report = await doctor(resolvedRoot);
       if (!report.ok) {
         throw new PoiesisError("INIT_DOCTOR_FAILED", "Poiesis installation did not pass doctor", { report });
       }
+      await assertDefaultSkillDestinationsAvailable(resolvedRoot, installedSkillSnapshots);
+      if ((await hashFile(openCodeConfigPath)) !== writtenOpenCodeConfigHash) {
+        throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed during final verification", {
+          path: relative(resolvedRoot, openCodeConfigPath),
+        });
+      }
     }
     return manifest;
   } catch (error) {
+    const rollbackFailures: Array<Record<string, unknown>> = [];
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-    if (
-      writtenManifestHash !== undefined &&
-      (await exists(manifestPath)) &&
-      (await hashFile(manifestPath)) === writtenManifestHash
-    ) {
-      await unlink(manifestPath);
+    await rollbackStep(rollbackFailures, "ownership receipt", async () => {
+      await removeOwnershipReceipt(resolvedRoot);
+    });
+    await rollbackStep(rollbackFailures, ".poiesis/manifest.json", async () => {
+      if (
+        writtenManifestHash !== undefined &&
+        (await pathEntryExists(manifestPath)) &&
+        (await isRegularFile(manifestPath)) &&
+        (await hashFile(manifestPath)) === writtenManifestHash
+      ) {
+        await unlink(manifestPath);
+      }
+    });
+    rollbackFailures.push(...await rollbackInit(
+      resolvedRoot,
+      managedFiles,
+      managedSkills,
+      openCodeConfigPath,
+      initialOpenCodeConfigSnapshot,
+      writtenOpenCodeConfigHash,
+    ));
+    await rollbackStep(rollbackFailures, ".gitignore", async () => {
+      await rollbackInitGitignore(gitignorePath, initialGitignoreSnapshot, writtenGitignoreHash);
+    });
+    await rollbackStep(rollbackFailures, "created directories", async () => {
+      await removeCreatedInitDirectories(resolvedRoot, createdInitDirectories);
+    });
+    if (rollbackFailures.length > 0) {
+      throw new PoiesisError("INIT_ROLLBACK_INCOMPLETE", "Initialization failed and rollback was incomplete", {
+        initialError: errorDetails(error),
+        rollbackFailures,
+      });
     }
-    await rollbackInit(resolvedRoot, managedFiles, managedSkills, configPatches, openCodeConfigCreated);
     throw error;
   }
 }
@@ -674,29 +931,7 @@ function groupPatchesByFile(patches: ConfigPatch[]): Map<string, ConfigPatch[]> 
   return grouped;
 }
 
-function manifestConsistency(manifest: Manifest): string[] {
-  const problems: string[] = [];
-  const filePaths = new Set<string>();
-  for (const file of manifest.files) {
-    if (!isSafeRelativePath(file.path)) problems.push(`unsafe file path: ${file.path}`);
-    if (filePaths.has(file.path)) problems.push(`duplicate file path: ${file.path}`);
-    filePaths.add(file.path);
-  }
-  const skillNames = new Set<string>();
-  for (const skill of manifest.skills) {
-    if (!isSafeRelativePath(skill.path)) problems.push(`unsafe skill path: ${skill.path}`);
-    if (skillNames.has(skill.name)) problems.push(`duplicate skill: ${skill.name}`);
-    skillNames.add(skill.name);
-  }
-  const patchPaths = new Set<string>();
-  for (const patch of manifest.configPatches) {
-    if (!isSafeRelativePath(patch.file)) problems.push(`unsafe config path: ${patch.file}`);
-    const key = patchKey(patch);
-    if (patchPaths.has(key)) problems.push(`duplicate config patch: ${patch.file}:${patch.path.join(".")}`);
-    patchPaths.add(key);
-  }
-  return problems;
-}
+
 
 export async function resolveConfigForRoot(root: string, draft?: PoiesisConfig): Promise<ResolvedPoiesisConfig> {
   const raw = draft ?? (await loadConfig(root));
@@ -734,15 +969,22 @@ export async function doctor(root: string): Promise<DoctorReport> {
 
   try {
     manifest = await loadManifest(resolvedRoot);
-    const problems = manifestConsistency(manifest);
-    checks.push({
-      id: "manifest",
-      status: problems.length === 0 ? "pass" : "fail",
-      message: problems.length === 0 ? "Ownership manifest is valid" : "Ownership manifest is inconsistent",
-      ...(problems.length > 0 ? { details: { problems } } : {}),
-    });
+    if (config === undefined) {
+      throw new PoiesisError("MANIFEST_AUTHORITY_INVALID", "Manifest authority cannot be checked without valid Poiesis config");
+    }
+    await assertManifestAuthority(resolvedRoot, manifest, config);
+    checks.push({ id: "manifest", status: "pass", message: "Ownership manifest matches the installed adapter" });
   } catch (error) {
-    checks.push({ id: "manifest", status: "fail", message: "Ownership manifest is invalid or missing", details: errorDetails(error) });
+    checks.push({ id: "manifest", status: "fail", message: "Ownership manifest is invalid or unauthorized", details: errorDetails(error) });
+  }
+
+  if (manifest !== undefined) {
+    try {
+      await assertOwnershipReceipt(resolvedRoot, manifest);
+      checks.push({ id: "receipt", status: "pass", message: "Ownership receipt matches this repository and manifest" });
+    } catch (error) {
+      checks.push({ id: "receipt", status: "fail", message: "Ownership receipt is missing or mismatched", details: errorDetails(error) });
+    }
   }
 
   if (manifest !== undefined) {
@@ -796,7 +1038,7 @@ export async function doctor(root: string): Promise<DoctorReport> {
           failures.push({ name: expected.name, reason: "directory missing" });
           continue;
         }
-        const actual = skill.preexisting ? await hashDirectory(path) : await hashOwnedSkillDirectory(path);
+        const actual = await hashOwnedSkillDirectory(path);
         if (!skill.preexisting && (skill.hash === undefined || actual !== skill.hash)) {
           failures.push({ name: expected.name, reason: "owned directory hash changed" });
         } else if (skill.preexisting && skill.hash !== undefined && actual !== skill.hash) {
@@ -940,13 +1182,9 @@ async function requireOwnedManagedFile(root: string, record: ManagedFile): Promi
 export async function update(root: string, options: MaintenanceOptions = {}): Promise<UpdateResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
-  const manifestProblems = manifestConsistency(manifest);
-  if (manifestProblems.length > 0) {
-    throw new PoiesisError("MANIFEST_OWNERSHIP_INVALID", "Refusing to update from an inconsistent manifest", {
-      problems: manifestProblems,
-    });
-  }
   const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -962,37 +1200,6 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     await requireOwnedManagedFile(resolvedRoot, record);
   }
   await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
-  const desiredPatchKeys = new Set(desiredOpenCodePatches(config).map((patch) => patch.path.join("\0")));
-  const obsoletePatches = manifest.configPatches.filter((patch) => !desiredPatchKeys.has(patch.path.join("\0")));
-  if (obsoletePatches.length > 0) {
-    throw new PoiesisError("CONFIG_MIGRATION_REQUIRED", "Current adapter cannot safely remove obsolete config patches", {
-      paths: obsoletePatches.map((patch) => patch.path),
-    });
-  }
-
-  const skills = options.skipSkills
-    ? manifest.skills
-    : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
-
-    const nextFiles = [...manifest.files];
-    const fileSnapshots = new Map<string, Buffer>();
-    for (const file of materialized) {
-      const path = join(resolvedRoot, file.path);
-      if (await exists(path)) {
-        const bytes = await readFile(path);
-        fileSnapshots.set(file.path, bytes);
-      }
-      await atomicWrite(path, file.content);
-      const index = nextFiles.findIndex((record) => record.path === file.path);
-      const template = templateMappings.find((mapping) => mapping.destination === file.path);
-      nextFiles[index] = {
-        path: file.path,
-        kind: file.kind,
-        hash: hashContent(file.content),
-        owned: true,
-        ...(template?.trackInProject === true ? { durable: true } : {}),
-      };
-    }
 
   const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
   if (managedConfigFiles.length !== 1) {
@@ -1003,24 +1210,34 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   const openCodeConfig = managedConfigFiles[0]!;
   const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
   const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
+  const fileSnapshots = new Map<string, Buffer>();
+  for (const file of materialized) {
+    const path = join(resolvedRoot, file.path);
+    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
+  }
 
   let manifestPath: string | undefined;
   let manifestBackup: Buffer | null = null;
+  let nextReceipt: OwnershipReceipt | undefined;
+  let skills = manifest.skills;
   try {
+    skills = options.skipSkills
+      ? manifest.skills
+      : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
+    for (const file of materialized) {
+      await atomicWrite(join(resolvedRoot, file.path), file.content);
+    }
+    const nextFiles = nextAdapterFiles(
+      manifest,
+      materialized.map((file) => ({
+        path: file.path,
+        kind: file.kind,
+        hash: hashContent(file.content),
+        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
+      })),
+    );
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const priorPatches = new Map(manifest.configPatches.map((patch) => [patchKey(patch), patch]));
-    const configPatches = appliedPatches.map((patch) => {
-      const prior = priorPatches.get(patchKey(patch));
-      return prior === undefined
-        ? patch
-        : {
-            file: patch.file,
-            path: patch.path,
-            previousExists: prior.previousExists,
-            ...(prior.previousExists ? { previous: prior.previous } : {}),
-            installed: patch.installed,
-          };
-    });
+    const configPatches = nextAdapterPatches(manifest, appliedPatches);
     if (openCodeConfigSnapshot !== null) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
@@ -1045,13 +1262,15 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     manifestPath = poiesisPath(resolvedRoot, "manifest.json");
     manifestBackup = await snapshotFile(manifestPath);
     await atomicWrite(manifestPath, serializeManifest(next));
+    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, next, receipt);
     const report = await doctor(resolvedRoot);
-    if (!report.ok) {
+    if (!options.skipSkills && !report.ok) {
       throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
     }
     return { manifest: next, doctor: report };
   } catch (error) {
     if (manifestPath !== undefined) await restoreManifest(manifestPath, manifestBackup);
+    await restoreOwnershipReceipt(resolvedRoot, receipt);
     await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
     await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
     throw error;
@@ -1127,15 +1346,32 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   return known;
 }
 
+export async function installAuthorizedCapability(root: string, input: CapabilityInstallInput) {
+  const resolvedRoot = resolve(root);
+  const manifest = await loadManifest(resolvedRoot);
+  const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
+  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+  const manifestBackup = await snapshotFile(manifestPath);
+  try {
+    const installed = await installCapability(resolvedRoot, input);
+    const next = await loadManifest(resolvedRoot);
+    await replaceOwnershipReceipt(resolvedRoot, next, receipt);
+    return installed;
+  } catch (error) {
+    await restoreManifest(manifestPath, manifestBackup);
+    await restoreOwnershipReceipt(resolvedRoot, receipt);
+    throw error;
+  }
+}
+
 export async function uninstall(root: string): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
-  const manifestProblems = manifestConsistency(manifest);
-  if (manifestProblems.length > 0) {
-    throw new PoiesisError("MANIFEST_OWNERSHIP_INVALID", "Refusing to uninstall from an inconsistent manifest", {
-      problems: manifestProblems,
-    });
-  }
+  const config = await resolveConfigForRoot(resolvedRoot);
+  await assertManifestAuthority(resolvedRoot, manifest, config);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   const result: UninstallResult = {
     complete: false,
     manifestRemoved: false,
@@ -1166,6 +1402,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   }
 
   const configPatchFiles = new Set(manifest.configPatches.map((patch) => patch.file));
+  const releasedDurable = new Set<string>();
   for (const file of manifest.files) {
     const path = ownedPath(resolvedRoot, file.path);
     if (!(await exists(path))) {
@@ -1173,7 +1410,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
       continue;
     }
     if (file.durable === true) {
-      result.preserved.push({ path: file.path, reason: "durable project-tracked file; ownership released but file retained" });
+      releasedDurable.add(file.path);
       continue;
     }
     if (configPatchFiles.has(file.path)) {
@@ -1211,6 +1448,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     );
     for (const path of remaining) {
       const details = await lstat(join(resolvedRoot, path));
+      if (releasedDurable.has(path)) continue;
       if (!known.has(path) || !details.isDirectory()) {
         result.preserved.push({ path, reason: "content appeared during uninstall" });
       }
@@ -1230,16 +1468,20 @@ export async function uninstall(root: string): Promise<UninstallResult> {
       }
     }
     result.complete = true;
+    await removeOwnershipReceipt(resolvedRoot);
   } else {
     const removed = new Set(result.removed);
     const changedConfigFiles = new Set(configResult.reverted.map((patch) => patch.file));
     const retained: Manifest = {
       ...manifest,
-      files: manifest.files.filter((file) => !removed.has(file.path) && !changedConfigFiles.has(file.path)),
+      files: manifest.files.filter(
+        (file) => !removed.has(file.path) && !changedConfigFiles.has(file.path) && !releasedDurable.has(file.path),
+      ),
       skills: manifest.skills.filter((skill) => !removed.has(skill.path)),
       configPatches: configResult.preserved,
     };
     await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), serializeManifest(retained));
+    await replaceOwnershipReceipt(resolvedRoot, retained, receipt);
   }
   return result;
 }

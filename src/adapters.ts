@@ -8,9 +8,11 @@ import { atomicWrite, exists, readUtf8 } from "./fs.js";
 import { run } from "./process.js";
 import {
   validateIntegrationEvidence,
+  validateProductionAuthorization,
   validateProofEvidence,
   validateStagingEvidence,
   type IntegrationEvidence,
+  type ProductionAuthorization,
   type ProofEvidence,
   type StagingEvidence,
 } from "./evidence.js";
@@ -691,29 +693,27 @@ export type DeliveryTarget = "preview" | "staging" | "production";
 
 export interface DeliveryIdentity {
   sha: string;
+  candidateSha: string;
+  candidateTree: string;
+  target: DeliveryTarget;
+  artifactIdentity: string;
+  verified: true;
   id?: string;
   url?: string;
   artifact?: string;
 }
 
 export interface DeliveryResult extends DeliveryIdentity {
-  target: DeliveryTarget;
   status: string;
-  verified: true;
 }
 
-export interface ProofPayload {
-  verified: true;
-  specReview: { verdict: "PASS"; reviewerIdentity: string };
-  standardsReview: { verdict: "PASS"; reviewerIdentity: string };
-  candidateTree?: string;
-}
+export type PreviewDeliveryResult = DeliveryResult & { target: "preview" };
+export type StagingDeliveryResult = DeliveryResult & StagingEvidence;
+export type ProductionDeliveryResult = DeliveryResult & { target: "production" };
 
-export interface StagingPayload {
-  artifactIdentity: string;
-  verified: true;
-  candidateTree?: string;
-}
+export type ProofPayload = ProofEvidence;
+
+export type StagingPayload = StagingEvidence;
 
 export interface PreviewDeliveryInput {
   sha: string;
@@ -725,18 +725,18 @@ export interface StagingPromotionInput {
   sha: string;
   target: "staging";
   candidateTree: string;
-  identity: DeliveryIdentity | string;
-  staging: StagingPayload;
+  identity: DeliveryIdentity;
 }
 
 export interface ProductionPromotionInput {
   sha: string;
   target: "production";
   candidateTree: string;
-  identity: DeliveryIdentity | string;
-  productionAuthorization: string;
+  identity: DeliveryIdentity;
+  productionAuthorization: ProductionAuthorization;
+  integrationRemote: string;
+  integrationBranch: string;
   proof: ProofPayload;
-  staging: StagingPayload;
   integration: IntegrationEvidence;
 }
 
@@ -744,8 +744,9 @@ export type PromoteDeliveryInput = StagingPromotionInput | ProductionPromotionIn
 
 export interface DeliveryAdapter {
   readonly kind: "command" | "fixture";
-  preview(input: PreviewDeliveryInput): Promise<DeliveryResult>;
-  promote(input: PromoteDeliveryInput): Promise<DeliveryResult>;
+  preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult>;
+  promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
+  promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
 }
 
 export interface CommandDeliveryConfig {
@@ -793,45 +794,44 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
     this.env = config.env;
   }
 
-  preview(input: PreviewDeliveryInput): Promise<DeliveryResult> {
+  async preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult> {
     const sha = exactSha(input.sha);
-    const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-    validateProofEvidence(proof, sha);
-    invariant(
-      !input.proof.candidateTree || input.proof.candidateTree === input.candidateTree,
-      "PROOF_TREE_MISMATCH",
-      "Preview tree must match the proof's recorded candidate tree",
-      { expected: input.candidateTree, proof: input.proof.candidateTree },
-    );
-    return this.execute(sha, "preview");
+    const candidateTree = await resolveCandidateTree(this.cwd, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
+    validateProofEvidence(input.proof, sha, candidateTree);
+    return this.execute(sha, candidateTree, "preview");
   }
 
-  promote(input: PromoteDeliveryInput): Promise<DeliveryResult> {
+  promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
+  promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
+  async promote(input: PromoteDeliveryInput): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
     const sha = exactSha(input.sha);
-    const identity = normalizeDeliveryIdentity(input.identity, sha);
-    assertProductionAuthorization(input);
+    const candidateTree = await resolveCandidateTree(this.cwd, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
     if (input.target === "staging") {
-      const staging: StagingEvidence = { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree };
-      validateStagingEvidence(staging, sha);
-    } else {
-      const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-      validateProofEvidence(proof, sha);
-      const staging: StagingEvidence = { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree };
-      validateStagingEvidence(staging, sha);
-      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
+      const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "preview");
+      return this.execute(sha, candidateTree, input.target, identity);
     }
-    return this.execute(sha, input.target, identity);
+    const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "staging");
+    validateProofEvidence(input.proof, sha, candidateTree);
+    validateStagingEvidence(identity, sha, candidateTree);
+    validateIntegrationEvidence(input.integration, sha, candidateTree);
+    await validateCanonicalIntegration(this.cwd, input.integrationRemote, input.integrationBranch, input.integration);
+    validateProductionAuthorization(input.productionAuthorization, sha, candidateTree, identity, input.integration);
+    return this.execute(sha, candidateTree, input.target, identity);
   }
 
-  private async execute(
+  private async execute<T extends DeliveryTarget>(
     sha: string,
-    target: DeliveryTarget,
+    candidateTree: string,
+    target: T,
     identity?: DeliveryIdentity,
-  ): Promise<DeliveryResult> {
+  ): Promise<DeliveryResult & { target: T }> {
     const args = this.args.map((argument) => (argument === "{sha}" ? sha : argument === "{target}" ? target : argument));
     const env: NodeJS.ProcessEnv = {
       ...this.env,
       POIESIS_CANDIDATE_SHA: sha,
+      POIESIS_CANDIDATE_TREE: candidateTree,
       POIESIS_DELIVERY_TARGET: target,
       ...(identity === undefined ? {} : { POIESIS_DELIVERY_IDENTITY: JSON.stringify(identity) }),
     };
@@ -849,29 +849,49 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
       "INVALID_COMMAND_OUTPUT",
       "Delivery output must contain a URL, artifact, or id",
     );
-    const reportedSha = output.sha ?? output.candidate;
     invariant(
-      reportedSha === undefined || reportedSha === sha,
+      output.sha === sha,
       "DELIVERY_IDENTITY_MISMATCH",
       "Delivery command reported a different candidate",
-      { expected: sha, actual: reportedSha },
+      { expected: sha, actual: output.sha },
     );
     invariant(
-      output.target === undefined || output.target === target,
+      output.candidateTree === candidateTree,
+      "DELIVERY_TREE_MISMATCH",
+      "Delivery command reported a different candidate tree",
+      { expected: candidateTree, actual: output.candidateTree },
+    );
+    invariant(
+      output.target === target,
       "DELIVERY_TARGET_MISMATCH",
       "Delivery command reported a different target",
       { expected: target, actual: output.target },
     );
-    if (target !== "preview") {
+    invariant(output.verified === true, "DELIVERY_VERIFICATION_FAILED", `${target} command must report verified: true`);
+    invariant(
+      typeof output.artifactIdentity === "string" && output.artifactIdentity.trim().length > 0,
+      "DELIVERY_ARTIFACT_IDENTITY_MISSING",
+      "Delivery command must report an immutable artifact identity",
+    );
+    const artifactIdentity = output.artifactIdentity as string;
+    invariant(
+      [output.id, output.url, output.artifact].includes(artifactIdentity),
+      "DELIVERY_ARTIFACT_IDENTITY_MISMATCH",
+      "Delivery artifact identity must match the reported id, URL, or artifact",
+    );
+    if (target === "production" && identity !== undefined) {
       invariant(
-        output.verified === true,
-        "DELIVERY_VERIFICATION_FAILED",
-        `${target} command must complete health verification and report verified: true`,
+        artifactIdentity === identity.artifactIdentity,
+        "PRODUCTION_STAGING_IDENTITY_MISMATCH",
+        "Production command did not preserve the verified Staging artifact identity",
       );
     }
     return {
       sha,
+      candidateSha: sha,
+      candidateTree,
       target,
+      artifactIdentity,
       status: typeof output.status === "string" ? output.status : "created",
       verified: true,
       ...(typeof output.id === "string" ? { id: output.id } : {}),
@@ -881,73 +901,80 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
   }
 }
 
-interface FixtureDeliveryRecord {
+interface FixtureDeliveryRecord<T extends DeliveryResult = DeliveryResult> {
   schema: 1;
   adapter: "fixture-test-only";
-  result: DeliveryResult;
+  result: T;
   sourceIdentity?: DeliveryIdentity;
 }
 
 class FixtureDeliveryAdapter implements DeliveryAdapter {
   readonly kind = "fixture" as const;
   private readonly fixturePath: string;
+  private readonly root: string;
 
   constructor(config: FixtureDeliveryConfig, root: string) {
+    this.root = resolve(root);
     this.fixturePath = resolveConfiguredPath(root, requiredText(config.path, "delivery fixture path"));
     assertExternalFixturePath(root, this.fixturePath, "delivery");
   }
 
-  async preview(input: PreviewDeliveryInput): Promise<DeliveryResult> {
+  async preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult> {
     const sha = exactSha(input.sha);
-    const proof: ProofEvidence = { ...input.proof, candidateSha: sha, candidateTree: input.candidateTree };
-    validateProofEvidence(proof, sha);
-    invariant(
-      !input.proof.candidateTree || input.proof.candidateTree === input.candidateTree,
-      "PROOF_TREE_MISMATCH",
-      "Preview tree must match the proof's recorded candidate tree",
-      { expected: input.candidateTree, proof: input.proof.candidateTree },
-    );
-    const result: DeliveryResult = {
+    const candidateTree = await resolveCandidateTree(this.root, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
+    validateProofEvidence(input.proof, sha, candidateTree);
+    const artifact = resolve(this.fixturePath, "candidates", identityFilename(sha));
+    const result: PreviewDeliveryResult = {
       sha,
+      candidateSha: sha,
+      candidateTree,
       target: "preview",
+      artifactIdentity: artifact,
       status: "created",
       verified: true,
       id: `fixture:${sha}`,
-      artifact: resolve(this.fixturePath, "candidates", identityFilename(sha)),
+      artifact,
     };
     return this.writeImmutable("candidates", sha, { schema: 1, adapter: "fixture-test-only", result });
   }
 
-  async promote(input: PromoteDeliveryInput): Promise<DeliveryResult> {
+  promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
+  promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
+  async promote(input: PromoteDeliveryInput): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
     const sha = exactSha(input.sha);
-    const identity = normalizeDeliveryIdentity(input.identity, sha);
-    assertProductionAuthorization(input);
-    let result: DeliveryResult;
+    const candidateTree = await resolveCandidateTree(this.root, sha);
+    validateCandidateTree(input.candidateTree, candidateTree);
+    let result: StagingDeliveryResult | ProductionDeliveryResult;
     let recordedSourceIdentity: DeliveryIdentity;
     if (input.target === "staging") {
-      validateStagingEvidence(
-        { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree },
-        sha,
-      );
-      recordedSourceIdentity = { sha, id: input.staging.artifactIdentity };
-      result = {
-        sha,
-        target: "staging",
-        status: "created",
-        verified: true,
-        id: input.staging.artifactIdentity,
-      };
-    } else {
-      validateProofEvidence({ ...input.proof, candidateSha: sha, candidateTree: input.candidateTree }, sha);
-      validateStagingEvidence(
-        { ...input.staging, candidateSha: sha, candidateTree: input.candidateTree },
-        sha,
-      );
-      validateIntegrationEvidence(input.integration, sha, input.candidateTree);
+      const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "preview");
+      const artifactIdentity = `fixture:staging:${sha}`;
       recordedSourceIdentity = identity;
       result = {
         sha,
+        candidateSha: sha,
+        candidateTree,
+        target: "staging",
+        artifactIdentity,
+        status: "created",
+        verified: true,
+        id: artifactIdentity,
+      };
+    } else {
+      const identity = validateDeliveryIdentity(input.identity, sha, candidateTree, "staging");
+      validateProofEvidence(input.proof, sha, candidateTree);
+      validateStagingEvidence(identity, sha, candidateTree);
+      validateIntegrationEvidence(input.integration, sha, candidateTree);
+      await validateCanonicalIntegration(this.root, input.integrationRemote, input.integrationBranch, input.integration);
+      validateProductionAuthorization(input.productionAuthorization, sha, candidateTree, identity, input.integration);
+      recordedSourceIdentity = identity;
+      result = {
+        sha,
+        candidateSha: sha,
+        candidateTree,
         target: "production",
+        artifactIdentity: identity.artifactIdentity,
         status: "created",
         verified: true,
         ...(identity.id === undefined ? {} : { id: identity.id }),
@@ -963,11 +990,11 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
     });
   }
 
-  private async writeImmutable(
+  private async writeImmutable<T extends DeliveryResult>(
     directory: "candidates" | "staging" | "production",
     sha: string,
-    record: FixtureDeliveryRecord,
-  ): Promise<DeliveryResult> {
+    record: FixtureDeliveryRecord<T>,
+  ): Promise<T> {
     const path = resolve(this.fixturePath, directory, identityFilename(sha));
     await mkdir(dirname(path), { recursive: true });
     const content = `${JSON.stringify(record, null, 2)}\n`;
@@ -992,43 +1019,109 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
   }
 }
 
-function assertProductionAuthorization(input: PromoteDeliveryInput): void {
-  if (input.target !== "production") return;
-  invariant(
-    typeof input.productionAuthorization === "string" && input.productionAuthorization.trim().length > 0,
-    "PRODUCTION_AUTHORIZATION_REQUIRED",
-    "Production promotion requires explicit Author authorization evidence",
-  );
-  const identity = normalizeDeliveryIdentity(input.identity, input.sha);
-  invariant(
-    identity.id === input.staging.artifactIdentity ||
-      identity.url === input.staging.artifactIdentity ||
-      identity.artifact === input.staging.artifactIdentity,
-    "PRODUCTION_STAGING_IDENTITY_MISMATCH",
-    "Production promotion identity does not match the verified Staging artifact identity",
-    { productionIdentity: identity, stagingArtifactIdentity: input.staging.artifactIdentity },
-  );
-}
-
 function exactSha(sha: string): string {
   requiredText(sha, "candidate sha");
   invariant(sha === sha.trim() && !sha.includes("\0"), "INVALID_DELIVERY_IDENTITY", "Candidate sha is not exact text", { sha });
   return sha;
 }
 
-function normalizeDeliveryIdentity(identity: DeliveryIdentity | string, sha: string): DeliveryIdentity {
-  const normalized: DeliveryIdentity =
-    typeof identity === "string" ? { sha, id: requiredText(identity, "delivery identity") } : { ...identity };
-  invariant(normalized.sha === sha, "DELIVERY_IDENTITY_MISMATCH", "Promotion identity belongs to a different candidate", {
-    expected: sha,
-    actual: normalized.sha,
+async function validateCanonicalIntegration(
+  root: string,
+  remote: string,
+  branch: string,
+  integration: IntegrationEvidence,
+): Promise<void> {
+  requiredText(remote, "integration remote");
+  requiredText(branch, "integration branch");
+  invariant(!remote.startsWith("-") && !remote.includes("\0"), "INVALID_REMOTE_NAME", "Configured integration remote is invalid", {
+    remote,
   });
+  const remotes = (await run("git", ["remote"], { cwd: root })).stdout.split("\n").filter(Boolean);
+  invariant(remotes.includes(remote), "GIT_REMOTE_UNAVAILABLE", "Configured integration remote is unavailable", { remote });
+  const branchCheck = await run("git", ["check-ref-format", "--branch", branch], { cwd: root, allowFailure: true });
+  invariant(branchCheck.exitCode === 0, "INVALID_BRANCH_NAME", "Configured integration branch is invalid", { branch });
+  const fetched = await run("git", ["fetch", "--quiet", "--no-tags", "--", remote, `refs/heads/${branch}`], {
+    cwd: root,
+    allowFailure: true,
+  });
+  invariant(fetched.exitCode === 0, "INTEGRATION_BRANCH_UNAVAILABLE", "Canonical integration branch could not be fetched", {
+    remote,
+    branch,
+  });
+  const head = await run("git", ["rev-parse", "--verify", "FETCH_HEAD^{commit}"], { cwd: root });
   invariant(
-    [normalized.id, normalized.url, normalized.artifact].some((value) => typeof value === "string" && value.length > 0),
-    "INVALID_DELIVERY_IDENTITY",
-    "Promotion requires an immutable URL, artifact, or id identity",
+    head.stdout === integration.integrationSha,
+    "PRODUCTION_INTEGRATION_HEAD_MISMATCH",
+    "Integration evidence is not the canonical remote integration head",
+    { expected: head.stdout, actual: integration.integrationSha, remote, branch },
   );
-  return normalized;
+  const tree = await run("git", ["rev-parse", "--verify", `${integration.integrationSha}^{tree}`], { cwd: root });
+  invariant(
+    tree.stdout === integration.integrationTree,
+    "PRODUCTION_INTEGRATION_TREE_MISMATCH",
+    "Integration evidence tree does not match the repository",
+    { expected: tree.stdout, actual: integration.integrationTree },
+  );
+}
+
+async function resolveCandidateTree(root: string, sha: string): Promise<string> {
+  const commit = await run("git", ["rev-parse", "--verify", `${sha}^{commit}`], { cwd: root, allowFailure: true });
+  invariant(
+    commit.exitCode === 0 && commit.stdout === sha,
+    "DELIVERY_CANDIDATE_NOT_FOUND",
+    "Delivery candidate must be an exact commit in the repository",
+    { candidateSha: sha },
+  );
+  const tree = await run("git", ["rev-parse", "--verify", `${sha}^{tree}`], { cwd: root, allowFailure: true });
+  invariant(tree.exitCode === 0, "DELIVERY_CANDIDATE_TREE_MISSING", "Delivery candidate tree could not be resolved", {
+    candidateSha: sha,
+  });
+  return tree.stdout;
+}
+
+function validateCandidateTree(provided: string, actual: string): void {
+  invariant(provided === actual, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
+    expected: actual,
+    provided,
+  });
+}
+
+function validateDeliveryIdentity(
+  identity: DeliveryIdentity,
+  sha: string,
+  candidateTree: string,
+  target: "preview",
+): DeliveryIdentity & { target: "preview" };
+function validateDeliveryIdentity(
+  identity: DeliveryIdentity,
+  sha: string,
+  candidateTree: string,
+  target: "staging",
+): DeliveryIdentity & { target: "staging" };
+function validateDeliveryIdentity(
+  identity: DeliveryIdentity,
+  sha: string,
+  candidateTree: string,
+  target: "preview" | "staging",
+): DeliveryIdentity & { target: "preview" | "staging" } {
+  invariant(isRecord(identity), "INVALID_DELIVERY_IDENTITY", "Promotion requires a structured delivery identity");
+  invariant(identity.sha === sha && identity.candidateSha === sha, "DELIVERY_IDENTITY_MISMATCH", "Promotion identity belongs to a different candidate", {
+    expected: sha,
+    actual: identity.sha,
+  });
+  invariant(identity.candidateTree === candidateTree, "DELIVERY_TREE_MISMATCH", "Promotion identity belongs to a different candidate tree");
+  invariant(identity.target === target, "DELIVERY_SOURCE_TARGET_MISMATCH", `Promotion requires a ${target} identity`);
+  invariant(
+    typeof identity.artifactIdentity === "string" && identity.artifactIdentity.trim().length > 0,
+    "INVALID_DELIVERY_IDENTITY",
+    "Promotion requires an immutable artifact identity",
+  );
+  invariant(
+    [identity.id, identity.url, identity.artifact].includes(identity.artifactIdentity),
+    "DELIVERY_ARTIFACT_IDENTITY_MISMATCH",
+    "Delivery artifact identity must match the reported id, URL, or artifact",
+  );
+  return identity as DeliveryIdentity & { target: "preview" | "staging" };
 }
 
 function identityFilename(identity: string): string {
@@ -1081,14 +1174,25 @@ export async function previewDelivery(
   config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
   input: PreviewDeliveryInput,
   root = process.cwd(),
-): Promise<DeliveryResult> {
+): Promise<PreviewDeliveryResult> {
   return createDeliveryAdapter(config, root).preview(input);
 }
 
+export function promoteDelivery(
+  config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
+  input: StagingPromotionInput,
+  root?: string,
+): Promise<StagingDeliveryResult>;
+export function promoteDelivery(
+  config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
+  input: ProductionPromotionInput,
+  root?: string,
+): Promise<ProductionDeliveryResult>;
 export async function promoteDelivery(
   config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
   input: PromoteDeliveryInput,
   root = process.cwd(),
-): Promise<DeliveryResult> {
-  return createDeliveryAdapter(config, root).promote(input);
+): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
+  const adapter = createDeliveryAdapter(config, root);
+  return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

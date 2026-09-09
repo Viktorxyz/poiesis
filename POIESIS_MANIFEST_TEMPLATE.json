@@ -3,30 +3,35 @@
   "poiesisVersion": "<installed-version>",
   "adapter": {
     "harness": "opencode",
-    "adapterVersion": "<adapter-version>"
+    "adapterVersion": "<adapter-version>",
+    "supportedVersion": "<supported-opencode-version>"
   },
   "files": [
     {
       "path": "<managed-path>",
-      "kind": "generated|canonical|config-patch",
+      "kind": "canonical|generated",
       "hash": "<sha256>",
-      "owned": true
+      "owned": true,
+      "durable": "<true only for adapter-tracked project files>"
     }
   ],
   "skills": [
     {
       "source": "<upstream-source>",
       "name": "<skill-name>",
+      "path": ".agents/skills/<skill-name>",
       "preexisting": false,
-      "installedRevision": "<revision-or-version>"
+      "installedRevision": "<revision-or-preexisting>",
+      "hash": "<sha256>"
     }
   ],
   "configPatches": [
     {
-      "file": "<config-path>",
-      "path": "<json-path>",
-      "previous": "<previous-value-or-null>",
-      "installed": "<poiesis-value>"
+      "file": "opencode.jsonc|opencode.json|.opencode/opencode.jsonc|.opencode/opencode.json",
+      "path": ["<json>", "<path>"],
+      "previousExists": false,
+      "previous": "<previous-value-if-previousExists>",
+      "installed": "<current-adapter-value>"
     }
   ]
 }

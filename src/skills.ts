@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
-import { cp, lstat, mkdir, mkdtemp, readdir, rename, rm } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { cp, lstat, mkdir, mkdtemp, readFile, readdir, rename, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { parseJsonc } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { exists, readUtf8 } from "./fs.js";
-import { hashDirectory, pathKind } from "./hash.js";
+import { pathKind } from "./hash.js";
 import type { ManagedSkill } from "./manifest.js";
 import { loadManifest, serializeManifest } from "./manifest.js";
 import { packageRoot } from "./paths.js";
@@ -26,6 +26,8 @@ export interface DefaultSkill {
 
 export interface SkillMaintenanceOptions {
   replaceOwned?: boolean;
+  expectedPreexisting?: ReadonlyMap<string, string>;
+  createdDirectories?: Set<string>;
 }
 
 export interface SkillRemovalResult {
@@ -159,14 +161,56 @@ async function stageSkills(skills: DefaultSkill[]): Promise<{ root: string; clea
   }
 }
 
-async function installDirectoryAtomically(source: string, destination: string): Promise<void> {
-  await mkdir(dirname(destination), { recursive: true });
-  const temporary = `${destination}.${randomUUID()}.tmp`;
+async function createMissingSkillParents(root: string, destination: string, created?: Set<string>): Promise<void> {
+  const parts = relative(root, dirname(destination)).split(sep);
+  let current = root;
+  for (const part of parts) {
+    current = join(current, part);
+    if (await pathEntryExists(current)) {
+      const details = await lstat(current);
+      if (!details.isDirectory() || details.isSymbolicLink()) {
+        throw new PoiesisError("SKILL_PATH_UNSAFE", "Refusing to traverse a non-directory skill parent", {
+          path: relative(root, current),
+        });
+      }
+      continue;
+    }
+    await mkdir(current);
+    created?.add(relative(root, current));
+  }
+}
+
+async function installDirectoryAtomically(
+  source: string,
+  destination: string,
+  root: string,
+  createdDirectories?: Set<string>,
+): Promise<void> {
+  await createMissingSkillParents(root, destination, createdDirectories);
+  if (await pathEntryExists(destination)) {
+    throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path appeared during installation", {
+      path: relative(root, destination),
+    });
+  }
   try {
-    await cp(source, temporary, { recursive: true, errorOnExist: true, force: false });
-    await rename(temporary, destination);
+    await cp(source, destination, { recursive: true, errorOnExist: true, force: false });
+    if ((await hashSafeSkillTree(destination)) !== (await hashSafeSkillTree(source))) {
+      throw new PoiesisError("SKILL_INSTALL_INCOMPLETE", "Installed skill content does not match its staged source", {
+        path: destination,
+      });
+    }
   } catch (error) {
-    await rm(temporary, { recursive: true, force: true });
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "ERR_FS_CP_EEXIST" && code !== "EEXIST" && (await pathEntryExists(destination))) {
+      try {
+        await rm(destination, { recursive: true, force: true });
+      } catch (cleanupError) {
+        throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Failed to remove a partial skill installation", {
+          path: relative(root, destination),
+          cause: cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+        });
+      }
+    }
     throw error;
   }
 }
@@ -192,12 +236,22 @@ async function isOwnedDirectory(path: string): Promise<boolean> {
   return details.isDirectory() && !details.isSymbolicLink();
 }
 
+async function pathEntryExists(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 async function assertSafeSkillParents(root: string, destination: string): Promise<void> {
   const parts = relative(root, destination).split(sep).slice(0, -1);
   let current = root;
   for (const part of parts) {
     current = join(current, part);
-    if ((await exists(current)) && (await lstat(current)).isSymbolicLink()) {
+    if ((await pathEntryExists(current)) && (await lstat(current)).isSymbolicLink()) {
       throw new PoiesisError("SKILL_PATH_UNSAFE", "Refusing to traverse a symlinked skill parent", {
         path: relative(root, current),
       });
@@ -205,19 +259,70 @@ async function assertSafeSkillParents(root: string, destination: string): Promis
   }
 }
 
-async function containsSymlink(directory: string): Promise<boolean> {
-  for (const entry of await readdir(directory, { withFileTypes: true })) {
-    if (entry.isSymbolicLink()) return true;
-    if (entry.isDirectory() && (await containsSymlink(join(directory, entry.name)))) return true;
+export async function assertDefaultSkillDestinationsAvailable(
+  root: string,
+  expectedPreexisting?: ReadonlyMap<string, string>,
+): Promise<Map<string, string>> {
+  const present = new Map<string, string>();
+  for (const skill of await loadDefaultSkills()) {
+    const destination = skillPath(root, skill.name);
+    await assertSafeSkillParents(root, destination);
+    const existsNow = await pathEntryExists(destination);
+    if (existsNow) {
+      const details = await lstat(destination);
+      if (details.isDirectory() && !details.isSymbolicLink()) {
+        present.set(skill.name, await hashSafeSkillTree(destination));
+      }
+      else {
+        throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path exists and is not a directory", {
+          path: relative(root, destination),
+        });
+      }
+    }
+    if (expectedPreexisting !== undefined) {
+      const expectedHash = expectedPreexisting.get(skill.name);
+      if ((expectedHash !== undefined) !== existsNow || (expectedHash !== undefined && present.get(skill.name) !== expectedHash)) {
+        throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path changed during initialization", {
+          path: relative(root, destination),
+        });
+      }
+    }
   }
-  return false;
+  return present;
+}
+
+async function hashSafeSkillTree(path: string): Promise<string> {
+  if (!(await isOwnedDirectory(path))) {
+    throw new PoiesisError("SKILL_PATH_UNSAFE", "An owned skill must be a real directory without symlinks", { path });
+  }
+  const hash = createHash("sha256");
+  async function walk(directory: string): Promise<void> {
+    const entries = await readdir(directory, { withFileTypes: true });
+    entries.sort((left, right) => left.name.localeCompare(right.name));
+    for (const entry of entries) {
+      const child = join(directory, entry.name);
+      const childPath = relative(path, child);
+      if (entry.isSymbolicLink() || (!entry.isDirectory() && !entry.isFile())) {
+        throw new PoiesisError("SKILL_PATH_UNSAFE", "An owned skill must contain only real files and directories", {
+          path: child,
+        });
+      }
+      if (entry.isDirectory()) {
+        hash.update(`directory\0${childPath}\0`);
+        await walk(child);
+      } else {
+        hash.update(`file\0${childPath}\0`);
+        hash.update(await readFile(child));
+        hash.update("\0");
+      }
+    }
+  }
+  await walk(path);
+  return hash.digest("hex");
 }
 
 export async function hashOwnedSkillDirectory(path: string): Promise<string> {
-  if (!(await isOwnedDirectory(path)) || (await containsSymlink(path))) {
-    throw new PoiesisError("SKILL_PATH_UNSAFE", "An owned skill must be a real directory without symlinks", { path });
-  }
-  return hashDirectory(path);
+  return hashSafeSkillTree(path);
 }
 
 function manifestSkill(defaultSkill: DefaultSkill, root: string, hash: string, preexisting: boolean): ManagedSkill {
@@ -269,8 +374,18 @@ export async function installDefaultSkills(
       continue;
     }
 
-    if (!(await exists(destination))) toInstall.push(skill);
-    else if ((await pathKind(destination)) !== "directory") {
+    const existsNow = await pathEntryExists(destination);
+    if (options.expectedPreexisting !== undefined) {
+      const expectedHash = options.expectedPreexisting.get(skill.name);
+      const currentHash = existsNow ? await hashSafeSkillTree(destination) : undefined;
+      if ((expectedHash !== undefined) !== existsNow || (expectedHash !== undefined && currentHash !== expectedHash)) {
+        throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path changed during initialization", {
+          path: relative(root, destination),
+        });
+      }
+    }
+    if (!existsNow) toInstall.push(skill);
+    else if (!(await isOwnedDirectory(destination))) {
       throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path exists and is not a directory", {
         path: relative(root, destination),
       });
@@ -293,7 +408,13 @@ export async function installDefaultSkills(
           await replaceDirectoryAtomically(source, destination);
           changed.push({ skill, previous: backup, installedHash });
         } else {
-          await installDirectoryAtomically(source, destination);
+          await assertSafeSkillParents(root, destination);
+          if (await pathEntryExists(destination)) {
+            throw new PoiesisError("SKILL_PATH_CONFLICT", "A default skill path appeared during installation", {
+              path: relative(root, destination),
+            });
+          }
+          await installDirectoryAtomically(source, destination, root, options.createdDirectories);
           changed.push({ skill, installedHash });
         }
       }
@@ -308,8 +429,20 @@ export async function installDefaultSkills(
           path: relative(root, destination),
         });
       }
-      const preexisting = prior?.preexisting ?? !toInstall.some((candidate) => candidate.name === skill.name);
-      const hash = preexisting ? await hashDirectory(destination) : await hashOwnedSkillDirectory(destination);
+      const installed = changed.find((candidate) => candidate.skill.name === skill.name);
+      const preexisting = prior?.preexisting ?? installed === undefined;
+      const hash = await hashOwnedSkillDirectory(destination);
+      const expectedHash = options.expectedPreexisting?.get(skill.name);
+      if (preexisting && expectedHash !== undefined && hash !== expectedHash) {
+        throw new PoiesisError("SKILL_PATH_CONFLICT", "A preexisting default skill changed during initialization", {
+          path: relative(root, destination),
+        });
+      }
+      if (installed !== undefined && hash !== installed.installedHash) {
+        throw new PoiesisError("SKILL_OWNERSHIP_LOST", "Installed skill changed before ownership was recorded", {
+          path: relative(root, destination),
+        });
+      }
       managed.push(manifestSkill(skill, root, hash, preexisting));
     }
 
@@ -317,64 +450,73 @@ export async function installDefaultSkills(
     managed.push(...previous.filter((skill) => !defaultNames.has(skill.name)));
     return managed;
   } catch (error) {
+    const rollbackFailures: Array<Record<string, unknown>> = [];
     for (const change of [...changed].reverse()) {
-      const destination = skillPath(root, change.skill.name);
-      if (!(await exists(destination)) || !(await isOwnedDirectory(destination))) continue;
       try {
-        if ((await hashOwnedSkillDirectory(destination)) !== change.installedHash) continue;
-      } catch {
-        continue;
+        const destination = skillPath(root, change.skill.name);
+        if (!(await exists(destination))) continue;
+        if (!(await isOwnedDirectory(destination)) || (await hashOwnedSkillDirectory(destination)) !== change.installedHash) {
+          rollbackFailures.push({ path: relative(root, destination), reason: "authored skill changed during rollback" });
+          continue;
+        }
+        if (change.previous === undefined) await rm(destination, { recursive: true });
+        else await replaceDirectoryAtomically(change.previous, destination);
+      } catch (rollbackError) {
+        rollbackFailures.push({
+          path: change.skill.name,
+          reason: rollbackError instanceof Error ? rollbackError.message : String(rollbackError),
+        });
       }
-      if (change.previous === undefined) await rm(destination, { recursive: true });
-      else await replaceDirectoryAtomically(change.previous, destination);
+    }
+    if (rollbackFailures.length > 0) {
+      throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Failed to roll back authored skills", {
+        cause: error instanceof Error ? error.message : String(error),
+        rollbackFailures,
+      });
     }
     throw error;
   } finally {
-    await staged?.cleanup();
+    await staged?.cleanup().catch(() => undefined);
   }
 }
 
 export async function removeOwnedSkills(root: string, skills: ManagedSkill[]): Promise<SkillRemovalResult> {
   const result: SkillRemovalResult = { removed: [], preserved: [] };
   for (const skill of skills) {
-    if (skill.preexisting) continue;
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(skill.name)) {
-      result.preserved.push({ path: skill.path, reason: "invalid skill name" });
-      continue;
-    }
-    const expectedPath = relative(root, skillPath(root, skill.name));
-    if (skill.path !== expectedPath || skill.hash === undefined) {
-      result.preserved.push({ path: skill.path, reason: "invalid ownership provenance" });
-      continue;
-    }
-    const destination = join(root, skill.path);
     try {
+      if (skill.preexisting) continue;
+      if (!/^[a-z0-9][a-z0-9-]*$/.test(skill.name)) {
+        result.preserved.push({ path: skill.path, reason: "invalid skill name" });
+        continue;
+      }
+      const expectedPath = relative(root, skillPath(root, skill.name));
+      if (skill.path !== expectedPath || skill.hash === undefined) {
+        result.preserved.push({ path: skill.path, reason: "invalid ownership provenance" });
+        continue;
+      }
+      const destination = join(root, skill.path);
       await assertSafeSkillParents(root, destination);
-    } catch {
-      result.preserved.push({ path: skill.path, reason: "skill parent is symlinked" });
-      continue;
-    }
-    if (!(await exists(destination))) {
+      if (!(await exists(destination))) {
+        result.removed.push(skill.path);
+        continue;
+      }
+      if (!(await isOwnedDirectory(destination))) {
+        result.preserved.push({ path: skill.path, reason: "path is not a directory" });
+        continue;
+      }
+      const currentHash = await hashOwnedSkillDirectory(destination);
+      if (currentHash !== skill.hash) {
+        result.preserved.push({ path: skill.path, reason: "directory hash changed" });
+        continue;
+      }
+      await rm(destination, { recursive: true });
       result.removed.push(skill.path);
-      continue;
+    } catch (error) {
+      result.preserved.push({
+        path: skill.path,
+        reason: error instanceof Error ? error.message : "skill removal failed",
+      });
     }
-    if (!(await isOwnedDirectory(destination))) {
-      result.preserved.push({ path: skill.path, reason: "path is not a directory" });
-      continue;
-    }
-    let currentHash: string;
-    try {
-      currentHash = await hashOwnedSkillDirectory(destination);
-    } catch {
-      result.preserved.push({ path: skill.path, reason: "directory contains a symlink or unsafe node" });
-      continue;
-    }
-    if (currentHash !== skill.hash) {
-      result.preserved.push({ path: skill.path, reason: "directory hash changed" });
-      continue;
-    }
-    await rm(destination, { recursive: true });
-    result.removed.push(skill.path);
   }
   return result;
 }
@@ -423,7 +565,7 @@ export async function installCapability(root: string, input: CapabilityInstallIn
       path: relative(root, destination),
       preexisting: true,
       installedRevision: "preexisting",
-      hash: await hashDirectory(destination),
+      hash: await hashOwnedSkillDirectory(destination),
     };
     const next = { ...manifest, skills: [...manifest.skills, preexisting] };
     await atomicWrite(poiesisPath(root, "manifest.json"), serializeManifest(next));
@@ -437,7 +579,7 @@ export async function installCapability(root: string, input: CapabilityInstallIn
   let changed = false;
   try {
     if (prior === undefined) {
-      await installDirectoryAtomically(source, destination);
+      await installDirectoryAtomically(source, destination, root);
     } else {
       await mkdir(dirname(backup), { recursive: true });
       await cp(destination, backup, { recursive: true, errorOnExist: true, force: false });
