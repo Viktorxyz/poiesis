@@ -60,6 +60,14 @@ pnpm dlx poiesis-cli@latest doctor
 pnpm dlx poiesis-cli@latest update
 ```
 
+Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
+
+```bash
+pnpm dlx poiesis-cli@latest update --bootstrap-legacy-ownership
+```
+
+After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
+
 `uninstall` removes only Poiesis-proven-owned state and preserves Git, tracker, PR/MR, and release history:
 
 ```bash
