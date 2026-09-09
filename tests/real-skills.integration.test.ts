@@ -16,7 +16,8 @@ describe("real upstream skill integration", () => {
         expect(report.ok).toBe(true);
         expect(report.checks.find((check) => check.id === "skills")?.status).toBe("pass");
         const removed = await uninstall(repository.root);
-        expect(removed.complete).toBe(true);
+        expect(removed.manifestRemoved).toBe(false);
+        expect(removed.preserved.some((entry) => entry.reason.includes("durable"))).toBe(true);
       } finally {
         await rm(repository.parent, { recursive: true, force: true });
       }
