@@ -5,6 +5,7 @@ import { init, uninstall, update, resolveConfigForRoot } from "../src/maintenanc
 import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { atomicWrite, exists } from "../src/fs.js";
 import { hashOwnedSkillDirectory } from "../src/skills.js";
+import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
 describe("maintenance ownership", () => {
@@ -365,6 +366,7 @@ describe("maintenance ownership", () => {
       hash: await hashOwnedSkillDirectory(skillPath),
     });
     await atomicWrite(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    await replaceOwnershipReceipt(repository.root, manifest, await readOwnershipReceipt(repository.root));
     await writeFile(join(repository.root, ".poiesis", "foreign.txt"), "keep\n");
 
     const result = await uninstall(repository.root);

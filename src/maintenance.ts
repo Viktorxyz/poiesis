@@ -16,6 +16,14 @@ import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { hashContent, hashFile } from "./hash.js";
 import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import {
+  assertOwnershipReceipt,
+  createOwnershipReceipt,
+  removeOwnershipReceipt,
+  replaceOwnershipReceipt,
+  restoreOwnershipReceipt,
+  type OwnershipReceipt,
+} from "./receipt.js";
+import {
   loadManifest,
   serializeManifest,
   type ConfigPatch,
@@ -770,6 +778,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const manifestContent = serializeManifest(manifest);
     await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
     writtenManifestHash = hashContent(manifestContent);
+    await createOwnershipReceipt(resolvedRoot, manifest);
     if (!options.skipSkills) {
       const report = await doctor(resolvedRoot);
       if (!report.ok) {
@@ -786,6 +795,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   } catch (error) {
     const rollbackFailures: Array<Record<string, unknown>> = [];
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+    await rollbackStep(rollbackFailures, "ownership receipt", async () => {
+      await removeOwnershipReceipt(resolvedRoot);
+    });
     await rollbackStep(rollbackFailures, ".poiesis/manifest.json", async () => {
       if (
         writtenManifestHash !== undefined &&
@@ -964,6 +976,15 @@ export async function doctor(root: string): Promise<DoctorReport> {
     checks.push({ id: "manifest", status: "pass", message: "Ownership manifest matches the installed adapter" });
   } catch (error) {
     checks.push({ id: "manifest", status: "fail", message: "Ownership manifest is invalid or unauthorized", details: errorDetails(error) });
+  }
+
+  if (manifest !== undefined) {
+    try {
+      await assertOwnershipReceipt(resolvedRoot, manifest);
+      checks.push({ id: "receipt", status: "pass", message: "Ownership receipt matches this repository and manifest" });
+    } catch (error) {
+      checks.push({ id: "receipt", status: "fail", message: "Ownership receipt is missing or mismatched", details: errorDetails(error) });
+    }
   }
 
   if (manifest !== undefined) {
@@ -1163,6 +1184,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -1214,6 +1236,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
 
   let manifestPath: string | undefined;
   let manifestBackup: Buffer | null = null;
+  let nextReceipt: OwnershipReceipt | undefined;
   try {
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -1241,13 +1264,15 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     manifestPath = poiesisPath(resolvedRoot, "manifest.json");
     manifestBackup = await snapshotFile(manifestPath);
     await atomicWrite(manifestPath, serializeManifest(next));
+    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, next, receipt);
     const report = await doctor(resolvedRoot);
-    if (!report.ok) {
+    if (!options.skipSkills && !report.ok) {
       throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
     }
     return { manifest: next, doctor: report };
   } catch (error) {
     if (manifestPath !== undefined) await restoreManifest(manifestPath, manifestBackup);
+    await restoreOwnershipReceipt(resolvedRoot, receipt);
     await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
     await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
     throw error;
@@ -1328,7 +1353,19 @@ export async function installAuthorizedCapability(root: string, input: Capabilit
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
-  return installCapability(resolvedRoot, input);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
+  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+  const manifestBackup = await snapshotFile(manifestPath);
+  try {
+    const installed = await installCapability(resolvedRoot, input);
+    const next = await loadManifest(resolvedRoot);
+    await replaceOwnershipReceipt(resolvedRoot, next, receipt);
+    return installed;
+  } catch (error) {
+    await restoreManifest(manifestPath, manifestBackup);
+    await restoreOwnershipReceipt(resolvedRoot, receipt);
+    throw error;
+  }
 }
 
 export async function uninstall(root: string): Promise<UninstallResult> {
@@ -1336,6 +1373,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
+  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   const result: UninstallResult = {
     complete: false,
     manifestRemoved: false,
@@ -1430,6 +1468,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
       }
     }
     result.complete = true;
+    await removeOwnershipReceipt(resolvedRoot);
   } else {
     const removed = new Set(result.removed);
     const changedConfigFiles = new Set(configResult.reverted.map((patch) => patch.file));
@@ -1440,6 +1479,7 @@ export async function uninstall(root: string): Promise<UninstallResult> {
       configPatches: configResult.preserved,
     };
     await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), serializeManifest(retained));
+    await replaceOwnershipReceipt(resolvedRoot, retained, receipt);
   }
   return result;
 }
