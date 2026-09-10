@@ -172,7 +172,7 @@ update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
 capability install      install one selected, revision-pinned skill
-workspace prepare       create an isolated owned branch/worktree
+workspace prepare       create an isolated owned branch/worktree (default path omits --path and lives under <root>/.poiesis/workspaces/<id>)
 checkpoint              commit an accepted reviewed ticket
 verify                  run checks against an exact clean SHA
 publish                 push and create/update a PR/MR after Proof
@@ -185,6 +185,13 @@ session cleanup         best-effort OpenCode child-session hygiene
 ```
 
 Every command emits structured JSON. Run `poiesis help` for command syntax.
+
+`workspace prepare` accepts `--path <absolute>` for specialized tests; the default
+omits `--path` and selects a deterministic, traversal-safe path under
+`<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is
+gitignored so it never appears as foreign work in the primary checkout. Direct
+calls from Poiesis should rely on the omitted-path form; the explicit `--path`
+form is for tests and special cases.
 
 ## Safety
 

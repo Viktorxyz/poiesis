@@ -304,4 +304,35 @@ describe("OpenCode adapter", () => {
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
     expect(await readFile(path, "utf8")).toBe('{ "share": "changed" }\n');
   });
+
+  it("never projects an external_directory permission key on any specialist", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config = testConfig(repository);
+    const patches = desiredOpenCodePatches(config);
+    for (const patch of patches) {
+      const value = patch.value as Record<string, unknown> | string | number | boolean | undefined;
+      expect(patch.path).not.toContain("external_directory");
+      expect(patch.path).not.toContain("externalDirectory");
+      expect(value).not.toHaveProperty("external_directory");
+      expect(value).not.toHaveProperty("externalDirectory");
+    }
+    // Also assert that the installed opencode.jsonc contains no
+    // external_directory key on any agent, after the managed config
+    // has been written.
+    const path = join(repository.root, "opencode.jsonc");
+    await writeFile(path, "{}\n");
+    await applyOpenCodeConfig(repository.root, config, path);
+    const installed = parseJsonc<Record<string, unknown>>(await readFile(path, "utf8"), path);
+    const agents = (installed.agent ?? {}) as Record<string, unknown>;
+    for (const agent of Object.values(agents)) {
+      const permission = (agent as { permission?: Record<string, unknown> }).permission;
+      if (permission !== undefined) {
+        expect(permission).not.toHaveProperty("external_directory");
+        expect(permission).not.toHaveProperty("externalDirectory");
+      }
+    }
+    expect(JSON.stringify(installed)).not.toContain("external_directory");
+    expect(JSON.stringify(installed)).not.toContain("externalDirectory");
+  });
 });

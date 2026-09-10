@@ -608,6 +608,60 @@ async function rollbackInitGitignore(path: string, snapshot: Buffer | null | und
   else await atomicWrite(path, snapshot.toString("utf8"));
 }
 
+/**
+ * Transactional default-path `.gitignore` seam.
+ *
+ * Receipt-bearing normal `update` and explicit 1.0.0 `bootstrap` MUST
+ * install the `.poiesis/workspaces/` ignore rule before any default-path
+ * workspace can leak into the primary checkout as foreign work. `init`
+ * installs the rule via the broader init gitignore call. `updateFromConfig`
+ * is the strict transactional path and intentionally does NOT mutate
+ * `.gitignore` to keep the receipt-authenticated transaction contract
+ * identical across the strict set of inputs.
+ *
+ * `ensureDefaultPathGitignore` only invokes `ensureGitignore` with the
+ * transactional rule. The caller is responsible for snapshotting the
+ * exact preimage (including absence) BEFORE the try block so any later
+ * failure can restore it byte-for-byte via `rollbackDefaultPathGitignore`.
+ * `ensureGitignore` returns its post-write content so the caller can
+ * capture the commit hash gate and detect concurrent user edits between
+ * the write and the rollback. Splitting snapshot + ensure keeps the
+ * gitignore mutation inside the transaction; the helper encapsulates
+ * only the "what rule to add" logic.
+ */
+const DEFAULT_PATH_GITIGNORE_HEADER =
+  "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
+const DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
+const DEFAULT_PATH_GITIGNORE_RULES: readonly string[] = [
+  DEFAULT_PATH_GITIGNORE_HEADER,
+  DEFAULT_PATH_GITIGNORE_PATTERN,
+];
+
+async function ensureDefaultPathGitignore(
+  root: string,
+  expected: Buffer | null,
+): Promise<{ writtenHash: string | undefined }> {
+  const written = await ensureGitignore(root, [...DEFAULT_PATH_GITIGNORE_RULES], expected);
+  return { writtenHash: written === undefined ? undefined : hashContent(written) };
+}
+
+async function rollbackDefaultPathGitignore(
+  path: string,
+  snapshot: Buffer | null,
+  writtenHash: string | undefined,
+): Promise<void> {
+  if (writtenHash === undefined) return;
+  if (!(await pathEntryExists(path))) return;
+  if (!(await isRegularFile(path)) || (await hashFile(path)) !== writtenHash) return;
+  if (snapshot === null) {
+    await unlink(path);
+    return;
+  }
+  // Byte-exact restoration: preserve the exact bytes that were snapshotted,
+  // including the precise trailing newline state (or absence thereof).
+  await atomicWrite(path, snapshot.toString("utf8"));
+}
+
 export async function init(root: string, config: PoiesisConfig, options: MaintenanceOptions = {}): Promise<Manifest> {
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
@@ -739,11 +793,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     }
     await assertGitignoreAvailable(resolvedRoot);
     const writtenGitignore = await ensureGitignore(resolvedRoot, [
-      `# Hide local Poiesis ownership snapshot`,
-      ...POIESIS_LOCAL_STATE_PATHS,
       `# Allow durable Poiesis project files to be tracked`,
       ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
       `!${".poiesis"}/`,
+      `# Hide local Poiesis state (added by \`poiesis init\` so the default-path workspace area and ownership snapshot never appear as foreign work)`,
+      ...POIESIS_LOCAL_STATE_PATHS,
     ], initialGitignoreSnapshot ?? null);
     if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -1275,11 +1329,22 @@ async function bootstrapLegacyOwnership(root: string, options: MaintenanceOption
   const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const manifestBackup = await snapshotFile(manifestPath);
+  // Snapshot the exact preimage of `.gitignore` BEFORE the transaction so
+  // a failure can restore it byte-for-byte. The transactional default-path
+  // gitignore rule is appended inside the try block; this seam exists for
+  // explicit 1.0.0 bootstrap because the predecessor init did not install
+  // the new rule.
+  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
+  let writtenGitignoreHash: string | undefined;
   try {
     const skills = options.skipSkills
       ? nextSkills
       : await installDefaultSkills(resolvedRoot, nextSkills, { replaceOwned: true });
     for (const file of materialized) await atomicWrite(join(resolvedRoot, file.path), file.content);
+    // Transactionally append the default-path `.gitignore` rule. The
+    // preimage snapshot above lets the rollback restore the exact bytes
+    // if any later step fails.
+    ({ writtenHash: writtenGitignoreHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
     const nextFiles = nextAdapterFiles(
       manifest,
       materialized.map((file) => ({
@@ -1320,6 +1385,7 @@ async function bootstrapLegacyOwnership(root: string, options: MaintenanceOption
     await removeOwnershipReceipt(resolvedRoot);
     await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
     await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
+    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, writtenGitignoreHash);
     throw error;
   }
 }
@@ -1376,6 +1442,12 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   let manifestBackup: Buffer | null = null;
   let nextReceipt: OwnershipReceipt | undefined;
   let skills = manifest.skills;
+  // Snapshot the exact preimage of `.gitignore` BEFORE the transaction so
+  // a failure can restore it byte-for-byte. The transactional default-path
+  // gitignore rule is appended inside the try block; updateFromConfig is
+  // intentionally unchanged and does not mutate `.gitignore`.
+  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
+  let writtenGitignoreHash: string | undefined;
   try {
     skills = options.skipSkills
       ? manifest.skills
@@ -1383,6 +1455,12 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     for (const file of materialized) {
       await atomicWrite(join(resolvedRoot, file.path), file.content);
     }
+    // Transactionally append the default-path `.gitignore` rule (and
+    // nothing else). `ensureGitignore` is idempotent on existing lines
+    // so a project that already has the rule is a no-op; the preimage
+    // snapshot above records the exact bytes in either case so a failure
+    // can restore them.
+    ({ writtenHash: writtenGitignoreHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
     const nextFiles = nextAdapterFiles(
       manifest,
       materialized.map((file) => ({
@@ -1430,6 +1508,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
     await restoreOwnershipReceipt(resolvedRoot, receipt);
     await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
     await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
+    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, writtenGitignoreHash);
     throw error;
   }
 }

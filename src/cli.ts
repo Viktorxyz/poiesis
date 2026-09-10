@@ -39,7 +39,7 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
-  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>
+  poiesis workspace prepare --branch <name> [--path <absolute>] --spec <id>
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
@@ -215,7 +215,7 @@ async function commandWorkspace(args: string[]): Promise<void> {
         remote: config.repository.remote,
         integrationBranch: config.repository.integrationBranch,
         branch: required(values, "branch"),
-        workspacePath: resolve(required(values, "path")),
+        ...optionalAbsoluteWorkspacePath(values.path),
         specId: required(values, "spec"),
       }),
     );
@@ -601,4 +601,11 @@ function isMainEntry(argv1: string | undefined, moduleUrl: string): boolean {
 const IS_MAIN_MODULE = isMainEntry(process.argv[1], import.meta.url);
 if (IS_MAIN_MODULE) {
   main(process.argv.slice(2)).catch(writeFailure);
+}
+
+function optionalAbsoluteWorkspacePath(value: string | boolean | string[] | undefined): Record<string, string> {
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return {};
+  return { workspacePath: resolve(trimmed) };
 }

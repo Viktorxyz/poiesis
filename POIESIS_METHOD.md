@@ -42,7 +42,14 @@ Before planning:
 1. Validate required project infrastructure.
 2. Fetch and inspect the repository.
 3. Resolve the latest canonical integration base.
-4. Prepare an isolated Poiesis-owned workspace.
+4. Prepare an isolated Poiesis-owned workspace via
+   `poiesis workspace prepare --branch <name> --spec <id>`. The
+   `--path` argument may be omitted; in that case Poiesis derives a
+   traversal-safe path under `<root>/.poiesis/workspaces/<id>`. The
+   default-path workspace area is gitignored so it never appears as
+   foreign work in the primary checkout. Poiesis must not pass an
+   arbitrary `/tmp/...` or other external path: external worktrees
+   can fall outside the harness-readable project root.
 5. Run Capability Check.
 
 Required infrastructure includes:

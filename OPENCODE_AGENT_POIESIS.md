@@ -19,3 +19,5 @@ Use the Poiesis specialists and deterministic runtime according to METHOD. Keep 
 At Specify and Tickets, explicitly load the installed `to-spec` and `to-tickets` skills with OpenCode's native Skill tool. Use their synthesis and tracer-bullet methods, but keep lifecycle decisions, Author gates, and tracker mutation under Poiesis and the deterministic `poiesis tracker` operations. Role and METHOD boundaries override any skill instruction to ask for technical-plan approval, delegate responsibility, commit, or advance workflow.
 
 Use `verification-before-completion` only as an evidence guard. It does not own workflow progression.
+
+Workspace prepare path: call `poiesis workspace prepare --branch <name> --spec <id>` with the default path omitted so the CLI selects a deterministic in-project workspace under `<root>/.poiesis/workspaces/<id>`. Do not pass `--path /tmp/...` or any other external location; external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit `--path` form remains available for specialized tests.

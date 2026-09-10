@@ -258,6 +258,19 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(predecessorManifest.poiesisVersion).toBe("1.0.2");
     await rebindReceipt(repository);
 
+    // Strip the new ticket #25 `.poiesis/workspaces/` rule from the
+    // pre-existing gitignore so the trusted 1.0.2 update transaction
+    // has to install it transactionally.
+    const gitignorePath = join(repository.root, ".gitignore");
+    const beforeBytes = await readFile(gitignorePath, "utf8");
+    const stripped = beforeBytes
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== ".poiesis/workspaces/")
+      .filter((line) => !line.includes("default-path workspace area"))
+      .join("\n");
+    await writeFile(gitignorePath, stripped);
+    expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
+
     const result = await update(repository.root, { skipSkills: true });
     expect(result.manifest.poiesisVersion).toBe("1.0.3");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
@@ -265,6 +278,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(reviewerAfter.previousExists).toBe(false);
     // gen 1: init; gen 2: rebind to predecessor; gen 3: receipt-authenticated update.
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(3);
+    // Receipt-bearing trusted update transactionally installs the new
+    // default-path gitignore rule. The `.poiesis/workspaces/` entry MUST
+    // be present after a successful update.
+    expect(await readFile(gitignorePath, "utf8")).toContain(".poiesis/workspaces/");
   }, 60_000);
 
   it("exact predecessor drift is rejected: any extra key in poiesis-reviewer.permission fails the migration", async () => {
@@ -348,6 +365,52 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
 
     // Tampered file is left as-is (no Poiesis mutation).
     expect(await readFile(reviewerMd, "utf8")).toBe("tampered\n");
+  }, 60_000);
+
+  it("rollback restores the .gitignore preimage byte-for-byte when update fails mid-transaction", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setup1_0_3Install(repository);
+    await asPredecessorManifest(repository, "1.0.1", { keepReceipt: true });
+    await rebindReceipt(repository);
+
+    const gitignorePath = join(repository.root, ".gitignore");
+    // The pre-ticket-#25 gitignore contract did NOT include the
+    // `.poiesis/workspaces/` rule. Force the post-ticket rule to be
+    // absent so the transaction must append it, and snapshot the
+    // preimage byte-for-byte.
+    const beforeBytes = (await readFile(gitignorePath, "utf8"))
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== ".poiesis/workspaces/")
+      .filter((line) => !line.includes("default-path workspace area"))
+      .join("\n");
+    await writeFile(gitignorePath, beforeBytes);
+    expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
+
+    // Force the update to fail at the ownership validation gate. The
+    // tampered managed file is detected BEFORE the try block, so the
+    // gitignore transaction never opens; the test still proves the
+    // preimage is left untouched when an update aborts at any gate.
+    const reviewerMd = join(repository.root, ".poiesis", "roles", "reviewer.md");
+    const reviewerOriginal = await readFile(reviewerMd, "utf8");
+    await writeFile(reviewerMd, "tampered\n");
+
+    await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({
+      code: expect.stringMatching(/UPDATE_DOCTOR_FAILED|FILE_OWNERSHIP_LOST/),
+    });
+
+    // Gitignore preimage is restored byte-for-byte. The transactional
+    // seam never leaves the `.poiesis/workspaces/` rule installed when
+    // the transaction aborts.
+    expect(await readFile(gitignorePath, "utf8")).toBe(beforeBytes);
+    expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
+
+    // Restore the reviewer file so the next assertion can verify the
+    // successful path: a non-tampered receipt-authenticated update
+    // installs the new `.poiesis/workspaces/` rule transactionally.
+    await writeFile(reviewerMd, reviewerOriginal);
+    await update(repository.root, { skipSkills: true });
+    expect(await readFile(gitignorePath, "utf8")).toContain(".poiesis/workspaces/");
   }, 60_000);
 
   it("doctor stays strict: predecessor manifest WITHOUT successful migration is reported as invalid", async () => {

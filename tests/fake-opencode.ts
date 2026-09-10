@@ -26,19 +26,41 @@ export interface FakeOpenCodeEnvironment {
   restore: () => void;
 }
 
+export interface InstallFakeOpenCodeOptions {
+  /** OpenCode version string to report for `--version`. */
+  version?: string;
+  /**
+   * When set, the fake increments a counter on every `debug config`
+   * invocation and fails (exit 1) once the counter exceeds `threshold`.
+   * Use this for deterministic post-write doctor failures (e.g. the
+   * first call inside `validateOpenCodeConfigPayload` succeeds and the
+   * second call inside `doctor → validateOpenCodeConfig` fails).
+   */
+  failAfterDebugCalls?: { file: string; threshold: number };
+}
+
 /**
  * Installs a fake `opencode` binary on a temporary `PATH` so maintenance tests
  * can drive `init` / `update` / `doctor` without a real OpenCode installation.
  * The binary echoes the requested version and a fixed model list for any
  * invocation; schema probes (`debug`) return success without touching disk.
+ *
+ * The `failAfterDebugCalls` option makes the fake stateful: the first N
+ * `debug config` calls succeed, and the (N+1)-th and later calls fail. N
+ * is `threshold`. The state is persisted via the supplied file so the
+ * counter survives across separate shell invocations.
  */
 export async function installFakeOpenCode(
-  version: string = TEST_OPENCODE_VERSION,
+  versionOrOptions: string | InstallFakeOpenCodeOptions = TEST_OPENCODE_VERSION,
 ): Promise<FakeOpenCodeEnvironment> {
+  const version = typeof versionOrOptions === "string" ? versionOrOptions : (versionOrOptions.version ?? TEST_OPENCODE_VERSION);
+  const failAfter = typeof versionOrOptions === "string" ? undefined : versionOrOptions.failAfterDebugCalls;
   const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-opencode-"));
   const bin = join(parent, "bin");
   await mkdir(bin);
   const script = join(bin, "opencode");
+  const debugCountFile = failAfter === undefined ? "" : failAfter.file;
+  const debugThreshold = failAfter === undefined ? "0" : String(failAfter.threshold);
   const body = `#!/bin/sh
 case "$1" in
   --version)
@@ -53,6 +75,16 @@ case "$1" in
     if [ "$POIESIS_TEST_OPENCODE_FAIL" = "1" ]; then
       printf 'forced doctor failure\\n' >&2
       exit 1
+    fi
+    if [ -n "${debugCountFile}" ]; then
+      count=$(cat "${debugCountFile}" 2>/dev/null || echo "0")
+      count=$(expr "\${count}" + 1)
+      mkdir -p "$(dirname "${debugCountFile}")"
+      printf '%s' "\${count}" > "${debugCountFile}"
+      if [ "\${count}" -gt "${debugThreshold}" ]; then
+        printf 'stateful fake-opencode: debug call #\${count} exceeds threshold ${debugThreshold}\\n' >&2
+        exit 1
+      fi
     fi
     exit 0
     ;;

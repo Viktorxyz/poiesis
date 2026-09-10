@@ -28,11 +28,31 @@ describe("legacy 1.0.0 ownership bootstrap", () => {
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({ code: "OWNERSHIP_RECEIPT_MISSING" });
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
 
+    // Synthetic 1.0.0 legacy init wrote the pre-ticket #25 `.gitignore`
+    // contract, which did NOT include `.poiesis/workspaces/`. Strip the
+    // new rule so the bootstrap transaction has to install it.
+    const gitignorePath = join(repository.root, ".gitignore");
+    const beforeBytes = await readFile(gitignorePath);
+    const stripped = beforeBytes
+      .toString("utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== ".poiesis/workspaces/")
+      .filter((line) => !line.includes("default-path workspace area"))
+      .join("\n");
+    await writeFile(gitignorePath, stripped);
+    expect((await readFile(gitignorePath, "utf8"))).not.toContain(".poiesis/workspaces/");
+
     const result = await update(repository.root, { skipSkills: true, bootstrapLegacyOwnership: true });
     expect(result.manifest.poiesisVersion).not.toBe("1.0.0");
     const receipt = await readOwnershipReceipt(repository.root);
     expect(receipt.generation).toBe(1);
     expect(await doctor(repository.root).then((report) => report.checks.find((check) => check.id === "receipt")?.status)).toBe("pass");
+
+    // After bootstrap, the transactional gitignore seam installed the
+    // `.poiesis/workspaces/` rule so the default-path workspace area
+    // never appears as foreign work in the primary checkout.
+    const afterBootstrap = await readFile(gitignorePath, "utf8");
+    expect(afterBootstrap).toContain(".poiesis/workspaces/");
 
     await update(repository.root, { skipSkills: true });
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(2);

@@ -70,7 +70,7 @@ export interface WorkspacePrepareOptions {
   remote: string;
   integrationBranch: string;
   branch: string;
-  workspacePath: string;
+  workspacePath?: string;
   specId: string;
 }
 
@@ -304,7 +304,9 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
   );
 
   const baseSha = await fetchIntegrationBase(root, options.remote, options.integrationBranch);
-  const workspacePath = await canonicalProspectivePath(options.workspacePath);
+  const workspacePath = options.workspacePath !== undefined
+    ? await canonicalProspectivePath(options.workspacePath)
+    : await deriveDefaultWorkspacePath(root, options.specId, options.branch);
   const commonDir = await gitCommonDir(root);
   const markers = await readMarkers(commonDir);
   invariant(
@@ -337,12 +339,22 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
   });
 
   const worktrees = await listWorktrees(root);
+  // The primary checkout (root) is always listed by `git worktree list`.
+  // A default-path workspace is intentionally nested inside
+  // `<root>/.poiesis/workspaces/`, so we must not treat that nesting
+  // as a worktree collision against the primary checkout. The nested
+  // area is reserved for Poiesis; only non-primary worktrees that
+  // overlap the workspace path are real collisions.
+  const nestedInProjectWorkspaces = isWithin(
+    join(root, ".poiesis", "workspaces"),
+    workspacePath,
+  );
   invariant(
     !worktrees.some(
       (worktree) =>
         worktree.branch === options.branch ||
         worktree.path === workspacePath ||
-        isWithin(worktree.path, workspacePath) ||
+        (!nestedInProjectWorkspaces && isWithin(worktree.path, workspacePath)) ||
         isWithin(workspacePath, worktree.path),
     ),
     "WORKTREE_COLLISION",
@@ -1511,4 +1523,60 @@ function isJsonRecord(value: unknown): value is Record<string, unknown> {
 function errorForEvidence(error: unknown): string | null {
   if (error === undefined) return null;
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Resolve the in-project workspace directory used when `workspace prepare`
+ * is invoked without an explicit `--path`. The directory lives under
+ * `<root>/.poiesis/workspaces/<derived-id>` so the workspace stays inside
+ * the harness-readable project root, never under `/tmp` or another
+ * external location that the harness cannot access. The returned path
+ * is treated like any other candidate workspace path: the marker, base,
+ * checkpoint, publish, cleanup, and rollback semantics are unchanged.
+ */
+export async function deriveDefaultWorkspacePath(
+  root: string,
+  specId: string,
+  branch: string,
+): Promise<string> {
+  validateText(specId, "specId");
+  validateText(branch, "branch");
+  const branchLeaf = branch.split("/").pop() ?? branch;
+  const safeSpec = sanitizeWorkspaceIdSegment(specId, "specId");
+  const safeBranch = sanitizeWorkspaceIdSegment(branchLeaf, "branch");
+  const directory = join(root, ".poiesis", "workspaces", `${safeSpec}__${safeBranch}`);
+  // Defence-in-depth: even after sanitization the result must stay
+  // inside the repository root. `relative` returns ".." or an absolute
+  // path when the candidate escapes the root, which would indicate a
+  // sanitization bug rather than user input.
+  const inside = relative(root, directory);
+  invariant(
+    !isAbsolute(inside) && inside !== ".." && !inside.startsWith(`..${sep}`),
+    "WORKSPACE_ID_TRAVERSAL_FORBIDDEN",
+    "Derived workspace id escapes the repository root",
+    { inside, specId, branch },
+  );
+  // `git worktree add` requires the parent directory to exist. The
+  // nested `.poiesis/workspaces/` area is gitignored so this directory
+  // never appears as foreign work in the primary checkout.
+  await mkdir(join(root, ".poiesis", "workspaces"), { recursive: true, mode: 0o700 });
+  return directory;
+}
+
+function sanitizeWorkspaceIdSegment(value: string, field: string): string {
+  invariant(!value.includes("\0"), "INVALID_ARGUMENT", `${field} must not contain null bytes`, { field });
+  invariant(
+    !value.includes("..") && !value.includes("/") && !value.includes(sep) && !value.includes("\\"),
+    "WORKSPACE_ID_TRAVERSAL_FORBIDDEN",
+    `${field} cannot contain traversal segments`,
+    { field, value },
+  );
+  const safe = value.replace(/[^A-Za-z0-9._-]/g, "-");
+  invariant(
+    safe.length > 0 && safe !== "." && safe !== "..",
+    "WORKSPACE_ID_INVALID",
+    `${field} cannot be sanitized to a usable identifier`,
+    { field, value },
+  );
+  return safe;
 }
