@@ -24,6 +24,7 @@ import {
   assertOwnershipReceipt,
   createOwnershipReceipt,
   ownershipReceiptExists,
+  ownershipReceiptLocation,
   removeOwnershipReceipt,
   replaceOwnershipReceipt,
   restoreOwnershipReceipt,
@@ -1625,6 +1626,14 @@ export interface UpdateWriterHooks {
   preManifestWrite?: () => void | Promise<void>;
   /** Called immediately before `replaceOwnershipReceipt` advances generation. */
   preReceiptReplace?: () => void | Promise<void>;
+  /**
+   * Called immediately AFTER `replaceOwnershipReceipt` returns and BEFORE
+   * the doctor gate runs. This seam exists for fail-closed rollback tests
+   * that need to inject foreign manifest or receipt bytes between the
+   * transaction's last write and the doctor gate, so the rollback path
+   * can prove it leaves foreign content intact.
+   */
+  postReceiptReplace?: () => void | Promise<void>;
 }
 
 function assertCompatibleUpdateConfigOptions(options: UpdateConfigOptions): void {
@@ -1779,6 +1788,7 @@ export async function updateFromConfig(
   const manifestBackup = await readFile(manifestPath);
   let openCodeWrittenHash: string | undefined;
   let poiesisConfigWrittenHash: string | undefined;
+  let manifestWrittenHash: string | undefined;
   let nextReceipt: OwnershipReceipt | undefined;
 
   try {
@@ -1851,10 +1861,12 @@ export async function updateFromConfig(
     };
     await writerHooks?.preManifestWrite?.();
     await atomicWrite(manifestPath, serializeManifest(nextManifest));
+    manifestWrittenHash = await hashFile(manifestPath);
 
     // 11. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
     await writerHooks?.preReceiptReplace?.();
     nextReceipt = await replaceOwnershipReceipt(resolvedRoot, nextManifest, receipt);
+    await writerHooks?.postReceiptReplace?.();
 
     // 12. Doctor gate: pass or roll back everything. The transaction is config-only
     //     so skills health is unrelated to the change under transaction; ignore
@@ -1880,12 +1892,24 @@ export async function updateFromConfig(
       const endsWithNewline = normalized.endsWith("\n");
       await atomicWrite(poiesisConfigPath, endsWithNewline ? normalized : `${normalized}\n`);
     }
-    if ((await exists(manifestPath)) && hashContent(await readFile(manifestPath)) !== hashContent(manifestBackup)) {
+    // Manifest fail-closed rollback: restore the preimage only if the on-disk
+    // manifest still matches the post-write identity we recorded above. A
+    // foreign writer between our write and the rollback leaves the manifest
+    // untouched.
+    if (manifestWrittenHash !== undefined && (await exists(manifestPath)) && (await hashFile(manifestPath)) === manifestWrittenHash) {
       const normalized = manifestBackup.toString("utf8");
       const endsWithNewline = normalized.endsWith("\n");
       await atomicWrite(manifestPath, endsWithNewline ? normalized : `${normalized}\n`);
     }
-    await restoreOwnershipReceipt(resolvedRoot, receipt);
+    // Receipt fail-closed rollback: restore the preimage only if the on-disk
+    // receipt still matches the post-write identity we last observed (nextReceipt
+    // if we wrote it, else the pre-transaction receipt). A foreign writer
+    // between our write and the rollback leaves the receipt untouched.
+    const expectedReceiptHash = hashContent(`${JSON.stringify(nextReceipt ?? receipt, null, 2)}\n`);
+    const onDiskReceiptPath = await ownershipReceiptLocation(resolvedRoot);
+    if ((await exists(onDiskReceiptPath)) && hashContent(await readFile(onDiskReceiptPath)) === expectedReceiptHash) {
+      await restoreOwnershipReceipt(resolvedRoot, receipt);
+    }
     throw error;
   }
 }

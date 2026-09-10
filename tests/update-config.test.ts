@@ -690,4 +690,141 @@ describe("update --config", () => {
     const afterBytes = await snapshotOwnedBytes(repository);
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
   }, 30_000);
+  // -- Fail-closed rollback: the manifest and ownership receipt are the last
+  //    two artifacts a transaction writes, and they sit closest to the doctor
+  //    gate. A concurrent writer that lands between our last write and the
+  //    doctor failure must not be clobbered by the rollback. These tests
+  //    exercise the fail-closed seam (via the new `postReceiptReplace` hook)
+  //    and prove ordinary doctor failure still restores the exact healthy
+  //    state.
+
+  it("still restores the exact healthy state on an ordinary doctor failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeConfig = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeManifest = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceipt = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // Every owned byte, including the receipts generation and digest,
+    // must match the pre-transaction baseline byte-for-byte.
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfig)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, "opencode.jsonc")), beforeOpenCode)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifest)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceipt)).toBe(0);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+    expectOwnedBytesUnchanged(beforeBytes, await snapshotOwnedBytes(repository));
+  }, 30_000);
+
+  it("preserves foreign manifest bytes when a concurrent writer lands between manifest write and doctor failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const receiptPath = await ownershipReceiptLocation(repository.root);
+    const foreignManifestBytes = Buffer.from(
+      `${JSON.stringify(
+        {
+          schema: 1,
+          poiesisVersion: "0.0.0-foreign",
+          adapter: { harness: "opencode", adapterVersion: "0", supportedVersion: "0", supportedVersions: ["0"] },
+          files: [],
+          skills: [],
+          configPatches: [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(
+        updateFromConfig(repository.root, candidatePath, {
+          writerHooks: {
+            // Concurrent foreign writer lands AFTER our manifest write and
+            // receipt replace but BEFORE the doctor gate. The fail-closed
+            // rollback must leave these foreign bytes intact; it must not
+            // rewind the manifest to our preimage.
+            postReceiptReplace: async () => {
+              await writeFile(manifestPath, foreignManifestBytes);
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    expect(Buffer.compare(await readFile(manifestPath), foreignManifestBytes)).toBe(0);
+    // The receipt is still ours (no foreign writer touched it), so ordinary
+    // receipt rollback applies: the receipt must be back at the pre-transaction
+    // byte and generation.
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+    const afterReceipt = JSON.parse(await readFile(receiptPath, "utf8")) as { generation: number };
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+  }, 30_000);
+
+  it("preserves foreign receipt bytes when a concurrent writer lands between receipt replacement and doctor failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const receiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeManifest = await readFile(manifestPath);
+    const foreignReceiptBytes = Buffer.from(
+      `{"schema":1,"commonDir":"/dev/null","workspace":"/dev/null","installationId":"foreign","manifestDigest":"deadbeef","generation":9999}\n`);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(
+        updateFromConfig(repository.root, candidatePath, {
+          writerHooks: {
+            // Concurrent foreign writer overwrites the receipt we just wrote
+            // BEFORE the doctor gate runs. The fail-closed rollback must
+            // leave these foreign bytes intact; it must not rewind the
+            // receipt to our preimage.
+            postReceiptReplace: async () => {
+              await writeFile(receiptPath, foreignReceiptBytes);
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    expect(Buffer.compare(await readFile(receiptPath), foreignReceiptBytes)).toBe(0);
+    // The manifest is still ours (no foreign writer touched it), so ordinary
+    // manifest rollback applies: the manifest must be back at the preimage.
+    expect(Buffer.compare(await readFile(manifestPath), beforeManifest)).toBe(0);
+  }, 30_000);
 });
