@@ -6,6 +6,7 @@ import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { ownershipReceiptExists, readOwnershipReceipt, removeOwnershipReceipt } from "../src/receipt.js";
 import { run } from "../src/process.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode } from "./fake-opencode.js";
 
 async function asLegacy1000(root: string): Promise<void> {
   const manifest = await loadManifest(root);
@@ -44,11 +45,25 @@ describe("legacy 1.0.0 ownership bootstrap", () => {
     repositories.push(repository);
     const configPath = join(repository.parent, "legacy-config.jsonc");
     await writeFile(configPath, `${JSON.stringify(testConfig(repository), null, 2)}\n`);
-    const installed = await run(
-      "pnpm",
-      ["dlx", "poiesis-cli@1.0.0", "init", "--config", configPath, "--allow-fixtures", "--cwd", repository.root],
-      { cwd: repository.root, allowFailure: true },
-    );
+    // The legacy poiesis-cli@1.0.0 init bundles SUPPORTED_OPENCODE_VERSION = "1.18.29"
+    // and fails closed against any other version. To exercise the real
+    // published legacy package on a host whose OpenCode is a later
+    // adapter-version-1 tag (e.g. 1.18.30), inject a fixture-local fake
+    // OpenCode that advertises 1.18.29 onto PATH for the duration of the
+    // legacy init. After the legacy init returns we restore PATH so the
+    // current compatible runtime that follows (update and doctor) runs
+    // against the real host OpenCode.
+    const fakeEnv = await installFakeOpenCode("1.18.29");
+    let installed;
+    try {
+      installed = await run(
+        "pnpm",
+        ["dlx", "poiesis-cli@1.0.0", "init", "--config", configPath, "--allow-fixtures", "--cwd", repository.root],
+        { cwd: repository.root, allowFailure: true },
+      );
+    } finally {
+      fakeEnv.restore();
+    }
     expect(installed.exitCode, installed.stderr || installed.stdout).toBe(0);
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({ code: "OWNERSHIP_RECEIPT_MISSING" });

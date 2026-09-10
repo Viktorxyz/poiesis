@@ -9,7 +9,19 @@ import type { ConfigPatch } from "./manifest.js";
 import { run } from "./process.js";
 
 export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
+/**
+ * The explicit, ordered set of OpenCode versions the V1 adapter contract
+ * applies to. Both `1.18.29` and `1.18.30` lower the same adapter-version-1
+ * config schema and use identical action keys and session endpoints; the
+ * 1.18.30 release changes are provider/model-only. Newer releases MUST
+ * NOT be added here without explicit contract verification.
+ */
+export const SUPPORTED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30"];
 export const OPENCODE_ADAPTER_VERSION = "1";
+
+export function isSupportedOpenCodeVersion(version: string): boolean {
+  return SUPPORTED_OPENCODE_VERSIONS.includes(version);
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -378,10 +390,10 @@ export async function verifyOpenCodeVersion(root: string): Promise<string> {
   if (result.exitCode !== 0) {
     throw new PoiesisError("OPENCODE_UNAVAILABLE", "OpenCode is not available", { stderr: result.stderr });
   }
-  if (result.stdout !== SUPPORTED_OPENCODE_VERSION) {
+  if (!isSupportedOpenCodeVersion(result.stdout)) {
     throw new PoiesisError("OPENCODE_VERSION_UNSUPPORTED", "Installed OpenCode version is not supported", {
       installed: result.stdout,
-      supported: SUPPORTED_OPENCODE_VERSION,
+      supported: [...SUPPORTED_OPENCODE_VERSIONS],
     });
   }
   return result.stdout;

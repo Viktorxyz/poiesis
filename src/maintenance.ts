@@ -39,6 +39,7 @@ import {
   detectOpenCodeConfigForInit,
   OPENCODE_ADAPTER_VERSION,
   SUPPORTED_OPENCODE_VERSION,
+  SUPPORTED_OPENCODE_VERSIONS,
   validateOpenCodeConfig,
   verifyOpenCodeVersion,
 } from "./opencode.js";
@@ -772,6 +773,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
       files: managedFiles,
       skills: managedSkills,
@@ -1291,6 +1293,7 @@ async function bootstrapLegacyOwnership(root: string, options: MaintenanceOption
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
       files: nextFiles,
       skills,
@@ -1388,6 +1391,7 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
       files: nextFiles,
       skills,
@@ -1727,6 +1731,7 @@ export async function updateFromConfig(
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
       files: manifest.files.map((file) => {
         if (file.path === POIESIS_CONFIG_RELATIVE_PATH) {

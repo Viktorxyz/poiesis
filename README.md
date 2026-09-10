@@ -15,7 +15,7 @@ Poiesis combines:
 
 - a harness-neutral method (Express → Understand → Authorize → Prepare → Capability Check → Plan → Specify → Tickets → Realize → Prove → Publish → Preview → Author validation → freshness → Staging → Integrate → Production authorization → Release → Complete);
 - a small TypeScript / Node.js CLI for exact mechanics (`init`, `doctor`, `update`, `uninstall`, `inspect`, `capability`, `workspace`, `checkpoint`, `verify`, `publish`, `preview`, `promote`, `integrate`, `tracker`, `session`);
-- a first OpenCode `1.18.29` adapter.
+- a first OpenCode `1.18.29` / `1.18.30` adapter (explicit adapter-version-1 supported set).
 
 Poiesis is not a workflow database, not an OpenCode plugin, and does not own your `AGENTS.md`.
 
@@ -23,7 +23,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 
 - Node.js `>=22.20.0`
 - Git
-- OpenCode `1.18.29`
+- OpenCode `1.18.29` or `1.18.30`
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
 - A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))

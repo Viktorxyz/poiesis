@@ -2,11 +2,13 @@
 
 ## OpenCode
 
-The first adapter is pinned to OpenCode `1.18.29`. The runtime validates the installed version against this exact string with `opencode --version` before applying changes.
+The first adapter is built against the adapter-version-1 contract. That contract is verified against OpenCode `1.18.29` and `1.18.30`: both tags lower the same V1 config schema and expose the same action keys, permission shape, and session endpoints. The `1.18.30` release changes are provider/model-only. The runtime validates the installed version against this explicit set (`SUPPORTED_OPENCODE_VERSIONS = ["1.18.29", "1.18.30"]`) with `opencode --version` before applying changes. Any other installed version is rejected fail-closed.
+
+The supported set is the smallest explicit list of tags, not a broad semver range. Newer OpenCode releases MUST NOT be added to `SUPPORTED_OPENCODE_VERSIONS` without explicit V1 contract verification.
 
 ### Verified schema
 
-The adapter projects a harness-native schema accepted by OpenCode `1.18.29`:
+The adapter projects a harness-native schema accepted by OpenCode `1.18.29` and `1.18.30`:
 
 ```text
 default_agent          string
@@ -18,9 +20,9 @@ agent                  object
   <name>.permission    object
 ```
 
-Action keys are the singular OpenCode `1.18.29` keys: `read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`. Permissions are an ordered object where the literal `"*"` denies everything else.
+Action keys are the singular OpenCode `1.18.29` / `1.18.30` keys: `read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`. Permissions are an ordered object where the literal `"*"` denies everything else.
 
-The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by OpenCode `1.18.29`. Poiesis generates the current native shape and validates it with `opencode debug config`.
+The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by either supported tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
 
 ### Subagent visibility
 
@@ -46,7 +48,7 @@ Session cleanup targets the supported HTTP endpoints at the OpenCode server (`ht
 - `GET /session/<id>/children` — child enumeration
 - `DELETE /session/<id>` — deletion
 
-Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness.
+Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness. Session-server integration is exercised via black-box acceptance, not by unit tests in this bundle.
 
 ## Skills
 

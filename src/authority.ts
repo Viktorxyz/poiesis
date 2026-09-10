@@ -5,12 +5,22 @@ import type { PoiesisConfig } from "./config.js";
 import {
   OPENCODE_ADAPTER_VERSION,
   OPENCODE_CONFIG_RELATIVE_PATHS,
+  SUPPORTED_OPENCODE_VERSIONS,
   SUPPORTED_OPENCODE_VERSION,
   desiredOpenCodePatches,
+  isSupportedOpenCodeVersion,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
 import { templateMappings } from "./templates.js";
 import type { ConfigPatch, ManagedFile, Manifest, ManagedSkill } from "./manifest.js";
+
+function manifestSupportedVersions(manifest: Manifest): readonly string[] {
+  return manifest.adapter.supportedVersions ?? [manifest.adapter.supportedVersion];
+}
+
+function isSupportedAdapterContract(manifest: Manifest): boolean {
+  return manifestSupportedVersions(manifest).every(isSupportedOpenCodeVersion);
+}
 
 function patchKey(file: string, path: readonly string[]): string {
   return `${file}\0${path.join("\0")}`;
@@ -45,7 +55,7 @@ export async function assertManifestAuthority(root: string, manifest: Manifest, 
   if (
     manifest.adapter.harness !== "opencode" ||
     manifest.adapter.adapterVersion !== OPENCODE_ADAPTER_VERSION ||
-    manifest.adapter.supportedVersion !== SUPPORTED_OPENCODE_VERSION
+    !isSupportedAdapterContract(manifest)
   ) {
     fail("MANIFEST_MIGRATION_REQUIRED", "Manifest adapter contract is not supported by this installation", {
       adapter: manifest.adapter,
@@ -53,6 +63,7 @@ export async function assertManifestAuthority(root: string, manifest: Manifest, 
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
     });
   }

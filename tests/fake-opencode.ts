@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 /**
- * The OpenCode version this test environment advertises. Keep in sync with
- * `SUPPORTED_OPENCODE_VERSION` in `src/opencode.ts` (1.18.29).
+ * The default OpenCode version this test environment advertises. Keep in
+ * sync with the adapter-version-1 supported set in `src/opencode.ts`
+ * (`SUPPORTED_OPENCODE_VERSIONS`).
  */
 export const TEST_OPENCODE_VERSION = "1.18.29";
 
@@ -28,10 +29,12 @@ export interface FakeOpenCodeEnvironment {
 /**
  * Installs a fake `opencode` binary on a temporary `PATH` so maintenance tests
  * can drive `init` / `update` / `doctor` without a real OpenCode installation.
- * The binary echoes the supported version and a fixed model list for any
+ * The binary echoes the requested version and a fixed model list for any
  * invocation; schema probes (`debug`) return success without touching disk.
  */
-export async function installFakeOpenCode(): Promise<FakeOpenCodeEnvironment> {
+export async function installFakeOpenCode(
+  version: string = TEST_OPENCODE_VERSION,
+): Promise<FakeOpenCodeEnvironment> {
   const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-opencode-"));
   const bin = join(parent, "bin");
   await mkdir(bin);
@@ -39,7 +42,7 @@ export async function installFakeOpenCode(): Promise<FakeOpenCodeEnvironment> {
   const body = `#!/bin/sh
 case "$1" in
   --version)
-    printf '${TEST_OPENCODE_VERSION}\\n'
+    printf '${version}\\n'
     exit 0
     ;;
   models)
