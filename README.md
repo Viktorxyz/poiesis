@@ -68,6 +68,52 @@ pnpm dlx poiesis-cli@latest update --bootstrap-legacy-ownership
 
 After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
 
+### Updating the managed config
+
+`.poiesis/config.jsonc` is a managed surface — Poiesis generated it from the
+original `init --config` input, and ordinary editing would create a stale
+configuration that nothing would reconcile. The supported update path is the
+intentional managed-config workflow:
+
+```bash
+pnpm dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
+```
+
+`update --config <path>` is the only sanctioned way to change the managed
+configuration after `init`. The command is narrowly scoped: it parses,
+validates, and resolves the proposed config first; authenticates the trusted
+ownership receipt; verifies the on-disk `.poiesis/config.jsonc` still matches
+the manifest's recorded hash; verifies every recorded OpenCode config patch is
+still owned; computes the new `.poiesis/config.jsonc` bytes and the new
+OpenCode projection in memory; and only then writes — atomically, in this
+fixed order: `.poiesis/config.jsonc`, then the OpenCode config, then
+`.poiesis/manifest.json`, then the ownership receipt — before `doctor` gates
+the result.
+
+`update --config` is deliberately incompatible with the registered
+`--skip-skills` and `--bootstrap-legacy-ownership` flags. The CLI rejects
+those combinations with `INCOMPATIBLE_UPDATE_OPTIONS` before reaching the
+maintenance surface. The transaction is config-only: it does not bootstrap
+legacy ownership, install skills, or accept fixture adapters.
+
+If the proposed config bytes and the OpenCode config bytes already match
+their recorded manifest hashes, `update --config` is a **no-op**: it returns
+the existing manifest unchanged and does not advance the ownership receipt
+generation. A repeated identical config cannot double-advance.
+
+If any write step fails after the transaction has started, `update --config`
+runs **transactional rollback**: each mutated artifact is restored to its
+pre-write snapshot only if its post-write hash still matches what was written
+by the failing step. The Poiesis config, the OpenCode config, the manifest,
+and the ownership receipt are all restored, leaving the installation
+byte-for-byte identical to its pre-transaction state.
+
+Editing `.poiesis/config.jsonc` by hand is a **fail-closed manual edit**. The
+manifest records the hash that `init` (or the previous successful transaction)
+wrote; on the next `update --config` the maintenance surface refuses the
+transaction with `FILE_OWNERSHIP_LOST` and the proposed config is rejected
+before any side effect.
+
 `uninstall` removes only Poiesis-proven-owned state and preserves Git, tracker, PR/MR, and release history:
 
 ```bash
