@@ -106,9 +106,7 @@
         { "action": "grep", "resource": "*", "effect": "allow" },
         { "action": "list", "resource": "*", "effect": "allow" },
 
-        { "action": "skill", "resource": "code-review", "effect": "allow" },
-
-        { "action": "subagent", "resource": "explore", "effect": "allow" }
+        { "action": "skill", "resource": "code-review", "effect": "allow" }
       ]
     },
 

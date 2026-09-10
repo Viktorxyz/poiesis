@@ -45,7 +45,11 @@ function fail(code: string, message: string, details: Record<string, unknown> = 
   throw new PoiesisError(code, message, details);
 }
 
-export async function assertManifestAuthority(root: string, manifest: Manifest, config: PoiesisConfig): Promise<void> {
+async function assertManifestAuthorityImpl(
+  root: string,
+  manifest: Manifest,
+  desired: ReadonlyArray<{ path: readonly string[]; value: unknown }>,
+): Promise<void> {
   if (manifest.schema !== 1) {
     fail("MANIFEST_MIGRATION_REQUIRED", "Manifest schema is not supported by this adapter", {
       schema: manifest.schema,
@@ -105,7 +109,6 @@ export async function assertManifestAuthority(root: string, manifest: Manifest, 
     }
   }
 
-  const desired = desiredOpenCodePatches(config);
   const desiredKeys = new Map(desired.map((patch) => [patch.path.join("\0"), patch]));
   const seenPatches = new Set<string>();
   let patchFile: string | undefined;
@@ -186,6 +189,113 @@ export async function assertManifestAuthority(root: string, manifest: Manifest, 
       });
     }
   }
+}
+
+
+/**
+ * The exact v1.0.0/v1.0.1/v1.0.2 predecessor config patches for the OpenCode
+ * adapter. Differs from the current projection ONLY in the `poiesis-reviewer`
+ * permission, which retains the obsolete `task: { explore: "allow" }` field
+ * that ticket #24 removed from runtime installations.
+ *
+ * Kept intentionally narrow: this is a migration-only exact predecessor
+ * projection, not a general historical-normalization helper. New patches
+ * must NOT be added here without an explicit ticket and migration contract.
+ */
+export function predecessorProjectionV100V101V102(
+  config: PoiesisConfig,
+): Array<{ path: string[]; value: unknown }> {
+  return desiredOpenCodePatches(config).map((patch) => {
+    if (
+      patch.path.length === 2 &&
+      patch.path[0] === "agent" &&
+      patch.path[1] === "poiesis-reviewer"
+    ) {
+      const installed = patch.value as Record<string, unknown>;
+      const permission = {
+        ...(installed.permission as Record<string, unknown>),
+        task: { explore: "allow" },
+      };
+      return { ...patch, value: { ...installed, permission } };
+    }
+    return patch;
+  });
+}
+
+/**
+ * Returns true if `manifest.configPatches` exactly matches the given projection:
+ * same length, same `(file, path)` keys, and `isDeepStrictEqual` values.
+ * Used to verify that a predecessor manifest is byte-for-byte the v1.0.0/1.0.1/1.0.2
+ * projection (no drift, no extra patches).
+ */
+export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ path: readonly string[]; value: unknown }>): boolean {
+  if (manifest.configPatches.length !== patches.length) return false;
+  for (const expected of patches) {
+    const actual = manifest.configPatches.find(
+      (p) =>
+        p.path.length === expected.path.length &&
+        p.path.every((segment, i) => segment === expected.path[i]),
+    );
+    if (actual === undefined) return false;
+    if (!isDeepStrictEqual(actual.installed, expected.value)) return false;
+  }
+  return true;
+}
+
+/**
+ * Authority check that, in addition to the strict current-only projection,
+ * also accepts the exact v1.0.0/v1.0.1/v1.0.2 predecessor projection (which
+ * retained `poiesis-reviewer.permission.task = { explore: "allow" }`).
+ *
+ * Use this ONLY after authenticating the receipt: the receipt binds the
+ * trusted manifest digest, this function then proves the manifest's projection
+ * matches either the current exact or the predecessor exact projection.
+ *
+ * Callers MUST pass the explicit predecessor version set they accept. The
+ * default accepts all three v1.0.0/1.0.1/1.0.2 versions, but bootstrap and
+ * update paths use different subsets per ticket #24 Replan:
+ *   - receipt-authenticated update: `["1.0.1", "1.0.2"]`
+ *   - bootstrap legacy ownership: `["1.0.0"]` (the version is already pinned
+ *     by `validateLegacyInstallation`, so this is defense-in-depth)
+ *
+ * If the manifest matches neither projection, the original strict failure
+ * is rethrown unchanged so callers see the same diagnostic.
+ */
+export async function assertManifestAuthorityToleratingPredecessor(
+  root: string,
+  manifest: Manifest,
+  config: PoiesisConfig,
+  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2"> = ["1.0.0", "1.0.1", "1.0.2"],
+): Promise<void> {
+  try {
+    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+    return;
+  } catch (strictError) {
+    if (!(strictError instanceof PoiesisError) || strictError.code !== "MANIFEST_AUTHORITY_INVALID") {
+      throw strictError;
+    }
+  }
+  const isPredecessorVersion = (acceptedPredecessorVersions as ReadonlyArray<string>).includes(manifest.poiesisVersion);
+  if (!isPredecessorVersion) {
+    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+    return;
+  }
+  const predecessor = predecessorProjectionV100V101V102(config);
+  if (!isExactProjection(manifest, predecessor)) {
+    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+    return;
+  }
+  await assertManifestAuthorityImpl(root, manifest, predecessor);
+}
+
+/**
+ * Strict current-only authority check. This function is the single source of
+ * truth for non-migration flows (init, installCapability, uninstall, doctor).
+ * Migration flows (update with receipt, bootstrap-legacy) delegate to
+ * `assertManifestAuthorityToleratingPredecessor` instead.
+ */
+export async function assertManifestAuthority(root: string, manifest: Manifest, config: PoiesisConfig): Promise<void> {
+  await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
 }
 
 export function nextAdapterFiles(manifest: Manifest, materialized: Array<{ path: string; kind: ManagedFile["kind"]; hash: string; durable?: boolean }>): ManagedFile[] {

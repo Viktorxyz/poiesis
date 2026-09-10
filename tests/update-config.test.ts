@@ -8,11 +8,9 @@ import {
 } from "../src/maintenance.js";
 import { commandUpdate } from "../src/cli.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
+import { predecessorProjectionV100V101V102 } from "../src/authority.js";
 import { parseJsonc, serializeConfig, type PoiesisConfig } from "../src/config.js";
-import {
-  ownershipReceiptLocation,
-  readOwnershipReceipt,
-} from "../src/receipt.js";
+import { ownershipReceiptLocation, readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
 import { hashContent, hashFile } from "../src/hash.js";
 import { desiredOpenCodePatches } from "../src/opencode.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
@@ -490,6 +488,111 @@ describe("update --config", () => {
     const afterBytes = await snapshotOwnedBytes(repository);
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
   }, 30_000);
+
+  // -- Regression: strict `updateFromConfig` rejects the exact v1.0.0/1.0.1/1.0.2
+  //    predecessor projection even with a valid receipt. Predecessor tolerance
+  //    is confined to receipt-authenticated normal `update()` and explicit
+  //    1.0.0 bootstrap; `updateFromConfig` must reject any other path
+  //    fail-closed before any owned byte is mutated.
+  async function asPredecessorManifest(
+    repository: TestRepository,
+    predecessorVersion: "1.0.0" | "1.0.1" | "1.0.2",
+  ): Promise<void> {
+    const { writeFile, readFile } = await import("node:fs/promises");
+    const { parseJsonc } = await import("../src/config.js");
+    const manifest: Manifest = await loadManifest(repository.root);
+    const predecessor = predecessorProjectionV100V101V102(testConfig(repository));
+    manifest.poiesisVersion = predecessorVersion;
+    manifest.configPatches = manifest.configPatches.map((patch) => {
+      const matching = predecessor.find(
+        (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
+      );
+      return matching === undefined ? patch : { ...patch, installed: matching.value };
+    });
+    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    // Rewrite on-disk opencode.jsonc so each claimed patch value matches the
+    // file content (otherwise `assertConfigPatchesOwned` would block before
+    // authority runs).
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const current = parseJsonc<Record<string, unknown>>(await readFile(openCodePath, "utf8"), openCodePath);
+    for (const patch of manifest.configPatches) {
+      let target: Record<string, unknown> = current;
+      for (let i = 0; i < patch.path.length - 1; i++) {
+        const segment = patch.path[i]!;
+        if (typeof target[segment] !== "object" || target[segment] === null) {
+          target[segment] = {};
+        }
+        target = target[segment] as Record<string, unknown>;
+      }
+      target[patch.path[patch.path.length - 1]!] = patch.installed;
+    }
+    await writeFile(openCodePath, JSON.stringify(current, null, 2) + "\n");
+    // Recompute the on-disk opencode.jsonc hash and update the manifest entry.
+    const newOpencodeHash = hashContent(await readFile(openCodePath));
+    const ocRecord = manifest.files.find((file) => file.path === "opencode.jsonc");
+    if (ocRecord !== undefined) ocRecord.hash = newOpencodeHash;
+    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    // Rebind the receipt to the new manifest digest so the receipt gate accepts.
+    const receipt = await readOwnershipReceipt(repository.root);
+    await replaceOwnershipReceipt(repository.root, manifest, receipt);
+  }
+
+  it("rejects exact v1.0.1 predecessor manifest with valid receipt and preserves owned bytes/generation", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await asPredecessorManifest(repository, "1.0.1");
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      updateFromConfig(repository.root, candidatePath),
+    ).rejects.toMatchObject({ code: "MANIFEST_AUTHORITY_INVALID" });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 60_000);
+
+  it("rejects exact v1.0.2 predecessor manifest with valid receipt and preserves owned bytes/generation", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await asPredecessorManifest(repository, "1.0.2");
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      updateFromConfig(repository.root, candidatePath),
+    ).rejects.toMatchObject({ code: "MANIFEST_AUTHORITY_INVALID" });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 60_000);
+
+  it("rejects exact v1.0.0 predecessor manifest with valid receipt and preserves owned bytes/generation", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await asPredecessorManifest(repository, "1.0.0");
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      updateFromConfig(repository.root, candidatePath),
+    ).rejects.toMatchObject({ code: "MANIFEST_AUTHORITY_INVALID" });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 60_000);
 
   // -- Deterministic fault injection per write step. Each test invokes the
   //    public `writerHooks` test seam introduced on `UpdateConfigOptions`.

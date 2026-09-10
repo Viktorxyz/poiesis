@@ -123,7 +123,6 @@ function permissions(config: PoiesisConfig): Record<string, JsonObject> {
         grep: "allow",
         list: "allow",
         skill: { "code-review": "allow" },
-        task: { explore: "allow" },
       },
     },
     "poiesis-final-reviewer": {

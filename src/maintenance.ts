@@ -14,7 +14,12 @@ import {
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { hashContent, hashDirectory, hashFile } from "./hash.js";
-import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
+import {
+  assertManifestAuthority,
+  assertManifestAuthorityToleratingPredecessor,
+  nextAdapterFiles,
+  nextAdapterPatches,
+} from "./authority.js";
 import {
   assertOwnershipReceipt,
   createOwnershipReceipt,
@@ -1206,7 +1211,11 @@ async function validateLegacyInstallation(root: string, manifest: Manifest, conf
       poiesisVersion: manifest.poiesisVersion,
     });
   }
-  await assertManifestAuthority(root, manifest, config);
+  // Tolerant authority check: the public 1.0.0 predecessor retained the
+  // obsolete `task: { explore: "allow" }` field on `poiesis-reviewer.permission`
+  // which the strict current projection no longer emits. The bootstrap path
+  // only accepts exact v1.0.0 predecessor projections; any drift still fails closed.
+  await assertManifestAuthorityToleratingPredecessor(root, manifest, config, ["1.0.0"]);
   for (const file of manifest.files) {
     const path = ownedPath(root, file.path);
     if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
@@ -1320,8 +1329,18 @@ export async function update(root: string, options: MaintenanceOptions = {}): Pr
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
-  await assertManifestAuthority(resolvedRoot, manifest, config);
+  // Receipt-first: authenticate the receipt against the on-disk manifest
+  // BEFORE any authority check consumes manifest records. This binds the
+  // trusted manifest digest and gates the migration tolerance on a known
+  // predecessor provenance. A 1.0.0 manifest WITHOUT a receipt must use the
+  // explicit --bootstrap-legacy-ownership path, not normal update.
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
+  // Tolerant authority check: accepts the strict current projection OR the
+  // exact v1.0.1/1.0.2 predecessor projection (which retained the obsolete
+  // `task: { explore: "allow" }` field on `poiesis-reviewer.permission` that
+  // ticket #24 removed). 1.0.0 is intentionally excluded here: bootstrap is
+  // the only legal migration for the public predecessor.
+  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2"]);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -1627,6 +1646,12 @@ export async function updateFromConfig(
   const manifest = await loadManifest(resolvedRoot);
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   const currentConfig = await loadConfig(resolvedRoot);
+  // Strict authority check: `update --config` is a narrowly scoped
+  // transaction that does NOT recognize the v1.0.0/v1.0.1/v1.0.2 predecessor
+  // projection. Predecessor tolerance is intentionally confined to receipt-
+  // authenticated normal `update()` and explicit 1.0.0 bootstrap. A receipt-
+  // bound predecessor manifest that reaches this path fails closed with
+  // MANIFEST_AUTHORITY_INVALID before any write.
   await assertManifestAuthority(resolvedRoot, manifest, currentConfig);
   const { content: currentConfigBytes, record: currentConfigRecord } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot);

@@ -27,7 +27,11 @@ Do not invent style preferences that do not matter.
 
 Use `code-review` methodology when available.
 
-You may use harness-native `explore` for bounded read-only context.
+The ticket Reviewer reviews the dispatched candidate directly using its
+own read, glob, grep, and list capabilities. The ticket Reviewer has no
+native Task/Explore delegation. Only the final Reviewer (Spec and Standards
+review using the reasoning model) may use harness-native `explore` for
+bounded read-only context.
 
 ## Boundaries
 

@@ -120,7 +120,7 @@ describe("manifest authority", () => {
     expect(report.ok).toBe(false);
     expect(report.checks.find((check) => check.id === "manifest")?.status).toBe("fail");
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({
-      code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED/),
+      code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED|OWNERSHIP_RECEIPT_MISMATCH/),
     });
     await expect(uninstall(repository.root)).rejects.toMatchObject({
       code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED/),
