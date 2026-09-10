@@ -743,11 +743,16 @@ describe("update --config", () => {
     });
     const manifestPath = join(repository.root, ".poiesis", "manifest.json");
     const receiptPath = await ownershipReceiptLocation(repository.root);
+    // Capture the pre-transaction receipt baseline BEFORE invocation: both
+    // raw bytes and parsed generation/manifestDigest. The fail-closed
+    // rollback must leave these exactly intact.
+    const beforeReceiptBytes = await readFile(receiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
     const foreignManifestBytes = Buffer.from(
       `${JSON.stringify(
         {
           schema: 1,
-          poiesisVersion: "0.0.0-foreign",
+          poiesisVersion: "0.0.0.0-foreign",
           adapter: { harness: "opencode", adapterVersion: "0", supportedVersion: "0", supportedVersions: ["0"] },
           files: [],
           skills: [],
@@ -781,11 +786,79 @@ describe("update --config", () => {
 
     expect(Buffer.compare(await readFile(manifestPath), foreignManifestBytes)).toBe(0);
     // The receipt is still ours (no foreign writer touched it), so ordinary
-    // receipt rollback applies: the receipt must be back at the pre-transaction
-    // byte and generation.
-    const beforeReceipt = await readOwnershipReceipt(repository.root);
-    const afterReceipt = JSON.parse(await readFile(receiptPath, "utf8")) as { generation: number };
-    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    // receipt rollback applies: the receipt bytes AND parsed
+    // generation/manifestDigest must match the pre-transaction baseline
+    // captured BEFORE invocation.
+    const afterReceiptBytes = await readFile(receiptPath);
+    const afterReceiptParsed = JSON.parse(afterReceiptBytes.toString("utf8")) as { generation: number; manifestDigest: string };
+    expect(Buffer.compare(afterReceiptBytes, beforeReceiptBytes)).toBe(0);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+  it("does not adopt a foreign replacement that lands immediately after manifest write as our identity", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const receiptPath = await ownershipReceiptLocation(repository.root);
+    // Capture the pre-transaction receipt baseline BEFORE invocation.
+    const beforeReceiptBytes = await readFile(receiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+    const foreignManifestBytes = Buffer.from(
+      `${JSON.stringify(
+        {
+          schema: 1,
+          poiesisVersion: "0.0.0.0-foreign",
+          adapter: { harness: "opencode", adapterVersion: "0", supportedVersion: "0", supportedVersions: ["0"] },
+          files: [],
+          skills: [],
+          configPatches: [],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(
+        updateFromConfig(repository.root, candidatePath, {
+          writerHooks: {
+            // Concurrent foreign writer lands IMMEDIATELY after our manifest
+            // atomic write completes but BEFORE the transaction observes the
+            // manifest (receipt replace, doctor gate, hashFile reread for
+            // ownership). The transaction must not adopt these foreign bytes
+            // as our post-write identity, and the fail-closed rollback must
+            // leave the foreign bytes intact instead of rewinding the
+            // manifest to our preimage.
+            postManifestWrite: async () => {
+              await writeFile(manifestPath, foreignManifestBytes);
+            },
+          },
+        }),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // Foreign manifest bytes survive: the rollback path did not see the
+    // foreign bytes as our identity, so it left the file alone.
+    expect(Buffer.compare(await readFile(manifestPath), foreignManifestBytes)).toBe(0);
+    // The receipt is still ours (no foreign writer touched it), so ordinary
+    // receipt rollback applies: the receipt bytes AND parsed
+    // generation/manifestDigest must match the pre-transaction baseline
+    // captured BEFORE invocation.
+    const afterReceiptBytes = await readFile(receiptPath);
+    const afterReceiptParsed = JSON.parse(afterReceiptBytes.toString("utf8")) as { generation: number; manifestDigest: string };
+    expect(Buffer.compare(afterReceiptBytes, beforeReceiptBytes)).toBe(0);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
   }, 30_000);
 
   it("preserves foreign receipt bytes when a concurrent writer lands between receipt replacement and doctor failure", async () => {

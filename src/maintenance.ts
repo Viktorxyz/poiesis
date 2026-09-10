@@ -1634,6 +1634,17 @@ export interface UpdateWriterHooks {
    * can prove it leaves foreign content intact.
    */
   postReceiptReplace?: () => void | Promise<void>;
+  /**
+   * Called immediately AFTER the atomic write of the new
+   * `.poiesis/manifest.json` completes and BEFORE the transaction
+   * observes the manifest (receipt replace, doctor gate, ownership
+   * hashFile). This seam exists for fail-closed rollback tests that need
+   * to inject a foreign replacement in the narrow window between our
+   * write and any subsequent observation, so the rollback path can
+   * prove it preserves the foreign bytes instead of rewinding the
+   * manifest to our preimage.
+   */
+  postManifestWrite?: () => void | Promise<void>;
 }
 
 function assertCompatibleUpdateConfigOptions(options: UpdateConfigOptions): void {
@@ -1860,8 +1871,15 @@ export async function updateFromConfig(
       configPatches: mergedPatches,
     };
     await writerHooks?.preManifestWrite?.();
-    await atomicWrite(manifestPath, serializeManifest(nextManifest));
-    manifestWrittenHash = await hashFile(manifestPath);
+    // Serialize nextManifest exactly once; derive the post-write identity
+    // from those exact bytes BEFORE write, and write those same bytes. A
+    // foreign replacement in the write window cannot be adopted as our
+    // identity, and the post-write `hashFile` re-read is removed.
+    const nextManifestBytes = serializeManifest(nextManifest);
+    const nextManifestHash = hashContent(nextManifestBytes);
+    await atomicWrite(manifestPath, nextManifestBytes);
+    manifestWrittenHash = nextManifestHash;
+    await writerHooks?.postManifestWrite?.();
 
     // 11. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
     await writerHooks?.preReceiptReplace?.();
