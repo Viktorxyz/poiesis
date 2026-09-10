@@ -558,22 +558,47 @@ function supersedeInput(values: Values): SupersedeInput {
 // module for `commandUpdate` without intending to invoke `main`; without this
 // guard the CLI's bootstrap runs as soon as Vitest loads the module and emits
 // HELP/error JSON into the test output.
+//
+// The check is symlink-aware so the packaged bin resolves to "main" both when
+// invoked directly (`node dist/cli.js ...`) and through `node_modules/.bin/`
+// (which is a symlink to `dist/cli.js`). A naive `argv[1] === import.meta.url`
+// comparison fails through `.bin` because `argv[1]` is the symlink path while
+// `import.meta.url` is the real file path, so `main` never runs and the bin
+// silently exits 0. We compare realpath-normalized paths so both invocation
+// forms boot `main`; importing `src/cli.ts` from a test (where `argv[1]` is
+// the vitest bin, not `cli.ts`) still yields "not main".
 import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
 import { resolve as resolvePath } from "node:path";
-const ENTRY_PATH = (() => {
+
+function resolveEntryPath(argv1: string | undefined): string {
+  if (!argv1) return "";
   try {
-    return process.argv[1] ? resolvePath(process.argv[1]) : "";
+    return resolvePath(argv1);
   } catch {
     return "";
   }
-})();
-const IS_MAIN_MODULE = (() => {
+}
+
+function sameEntry(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
   try {
-    return fileURLToPath(import.meta.url) === ENTRY_PATH;
+    return realpathSync(a) === realpathSync(b);
   } catch {
     return false;
   }
-})();
+}
+
+function isMainEntry(argv1: string | undefined, moduleUrl: string): boolean {
+  try {
+    return sameEntry(resolveEntryPath(argv1), fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+const IS_MAIN_MODULE = isMainEntry(process.argv[1], import.meta.url);
 if (IS_MAIN_MODULE) {
   main(process.argv.slice(2)).catch(writeFailure);
 }
