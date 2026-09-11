@@ -14,12 +14,15 @@ import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
 import { templateMappings } from "./templates.js";
 import type { ConfigPatch, ManagedFile, Manifest, ManagedSkill } from "./manifest.js";
 
-function manifestSupportedVersions(manifest: Manifest): readonly string[] {
-  return manifest.adapter.supportedVersions ?? [manifest.adapter.supportedVersion];
-}
-
 function isSupportedAdapterContract(manifest: Manifest): boolean {
-  return manifestSupportedVersions(manifest).every(isSupportedOpenCodeVersion);
+  const explicit = manifest.adapter.supportedVersions;
+  if (explicit !== undefined) {
+    if (explicit.length === 0) return false;
+    if (!explicit.every(isSupportedOpenCodeVersion)) return false;
+    if (!explicit.includes(manifest.adapter.supportedVersion)) return false;
+    return true;
+  }
+  return isSupportedOpenCodeVersion(manifest.adapter.supportedVersion);
 }
 
 function patchKey(file: string, path: readonly string[]): string {
