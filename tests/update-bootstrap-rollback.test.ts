@@ -2,6 +2,12 @@
  * Ticket #30 -- Ordinary `update()` and explicit 1.0.0 bootstrap rollback
  * hardening.
  *
+ * Ticket #32 -- Next-manifest OpenCode file hash binding to the
+ * `applyOpenCodeConfig` callback's exact transaction-written bytes
+ * (never a later mutable-path reread), with a defensive pre-materialize
+ * identity check that fails closed on any post-write foreign
+ * replacement.
+ *
  * The deterministic fault-injection tests below exercise the
  * `runUpdateTransaction` and `runBootstrapLegacyOwnershipTransaction`
  * seams introduced in `src/update-internal.ts`. Every test asserts
@@ -20,6 +26,18 @@
  *
  *   3. Bootstrap parity: the explicit 1.0.0 bootstrap path restores
  *      the same invariants and preserves the same foreign writes.
+ *
+ *   4. (#32) The next manifest's OpenCode file hash is bound to the
+ *      EXACT bytes captured by `applyOpenCodeConfig`'s `onWritten`
+ *      callback (never a later mutable-path reread). A post-write
+ *      foreign replacement that lands between the callback and
+ *      manifest/receipt materialization fails closed with
+ *      `OPENCODE_CONFIG_CHANGED`; the no-interference happy path
+ *      records the exact callback bytes in the new manifest. The
+ *      rollback path preserves the foreign OpenCode replacement
+ *      (hash-gated against the captured callback identity) and only
+ *      restores the transaction-owned preimage when the on-disk bytes
+ *      still match the transaction's writes.
  *
  * The seam lives in `src/update-internal.ts`, which is NOT re-exported
  * by `src/index.ts` and therefore does not appear in the packed
@@ -47,6 +65,7 @@ import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-openco
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import type { DoctorReport } from "../src/maintenance.js";
 import { PoiesisError } from "../src/errors.js";
+import { hashContent } from "../src/hash.js";
 
 interface OwnedByteSnapshot {
   materializedFiles: Map<string, { content: Buffer; absent: boolean }>;
@@ -464,6 +483,13 @@ describe("ordinary update rollback hardening (ticket #30)", () => {
   }, 60_000);
 
   it("ordinary update rollback preserves foreign OpenCode config bytes when a concurrent writer lands after applyOpenCodeConfig", async () => {
+    // The transaction's defensive fail-closed check fires immediately
+    // after the postOpenCodeApply hook and rejects any post-write foreign
+    // replacement before the manifest is materialized. The error code
+    // is therefore OPENCODE_CONFIG_CHANGED (not UPDATE_DOCTOR_FAILED);
+    // the rollback path is exercised in the same way and still
+    // preserves the foreign OpenCode bytes by hash-gating against the
+    // captured callback identity.
     const repository = await createTestRepository();
     repositories.push(repository);
     await install(repository);
@@ -472,7 +498,10 @@ describe("ordinary update rollback hardening (ticket #30)", () => {
     await rebindReceipt(repository);
     await stripNewGitignoreRule(repository);
 
-    const foreignOpenCodeBytes = Buffer.from('{ "default_agent": "foreign-agent" }\\n');
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeManifest = await readFile(manifestPath);
+    const foreignOpenCodeBytes = Buffer.from('{ "default_agent": "foreign-agent" }\n');
 
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
@@ -483,17 +512,25 @@ describe("ordinary update rollback hardening (ticket #30)", () => {
           {},
           {
             postOpenCodeApply: async () => {
-              await writeFile(join(repository.root, "opencode.jsonc"), foreignOpenCodeBytes);
+              await writeFile(openCodePath, foreignOpenCodeBytes);
             },
           } satisfies UpdateBootstrapTransactionHooks,
         ),
-      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+      ).rejects.toMatchObject({ code: "OPENCODE_CONFIG_CHANGED" });
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
     }
 
-    expect(Buffer.compare(await readFile(join(repository.root, "opencode.jsonc")), foreignOpenCodeBytes)).toBe(0);
+    // Foreign OpenCode bytes survive: the transaction's hash-gate
+    // compares current bytes against the callback's openCodeWrittenHash
+    // and the comparison fails, so the rollback path skips the OpenCode
+    // restore step entirely.
+    expect(Buffer.compare(await readFile(openCodePath), foreignOpenCodeBytes)).toBe(0);
+    // The manifest was never written (the transaction failed closed
+    // before atomicWrite ran), so the manifest is byte-exact to the
+    // preimage captured before the transaction started.
+    expect(Buffer.compare(await readFile(manifestPath), beforeManifest)).toBe(0);
   }, 60_000);
 
   it("ordinary update rollback preserves foreign manifest bytes when a concurrent writer lands after manifest write", async () => {
@@ -792,5 +829,228 @@ describe("explicit 1.0.0 bootstrap rollback hardening (ticket #30)", () => {
     // The ordinary update advances generation even when the manifest
     // is byte-identical to the bootstrap manifest (no skills update).
     expect(receiptAfterUpdate.generation).toBe(receiptAfterBootstrap.generation + 1);
+  }, 60_000);
+});
+
+describe("ticket #32 -- next-manifest OpenCode hash bound to applyOpenCodeConfig callback bytes", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  it("ordinary update fails closed when a concurrent writer replaces the OpenCode config between callback and manifest materialization", async () => {
+    // Race the transaction between `applyOpenCodeConfig` (which calls the
+    // `onWritten` callback with the exact bytes it wrote) and the
+    // manifest materialization step. A concurrent writer that replaces
+    // the file in this window must be detected by the defensive
+    // identity check and must fail closed; the transaction must NOT
+    // adopt the foreign bytes as its own identity, and the manifest
+    // must NEVER be written (a brief moment of the wrong hash would be
+    // a rollback hazard).
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+    await asPredecessorManifest(repository, "1.0.2", { keepReceipt: true });
+    await rebindReceipt(repository);
+    await stripNewGitignoreRule(repository);
+
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeManifest = await readFile(manifestPath);
+    const beforeOpenCode = await readFile(openCodePath);
+    const foreignOpenCodeBytes = Buffer.from('{ "default_agent": "foreign-agent", "agent": {} }\n');
+
+    await expect(
+      runUpdateTransaction(
+        repository.root,
+        {},
+        {
+          postOpenCodeApply: async () => {
+            // Simulate a concurrent writer that replaces the OpenCode
+            // config AFTER applyOpenCodeConfig returned (and after the
+            // onWritten callback fired) but BEFORE the defensive
+            // identity check runs.
+            await writeFile(openCodePath, foreignOpenCodeBytes);
+          },
+        } satisfies UpdateBootstrapTransactionHooks,
+      ),
+    ).rejects.toMatchObject({ code: "OPENCODE_CONFIG_CHANGED" });
+
+    // The defensive check fires BEFORE manifest materialization, so the
+    // manifest is never written. The manifest on disk must therefore
+    // remain byte-exact to the preimage captured before the transaction
+    // started. A production code path that re-reads the file to derive
+    // the next manifest's OpenCode hash would have written the manifest
+    // with the foreign bytes' hash first, and the rollback would have
+    // had to restore it; here the manifest never moves.
+    const afterManifest = await readFile(manifestPath);
+    expect(Buffer.compare(afterManifest, beforeManifest), "manifest was written before the fail-closed check").toBe(0);
+    // The pre-opencode write was the legitimate transaction-owned bytes;
+    // the foreign write is preserved untouched by the rollback because
+    // the hash-gate compares current bytes against the callback's
+    // openCodeWrittenHash and the comparison fails.
+    expect(Buffer.compare(await readFile(openCodePath), foreignOpenCodeBytes), "foreign opencode bytes were overwritten by the rollback").toBe(0);
+    expect(Buffer.compare(await readFile(openCodePath), beforeOpenCode), "foreign opencode bytes were overwritten by the rollback").not.toBe(0);
+  }, 60_000);
+
+  it("ordinary update records the EXACT applyOpenCodeConfig callback bytes in the next manifest's OpenCode file hash (no race, no-interference happy path)", async () => {
+    // No concurrent writer replaces the OpenCode config between the
+    // callback and manifest materialization. The next manifest's
+    // OpenCode file hash MUST equal the hash of the file's current
+    // bytes (which are the transaction's own callback bytes) and NOT
+    // the pre-write file's bytes (a mis-binding bug that would cause
+    // the doctor hash check to fail immediately after the update).
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+    await asPredecessorManifest(repository, "1.0.2", { keepReceipt: true });
+    await rebindReceipt(repository);
+    await stripNewGitignoreRule(repository);
+
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const result = await runUpdateTransaction(repository.root, {}, {});
+
+    const openCodeRecord = result.manifest.files.find((file) => file.path === "opencode.jsonc");
+    expect(openCodeRecord, "manifest records the OpenCode config").toBeDefined();
+    const currentOpenCodeBytes = await readFile(openCodePath);
+    expect(
+      openCodeRecord!.hash,
+      "manifest OpenCode hash equals the on-disk hash (callback bytes are exactly the bytes on disk)",
+    ).toBe(hashContent(currentOpenCodeBytes));
+    // Doctor must pass: this proves the hash binding is consistent
+    // with the actual file state, not just internally self-consistent.
+    expect(result.doctor.ok, "doctor must pass after a no-interference update").toBe(true);
+  }, 60_000);
+
+  it("bootstrap fails closed when a concurrent writer replaces the OpenCode config between callback and manifest materialization", async () => {
+    // Bootstrap parity with the ordinary update race test: a concurrent
+    // OpenCode replacement between the applyOpenCodeConfig callback and
+    // manifest materialization must fail closed with
+    // OPENCODE_CONFIG_CHANGED. The manifest must NEVER be written with
+    // the foreign bytes' hash; the foreign write survives untouched.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.poiesisVersion = "1.0.0";
+    await writeFile(
+      join(repository.root, ".poiesis", "manifest.json"),
+      serializeManifest(manifest),
+    );
+    const { removeOwnershipReceipt } = await import("../src/receipt.js");
+    await removeOwnershipReceipt(repository.root);
+    await stripNewGitignoreRule(repository);
+
+    const manifestPath = join(repository.root, ".poiesis", "manifest.json");
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeManifest = await readFile(manifestPath);
+    const foreignOpenCodeBytes = Buffer.from('{ "default_agent": "foreign-agent", "agent": {} }\n');
+
+    await expect(
+      runBootstrapLegacyOwnershipTransaction(
+        repository.root,
+        {},
+        {
+          postOpenCodeApply: async () => {
+            await writeFile(openCodePath, foreignOpenCodeBytes);
+          },
+        } satisfies UpdateBootstrapTransactionHooks,
+      ),
+    ).rejects.toMatchObject({ code: "OPENCODE_CONFIG_CHANGED" });
+
+    const afterManifest = await readFile(manifestPath);
+    expect(Buffer.compare(afterManifest, beforeManifest), "bootstrap manifest was written before the fail-closed check").toBe(0);
+    expect(Buffer.compare(await readFile(openCodePath), foreignOpenCodeBytes), "foreign opencode bytes were overwritten by the bootstrap rollback").toBe(0);
+    // Bootstrap has no receipt at the start and the transaction never
+    // reached createOwnershipReceipt; the receipt therefore remains
+    // absent and the legacy 1.0.0 manifest survives unchanged.
+    const { ownershipReceiptExists } = await import("../src/receipt.js");
+    expect(await ownershipReceiptExists(repository.root), "bootstrap receipt must remain absent after a fail-closed race").toBe(false);
+  }, 60_000);
+
+  it("bootstrap records the EXACT applyOpenCodeConfig callback bytes in the next manifest's OpenCode file hash (no race, no-interference happy path)", async () => {
+    // Bootstrap parity with the ordinary update no-interference test:
+    // the next manifest's OpenCode file hash MUST equal the hash of
+    // the file's current bytes (the transaction's own callback bytes).
+    // Doctor must pass to prove the binding is consistent with reality.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.poiesisVersion = "1.0.0";
+    await writeFile(
+      join(repository.root, ".poiesis", "manifest.json"),
+      serializeManifest(manifest),
+    );
+    const { removeOwnershipReceipt } = await import("../src/receipt.js");
+    await removeOwnershipReceipt(repository.root);
+    await stripNewGitignoreRule(repository);
+
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const result = await runBootstrapLegacyOwnershipTransaction(repository.root, {}, {});
+
+    const openCodeRecord = result.manifest.files.find((file) => file.path === "opencode.jsonc");
+    expect(openCodeRecord, "bootstrap manifest records the OpenCode config").toBeDefined();
+    const currentOpenCodeBytes = await readFile(openCodePath);
+    expect(
+      openCodeRecord!.hash,
+      "bootstrap manifest OpenCode hash equals the on-disk hash",
+    ).toBe(hashContent(currentOpenCodeBytes));
+    expect(result.doctor.ok, "doctor must pass after a no-interference bootstrap").toBe(true);
+    // Generation 1 receipt is created and bound to the new manifest digest.
+    const receipt = await readOwnershipReceipt(repository.root);
+    expect(receipt.generation).toBe(1);
+    expect(receipt.manifestDigest).toBe(hashContent(serializeManifest(result.manifest)));
+  }, 60_000);
+
+  it("ordinary update rollback restores the EXACT preimage OpenCode config on a post-write doctor failure with no foreign writer", async () => {
+    // Defends the symmetric case of the rollback contract: when no
+    // concurrent writer races the transaction, the on-disk OpenCode
+    // config still matches the callback's openCodeWrittenHash at
+    // rollback time. The rollback must therefore restore the EXACT
+    // preimage bytes (byte-for-byte, no newline normalization) instead
+    // of leaving the transaction-owned post-write bytes in place. The
+    // post-write foreign replacement case is covered separately by the
+    // fail-closed test above; this test pins down the no-interference
+    // doctor-failure rollback path.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+    await asPredecessorManifest(repository, "1.0.2", { keepReceipt: true });
+    await rebindReceipt(repository);
+    await stripNewGitignoreRule(repository);
+
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeOpenCode = await readFile(openCodePath);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(runUpdateTransaction(repository.root, {}, {})).rejects.toMatchObject({
+        code: "UPDATE_DOCTOR_FAILED",
+      });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // No concurrent writer races the rollback, so the on-disk bytes
+    // still match the transaction's openCodeWrittenHash and the
+    // rollback restores the EXACT preimage (byte-for-byte, no
+    // newline normalization).
+    const afterOpenCode = await readFile(openCodePath);
+    expect(Buffer.compare(afterOpenCode, beforeOpenCode), "opencode preimage was not restored byte-for-byte").toBe(0);
   }, 60_000);
 });

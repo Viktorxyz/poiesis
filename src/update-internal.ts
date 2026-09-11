@@ -305,13 +305,39 @@ export async function runUpdateTransaction(
       },
     });
     await hooks?.postOpenCodeApply?.();
+    // Defensive fail-closed check: confirm the on-disk OpenCode config still
+    // matches the exact bytes captured by the onWritten callback before any
+    // manifest/receipt materialization. A concurrent replacement that lands
+    // between the callback and this check would produce a manifest hash
+    // derived from foreign bytes; the receipt auth + doctor gate would only
+    // detect it after the fact. Catch the race here so the next manifest's
+    // OpenCode record is always derived from this transaction's callback
+    // bytes (never a later mutable-path reread) and a foreign replacement
+    // fails closed instead of being silently adopted.
+    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
+      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
+      if (hashContent(currentOpenCodeBytes) !== openCodeWrittenHash) {
+        throw new PoiesisError(
+          "OPENCODE_CONFIG_CHANGED",
+          "OpenCode config changed between transaction write and manifest materialization",
+          { path: openCodeConfig },
+        );
+      }
+    }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
+    if (openCodeConfigSnapshot !== null && openCodeWrittenHash !== undefined) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
+        // Bind the next manifest's OpenCode file hash to the EXACT
+        // transaction-written bytes captured by the onWritten callback.
+        // Never re-read the mutable path: a foreign replacement in the
+        // post-write window must not be adopted as this transaction's
+        // identity (the check above has already failed closed on that
+        // path; this branch only executes when the file still matches
+        // our callback bytes).
         nextFiles[nextRecord] = {
           ...nextFiles[nextRecord]!,
-          hash: hashContent(await readFile(openCodeConfigPath)),
+          hash: openCodeWrittenHash,
         };
       }
     }
@@ -580,11 +606,35 @@ export async function runBootstrapLegacyOwnershipTransaction(
       },
     });
     await hooks?.postOpenCodeApply?.();
+    // Defensive fail-closed check (bootstrap parity with ordinary update):
+    // confirm the on-disk OpenCode config still matches the exact bytes
+    // captured by the onWritten callback before any manifest/receipt
+    // materialization. A concurrent replacement that lands between the
+    // callback and this check would otherwise produce a manifest hash
+    // derived from foreign bytes; we reject it here so the next manifest
+    // record is always bound to this transaction's callback bytes and a
+    // foreign replacement fails closed.
+    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
+      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
+      if (hashContent(currentOpenCodeBytes) !== openCodeWrittenHash) {
+        throw new PoiesisError(
+          "OPENCODE_CONFIG_CHANGED",
+          "OpenCode config changed between transaction write and manifest materialization",
+          { path: openCodeConfig },
+        );
+      }
+    }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
+    if (openCodeConfigSnapshot !== null && openCodeWrittenHash !== undefined) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
-        nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: hashContent(await readFile(openCodeConfigPath)) };
+        // Bind the next manifest's OpenCode file hash to the EXACT
+        // transaction-written bytes captured by the onWritten callback.
+        // Never re-read the mutable path: the defensive check above has
+        // already failed closed on any post-write foreign replacement;
+        // this branch only executes when the file still matches our
+        // callback bytes.
+        nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: openCodeWrittenHash };
       }
     }
     const next: Manifest = {
