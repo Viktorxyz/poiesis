@@ -6,6 +6,10 @@ import {
   init,
   updateFromConfig,
 } from "../src/maintenance.js";
+import {
+  runUpdateConfigTransaction,
+  type UpdateTransactionHooks,
+} from "../src/update-config-internal.js";
 import { commandUpdate } from "../src/cli.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { predecessorProjectionV100V101V102 } from "../src/authority.js";
@@ -610,8 +614,8 @@ describe("update --config", () => {
     });
     const beforeBytes = await snapshotOwnedBytes(repository);
     await expect(
-      updateFromConfig(repository.root, candidatePath, {
-        writerHooks: { prePoiesisConfigWrite: () => { throw new Error("injected: poiesis config write"); } },
+      runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+        prePoiesisConfigWrite: () => { throw new Error("injected: poiesis config write"); },
       }),
     ).rejects.toMatchObject({ message: expect.stringMatching(/injected: poiesis config write/) });
     const afterBytes = await snapshotOwnedBytes(repository);
@@ -627,8 +631,8 @@ describe("update --config", () => {
     });
     const beforeBytes = await snapshotOwnedBytes(repository);
     await expect(
-      updateFromConfig(repository.root, candidatePath, {
-        writerHooks: { preOpenCodeApply: () => { throw new Error("injected: opencode apply"); } },
+      runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+        preOpenCodeApply: () => { throw new Error("injected: opencode apply"); },
       }),
     ).rejects.toMatchObject({ message: expect.stringMatching(/injected: opencode apply/) });
     const afterBytes = await snapshotOwnedBytes(repository);
@@ -644,8 +648,8 @@ describe("update --config", () => {
     });
     const beforeBytes = await snapshotOwnedBytes(repository);
     await expect(
-      updateFromConfig(repository.root, candidatePath, {
-        writerHooks: { preManifestWrite: () => { throw new Error("injected: manifest write"); } },
+      runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+        preManifestWrite: () => { throw new Error("injected: manifest write"); },
       }),
     ).rejects.toMatchObject({ message: expect.stringMatching(/injected: manifest write/) });
     const afterBytes = await snapshotOwnedBytes(repository);
@@ -661,8 +665,8 @@ describe("update --config", () => {
     });
     const beforeBytes = await snapshotOwnedBytes(repository);
     await expect(
-      updateFromConfig(repository.root, candidatePath, {
-        writerHooks: { preReceiptReplace: () => { throw new Error("injected: receipt replace"); } },
+      runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+        preReceiptReplace: () => { throw new Error("injected: receipt replace"); },
       }),
     ).rejects.toMatchObject({ message: expect.stringMatching(/injected: receipt replace/) });
     const afterBytes = await snapshotOwnedBytes(repository);
@@ -734,6 +738,80 @@ describe("update --config", () => {
     expectOwnedBytesUnchanged(beforeBytes, await snapshotOwnedBytes(repository));
   }, 30_000);
 
+  // -- Exact preimage bytes: the rollback path writes the preimage Buffer
+  //    directly (no string conversion, no newline normalization). A
+  //    pre-update OpenCode config that lacks a trailing newline must be
+  //    restored byte-for-byte (no newline appended), and the doctor must
+  //    pass against the rolled-back state because the preimage was a
+  //    valid Poiesis-managed file all along.
+
+  it("restores a no-trailing-newline OpenCode config exactly on doctor failure and leaves a healthy doctor state", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    // Rewrite the post-init OpenCode config without a trailing newline
+    // AND keep every managed patch value intact. Update the manifest to
+    // record the new hash, then rebind the receipt to the new manifest
+    // digest so the receipt gate accepts the fixture.
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const originalOpenCodeBytes = await readFile(openCodePath);
+    let openCodeContent = originalOpenCodeBytes.toString("utf8");
+    if (openCodeContent.endsWith("\n")) {
+      openCodeContent = openCodeContent.slice(0, -1);
+    }
+    // The post-install `init` always normalizes OpenCode config to a
+    // trailing newline. Verify that the manual rewrite actually dropped
+    // it; the assertion below would silently pass if the install
+    // layout were different, so we pin the precondition here.
+    expect(openCodeContent.endsWith("\n")).toBe(false);
+    const noNewlineOpenCodeBytes = Buffer.from(openCodeContent, "utf8");
+    await writeFile(openCodePath, noNewlineOpenCodeBytes);
+    const manifest = await loadManifest(repository.root);
+    const ocRecord = manifest.files.find((file) => file.path === "opencode.jsonc");
+    if (ocRecord === undefined) {
+      throw new PoiesisError("FILE_OWNERSHIP_UNKNOWN", "OpenCode config not in manifest", {});
+    }
+    ocRecord.hash = hashContent(noNewlineOpenCodeBytes);
+    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    const receipt = await readOwnershipReceipt(repository.root);
+    await replaceOwnershipReceipt(repository.root, manifest, receipt);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeOpenCode = await readFile(openCodePath);
+    const beforeConfig = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // The rollback must restore the EXACT preimage bytes (no newline
+    // appended) for the OpenCode config, the Poiesis config, and the
+    // manifest. The receipt rollback also restores the preimage.
+    expect(Buffer.compare(await readFile(openCodePath), beforeOpenCode)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfig)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+
+    // The preimage was a valid Poiesis-managed file, so the doctor must
+    // pass against the rolled-back state.
+    const report = await doctor(repository.root);
+    expectTransactionChecksPass(report);
+  }, 30_000);
+
   it("preserves foreign manifest bytes when a concurrent writer lands between manifest write and doctor failure", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
@@ -767,15 +845,13 @@ describe("update --config", () => {
     process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
     try {
       await expect(
-        updateFromConfig(repository.root, candidatePath, {
-          writerHooks: {
-            // Concurrent foreign writer lands AFTER our manifest write and
-            // receipt replace but BEFORE the doctor gate. The fail-closed
-            // rollback must leave these foreign bytes intact; it must not
-            // rewind the manifest to our preimage.
-            postReceiptReplace: async () => {
-              await writeFile(manifestPath, foreignManifestBytes);
-            },
+        runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+          // Concurrent foreign writer lands AFTER our manifest write and
+          // receipt replace but BEFORE the doctor gate. The fail-closed
+          // rollback must leave these foreign bytes intact; it must not
+          // rewind the manifest to our preimage.
+          postReceiptReplace: async () => {
+            await writeFile(manifestPath, foreignManifestBytes);
           },
         }),
       ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
@@ -827,18 +903,16 @@ describe("update --config", () => {
     process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
     try {
       await expect(
-        updateFromConfig(repository.root, candidatePath, {
-          writerHooks: {
-            // Concurrent foreign writer lands IMMEDIATELY after our manifest
-            // atomic write completes but BEFORE the transaction observes the
-            // manifest (receipt replace, doctor gate, hashFile reread for
-            // ownership). The transaction must not adopt these foreign bytes
-            // as our post-write identity, and the fail-closed rollback must
-            // leave the foreign bytes intact instead of rewinding the
-            // manifest to our preimage.
-            postManifestWrite: async () => {
-              await writeFile(manifestPath, foreignManifestBytes);
-            },
+        runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+          // Concurrent foreign writer lands IMMEDIATELY after our manifest
+          // atomic write completes but BEFORE the transaction observes the
+          // manifest (receipt replace, doctor gate, hashFile reread for
+          // ownership). The transaction must not adopt these foreign bytes
+          // as our post-write identity, and the fail-closed rollback must
+          // leave the foreign bytes intact instead of rewinding the
+          // manifest to our preimage.
+          postManifestWrite: async () => {
+            await writeFile(manifestPath, foreignManifestBytes);
           },
         }),
       ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
@@ -878,15 +952,13 @@ describe("update --config", () => {
     process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
     try {
       await expect(
-        updateFromConfig(repository.root, candidatePath, {
-          writerHooks: {
-            // Concurrent foreign writer overwrites the receipt we just wrote
-            // BEFORE the doctor gate runs. The fail-closed rollback must
-            // leave these foreign bytes intact; it must not rewind the
-            // receipt to our preimage.
-            postReceiptReplace: async () => {
-              await writeFile(receiptPath, foreignReceiptBytes);
-            },
+        runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+          // Concurrent foreign writer overwrites the receipt we just wrote
+          // BEFORE the doctor gate runs. The fail-closed rollback must
+          // leave these foreign bytes intact; it must not rewind the
+          // receipt to our preimage.
+          postReceiptReplace: async () => {
+            await writeFile(receiptPath, foreignReceiptBytes);
           },
         }),
       ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
