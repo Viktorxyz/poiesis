@@ -14,7 +14,11 @@ import {
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { runUpdateConfigTransaction } from "./update-config-internal.js";
-import { hashContent, hashDirectory, hashFile } from "./hash.js";
+import {
+  runUpdateTransaction,
+  runBootstrapLegacyOwnershipTransaction,
+} from "./update-internal.js";
+import { hashContent, hashFile } from "./hash.js";
 import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -50,7 +54,7 @@ import {
   validateOpenCodeConfig,
   verifyOpenCodeVersion,
 } from "./opencode.js";
-import { packageRoot, poiesisPath } from "./paths.js";
+import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
@@ -136,22 +140,6 @@ function errorDetails(error: unknown): Record<string, unknown> {
   return { message: String(error) };
 }
 
-function isSafeRelativePath(path: string): boolean {
-  if (path.length === 0 || isAbsolute(path)) return false;
-  const parts = path.split(/[\\/]/);
-  return !parts.includes("") && !parts.includes(".") && !parts.includes("..");
-}
-
-function ownedPath(root: string, path: string): string {
-  if (!isSafeRelativePath(path)) {
-    throw new PoiesisError("UNSAFE_MANAGED_PATH", "Manifest contains an unsafe managed path", { path });
-  }
-  const destination = resolve(root, path);
-  if (destination !== root && !destination.startsWith(`${root}${sep}`)) {
-    throw new PoiesisError("UNSAFE_MANAGED_PATH", "Managed path escapes the repository", { path });
-  }
-  return destination;
-}
 
 async function pathEntryExists(path: string): Promise<boolean> {
   try {
@@ -1244,275 +1232,18 @@ async function requireOwnedManagedFile(root: string, record: ManagedFile): Promi
   }
 }
 
-async function validateLegacySkillIdentity(root: string, skill: Manifest["skills"][number]): Promise<string> {
-  const destination = ownedPath(root, skill.path);
-  if (skill.preexisting) return hashOwnedSkillDirectory(destination);
-  if (skill.hash === undefined) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill is missing a hash", { path: skill.path });
-  }
-  const legacyHash = await hashDirectory(destination);
-  if (legacyHash !== skill.hash) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill content does not match the 1.0.0 manifest", {
-      path: skill.path,
-      expected: skill.hash,
-      actual: legacyHash,
-    });
-  }
-  return hashOwnedSkillDirectory(destination);
-}
-
-async function validateLegacyInstallation(root: string, manifest: Manifest, config: ResolvedPoiesisConfig): Promise<void> {
-  if (manifest.poiesisVersion !== "1.0.0") {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_UNSUPPORTED", "Legacy bootstrap only accepts public Poiesis 1.0.0 installations", {
-      poiesisVersion: manifest.poiesisVersion,
-    });
-  }
-  // Tolerant authority check: the public 1.0.0 predecessor retained the
-  // obsolete `task: { explore: "allow" }` field on `poiesis-reviewer.permission`
-  // which the strict current projection no longer emits. The bootstrap path
-  // only accepts exact v1.0.0 predecessor projections; any drift still fails closed.
-  await assertManifestAuthorityToleratingPredecessor(root, manifest, config, ["1.0.0"]);
-  for (const file of manifest.files) {
-    const path = ownedPath(root, file.path);
-    if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file is missing or not a regular file", {
-        path: file.path,
-      });
-    }
-    const actual = await hashFile(path);
-    if (actual !== file.hash) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file does not match the 1.0.0 manifest", {
-        path: file.path,
-        expected: file.hash,
-        actual,
-      });
-    }
-  }
-  const defaults = await loadDefaultSkills();
-  const defaultNames = new Set(defaults.map((skill) => skill.name));
-  for (const skill of manifest.skills) {
-    if (!defaultNames.has(skill.name) && !skill.preexisting) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest claims an unknown owned skill", {
-        name: skill.name,
-      });
-    }
-    await validateLegacySkillIdentity(root, skill);
-  }
-}
-
-async function bootstrapLegacyOwnership(root: string, options: MaintenanceOptions): Promise<UpdateResult> {
-  const resolvedRoot = resolve(root);
-  if (await ownershipReceiptExists(resolvedRoot)) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Refusing to bootstrap over an existing ownership receipt");
-  }
-  const manifest = await loadManifest(resolvedRoot);
-  const config = await resolveConfigForRoot(resolvedRoot);
-  await validateLegacyInstallation(resolvedRoot, manifest, config);
-  await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
-
-  const nextSkills = await Promise.all(
-    manifest.skills.map(async (skill) => ({
-      ...skill,
-      hash: await validateLegacySkillIdentity(resolvedRoot, skill),
-    })),
-  );
-  const materialized = await materializeFiles(config);
-  const fileSnapshots = new Map<string, Buffer>();
-  for (const file of materialized) {
-    const path = join(resolvedRoot, file.path);
-    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
-  }
-  const openCodeConfig = manifest.configPatches[0]?.file;
-  if (openCodeConfig === undefined) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest does not identify an OpenCode config");
-  }
-  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
-  // Snapshot the exact preimage of `.gitignore` BEFORE the transaction so
-  // a failure can restore it byte-for-byte. The transactional default-path
-  // gitignore rule is appended inside the try block; this seam exists for
-  // explicit 1.0.0 bootstrap because the predecessor init did not install
-  // the new rule.
-  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
-  let writtenGitignoreHash: string | undefined;
-  try {
-    const skills = options.skipSkills
-      ? nextSkills
-      : await installDefaultSkills(resolvedRoot, nextSkills, { replaceOwned: true });
-    for (const file of materialized) await atomicWrite(join(resolvedRoot, file.path), file.content);
-    // Transactionally append the default-path `.gitignore` rule. The
-    // preimage snapshot above lets the rollback restore the exact bytes
-    // if any later step fails.
-    ({ writtenHash: writtenGitignoreHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
-    const nextFiles = nextAdapterFiles(
-      manifest,
-      materialized.map((file) => ({
-        path: file.path,
-        kind: file.kind,
-        hash: hashContent(file.content),
-        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
-      })),
-    );
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
-      const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
-      if (nextRecord >= 0) nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: await hashFile(openCodeConfigPath) };
-    }
-    const next: Manifest = {
-      schema: 1,
-      poiesisVersion: await packageVersion(),
-      adapter: {
-        harness: "opencode",
-        adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
-      },
-      files: nextFiles,
-      skills,
-      configPatches,
-    };
-    await atomicWrite(manifestPath, serializeManifest(next));
-    await createOwnershipReceipt(resolvedRoot, next);
-    const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Legacy ownership bootstrap did not pass doctor", { report });
-    }
-    return { manifest: next, doctor: report };
-  } catch (error) {
-    await restoreManifest(manifestPath, manifestBackup);
-    await removeOwnershipReceipt(resolvedRoot);
-    await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
-    await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
-    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, writtenGitignoreHash);
-    throw error;
-  }
-}
-
+/**
+ * Public entry point for the receipt-authenticated ordinary `update()`
+ * transaction and the explicit 1.0.0 bootstrap. The implementation is
+ * in `src/update-internal.ts`, which is NOT re-exported via `src/index.ts`,
+ * so the security-sensitive fault-injection surface stays confined to the
+ * repo and never appears in the packed `dist/index.d.ts` declaration.
+ */
 export async function update(root: string, options: MaintenanceOptions = {}): Promise<UpdateResult> {
-  if (options.bootstrapLegacyOwnership) return bootstrapLegacyOwnership(root, options);
-  const resolvedRoot = resolve(root);
-  const manifest = await loadManifest(resolvedRoot);
-  const config = await resolveConfigForRoot(resolvedRoot);
-  // Receipt-first: authenticate the receipt against the on-disk manifest
-  // BEFORE any authority check consumes manifest records. This binds the
-  // trusted manifest digest and gates the migration tolerance on a known
-  // predecessor provenance. A 1.0.0 manifest WITHOUT a receipt must use the
-  // explicit --bootstrap-legacy-ownership path, not normal update.
-  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
-  // Tolerant authority check: accepts the strict current projection OR the
-  // exact v1.0.1/1.0.2 predecessor projection (which retained the obsolete
-  // `task: { explore: "allow" }` field on `poiesis-reviewer.permission` that
-  // ticket #24 removed). 1.0.0 is intentionally excluded here: bootstrap is
-  // the only legal migration for the public predecessor.
-  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2"]);
-  await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
-
-  const materialized = await materializeFiles(config);
-  const records = new Map(manifest.files.map((file) => [file.path, file]));
-  for (const file of materialized) {
-    const record = records.get(file.path);
-    if (record === undefined || record.kind !== file.kind) {
-      throw new PoiesisError("FILE_OWNERSHIP_UNKNOWN", "Current manifest does not prove ownership of an update destination", {
-        path: file.path,
-      });
-    }
-    await requireOwnedManagedFile(resolvedRoot, record);
+  if (options.bootstrapLegacyOwnership) {
+    return runBootstrapLegacyOwnershipTransaction(root, options, {});
   }
-  await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
-
-  const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
-  if (managedConfigFiles.length !== 1) {
-    throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
-      files: managedConfigFiles,
-    });
-  }
-  const openCodeConfig = managedConfigFiles[0]!;
-  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-  const fileSnapshots = new Map<string, Buffer>();
-  for (const file of materialized) {
-    const path = join(resolvedRoot, file.path);
-    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
-  }
-
-  let manifestPath: string | undefined;
-  let manifestBackup: Buffer | null = null;
-  let nextReceipt: OwnershipReceipt | undefined;
-  let skills = manifest.skills;
-  // Snapshot the exact preimage of `.gitignore` BEFORE the transaction so
-  // a failure can restore it byte-for-byte. The transactional default-path
-  // gitignore rule is appended inside the try block; updateFromConfig is
-  // intentionally unchanged and does not mutate `.gitignore`.
-  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
-  let writtenGitignoreHash: string | undefined;
-  try {
-    skills = options.skipSkills
-      ? manifest.skills
-      : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
-    for (const file of materialized) {
-      await atomicWrite(join(resolvedRoot, file.path), file.content);
-    }
-    // Transactionally append the default-path `.gitignore` rule (and
-    // nothing else). `ensureGitignore` is idempotent on existing lines
-    // so a project that already has the rule is a no-op; the preimage
-    // snapshot above records the exact bytes in either case so a failure
-    // can restore them.
-    ({ writtenHash: writtenGitignoreHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
-    const nextFiles = nextAdapterFiles(
-      manifest,
-      materialized.map((file) => ({
-        path: file.path,
-        kind: file.kind,
-        hash: hashContent(file.content),
-        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
-      })),
-    );
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
-      const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
-      if (nextRecord >= 0) {
-        nextFiles[nextRecord] = {
-          ...nextFiles[nextRecord]!,
-          hash: await hashFile(openCodeConfigPath),
-        };
-      }
-    }
-    const next: Manifest = {
-      schema: 1,
-      poiesisVersion: await packageVersion(),
-      adapter: {
-        harness: "opencode",
-        adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
-      },
-      files: nextFiles,
-      skills,
-      configPatches,
-    };
-    manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-    manifestBackup = await snapshotFile(manifestPath);
-    await atomicWrite(manifestPath, serializeManifest(next));
-    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, next, receipt);
-    const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
-    }
-    return { manifest: next, doctor: report };
-  } catch (error) {
-    if (manifestPath !== undefined) await restoreManifest(manifestPath, manifestBackup);
-    await restoreOwnershipReceipt(resolvedRoot, receipt);
-    await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
-    await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
-    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, writtenGitignoreHash);
-    throw error;
-  }
+  return runUpdateTransaction(root, options, {});
 }
 
 async function snapshotFile(path: string): Promise<Buffer | null> {
@@ -1532,32 +1263,6 @@ async function snapshotFileIfOwned(
   return readFile(path);
 }
 
-async function restoreOpenCodeConfig(path: string, snapshot: Buffer | null): Promise<void> {
-  if (snapshot === null) return;
-  await atomicWrite(path, snapshot.toString("utf8").endsWith("\n") ? snapshot.toString("utf8") : `${snapshot.toString("utf8")}\n`);
-}
-
-async function restoreManifest(path: string, snapshot: Buffer | null): Promise<void> {
-  if (snapshot === null) await rm(path, { force: true });
-  else await atomicWrite(path, snapshot.toString("utf8").endsWith("\n") ? snapshot.toString("utf8") : `${snapshot.toString("utf8")}\n`);
-}
-
-async function restoreMaterializedFiles(
-  root: string,
-  materialized: MaterializedFile[],
-  snapshots: Map<string, Buffer>,
-): Promise<void> {
-  for (const file of [...materialized].reverse()) {
-    const path = join(root, file.path);
-    const snapshot = snapshots.get(file.path);
-    if (snapshot === undefined) {
-      if (await exists(path)) await rm(path, { force: true });
-    } else {
-      const content = snapshot.toString("utf8");
-      await atomicWrite(path, content.endsWith("\n") ? content : `${content}\n`);
-    }
-  }
-}
 
 async function listTree(root: string, directory: string): Promise<string[]> {
   if (!(await exists(directory))) return [];
@@ -1598,7 +1303,16 @@ export async function installAuthorizedCapability(root: string, input: Capabilit
     await replaceOwnershipReceipt(resolvedRoot, next, receipt);
     return installed;
   } catch (error) {
-    await restoreManifest(manifestPath, manifestBackup);
+    // Byte-exact manifest rollback: restore the preimage Buffer directly
+    // (no newline normalization) so a no-trailing-newline preimage
+    // restores to a no-trailing-newline file. A null preimage removes
+    // the file (the manifest was created by this transaction).
+    if (manifestBackup === null) {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(manifestPath).catch(() => undefined);
+    } else {
+      await atomicWrite(manifestPath, manifestBackup);
+    }
     await restoreOwnershipReceipt(resolvedRoot, receipt);
     throw error;
   }

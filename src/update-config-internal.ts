@@ -18,7 +18,7 @@
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
  */
-import { readFile } from "node:fs/promises";
+import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadConfig, parseJsonc, serializeConfig, validateConfig, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
@@ -43,15 +43,12 @@ import {
 import { poiesisPath } from "./paths.js";
 import { createDeliveryAdapter } from "./adapters.js";
 import type { UpdateResult } from "./maintenance.js";
-import {
-  assertConfigPatchesOwned,
-  assertResolvedConfig,
-  autoResolveConfigDefaults,
-  doctor,
-  isRegularManagedFile,
-  packageVersion,
-  verifyGitRepository,
-} from "./maintenance.js";
+// Maintenance helpers are accessed via delayed dynamic import inside
+// `runUpdateConfigTransaction` to avoid a top-level runtime circular
+// import between this module and `maintenance.ts`. Only the types
+// `MaintenanceOptions` / `UpdateResult` are statically imported (via
+// `import type`) and erased at compile time, so they contribute nothing
+// to runtime.
 
 type JsonObject = Record<string, unknown>;
 
@@ -121,6 +118,16 @@ function assertCompatibleUpdateConfigOptions(options: UpdateConfigOptions): void
   }
 }
 
+/**
+ * Inline copy of the lstat-and-validate step from `isRegularManagedFile`
+ * in `maintenance.ts`. Used by `assertPoiesisConfigOwnership` to avoid
+ * pulling maintenance into this module's load cycle.
+ */
+async function isRegularFileNoFollow(path: string): Promise<boolean> {
+  const details = await lstat(path);
+  return details.isFile() && !details.isSymbolicLink();
+}
+
 async function assertPoiesisConfigOwnership(root: string, manifest: Manifest): Promise<{ content: Buffer; record: ManagedFile }> {
   const record = manifest.files.find((file) => file.path === POIESIS_CONFIG_RELATIVE_PATH);
   if (record === undefined) {
@@ -135,7 +142,7 @@ async function assertPoiesisConfigOwnership(root: string, manifest: Manifest): P
     });
   }
   const path = join(root, POIESIS_CONFIG_RELATIVE_PATH);
-  if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
+  if (!(await exists(path)) || !(await isRegularFileNoFollow(path))) {
     throw new PoiesisError("FILE_OWNERSHIP_LOST", "Poiesis config is missing or not a regular file", {
       path: POIESIS_CONFIG_RELATIVE_PATH,
     });
@@ -181,6 +188,20 @@ export async function runUpdateConfigTransaction(
   options: UpdateConfigOptions,
   hooks: UpdateTransactionHooks,
 ): Promise<UpdateResult> {
+  // Delayed dynamic import: pulls maintenance helpers in only after the
+  // top-level load completes, avoiding a runtime circular import back
+  // into `maintenance.ts`. Types only (`UpdateResult`) are imported
+  // statically and erased at compile time.
+  const {
+    assertConfigPatchesOwned,
+    assertResolvedConfig,
+    autoResolveConfigDefaults,
+    doctor,
+    isRegularManagedFile,
+    packageVersion,
+    verifyGitRepository,
+  } = await import("./maintenance.js");
+
   assertCompatibleUpdateConfigOptions(options);
   const resolvedRoot = resolve(root);
   const resolvedConfigPath = resolve(configPath);
@@ -215,7 +236,7 @@ export async function runUpdateConfigTransaction(
   await verifyOpenCodeVersion(resolvedRoot);
   const openCodeRelativePath = await identifyManagedOpenCodeConfig(manifest);
   const openCodeConfigPath = join(resolvedRoot, openCodeRelativePath);
-  if (!(await exists(openCodeConfigPath)) || !(await isRegularManagedFile(resolvedRoot, openCodeConfigPath))) {
+  if (!(await exists(openCodeConfigPath)) || !(await isRegularFileNoFollow(openCodeConfigPath))) {
     throw new PoiesisError("CONFIG_OWNERSHIP_LOST", "Managed OpenCode config is missing or not a regular file", {
       file: openCodeRelativePath,
     });

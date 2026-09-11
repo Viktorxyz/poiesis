@@ -8,6 +8,11 @@
  *     and `UpdateTransactionHooks`) that lives in
  *     `src/update-config-internal.ts` and is not re-exported by
  *     `src/index.ts`;
+ *   - the ordinary-update / explicit-1.0.0-bootstrap transaction seam
+ *     (`runUpdateTransaction`, `runBootstrapLegacyOwnershipTransaction`,
+ *     and `UpdateBootstrapTransactionHooks`) that lives in
+ *     `src/update-internal.ts` and is not re-exported by
+ *     `src/index.ts`;
  *   - the six internal maintenance helpers (`assertResolvedConfig`,
  *     `isRegularManagedFile`, `packageVersion`, `autoResolveConfigDefaults`,
  *     `verifyGitRepository`, `assertConfigPatchesOwned`) that back the
@@ -57,6 +62,8 @@ type AssertNotExported<K extends string> = K extends keyof PublicApiValues
 const forbiddenFunctions = [
   "writerHooks",
   "runUpdateConfigTransaction",
+  "runUpdateTransaction",
+  "runBootstrapLegacyOwnershipTransaction",
   "assertResolvedConfig",
   "isRegularManagedFile",
   "packageVersion",
@@ -68,6 +75,7 @@ const forbiddenFunctions = [
 const forbiddenTypes = [
   "UpdateWriterHooks",
   "UpdateTransactionHooks",
+  "UpdateBootstrapTransactionHooks",
 ] as const;
 
 describe("public API declarations (type-level)", () => {
