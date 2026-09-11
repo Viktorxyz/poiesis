@@ -1525,6 +1525,41 @@ function errorForEvidence(error: unknown): string | null {
   return error instanceof Error ? error.message : String(error);
 }
 
+async function assertSafeManagedParentChain(root: string, components: string[]): Promise<void> {
+  // lstat-style no-follow validation: walk each existing component of
+  // the managed parent chain under `root` and refuse to follow any
+  // symlink or treat a non-directory as a directory. mkdir(..., {
+  // recursive: true }) would otherwise follow an attacker-placed
+  // symlink at any level and create the workspace at an external
+  // target. Missing components are fine — they will be created by the
+  // caller and re-validated.
+  let current = root;
+  for (const part of components) {
+    current = join(current, part);
+    let stat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stat = await lstat(current);
+    } catch (error) {
+      if (isJsonRecord(error) && error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new PoiesisError(
+        "WORKSPACE_PARENT_UNSAFE",
+        "Refusing to traverse a symlinked workspace parent",
+        { path: relative(root, current) },
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw new PoiesisError(
+        "WORKSPACE_PARENT_UNSAFE",
+        "Workspace parent must be a regular directory",
+        { path: relative(root, current) },
+      );
+    }
+  }
+}
+
 /**
  * Resolve the in-project workspace directory used when `workspace prepare`
  * is invoked without an explicit `--path`. The directory lives under
@@ -1533,6 +1568,12 @@ function errorForEvidence(error: unknown): string | null {
  * external location that the harness cannot access. The returned path
  * is treated like any other candidate workspace path: the marker, base,
  * checkpoint, publish, cleanup, and rollback semantics are unchanged.
+ *
+ * The parent chain `<root>/.poiesis` and `<root>/.poiesis/workspaces`
+ * is validated with lstat-style no-follow semantics before any
+ * mkdir/realpath/write. A hostile symlink at any of these components
+ * would otherwise be followed by mkdir and let the default path
+ * escape the project root and mutate an external target.
  */
 export async function deriveDefaultWorkspacePath(
   root: string,
@@ -1556,10 +1597,19 @@ export async function deriveDefaultWorkspacePath(
     "Derived workspace id escapes the repository root",
     { inside, specId, branch },
   );
+  // Validate the parent chain with lstat-style no-follow semantics
+  // before any mkdir/realpath/write. A hostile symlink at `.poiesis`
+  // or `.poiesis/workspaces` would otherwise be followed by mkdir
+  // and let the default path escape the project root.
+  await assertSafeManagedParentChain(root, [".poiesis", "workspaces"]);
   // `git worktree add` requires the parent directory to exist. The
   // nested `.poiesis/workspaces/` area is gitignored so this directory
   // never appears as foreign work in the primary checkout.
   await mkdir(join(root, ".poiesis", "workspaces"), { recursive: true, mode: 0o700 });
+  // Re-validate the parent chain after mkdir to close the
+  // validate-mutate-create TOCTOU window (a concurrent attacker could
+  // swap a regular directory for a symlink between the two checks).
+  await assertSafeManagedParentChain(root, [".poiesis", "workspaces"]);
   return directory;
 }
 

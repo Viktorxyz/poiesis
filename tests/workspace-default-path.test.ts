@@ -1,4 +1,4 @@
-import { lstat, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, workspaceCleanup, workspacePrepare } from "../src/git.js";
@@ -242,12 +242,213 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 });
 
+/**
+ * Default-path parent chain hardening.
+ *
+ * `poiesis workspace prepare` (default path) must validate every relevant
+ * component of `<root>/.poiesis/workspaces/` with lstat-style no-follow
+ * semantics before any mkdir/worktree write. A hostile symlink at
+ * `.poiesis` or `.poiesis/workspaces` would otherwise let the default
+ * path escape the project root and mutate an external target. The
+ * same applies to a non-directory component that would silently redirect
+ * mkdir/realpath. All four hostile cases must fail closed before any
+ * target mutation, worktree, marker, or branch creation; a positive
+ * lifecycle must still place the workspace physically inside the project
+ * root (realpath containment under realpath(root)).
+ */
+
+describe("workspace prepare default path parent chain hardening", () => {
+  const repositories: TestRepository[] = [];
+  const externalTargets: string[] = [];
+  afterEach(async () => {
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+    await Promise.all(externalTargets.splice(0).map((target) => rm(target, { recursive: true, force: true })));
+  });
+
+  async function branchExists(repository: TestRepository, branch: string): Promise<boolean> {
+    const result = await run("git", ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`], { cwd: repository.root, allowFailure: true });
+    return result.exitCode === 0;
+  }
+
+  async function markersCount(repository: TestRepository): Promise<number> {
+    const commonDirResult = await run("git", ["rev-parse", "--git-common-dir"], { cwd: repository.root });
+    const commonDir = commonDirResult.stdout.startsWith("/")
+      ? commonDirResult.stdout
+      : join(repository.root, commonDirResult.stdout);
+    try {
+      const entries = await readdir(join(commonDir, "poiesis-workspaces-v1"));
+      return entries.length;
+    } catch (error) {
+      if (typeof error === "object" && error !== null && "code" in error && (error as { code: string }).code === "ENOENT") {
+        return 0;
+      }
+      throw error;
+    }
+  }
+
+  it("rejects when <root>/.poiesis is a symlink to an external target (no target mutation, no worktree, no marker, no branch)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const external = join(repository.parent, "external-poiesis-target");
+    await mkdir(external, { recursive: false });
+    await writeFile(join(external, "preexisting.txt"), "do not touch\n");
+    externalTargets.push(external);
+    await rm(join(repository.root, ".poiesis"), { recursive: true, force: true }).catch(() => undefined);
+    await symlink(external, join(repository.root, ".poiesis"));
+
+    const branch = "poiesis/hostile-poiesis-symlink";
+    const beforeBranches = (await run("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repository.root })).stdout.trim();
+    await expect(
+      workspacePrepare({
+        cwd: repository.root,
+        remote: "origin",
+        integrationBranch: "main",
+        branch,
+        specId: "spec-hostile-poiesis-symlink",
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+
+    // Hostile symlink at .poiesis survives untouched (no follow, no replace).
+    const poiesisStat = await lstat(join(repository.root, ".poiesis"));
+    expect(poiesisStat.isSymbolicLink()).toBe(true);
+    // External target is not mutated: no Poiesis workspace directory,
+    // no workspace files, no marker bytes.
+    expect(await directoryExists(join(external, "workspaces"))).toBe(false);
+    expect(await directoryExists(join(external, "poiesis-workspaces-v1"))).toBe(false);
+    expect(await readdir(external)).toEqual(["preexisting.txt"]);
+    expect(await readFile(join(external, "preexisting.txt"), "utf8")).toBe("do not touch\n");
+    // No worktree, no marker, no branch were created. The hostile symlink
+    // at .poiesis already survived untouched (checked above via lstat); we
+    // do not assert it is a directory because it is intentionally a symlink.
+    expect(await directoryExists(join(repository.root, ".poiesis", "workspaces"))).toBe(false);
+    expect(await markersCount(repository)).toBe(0);
+    expect(await branchExists(repository, branch)).toBe(false);
+    const afterBranches = (await run("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repository.root })).stdout.trim();
+    expect(afterBranches).toBe(beforeBranches);
+  }, 30_000);
+
+  it("rejects when <root>/.poiesis/workspaces is a symlink to an external target (no target mutation, no worktree, no marker, no branch)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await mkdir(join(repository.root, ".poiesis"), { recursive: false });
+    const external = join(repository.parent, "external-workspaces-target");
+    await mkdir(external, { recursive: false });
+    await writeFile(join(external, "preexisting.txt"), "do not touch\n");
+    externalTargets.push(external);
+    await symlink(external, join(repository.root, ".poiesis", "workspaces"));
+
+    const branch = "poiesis/hostile-workspaces-symlink";
+    const beforeBranches = (await run("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repository.root })).stdout.trim();
+    await expect(
+      workspacePrepare({
+        cwd: repository.root,
+        remote: "origin",
+        integrationBranch: "main",
+        branch,
+        specId: "spec-hostile-workspaces-symlink",
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+
+    // Hostile symlink at .poiesis/workspaces survives untouched.
+    const workspacesStat = await lstat(join(repository.root, ".poiesis", "workspaces"));
+    expect(workspacesStat.isSymbolicLink()).toBe(true);
+    // External target is not mutated.
+    expect(await directoryExists(join(external, "spec-hostile-workspaces-symlink__hostile-workspaces-symlink"))).toBe(false);
+    expect(await directoryExists(join(external, "poiesis-workspaces-v1"))).toBe(false);
+    expect(await readdir(external)).toEqual(["preexisting.txt"]);
+    expect(await readFile(join(external, "preexisting.txt"), "utf8")).toBe("do not touch\n");
+    // No worktree, no marker, no branch.
+    expect(await markersCount(repository)).toBe(0);
+    expect(await branchExists(repository, branch)).toBe(false);
+    const afterBranches = (await run("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads"], { cwd: repository.root })).stdout.trim();
+    expect(afterBranches).toBe(beforeBranches);
+  }, 30_000);
+
+  it("rejects when <root>/.poiesis is a regular file (non-directory parent)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await rm(join(repository.root, ".poiesis"), { recursive: true, force: true }).catch(() => undefined);
+    await writeFile(join(repository.root, ".poiesis"), "not a directory\n");
+
+    const branch = "poiesis/regular-file-poiesis";
+    await expect(
+      workspacePrepare({
+        cwd: repository.root,
+        remote: "origin",
+        integrationBranch: "main",
+        branch,
+        specId: "spec-regular-poiesis",
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+
+    // The regular file is left intact and the parent chain was not created.
+    expect((await lstat(join(repository.root, ".poiesis"))).isFile()).toBe(true);
+    expect(await readFile(join(repository.root, ".poiesis"), "utf8")).toBe("not a directory\n");
+    expect(await directoryExists(join(repository.root, ".poiesis", "workspaces"))).toBe(false);
+    expect(await markersCount(repository)).toBe(0);
+    expect(await branchExists(repository, branch)).toBe(false);
+  }, 30_000);
+
+  it("rejects when <root>/.poiesis/workspaces is a regular file (non-directory parent)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await mkdir(join(repository.root, ".poiesis"), { recursive: false });
+    await writeFile(join(repository.root, ".poiesis", "workspaces"), "not a directory\n");
+
+    const branch = "poiesis/regular-file-workspaces";
+    await expect(
+      workspacePrepare({
+        cwd: repository.root,
+        remote: "origin",
+        integrationBranch: "main",
+        branch,
+        specId: "spec-regular-workspaces",
+      }),
+    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+
+    // The regular file is left intact.
+    expect((await lstat(join(repository.root, ".poiesis", "workspaces"))).isFile()).toBe(true);
+    expect(await readFile(join(repository.root, ".poiesis", "workspaces"), "utf8")).toBe("not a directory\n");
+    expect(await markersCount(repository)).toBe(0);
+    expect(await branchExists(repository, branch)).toBe(false);
+  }, 30_000);
+
+  it("keeps the normal lifecycle intact and proves canonical physical containment under the project root", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const workspace = await workspacePrepare({
+      cwd: repository.root,
+      remote: "origin",
+      integrationBranch: "main",
+      branch: "poiesis/default-path-containment",
+      specId: "spec-default-containment",
+    });
+    // The returned workspace path is the canonical physical path; it must
+    // live strictly inside the realpath(root) — not a sibling escape.
+    const realRoot = await realpath(repository.root);
+    const realWorkspace = await realpath(workspace.path);
+    expect(realWorkspace.startsWith(realRoot + sep)).toBe(true);
+    expect(relative(realRoot, realWorkspace)).not.toMatch(/^\.\./);
+    expect(relative(realRoot, realWorkspace).startsWith(`.poiesis${sep}workspaces${sep}`)).toBe(true);
+    // And `.poiesis`/`.poiesis/workspaces` are real directories (not symlinks).
+    expect((await lstat(join(repository.root, ".poiesis"))).isDirectory()).toBe(true);
+    expect((await lstat(join(repository.root, ".poiesis", "workspaces"))).isDirectory()).toBe(true);
+    expect((await lstat(join(repository.root, ".poiesis"))).isSymbolicLink()).toBe(false);
+    expect((await lstat(join(repository.root, ".poiesis", "workspaces"))).isSymbolicLink()).toBe(false);
+  }, 30_000);
+});
+
 async function directoryExists(path: string): Promise<boolean> {
   try {
     const stat = await lstat(path);
     return stat.isDirectory();
   } catch (error) {
-    if (typeof error === "object" && error !== null && "code" in error && (error as { code: string }).code === "ENOENT") {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      ((error as { code: string }).code === "ENOENT" || (error as { code: string }).code === "ENOTDIR")
+    ) {
       return false;
     }
     throw error;
