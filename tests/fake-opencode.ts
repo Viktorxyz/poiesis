@@ -37,6 +37,13 @@ export interface InstallFakeOpenCodeOptions {
    * second call inside `doctor → validateOpenCodeConfig` fails).
    */
   failAfterDebugCalls?: { file: string; threshold: number };
+  /**
+   * When set, the fake reports this list for `models` instead of
+   * `TEST_OPENCODE_MODEL_LIST`. Pass an empty list to simulate an
+   * OpenCode installation that has not downloaded any models so every
+   * configured model is reported as unavailable.
+   */
+  modelList?: readonly string[];
 }
 
 /**
@@ -55,6 +62,9 @@ export async function installFakeOpenCode(
 ): Promise<FakeOpenCodeEnvironment> {
   const version = typeof versionOrOptions === "string" ? versionOrOptions : (versionOrOptions.version ?? TEST_OPENCODE_VERSION);
   const failAfter = typeof versionOrOptions === "string" ? undefined : versionOrOptions.failAfterDebugCalls;
+  const modelList = typeof versionOrOptions === "string"
+    ? TEST_OPENCODE_MODEL_LIST
+    : (versionOrOptions.modelList ?? TEST_OPENCODE_MODEL_LIST);
   const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-opencode-"));
   const bin = join(parent, "bin");
   await mkdir(bin);
@@ -64,11 +74,19 @@ export async function installFakeOpenCode(
   const body = `#!/bin/sh
 case "$1" in
   --version)
-    printf '${version}\\n'
+    if [ "\${POIESIS_TEST_OPENCODE_VERSION+set}" = set ]; then
+      printf '%s\\n' "$POIESIS_TEST_OPENCODE_VERSION"
+    else
+      printf '${version}\\n'
+    fi
     exit 0
     ;;
   models)
-    printf '${TEST_OPENCODE_MODEL_LIST.join("\\n")}\\n'
+    if [ "\${POIESIS_TEST_OPENCODE_MODELS+set}" = set ]; then
+      printf '%s\\n' "$POIESIS_TEST_OPENCODE_MODELS"
+    else
+      printf '${modelList.join("\\n")}\\n'
+    fi
     exit 0
     ;;
   debug)

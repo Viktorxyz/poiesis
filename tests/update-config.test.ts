@@ -972,4 +972,171 @@ describe("update --config", () => {
     // manifest rollback applies: the manifest must be back at the preimage.
     expect(Buffer.compare(await readFile(manifestPath), beforeManifest)).toBe(0);
   }, 30_000);
+
+  // -- Ticket #31: `update --config` must use the resolved config returned by
+  //    `autoResolveConfigDefaults` for serialization, delivery checks, OpenCode
+  //    projection, and the next manifest content. Complete model inventory,
+  //    repository, tracker, delivery, adapter/OpenCode validation must run
+  //    BEFORE the first write. Unavailable model / invalid environment must
+  //    cause ZERO transaction write attempts; discovered defaults must be
+  //    persisted.
+
+  it("uses the resolved config for serialization, so a candidate that only omits the discovered repository fields is a no-op", async () => {
+    // Install with the standard test config (repository.remote = "origin",
+    // repository.integrationBranch = "main"). The on-disk
+    // `.poiesis/config.jsonc` carries the same resolved values that
+    // `autoResolveConfigDefaults` would produce. The candidate config omits
+    // `repository` entirely; after resolution the discovered defaults fill it
+    // back in and the serialized bytes match the on-disk preimage byte-for-byte.
+    // If the transaction used the unresolved proposed config, the `repository`
+    // field would be absent from the serialized bytes and a write would
+    // happen — which this no-op detection rejects.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidateConfig = structuredClone(testConfig(repository)) as PoiesisConfig;
+    delete (candidateConfig as { repository?: unknown }).repository;
+    const candidatePath = join(repository.parent, "candidate-omits-repository.jsonc");
+    await writeFile(candidatePath, serializeConfig(candidateConfig));
+
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCodeBytes = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeManifest = await loadManifest(repository.root);
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+
+    const result = await updateFromConfig(repository.root, candidatePath);
+
+    // Resolved defaults are equal to the on-disk values: no write, no
+    // generation advance, no receipt digest change.
+    expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
+    expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCodeBytes);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+    expect(result.doctor.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
+    expect(result.doctor.checks.find((check) => check.id === "receipt")?.status).toBe("pass");
+  }, 30_000);
+
+  it("persists the resolved config to .poiesis/config.jsonc, manifest content, and OpenCode projection", async () => {
+    // Candidate omits `repository` AND changes the execution model. After
+    // resolution the candidate carries the discovered remote/branch plus the
+    // new execution model. The transaction MUST write those resolved values
+    // everywhere: the on-disk `.poiesis/config.jsonc`, the next manifest
+    // digest for `.poiesis/config.jsonc`, and the OpenCode agent permission
+    // bound to the new execution model.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidateConfig = structuredClone(testConfig(repository)) as PoiesisConfig;
+    delete (candidateConfig as { repository?: unknown }).repository;
+    candidateConfig.models.execution = "minimax/MiniMax-M3-alt";
+    const candidatePath = join(repository.parent, "candidate-resolved-defaults.jsonc");
+    await writeFile(candidatePath, serializeConfig(candidateConfig));
+
+    const result = await updateFromConfig(repository.root, candidatePath);
+
+    const onDiskConfig = await readPoiesisConfig(repository);
+    expect(onDiskConfig.repository?.remote).toBe("origin");
+    expect(onDiskConfig.repository?.integrationBranch).toBe("main");
+    expect(onDiskConfig.models.execution).toBe("minimax/MiniMax-M3-alt");
+
+    // Manifest entry for the Poiesis config reflects the new hash.
+    const manifest = await loadManifest(repository.root);
+    const configRecord = manifest.files.find((file) => file.path === CONFIG_ROOT);
+    expect(configRecord?.hash).toBe(hashContent(await readFile(join(repository.root, CONFIG_ROOT))));
+
+    // OpenCode projection reflects the new execution model.
+    const openCodeJson = await readOpenCodeJson(repository);
+    expect((openCodeJson.agent as Record<string, Record<string, unknown>>)?.poiesis?.model).toBe(onDiskConfig.models.reasoning);
+    expect((openCodeJson.agent as Record<string, Record<string, unknown>>)?.explore?.model).toBe("minimax/MiniMax-M3-alt");
+    expect((openCodeJson.agent as Record<string, Record<string, unknown>>)?.["poiesis-worker"]?.model).toBe("minimax/MiniMax-M3-alt");
+
+    expectTransactionChecksPass(result.doctor);
+  }, 30_000);
+
+  it("rejects with MODEL_UNAVAILABLE before any write when the OpenCode model inventory lacks the configured models", async () => {
+    // Override the fake `opencode models` output to an empty list. The
+    // model-inventory probe (`verifyModels`) MUST run before the first write
+    // and MUST reject every owned byte — including the Poiesis config, the
+    // OpenCode config, the manifest, and the ownership receipt — exactly
+    // because the transaction has not yet committed any change.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    const prevModels = process.env.POIESIS_TEST_OPENCODE_MODELS;
+    process.env.POIESIS_TEST_OPENCODE_MODELS = ""; // empty model inventory
+    try {
+      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+        code: "MODEL_UNAVAILABLE",
+      });
+    } finally {
+      if (prevModels === undefined) delete process.env.POIESIS_TEST_OPENCODE_MODELS;
+      else process.env.POIESIS_TEST_OPENCODE_MODELS = prevModels;
+    }
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 30_000);
+
+  it("rejects with OPENCODE_VERSION_UNSUPPORTED before any write when the installed OpenCode version is not in the supported set", async () => {
+    // Override the fake `opencode --version` output to a version outside the
+    // supported set. The OpenCode-version probe MUST run before the first
+    // write and MUST reject every owned byte.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    env?.restore();
+    env = await installFakeOpenCode("1.19.0"); // not in SUPPORTED_OPENCODE_VERSIONS
+    try {
+      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+        code: "OPENCODE_VERSION_UNSUPPORTED",
+      });
+    } finally {
+      env.restore();
+      env = await installFakeOpenCode(); // restore default for afterEach
+    }
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 30_000);
+
+  it("rejects with UNKNOWN_DELIVERY_ADAPTER after receipt auth and before any write when the resolved config has an unknown adapter", async () => {
+    // The narrowest `verifyDeliveryConfiguration` helper must run against the
+    // RESOLVED config (i.e. after `autoResolveConfigDefaults`) so a foreign
+    // delivery adapter name can never land in the transaction. The
+    // `createDeliveryAdapter` call inside `verifyDeliveryConfiguration`
+    // throws `UNKNOWN_DELIVERY_ADAPTER` for unsupported adapter names; the
+    // transaction MUST reject before any owned byte is mutated.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    const invalidDelivery = structuredClone(testConfig(repository)) as PoiesisConfig;
+    invalidDelivery.delivery = {
+      preview: { adapter: "not-a-real-adapter" },
+      staging: { adapter: "fixture", path: repository.fixtures },
+      production: { adapter: "fixture", path: repository.fixtures },
+    };
+    const candidatePath = join(repository.parent, "candidate-bad-delivery.jsonc");
+    await writeFile(candidatePath, serializeConfig(invalidDelivery));
+
+    await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+      code: "UNKNOWN_DELIVERY_ADAPTER",
+    });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+  }, 30_000);
 });

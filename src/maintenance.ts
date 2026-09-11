@@ -407,7 +407,7 @@ export async function verifyGitRepository(root: string, config?: ResolvedPoiesis
   }
 }
 
-async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promise<void> {
+export async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promise<void> {
   const result = await run("opencode", ["models"], { cwd: root, allowFailure: true });
   if (result.exitCode !== 0) {
     throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {
@@ -441,7 +441,7 @@ async function validateOpenCodeConfigPayload(content: string): Promise<void> {
   }
 }
 
-async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
+export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
@@ -453,7 +453,7 @@ async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promi
   return "verified";
 }
 
-function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
+export function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
   let fixture = false;
   for (const target of ["preview", "staging", "production"] as const) {
     const adapter = createDeliveryAdapter(config.delivery[target], root);

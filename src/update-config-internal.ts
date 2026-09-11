@@ -199,7 +199,10 @@ export async function runUpdateConfigTransaction(
     doctor,
     isRegularManagedFile,
     packageVersion,
+    verifyDeliveryConfiguration,
     verifyGitRepository,
+    verifyModels,
+    verifyTracker,
   } = await import("./maintenance.js");
 
   assertCompatibleUpdateConfigOptions(options);
@@ -210,12 +213,6 @@ export async function runUpdateConfigTransaction(
   const proposedConfigRaw = await readUtf8(resolvedConfigPath);
   const proposedConfig = validateConfig(parseJsonc<unknown>(proposedConfigRaw, resolvedConfigPath), resolvedConfigPath);
   assertResolvedConfig(proposedConfig);
-
-  // 1b. Pre-validate each delivery adapter so an unsupported adapter name fails
-  //     fast with `UNKNOWN_DELIVERY_ADAPTER` before any receipt or write work.
-  for (const target of ["preview", "staging", "production"] as const) {
-    createDeliveryAdapter(proposedConfig.delivery[target], resolvedRoot);
-  }
 
   // 2. Authenticate the trusted receipt FIRST, before any other ownership check
   //    consumes manifest records. This locks in the receipt's claim about the
@@ -246,11 +243,42 @@ export async function runUpdateConfigTransaction(
   // collisions are caught via `CONFIG_OWNERSHIP_LOST`).
   await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
 
-  // 3. Auto-discover default fields on the proposed config (without writing) so we can resolve fully.
-  await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+  // 3. Auto-discover default fields on the proposed config (without writing) so we
+  //    can resolve fully. The returned `ResolvedPoiesisConfig` carries the
+  //    discovered repository remote, integration branch, tracker project, and
+  //    verification commands; it is the value used for every downstream step
+  //    (delivery check, OpenCode projection, serialization, and next manifest
+  //    content). Discovered defaults are persisted because this is the value
+  //    that is written to `.poiesis/config.jsonc`, projected onto the OpenCode
+  //    config, and baked into the new manifest entry.
+  const { config: resolvedConfigWithDefaults } = await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
 
-  // 4. Compute the new content + patch projection in memory for the no-op check.
-  const newConfigContent = serializeConfig(proposedConfig);
+  // 4. Complete environment validation BEFORE the first write. The narrowest
+  //    internal helpers from `init` are reused so a missing model, an
+  //    unreachable tracker, or an unsupported delivery adapter fails closed
+  //    with the same error code the doctor gate would later report, and
+  //    without ever touching the Poiesis config, the OpenCode config, the
+  //    manifest, or the ownership receipt. `verifyGitRepository` is called
+  //    with the resolved config so the discovered remote and integration
+  //    branch are validated against the live Git state. `verifyModels` runs
+  //    the same model-inventory probe the doctor gate would run, against the
+  //    resolved reasoning and execution models. `verifyTracker` and
+  //    `verifyDeliveryConfiguration` cover the same ground the doctor gate
+  //    covers for `tracker` and `delivery`; their return values are
+  //    intentionally discarded because the `update --config` surface rejects
+  //    `allowFixtureAdapters` up front via `assertCompatibleUpdateConfigOptions`,
+  //    but the call still validates the resolved adapter names and the live
+  //    tracker reachability so a foreign tracker change cannot land in the
+  //    transaction before the first write.
+  await verifyGitRepository(resolvedRoot, resolvedConfigWithDefaults);
+  await verifyModels(resolvedRoot, resolvedConfigWithDefaults);
+  await verifyTracker(resolvedRoot, resolvedConfigWithDefaults);
+  verifyDeliveryConfiguration(resolvedRoot, resolvedConfigWithDefaults);
+
+  // 5. Compute the new content + patch projection in memory for the no-op check,
+  //    using the resolved config so discovered defaults are reflected in the
+  //    serialized bytes and the OpenCode projection.
+  const newConfigContent = serializeConfig(resolvedConfigWithDefaults);
   const newConfigHash = hashContent(newConfigContent);
   const openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
   const currentOpenCodeContentString = openCodeConfigCurrentBytes.toString("utf8");
@@ -302,9 +330,11 @@ export async function runUpdateConfigTransaction(
     //    `init()` and incorrectly refuse the update whenever the OpenCode config
     //    already contains a desired path. Concurrent writers between our
     //    snapshot and the atomic write are caught via the
-    //    `expectedContent` snapshot that `applyOpenCodeConfig` enforces.
+    //    `expectedContent` snapshot that `applyOpenCodeConfig` enforces. The
+    //    projection uses the resolved config so discovered defaults are
+    //    reflected in the merged patches and the next manifest entry.
     await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, proposedConfig, openCodeConfigPath, {
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
       expectedContent: openCodeConfigCurrentBytes,
       onWritten: (content) => {
         openCodeWrittenHash = hashContent(content);
