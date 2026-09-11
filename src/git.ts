@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
-import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run } from "./process.js";
+import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
 import {
   validateProofEvidence,
@@ -514,13 +514,24 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   let failed: VerifyCommandResult | null = null;
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+  // run() only rejects after it has terminated the spawned process tree
+  // (see process.ts settle()). The workspace state is therefore safe to
+  // observe immediately after a rejection, so the exact-SHA clean-after
+  // check below can run unconditionally.
+  let runError: unknown = null;
   for (const command of options.commands) {
-    const result = await run("/bin/sh", ["-c", command], {
-      cwd: root,
-      allowFailure: true,
-      timeoutMs,
-      ...(options.env === undefined ? {} : { env: options.env }),
-    });
+    let result: RunResult;
+    try {
+      result = await run("/bin/sh", ["-c", command], {
+        cwd: root,
+        allowFailure: true,
+        timeoutMs,
+        ...(options.env === undefined ? {} : { env: options.env }),
+      });
+    } catch (error) {
+      runError = error;
+      break;
+    }
     const evidence = {
       command,
       exitCode: result.exitCode,
@@ -534,7 +545,38 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
     }
   }
 
-  await assertExactClean(root, candidateSha);
+  // Exact-SHA clean-after must always run, even after a run() rejection or a
+  // non-zero exit. The verify invocation is the only writer of the candidate
+  // workspace, so any residue is the deterministic footprint of the verify
+  // command. A non-empty residue fails closed with DIRTY_CANDIDATE
+  // regardless of how the loop ended; otherwise the original COMMAND_TIMEOUT
+  // or VERIFICATION_FAILED is preserved unchanged.
+  let dirtyStatus: string[] | null = null;
+  try {
+    await assertExactClean(root, candidateSha);
+  } catch (cleanError) {
+    if (cleanError instanceof PoiesisError && cleanError.code === "DIRTY_CANDIDATE") {
+      const status = cleanError.details.status;
+      dirtyStatus = Array.isArray(status) ? (status as string[]) : [];
+    } else {
+      throw cleanError;
+    }
+  }
+
+  if (dirtyStatus !== null) {
+    throw new PoiesisError(
+      "DIRTY_CANDIDATE",
+      "Verify invocation left the exact candidate workspace dirty",
+      {
+        candidateSha,
+        commands: results,
+        runError: runError === null ? null : errorForEvidence(runError),
+        status: dirtyStatus.map(statusEntryForEvidence),
+      },
+    );
+  }
+
+  if (runError !== null) throw runError;
   if (failed !== null) {
     throw new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
       candidateSha,

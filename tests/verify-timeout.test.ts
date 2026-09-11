@@ -59,16 +59,67 @@ async function stageParentAndDescendant() {
     [
       "#!/bin/sh",
       "exec 0</dev/null 1>/dev/null 2>/dev/null",
-      'printf "%s\\n" "$$" > "$1"',
+      'printf "%s\n" "$$" > "$1"',
       "while :; do sleep 1; done",
       "",
     ].join("\n"),
     "utf8",
   );
-  await writeFile(parent, `#!/bin/sh\n"${descendant}" "${pidFile}" &\nsleep 30\n`, "utf8");
+  await writeFile(parent, `#!/bin/sh
+"${descendant}" "${pidFile}" &
+sleep 30
+`, "utf8");
   await chmod(descendant, 0o755);
   await chmod(parent, 0o755);
   return { dir, parent, pidFile };
+}
+
+async function stageDirtyHang(trackedPath: string, marker: string): Promise<{ dir: string; script: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "poiesis-verify-dirty-"));
+  fixtures.push(dir);
+  const script = join(dir, "dirty-hang.sh");
+  await writeFile(
+    script,
+    [
+      "#!/bin/sh",
+      `printf "%s\\n" "${marker}" > "${trackedPath}"`,
+      "while :; do sleep 1; done",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await chmod(script, 0o755);
+  return { dir, script };
+}
+
+async function stageDirtyDescendant(
+  trackedPath: string,
+  marker: string,
+): Promise<{ dir: string; parent: string; pidFile: string; descendant: string }> {
+  const dir = await mkdtemp(join(tmpdir(), "poiesis-verify-descendant-"));
+  fixtures.push(dir);
+  const descendant = join(dir, "descendant.sh");
+  const parent = join(dir, "parent.sh");
+  const pidFile = join(dir, "descendant.pid");
+  await writeFile(
+    descendant,
+    [
+      "#!/bin/sh",
+      "exec 0</dev/null 1>/dev/null 2>/dev/null",
+      `printf "%s\\n" "${marker}" > "${trackedPath}"`,
+      'printf "%s\n" "$$" > "$1"',
+      "while :; do sleep 1; done",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(parent, `#!/bin/sh
+"${descendant}" "${pidFile}" &
+sleep 30
+`, "utf8");
+  await chmod(descendant, 0o755);
+  await chmod(parent, 0o755);
+  return { dir, parent, pidFile, descendant };
 }
 
 async function waitForPid(path: string, timeoutMs = 2_000): Promise<number> {
@@ -92,8 +143,6 @@ describe("deterministic Verify timeout", () => {
     async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
-      // sleep 32 exceeds the 30s generic process default but stays within the
-      // explicit Verify suite bound.
       const startedAt = Date.now();
       const result = await verify({
         cwd: repository.root,
@@ -141,6 +190,131 @@ describe("deterministic Verify timeout", () => {
       expect(elapsed).toBeLessThan(10000);
       expect(await isSameProcess(descendantPid, startTime)).toBe(false);
       survivorPids.delete(descendantPid);
+    },
+  );
+});
+
+describe("Verify exact-SHA clean-after reporting", () => {
+  it.skipIf(process.platform === "win32")(
+    "fails closed with DIRTY_CANDIDATE when a timed-out verify command mutates tracked state",
+    { timeout: 30000 },
+    async () => {
+      const repository = await createTestRepository();
+      repositories.push(repository);
+      const trackedPath = join(repository.root, "README.md");
+      const marker = "dirty-hang residue";
+      const { dir, script } = await stageDirtyHang(trackedPath, marker);
+      fixtures.push(dir);
+
+      const startedAt = Date.now();
+      await expect(
+        verify({
+          cwd: repository.root,
+          candidateSha: repository.baseSha,
+          commands: [`/bin/sh ${script}`],
+          timeoutMs: 500,
+        }),
+      ).rejects.toMatchObject({
+        code: "DIRTY_CANDIDATE",
+      });
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeLessThan(10000);
+
+      const after = await readFile(trackedPath, "utf8");
+      expect(after).toBe(`${marker}\n`);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "reports DIRTY_CANDIDATE only after the descendant that mutated tracked state is reaped",
+    { timeout: 30000 },
+    async () => {
+      const repository = await createTestRepository();
+      repositories.push(repository);
+      const trackedPath = join(repository.root, "README.md");
+      const marker = "descendant residue";
+      const { dir, parent, pidFile } = await stageDirtyDescendant(trackedPath, marker);
+      fixtures.push(dir);
+
+      const startedAt = Date.now();
+      const invocation = verify({
+        cwd: repository.root,
+        candidateSha: repository.baseSha,
+        commands: [`/bin/sh ${parent}`],
+        timeoutMs: 500,
+      });
+      const descendantPid = await waitForPid(pidFile);
+      const startTime = await processStartTime(descendantPid);
+      survivorPids.set(descendantPid, startTime);
+
+      await expect(invocation).rejects.toMatchObject({
+        code: "DIRTY_CANDIDATE",
+      });
+      const elapsed = Date.now() - startedAt;
+      expect(elapsed).toBeLessThan(10000);
+
+      expect(await isSameProcess(descendantPid, startTime)).toBe(false);
+      survivorPids.delete(descendantPid);
+
+      const after = await readFile(trackedPath, "utf8");
+      expect(after).toBe(`${marker}\n`);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "preserves success and non-zero command evidence semantics on the exact candidate",
+    { timeout: 30000 },
+    async () => {
+      const repository = await createTestRepository();
+      repositories.push(repository);
+
+      const successResult = await verify({
+        cwd: repository.root,
+        candidateSha: repository.baseSha,
+        commands: [`printf "%s" first`, `printf "%s" second`],
+      });
+      expect(successResult).toMatchObject({
+        candidateSha: repository.baseSha,
+        cleanBefore: true,
+        cleanAfter: true,
+      });
+      expect(successResult.commands).toHaveLength(2);
+      expect(successResult.commands[0]).toMatchObject({
+        command: `printf "%s" first`,
+        exitCode: 0,
+        stdout: "first",
+      });
+      expect(successResult.commands[1]).toMatchObject({
+        command: `printf "%s" second`,
+        exitCode: 0,
+        stdout: "second",
+      });
+
+      await expect(
+        verify({
+          cwd: repository.root,
+          candidateSha: repository.baseSha,
+          commands: [
+            `printf "%s" ok`,
+            `printf "%s" bad 1>&2; exit 7`,
+            `printf "%s" never`,
+          ],
+        }),
+      ).rejects.toMatchObject({
+        code: "VERIFICATION_FAILED",
+        details: {
+          candidateSha: repository.baseSha,
+          failed: {
+            command: `printf "%s" bad 1>&2; exit 7`,
+            exitCode: 7,
+            stderr: "bad",
+          },
+          commands: [
+            { command: `printf "%s" ok`, exitCode: 0, stdout: "ok" },
+            { command: `printf "%s" bad 1>&2; exit 7`, exitCode: 7, stderr: "bad" },
+          ],
+        },
+      });
     },
   );
 });
