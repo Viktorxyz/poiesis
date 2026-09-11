@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
-import { bounded, run } from "./process.js";
+import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
 import {
   validateProofEvidence,
@@ -113,6 +113,7 @@ export interface VerifyOptions {
   cwd: string;
   candidateSha: string;
   commands: string[];
+  timeoutMs?: number;
   outputLimit?: number;
   env?: NodeJS.ProcessEnv;
 }
@@ -512,10 +513,12 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   const results: VerifyCommandResult[] = [];
   let failed: VerifyCommandResult | null = null;
 
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
   for (const command of options.commands) {
     const result = await run("/bin/sh", ["-c", command], {
       cwd: root,
       allowFailure: true,
+      timeoutMs,
       ...(options.env === undefined ? {} : { env: options.env }),
     });
     const evidence = {

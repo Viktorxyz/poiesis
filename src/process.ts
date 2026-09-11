@@ -5,6 +5,7 @@ import { PoiesisError } from "./errors.js";
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_VERIFY_TIMEOUT_MS = 10 * 60_000;
 const MAX_TIMEOUT_MS = 30 * 60_000;
 const GRACEFUL_TIMEOUT_MS = 2_000;
 const TERMINATION_CONFIRM_MS = 2_000;
