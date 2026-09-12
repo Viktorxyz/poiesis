@@ -1,6 +1,8 @@
 import { applyEdits, modify } from "jsonc-parser";
+import { isDeepStrictEqual } from "node:util";
 import { relative } from "node:path";
 import { parseJsonc } from "./config.js";
+import { PoiesisError } from "./errors.js";
 import type { ConfigPatch } from "./manifest.js";
 
 type JsonObject = Record<string, unknown>;
@@ -45,11 +47,7 @@ function getAtPathLocal(value: unknown, path: string[]): { exists: boolean; valu
  * should be atomically written. It performs NO filesystem work, so
  * install-time `applyOpenCodeConfig` AND transaction-time preflight in
  * `runUpdateConfigTransaction` can call it byte-for-byte with the same
- * arguments and observe the same payload. The serialized output matches
- * the previous inline projection in `applyOpenCodeConfig` byte-for-byte
- * (same `formattingOptions`, same trailing newline normalization) so the
- * preflight's serialized bytes can be asserted equal to the post-apply
- * `onWritten` callback bytes deterministically before manifest write.
+ * arguments and observe the same payload.
  */
 export function projectOpenCodePayload(input: ProjectOpenCodePayloadInput): ProjectOpenCodePayloadResult {
   const relativeFile = relative(input.root, input.configPath);
@@ -74,4 +72,40 @@ export function projectOpenCodePayload(input: ProjectOpenCodePayloadInput): Proj
   }
   const serialized = content.endsWith("\n") ? content : `${content}\n`;
   return { serialized, configPatches };
+}
+
+/**
+ * Pure ownership check: every manifest `ConfigPatch` for the OpenCode
+ * file must observe its `installed` value at `parsedSnapshot.patch.path`.
+ *
+ * Replaces the disk-re-reading path inside the maintenance
+ * `assertConfigPatchesOwned` helper for the OpenCode config specifically.
+ * Callers MUST pass the same parsed snapshot they captured once when
+ * reading the OpenCode config bytes; this helper performs no I/O and
+ * produces the same `CONFIG_OWNERSHIP_LOST` semantics for a foreign or
+ * missing value at any recorded path.
+ *
+ * Patches with a `file` other than `openCodeRelativeFile` are ignored
+ * (the caller must pre-filter by file if it stores patches for multiple
+ * managed files in one call). The `root` parameter is used only for
+ * error-message paths so callers can map the `file` field back to a
+ * stable, canonical relative path.
+ */
+export function assertOpenCodeOwnershipAgainstSnapshot(args: {
+  root: string;
+  configPath: string;
+  parsedSnapshot: JsonObject;
+  patches: ConfigPatch[];
+}): void {
+  const relativeFile = relative(args.root, args.configPath);
+  for (const patch of args.patches) {
+    if (patch.file !== relativeFile) continue;
+    const value = getAtPathLocal(args.parsedSnapshot, patch.path);
+    if (!value.exists || !isDeepStrictEqual(value.value, patch.installed)) {
+      throw new PoiesisError("CONFIG_OWNERSHIP_LOST", "Managed OpenCode config value was changed", {
+        file: patch.file,
+        path: patch.path,
+      });
+    }
+  }
 }

@@ -804,9 +804,10 @@ describe("update --config", () => {
     // Force the doctor gate to fail AFTER all writes complete by flipping the fake
     // opencode `debug config` exit to non-zero.
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -844,9 +845,10 @@ describe("update --config", () => {
     const beforeBytes = await snapshotOwnedBytes(repository);
 
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -919,9 +921,10 @@ describe("update --config", () => {
     const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
 
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -980,9 +983,10 @@ describe("update --config", () => {
     );
 
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -1044,9 +1048,10 @@ describe("update --config", () => {
     );
 
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -1099,9 +1104,10 @@ describe("update --config", () => {
       `{"schema":1,"commonDir":"/dev/null","workspace":"/dev/null","installationId":"foreign","manifestDigest":"deadbeef","generation":9999}\n`);
 
     // Re-install the fake `opencode debug config` with a fail-after threshold so
-    // the preflight schema call (count #2 — init already consumed #1) passes
-    // and the doctor gate schema call (count #3) fails. After the assertion,
-    // restore the default healthy fake so subsequent tests get a fresh state.
+    // the preflight schema call (count #1 against the stateful fake,
+    // threshold=1, 1>1? no → success) passes and the doctor gate schema
+    // call (count #2, 2>1? yes → fail). After the assertion, restore
+    // the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     await installStatefulFakeForDoctorFailure(1);
     try {
@@ -1303,7 +1309,7 @@ describe("update --config", () => {
   //    toggle happens AFTER `install()` so init's own schema validation
   //    pass-through still succeeds; the preflight is the next `opencode
   //    debug config` call the transaction makes.
-  it("rejects preflight OpenCode schema validation before any write when fake opencode rejects the projected payload", async () => {
+  it("rejects preflight schema validation before any managed write with zero hook invocations and exact byte preservation", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await install(repository);
@@ -1313,21 +1319,72 @@ describe("update --config", () => {
     const beforeBytes = await snapshotOwnedBytes(repository);
     const beforeReceipt = await readOwnershipReceipt(repository.root);
 
-    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    // Install a stateful fake with threshold=0 so the FIRST `opencode
+    // debug config` call against this fake fails on the very first
+    // invocation. init() ran with the DEFAULT fake before this
+    // helper (its single `validateOpenCodeConfigPayload` succeeded
+    // there), so it never touches this counter. The transaction-side
+    // `validateOpenCodeConfigPayload(preflightSerialized)` at step 8
+    // is the first debug call against the new stateful fake → fails.
+    await installStatefulFakeForDoctorFailure(0);
+
+    // Hook invocation counters — all hooks are intentionally internal
+    // surfaces of `UpdateTransactionHooks`; this test proves the
+    // preflight rejection happens BEFORE any of them fire. Counters
+    // are LOCAL closures here, exposed only through the transaction
+    // call; the public `UpdateConfigOptions` type never sees them.
+    let countPrePoiesisConfigWrite = 0;
+    let countPreOpenCodeApply = 0;
+    let countPreManifestWrite = 0;
+    let countPreReceiptReplace = 0;
+    let countPostReceiptReplace = 0;
+    let countPostManifestWrite = 0;
+    let countPreNoopDoctor = 0;
+    let countInjectDriftedOnWrittenContent = 0;
+    let capturedDryRunBytes: string | null = null;
+
     try {
-      // The preflight schema call is the first `opencode debug config`
-      // invocation after `install()`. Toggling the rejection flag at
-      // this point catches ONLY the preflight; init's earlier
-      // validateOpenCodeConfigPayload already passed (call #1 under
-      // failAfterDebugCalls counting).
-      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toThrow();
+      await expect(
+        runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+          prePoiesisConfigWrite: () => { countPrePoiesisConfigWrite++; },
+          preOpenCodeApply: () => { countPreOpenCodeApply++; },
+          preManifestWrite: () => { countPreManifestWrite++; },
+          preReceiptReplace: () => { countPreReceiptReplace++; },
+          postReceiptReplace: () => { countPostReceiptReplace++; },
+          postManifestWrite: () => { countPostManifestWrite++; },
+          preNoopDoctor: () => { countPreNoopDoctor++; },
+          injectDriftedOnWrittenContent: (defaultContent) => {
+            countInjectDriftedOnWrittenContent++;
+            capturedDryRunBytes = defaultContent;
+            return defaultContent;
+          },
+        }),
+      ).rejects.toThrow();      // The mutating preflight surfaces the pre-#37 error semantics of
+      // `validateOpenCodeConfigPayload` (the fake `opencode debug config`
+      // exits non-zero, which `run()` translates into `PoiesisError`
+      // with code `COMMAND_FAILED` and a message including the fake's
+      // stderr). The test deliberately does NOT remap the code to
+      // `UPDATE_DOCTOR_FAILED` here — that convergence is reserved for
+      // the no-op branch via `doctor()` + `assertUpdateConfigDoctorGate`.
+      // Only the schema rejection itself is asserted.
     } finally {
       env?.restore();
       env = await installFakeOpenCode();
-      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
-      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
     }
+
+    // All hooks fired ZERO times — the rejection happened before any
+    // pre-write or post-write seam was reachable. This proves the
+    // transaction fails closed before mutating any owned byte.
+    expect(countPrePoiesisConfigWrite, "prePoiesisConfigWrite must not fire").toBe(0);
+    expect(countPreOpenCodeApply, "preOpenCodeApply must not fire").toBe(0);
+    expect(countPreManifestWrite, "preManifestWrite must not fire").toBe(0);
+    expect(countPreReceiptReplace, "preReceiptReplace must not fire").toBe(0);
+    expect(countPostReceiptReplace, "postReceiptReplace must not fire").toBe(0);
+    expect(countPostManifestWrite, "postManifestWrite must not fire").toBe(0);
+    expect(countPreNoopDoctor, "preNoopDoctor must not fire").toBe(0);
+    expect(countInjectDriftedOnWrittenContent, "injectDriftedOnWrittenContent must not fire").toBe(0);
+    // And the dry-run bytes are never observed (callback not reached).
+    expect(capturedDryRunBytes, "onWritten not reached").toBeNull();
 
     const afterBytes = await snapshotOwnedBytes(repository);
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
@@ -1337,5 +1394,228 @@ describe("update --config", () => {
     expect(afterReceipt.generation).toBe(beforeReceipt.generation);
     expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
   }, 30_000);
+
+  // -- Ticket #37 correction 1: deterministic internal-hook regression for
+  //    projection drift after preflight. Asserts that the onWritten
+  //    callback assigns `openCodeWrittenHash` BEFORE the drift equality
+  //    check throws, so the rollback identity is preserved when the drift
+  //    throw fires. The hook (`injectDriftedOnWrittenContent`) is an
+  //    internal test seam only — production callers leave it unset and
+  //    the apply path produces byte-identical content to preflight (the
+  //    pure helper is deterministic), so the throw path is unreachable
+  //    in production. The test asserts the rollback survives the throw
+  //    by reading the on-disk OpenCode config preimage byte-for-byte.
+  it("preserves rollback identity when the apply path sees drifted serialized bytes after preflight", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeOpenCodeBytes = await readFile(openCodePath);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    // The onWritten callback captures the expected content from the
+    // preflight. Force a different return from the callback via the
+    // internal `injectDriftedOnWrittenContent` hook. Because the
+    // hook-fired content differs from `preflightSerialized`, the apply
+    // step throws INSTALL_PATH_CONFLICT after the OpenCode config was
+    // already written. The fix under test: `openCodeWrittenHash` is
+    // computed BEFORE the throw so the rollback can identify the on-disk
+    // hash and restore the preimage byte-for-byte.
+    const driftBytes = "{} ";
+    let observedOpenCodeWrittenHash: string | undefined = undefined;
+    await expect(
+      runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+        injectDriftedOnWrittenContent: (defaultContent) => {
+          observedOpenCodeWrittenHash = hashContent(defaultContent);
+          return driftBytes;
+        },
+      }),
+    ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
+
+    // The hook captured the actual content that applyOpenCodeConfig wrote
+    // (synchronously, before the drift throw fired). This proves the onWritten
+    // callback reached the recording line BEFORE the throw, which is the
+    // contract the fix establishes: `openCodeWrittenHash` is set on the
+    // captured bytes so the rollback path can identify the on-disk hash.
+    expect(observedOpenCodeWrittenHash, "hook observed applyOpenCodeConfig bytes").toMatch(/^[a-f0-9]{64}$/);
+    // Confirm the apply step actually wrote (the on-disk content after the
+    // throw equals what `applyOpenCodeConfig` would have written for the
+    // original config; the rollback later restores the preimage, so this
+    // assertion runs BEFORE we sample the rolled-back state).
+    // We assert non-empty + the hook recorded a distinct hash from the
+    // preimage so the recording is non-trivial.
+    expect(observedOpenCodeWrittenHash).not.toBe(hashContent(beforeOpenCodeBytes));
+
+    // The rollback identity matched: the on-disk OpenCode config is the
+    // preimage byte-for-byte (since `openCodeWrittenHash` was set BEFORE
+    // the throw, the hash-gated rollback can identify and restore).
+    expect(Buffer.compare(await readFile(openCodePath), beforeOpenCodeBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfigBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+
+    it("rejects no-op schema failure as UPDATE_DOCTOR_FAILED and preserves every owned byte/receipt", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, () => undefined);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCodeBytes = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    // threshold=0 → first debug call against this fake fails immediately.
+    await installStatefulFakeForDoctorFailure(0);
+    try {
+      await expect(
+        updateFromConfig(repository.root, candidatePath),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED", message: "Poiesis update --config did not pass doctor" });
+    } finally {
+      env?.restore();
+      env = await installFakeOpenCode();
+    }
+
+    // Exact zero-byte preservation of every owned file and the receipt.
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfigBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, "opencode.jsonc")), beforeOpenCodeBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+  // -- Ticket #37 correction 3: UTF-8 non-round-tripping rejection.
+  //    The OpenCode config is captured ONCE at step 5. If the on-disk
+  //    bytes do not round-trip through `Buffer.from(content, "utf8")`,
+  //    the transaction throws INSTALL_PATH_CONFLICT before any patch
+  //    ownership check, helper call, no-op detection, or write. The
+  //    rejection must preserve every owned byte and the receipt.
+  it("rejects non-round-tripping UTF-8 in the OpenCode config before any write", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeBytes = await readFile(openCodePath);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    // Replace the OpenCode config bytes with ones that are NOT valid
+    // UTF-8 round-trip. The byte 0xff alone is invalid UTF-8 and any
+    // valid-enough prefix followed by 0xff will not survive a
+    // Buffer.from(s, "utf8") round trip.
+    const foreignBytes = Buffer.concat([beforeBytes, Buffer.from([0xff, 0xfe])]);
+    await writeFile(openCodePath, foreignBytes);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+
+    await expect(
+      updateFromConfig(repository.root, candidatePath),
+    ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT", message: expect.stringMatching(/UTF-8/) });
+
+    // The foreign bytes must remain intact (no rollback because we
+    // never wrote anything).
+    expect(Buffer.compare(await readFile(openCodePath), foreignBytes)).toBe(0);
+    // Every other owned byte must remain at its preimage (no writes).
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfigBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+  // -- OpenCode config whose on-disk values no longer agree with the
+  //    recorded manifest patches fails `CONFIG_OWNERSHIP_LOST` before
+  //    any mutating step. The single captured snapshot feeds the
+  //    `assertOpenCodeOwnershipAgainstSnapshot` helper that compares
+  //    every `recorded.patch.installed` against the parsed preimage's
+  //    value at the same `path`; if any recorded claim is missing or
+  //    differs from the parsed form, the helper raises
+  //    `CONFIG_OWNERSHIP_LOST`. The helper is the single source of
+  //    truth here: it operates on the captured parsed form, so a
+  //    foreign writer that lands in the same parse step (or any
+  //    later apply-step read) does not change this assertion.
+  it("rejects when the OpenCode config disagrees with the recorded patches", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeBytes = await readFile(openCodePath);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    // Install a `preReadOpencode` hook that, after the step 5 snapshot
+    // reads the OpenCode config, replaces it with foreign bytes that DO
+    // NOT contain the recorded patch `installed` values (so the
+    // ownership verification at step 5a will throw CONFIG_OWNERSHIP_LOST).
+    // Since step 5 reads BEFORE the hook fires, the parsed snapshot at
+    // step 5 still holds the preimage bytes. The foreign bytes arrive in
+    // step 5a's `currentOpenCodeJson` only because step 5 uses the
+    // stale snapshot — but the ownership check operates on the parsed
+    // form returned by step 5 (not on freshly read bytes), so a foreign
+    // byte replacement DURING step 5's parse-window is OUTSIDE this
+    //    test's reach. Instead, this test exercises a different angle:
+    //    we manually replace the file BEFORE updateFromConfig runs and
+    //    expect the ownership check to fail because the parsed
+    //    preimage (captured at step 5) shows a different shape than
+    //    what the recorded patches claim to own.
+    const foreignBytes = Buffer.from(
+      JSON.stringify(
+        {
+          $schema: "https://opencode.ai/config.json",
+          foreign_marker: true,
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf8",
+    );
+    await writeFile(openCodePath, foreignBytes);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+
+    // The transaction must fail closed because the recorded config
+    // patches claim values at e.g. `["agent", "poiesis", ...]` that do
+    //    not exist in the foreign file — `assertOpenCodeOwnershipAgainstSnapshot`
+    //    raises `CONFIG_OWNERSHIP_LOST`.
+    await expect(
+      updateFromConfig(repository.root, candidatePath),
+    ).rejects.toMatchObject({ code: "CONFIG_OWNERSHIP_LOST" });
+
+    // The foreign bytes must remain intact (no writes ever happened).
+    expect(Buffer.compare(await readFile(openCodePath), foreignBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfigBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
 
 });

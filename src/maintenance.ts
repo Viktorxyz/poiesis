@@ -441,6 +441,7 @@ export async function validateOpenCodeConfigPayload(content: string): Promise<vo
   }
 }
 
+
 export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
   if (config.tracker.provider === "github") {

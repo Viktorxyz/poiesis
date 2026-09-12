@@ -328,6 +328,26 @@ export async function applyOpenCodeConfig(
     currentContent: content,
     patches: desiredOpenCodePatches(config),
   });
+  // Strengthened apply: re-read the on-disk bytes immediately before the
+  // atomicWrite and compare against `options.expectedContent`. This is a TOCTOU
+  // pre-write byte equality check — POSIX does not offer a portable file-CAS
+  // primitive across filesystems (e.g. network mounts may silently rewrite),
+  // so this guard is explicitly NOT called a compare-and-swap. A mismatch
+  // here is the same kind of foreign-writer race the original
+  // `expectedContent.equals(...)` check at the head of this function detects;
+  // adding a second sample at the moment of the write raises the probability
+  // of catching a foreign writer that slipped in between the head check and
+  // the write without changing the caller's contract.
+  if (present && options.expectedContent !== undefined && options.expectedContent !== null) {
+    const rereadBeforeWrite = await readFile(configPath);
+    if (!rereadBeforeWrite.equals(options.expectedContent)) {
+      throw new PoiesisError(
+        "INSTALL_PATH_CONFLICT",
+        "OpenCode config changed between expected-content check and atomic write",
+        { path: relative(root, configPath) },
+      );
+    }
+  }
   if (present) await atomicWrite(configPath, serialized);
   else await atomicCreate(configPath, serialized);
   options.onWritten?.(serialized);

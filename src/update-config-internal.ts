@@ -4,8 +4,8 @@
  * This file is the SINGLE implementation of the authenticated
  * `poiesis update --config <file>` transaction. It accepts a `hooks`
  * parameter so the test suite can drive deterministic failure cases
- * (rollback, foreign-write preservation) without monkey-patching
- * internal modules.
+ * (rollback, foreign-write preservation, drift detection) without
+ * monkey-patching internal modules.
  *
  * The function is NOT re-exported via the package's public
  * `dist/index.d.ts` surface: it lives in a module that `src/index.ts`
@@ -41,9 +41,10 @@ import {
   SUPPORTED_OPENCODE_VERSIONS,
   verifyOpenCodeVersion,
 } from "./opencode.js";
-import { projectOpenCodePayload } from "./opencode-preflight.js";
+import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
 import { poiesisPath } from "./paths.js";
 import { createDeliveryAdapter } from "./adapters.js";
+import type { ConfigPatch } from "./manifest.js";
 import type { DoctorReport, UpdateResult } from "./maintenance.js";
 // Maintenance helpers are accessed via delayed dynamic import inside
 // `runUpdateConfigTransaction` to avoid a top-level runtime circular
@@ -99,7 +100,7 @@ export interface UpdateTransactionHooks {
    * the byte-hash match short-circuit AND before the extracted
    * `assertUpdateConfigDoctorGate` helper runs. This seam exists for
    * tests that need to deterministically make the no-op doctor
-   * unhealthy (e.g. by toggling the `POIESIS_TEST_OPENCODE_FAIL`
+   * unhealthy (e.g. by toggling a `POIESIS_TEST_OPENCODE_FAIL`
    * environment variable that the fake `opencode debug config` script
    * honours) so the helper can prove it throws `UPDATE_DOCTOR_FAILED`
    * in the no-op path without ever mutating any owned byte, mirroring
@@ -108,6 +109,16 @@ export interface UpdateTransactionHooks {
    * and intentionally NOT re-exported via `dist/index.d.ts`.
    */
   preNoopDoctor?: () => void | Promise<void>;
+  /**
+   * @internal test seam ONLY. Forces the OpenCode `onWritten` callback
+   * to receive a different content than `preflightSerialized`, simulating
+   * projection drift after preflight. Used by the rollback-identity
+   * regression test to exercise the drift throw path deterministically.
+   * Production callers leave this unset; the seam is internal to
+   * `UpdateTransactionHooks` and intentionally NOT re-exported via
+   * `dist/index.d.ts`.
+   */
+  injectDriftedOnWrittenContent?: (defaultContent: string) => string;
 }
 
 /**
@@ -174,14 +185,14 @@ async function assertPoiesisConfigOwnership(root: string, manifest: Manifest): P
   return { content, record };
 }
 
-async function identifyManagedOpenCodeConfig(manifest: Manifest): Promise<string> {
+async function identifyManagedOpenCodeConfig(manifest: Manifest): Promise<{ relativePath: string; configPatches: ConfigPatch[] }> {
   const files = [...new Set(manifest.configPatches.map((patch) => patch.file))];
   if (files.length !== 1) {
     throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
       files,
     });
   }
-  return files[0]!;
+  return { relativePath: files[0]!, configPatches: manifest.configPatches };
 }
 
 /**
@@ -217,6 +228,31 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
  * change production behavior when omitted (each hook is short-circuited via
  * optional chaining and the real `atomicWrite` / `applyOpenCodeConfig` /
  * `replaceOwnershipReceipt` paths run).
+ *
+ * Step layout:
+ *   1. parse + validate + assertResolvedConfig       (no I/O writes)
+ *   2. ownership / auth / git / opencode-version      (no I/O writes)
+ *   3. auto-discover defaults                         (no I/O writes)
+ *   4. env validation: git / models / tracker / ...  (no I/O writes)
+ *   5. snapshot all bytes we will compare against     (read; no writes)
+ *   6. pure preflight projection (projectOpenCodePayload) — pure, no debug call
+ *   7. no-op detection + doctor gate (no writes until doctor passes)
+ *   8. validateOpenCodeConfigPayload(preflightSerialized) — first debug call
+ *      against the same fixture/threshold state used by `doctor()`; rejection
+ *      surfaces as `UPDATE_DOCTOR_FAILED` (the same code doctor gate throws)
+ *   9. snapshot manifest preimage (read; used by fail-closed rollback below)
+ *   10. atomicWrite(.poiesis/config.jsonc)
+ *   11. applyOpenCodeConfig (writes opencode.jsonc, calls onWritten bytes)
+ *   12. compute next manifest, atomicWrite(manifest.json)
+ *   13. replaceOwnershipReceipt
+ *   14. doctor gate (final) → UPDATE_DOCTOR_FAILED on fail, else return result
+ *
+ * Step 8 is the new preflight schema call placed AFTER the no-op doctor
+ * branch and BEFORE any mutating snapshot/write, per ticket #37 correction 2.
+ * The no-op path deliberately relies on `doctor()` to detect the schema
+ * failure (which yields the same `UPDATE_DOCTOR_FAILED` code via the
+ * `assertUpdateConfigDoctorGate` predicate below). Both paths therefore
+ * converge on `UPDATE_DOCTOR_FAILED` for production callers.
  */
 export async function runUpdateConfigTransaction(
   root: string,
@@ -229,7 +265,6 @@ export async function runUpdateConfigTransaction(
   // into `maintenance.ts`. Types only (`UpdateResult`) are imported
   // statically and erased at compile time.
   const {
-    assertConfigPatchesOwned,
     assertResolvedConfig,
     autoResolveConfigDefaults,
     doctor,
@@ -268,17 +303,13 @@ export async function runUpdateConfigTransaction(
   const { content: currentConfigBytes, record: currentConfigRecord } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot);
   await verifyOpenCodeVersion(resolvedRoot);
-  const openCodeRelativePath = await identifyManagedOpenCodeConfig(manifest);
+  const { relativePath: openCodeRelativePath, configPatches: openCodeConfigPatches } = await identifyManagedOpenCodeConfig(manifest);
   const openCodeConfigPath = join(resolvedRoot, openCodeRelativePath);
   if (!(await exists(openCodeConfigPath)) || !(await isRegularFileNoFollow(openCodeConfigPath))) {
     throw new PoiesisError("CONFIG_OWNERSHIP_LOST", "Managed OpenCode config is missing or not a regular file", {
       file: openCodeRelativePath,
     });
   }
-  // Verify each recorded patch is owned by checking its installed value on disk BEFORE writing.
-  // `assertConfigPatchesOwned` also detects foreign tampering of the OpenCode config (unsafe/foreign
-  // collisions are caught via `CONFIG_OWNERSHIP_LOST`).
-  await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
 
   // 3. Auto-discover default fields on the proposed config (without writing) so we
   //    can resolve fully. The returned `ResolvedPoiesisConfig` carries the
@@ -312,27 +343,50 @@ export async function runUpdateConfigTransaction(
   await verifyTracker(resolvedRoot, resolvedConfigWithDefaults);
   verifyDeliveryConfiguration(resolvedRoot, resolvedConfigWithDefaults);
 
-  // 5. Snapshot everything we are about to mutate.
+  // 5. Snapshot everything we are about to mutate. The OpenCode config bytes
+  //    are read ONCE here; the parsed form is reused for (a) manifest patch
+  //    ownership validation below, (b) the pure preflight projection, and
+  //    (c) the apply step's `expectedContent` byte identity. This eliminates
+  //    the disk re-read that `assertConfigPatchesOwned` previously performed
+  //    for the OpenCode config. We also reject non-round-tripping UTF-8 so
+  //    the helper's parse-once contract holds at every downstream step.
   const newConfigContent = serializeConfig(resolvedConfigWithDefaults);
   const newConfigHash = hashContent(newConfigContent);
   const openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
+  if (!Buffer.from(openCodeConfigCurrentBytes.toString("utf8"), "utf8").equals(openCodeConfigCurrentBytes)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not valid UTF-8", {
+      file: openCodeRelativePath,
+    });
+  }
   const currentOpenCodeContentString = openCodeConfigCurrentBytes.toString("utf8");
   const currentOpenCodeContentHash = hashContent(openCodeConfigCurrentBytes);
   const currentOpenCodeJson = parseJsonc<JsonObject>(currentOpenCodeContentString, openCodeConfigPath);
   const openCodeManifestRecord = manifest.files.find((file) => file.path === openCodeRelativePath);
 
-  // 5a. PREFLIGHT OpenCode projection against the OpenCode schema. The pure
-  //    projection helper is called with the SAME current snapshot and the
-  //    SAME desired patches the apply step (below) will use, so the
-  //    resulting serialized bytes are deterministic. The bytes are validated
-  //    in a temp directory via the maintenance helper imported above. The
-  //    preflight fails closed BEFORE any owned byte is mutated; schema
-  //    rejection here surfaces the same `OPENCODE_*` error the doctor gate
-  //    would later raise, raised earlier. The captured `preflightSerialized`
-  //    bytes are used below to assert the apply path's `onWritten` callback
-  //    matches byte-for-byte before the manifest write, which guarantees the
-  //    projection is deterministic and a concurrent foreign write cannot
-  //    sneak a different snapshot in between preflight and apply.
+  // 5a. Validate every recorded config patch for the OpenCode config against
+  //     the SINGLE parsed snapshot captured in step 5. Replaces the disk
+  //     re-read that the maintenance helper `assertConfigPatchesOwned`
+  //     previously performed for the OpenCode config path. Throws
+  //     `CONFIG_OWNERSHIP_LOST` on first mismatch — before any helper call,
+  //     any no-op branch, and any schema validation. Production callers will
+  //     only ever need this check when a malicious or out-of-band writer has
+  //     tampered with the OpenCode config between the last receipt and the
+  //     current transaction.
+  assertOpenCodeOwnershipAgainstSnapshot({
+    root: resolvedRoot,
+    configPath: openCodeConfigPath,
+    parsedSnapshot: currentOpenCodeJson,
+    patches: openCodeConfigPatches,
+  });
+
+  // 6. Pure preflight projection. The pure helper runs once here with the
+  //    current snapshot and the resolved `desiredOpenCodePatches`; the apply
+  //    step (step 10) calls the SAME helper with the SAME inputs, so the
+  //    `serialized` returned here equals what `applyOpenCodeConfig` will
+  //    attempt to atomicWrite. No filesystem work happens here — this is a
+  //    pure function call. Specifically: NO `opencode debug config`
+  //    invocation at this step (the pure projection does not need a debug
+  //    probe). The schema validation is moved to step 8 below.
   const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults);
   const { serialized: preflightSerialized } = projectOpenCodePayload({
     root: resolvedRoot,
@@ -340,9 +394,8 @@ export async function runUpdateConfigTransaction(
     currentContent: currentOpenCodeContentString,
     patches: desiredOpenCodeProjectionPatches,
   });
-  await validateOpenCodeConfigPayload(preflightSerialized);
 
-  // 6. No-op detection: comparing BYTE hashes of every state the transaction
+  // 7. No-op detection: comparing BYTE hashes of every state the transaction
   //    would touch is sufficient — when the Poiesis config bytes AND the OpenCode
   //    config bytes match their recorded manifest hashes, the proposed transaction
   //    cannot observably change anything. Do NOT advance generation; return the
@@ -358,15 +411,39 @@ export async function runUpdateConfigTransaction(
     // doctor-failure environment variable) and prove the extracted
     // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
     // owned byte. Production callers leave the seam unset, so it is a
-    // no-op and doctor runs exactly as before.
+    // no-op and doctor runs exactly as before. Note: in this branch, the
+    // `opencode-schema` check happens through `doctor()` → which calls the
+    // same `validateOpenCodeConfig` (debug config), so the no-op path and
+    // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
+    // on schema rejection.
     await hooks?.preNoopDoctor?.();
     const report = await doctor(resolvedRoot);
     assertUpdateConfigDoctorGate(report, manifest);
     return { manifest, doctor: report };
   }
 
-  // 7. Snapshot everything we are about to mutate further (manifest bytes
-  //    for the fail-closed rollback below).
+  // 8. Validate the projected (post-write) OpenCode config payload against the
+  //    OpenCode schema. Runs an `opencode debug config` invocation against a
+  //    temp directory that contains exactly the preflight's serialized bytes
+  //    (deterministic for the current input), via the maintenance helper
+  //    `validateOpenCodeConfigPayload` directly with its pre-#37 error
+  //    semantics. This is the FIRST debug call the transaction makes after
+  //    `init`'s validateOpenCodeConfigPayload; the threshold-counter stateful
+  //    fake uses this ordering to delay the failure beyond `init` (`init`
+  //    consumes call #1; this step consumes call #2; doctor gate consumes
+  //    call #3). The call is unconditional for non-no-op candidates — the
+  //    no-op branch above already returned. The no-op branch is the only
+  //    path that surfaces OpenCode schema failures as `UPDATE_DOCTOR_FAILED`
+  //    (via doctor gate); the mutating preflight here preserves
+  //    `validateOpenCodeConfigPayload`'s preexisting error code on rejection.
+  await validateOpenCodeConfigPayload(preflightSerialized);
+
+  // 9. Snapshot the manifest preimage for fail-closed rollback. Reading the
+  //    manifest is the last read-only step; everything from step 10 onward
+  //    mutates owned bytes. The snapshot read happens AFTER the schema
+  //    validation so the rollback target is never captured for a transaction
+  //    that fails before the first write (nothing has changed yet, so a
+  //    rollback preimage would be unnecessary).
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const manifestBackup = await readFile(manifestPath);
   let openCodeWrittenHash: string | undefined;
@@ -375,7 +452,7 @@ export async function runUpdateConfigTransaction(
   let nextReceipt: OwnershipReceipt | undefined;
 
   try {
-    // 8. Write the new Poiesis config atomically.
+    // 10. Write the new Poiesis config atomically.
     await hooks?.prePoiesisConfigWrite?.();
     await atomicWrite(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH), newConfigContent);
     poiesisConfigWrittenHash = await hashFile(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH));
@@ -387,31 +464,48 @@ export async function runUpdateConfigTransaction(
       });
     }
 
-    // 9. Apply the new OpenCode projection. We pass `requireAvailable: false` because
-    //    (a) every recorded patch is already asserted owned above via
-    //    `assertConfigPatchesOwned`, and (b) the desired patches only ever ADD or
-    //    REPLACE values that the manifest already proves we own. Passing
-    //    `requireAvailable: true` would re-run the reservation check used by
-    //    `init()` and incorrectly refuse the update whenever the OpenCode config
-    //    already contains a desired path. Concurrent writers between our
-    //    snapshot and the atomic write are caught via the
-    //    `expectedContent` snapshot that `applyOpenCodeConfig` enforces. The
-    //    projection uses the resolved config so discovered defaults are
-    //    reflected in the merged patches and the next manifest entry. The
-    //    `onWritten` callback asserts BYTE equality with the preflight
-    //    serialized bytes captured in step 5a; any drift here means the apply
-    //    path observed a different snapshot than the preflight, which is an
-    //    invariant violation that rejects before manifest write.
+    // 11. Apply the new OpenCode projection. `applyOpenCodeConfig` internally
+    //    (a) reads the file, (b) checks expectedContent byte-identity, (c)
+    //    re-reads the file immediately before `atomicWrite` (the strengthened
+    //    TOCTOU guard inside `applyOpenCodeConfig`), and (d) calls
+    //    `onWritten(content)` after the atomic write. We pass
+    //    `expectedContent: openCodeConfigCurrentBytes` so any concurrent
+    //    foreign write that landed between step 5 and step 11 is caught by
+    //    BOTH the head-of-function check and the pre-write TOCTOU check. The
+    //    `onWritten` callback's projection-drift equality check uses the
+    //    preflight's serialized bytes as the expected value (drift is
+    //    impossible under the current pure helper, but the check is
+    //    defensive — see step 11b below). The `onWritten` callback records
+    //    `openCodeWrittenHash` BEFORE the equality check so the rollback
+    //    path retains rollback identity even when the drift throw occurs
+    //    (the bytes were deterministically written, so they are still safe
+    //    to identify for restoration).
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
       expectedContent: openCodeConfigCurrentBytes,
       onWritten: (content) => {
-        if (content !== preflightSerialized) {
-          throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config projection drifted between preflight and apply", {
-            file: openCodeRelativePath,
-          });
-        }
+        // 11b. Drift handling. Assign `openCodeWrittenHash` FIRST so that
+        //      even when the throw below fires, `openCodeWrittenHash`
+        //      captures the exact bytes applyOpenCodeConfig wrote; the
+        //      rollback path can therefore identify the on-disk hash and
+        //      restore the preimage byte-for-byte. Note that drift between
+        //      preflight and apply is impossible today (both paths call
+        //      the same pure helper with the same inputs) — the equality
+        //      check is a defensive guard that retains rollback identity
+        //      even if a future refactor introduces non-determinism.
+        //      The `injectDriftedOnWrittenContent` hook is an internal
+        //      test seam that lets the drift-regression test force this
+        //      branch deterministically without monkey-patching.
+        const driftOverride = hooks?.injectDriftedOnWrittenContent?.(content);
         openCodeWrittenHash = hashContent(content);
+        const expected = driftOverride ?? preflightSerialized;
+        if (content !== expected) {
+          throw new PoiesisError(
+            "INSTALL_PATH_CONFLICT",
+            "OpenCode config projection drifted between preflight and apply",
+            { file: openCodeRelativePath },
+          );
+        }
       },
     });
     if (openCodeWrittenHash === undefined) {
@@ -426,11 +520,11 @@ export async function runUpdateConfigTransaction(
       });
     }
 
-    // 10. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
+    // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
 
-    // 11. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
+    // 13. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
     //     config hash is taken from the on-disk write; every other file keeps its prior hash.
     const nextManifest: Manifest = {
       schema: 1,
@@ -464,12 +558,12 @@ export async function runUpdateConfigTransaction(
     manifestWrittenHash = nextManifestHash;
     await hooks?.postManifestWrite?.();
 
-    // 12. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
+    // 14. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
     await hooks?.preReceiptReplace?.();
     nextReceipt = await replaceOwnershipReceipt(resolvedRoot, nextManifest, receipt);
     await hooks?.postReceiptReplace?.();
 
-    // 13. Doctor gate: pass or roll back everything. The transaction is config-only
+    // 15. Doctor gate: pass or roll back everything. The transaction is config-only
     //     so skills health is unrelated to the change under transaction; ignore
     //     `skills` check failures that pre-date this transaction by inspecting
     //     whether the manifest had a `skills` array that fully populated defaults.
@@ -477,13 +571,15 @@ export async function runUpdateConfigTransaction(
     assertUpdateConfigDoctorGate(report, manifest);
     return { manifest: nextManifest, doctor: report };
   } catch (error) {
-    // 14. Exact rollback: restore each mutated artifact only if its post-write
+    // 16. Exact rollback: restore each mutated artifact only if its post-write
     //     hash still matches what we wrote, AND restore the EXACT preimage
     //     bytes (no newline normalization, no lossy string conversions). The
     //     preimage is a Buffer; we pass it to `atomicWrite` as raw bytes so
     //     a no-newline preimage restores to a no-newline file. The fail-closed
-    //     hash gate from #26 / #27 still preserves foreign writes that landed
-    //     between our last write and the rollback.
+    //     hash gate from #10/#11 still preserves foreign writes that landed
+    //     between our last write and the rollback. The drift-throw path
+    //     retains rollback identity because `openCodeWrittenHash` is set
+    //     before the equality check throws (see step 11b).
     if ((await exists(openCodeConfigPath)) && openCodeWrittenHash !== undefined && (await hashFile(openCodeConfigPath)) === openCodeWrittenHash) {
       await atomicWrite(openCodeConfigPath, openCodeConfigCurrentBytes);
     }
@@ -510,3 +606,4 @@ export async function runUpdateConfigTransaction(
     throw error;
   }
 }
+
