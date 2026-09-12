@@ -42,7 +42,7 @@ import {
 } from "./opencode.js";
 import { poiesisPath } from "./paths.js";
 import { createDeliveryAdapter } from "./adapters.js";
-import type { UpdateResult } from "./maintenance.js";
+import type { DoctorReport, UpdateResult } from "./maintenance.js";
 // Maintenance helpers are accessed via delayed dynamic import inside
 // `runUpdateConfigTransaction` to avoid a top-level runtime circular
 // import between this module and `maintenance.ts`. Only the types
@@ -92,6 +92,20 @@ export interface UpdateTransactionHooks {
    * manifest to our preimage.
    */
   postManifestWrite?: () => void | Promise<void>;
+  /**
+   * Called immediately BEFORE `doctor()` in the no-op branch — after
+   * the byte-hash match short-circuit AND before the extracted
+   * `assertUpdateConfigDoctorGate` helper runs. This seam exists for
+   * tests that need to deterministically make the no-op doctor
+   * unhealthy (e.g. by toggling the `POIESIS_TEST_OPENCODE_FAIL`
+   * environment variable that the fake `opencode debug config` script
+   * honours) so the helper can prove it throws `UPDATE_DOCTOR_FAILED`
+   * in the no-op path without ever mutating any owned byte, mirroring
+   * the post-mutation fail-closed rollback. Production callers leave
+   * this hook unset; the seam is internal to `UpdateTransactionHooks`
+   * and intentionally NOT re-exported via `dist/index.d.ts`.
+   */
+  preNoopDoctor?: () => void | Promise<void>;
 }
 
 /**
@@ -166,6 +180,26 @@ async function identifyManagedOpenCodeConfig(manifest: Manifest): Promise<string
     });
   }
   return files[0]!;
+}
+
+/**
+ * Doctor gate predicate shared by the no-op branch and the
+ * post-mutation branch of `runUpdateConfigTransaction`. The transaction
+ * is config-only, so `skills` health is unrelated to the change under
+ * transaction; a `skills` check failure is ignored ONLY when the
+ * pre-transaction manifest had a `skills` array of length zero
+ * (i.e. defaults were never populated by an `init` run that included
+ * skills). Every other doctor failure throws `UPDATE_DOCTOR_FAILED`
+ * with the existing message and the full report, regardless of which
+ * branch invoked the helper — so the no-op path now fails closed
+ * identically to the post-mutation path.
+ */
+function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest): void {
+  const skipSkillsGate = manifest.skills.length === 0;
+  const gateFailure = report.checks.find((check) => check.status === "fail" && !(skipSkillsGate && check.id === "skills"));
+  if (gateFailure !== undefined) {
+    throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update --config did not pass doctor", { report });
+  }
 }
 
 /**
@@ -297,7 +331,15 @@ export async function runUpdateConfigTransaction(
       ? false
       : currentOpenCodeContentHash === openCodeManifestRecord.hash;
   if (poiesisConfigBytesMatch && openCodeBytesMatch) {
+    // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
+    // so tests can deterministically fail the gate (e.g. by toggling a
+    // doctor-failure environment variable) and prove the extracted
+    // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
+    // owned byte. Production callers leave the seam unset, so it is a
+    // no-op and doctor runs exactly as before.
+    await hooks?.preNoopDoctor?.();
     const report = await doctor(resolvedRoot);
+    assertUpdateConfigDoctorGate(report, manifest);
     return { manifest, doctor: report };
   }
 
@@ -400,11 +442,7 @@ export async function runUpdateConfigTransaction(
     //     `skills` check failures that pre-date this transaction by inspecting
     //     whether the manifest had a `skills` array that fully populated defaults.
     const report = await doctor(resolvedRoot);
-    const skipSkillsGate = manifest.skills.length === 0;
-    const gateFailure = report.checks.find((check) => check.status === "fail" && !(skipSkillsGate && check.id === "skills"));
-    if (gateFailure !== undefined) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update --config did not pass doctor", { report });
-    }
+    assertUpdateConfigDoctorGate(report, manifest);
     return { manifest: nextManifest, doctor: report };
   } catch (error) {
     // 13. Exact rollback: restore each mutated artifact only if its post-write

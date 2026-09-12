@@ -215,6 +215,109 @@ describe("update --config", () => {
     expect(result.doctor.checks.find((check) => check.id === "receipt")?.status).toBe("pass");
   }, 30_000);
 
+  // -- Ticket #36: the no-op branch of `runUpdateConfigTransaction` must
+  //    exercise the SAME doctor gate predicate the post-mutation branch
+  //    already exercises (extracted as `assertUpdateConfigDoctorGate`).
+  //    Healthy doctor → the no-op result returns the existing manifest
+  //    and the receipt generation/digest stay exactly as before. Unhealthy
+  //    doctor → the no-op path throws `UPDATE_DOCTOR_FAILED` exactly like
+  //    the post-mutation path, without ever mutating any owned byte. The
+  //    test seam (`preNoopDoctor`) is intentionally internal to
+  //    `UpdateTransactionHooks` so production callers see no new surface.
+
+  it("returns the existing manifest unchanged and keeps receipt generation/digest when the no-op branch passes doctor", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, () => undefined);
+    const beforeConfig = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    const result = await runUpdateConfigTransaction(repository.root, candidatePath, {}, {});
+
+    // The no-op branch returns the EXISTING manifest (same bytes as
+    // captured before invocation; identity equality with a fresh load is
+    // not guaranteed by the loader), and the doctor report it returns
+    // comes from `doctor()` — which is healthy after `install()`.
+    const afterManifest = await loadManifest(repository.root);
+    expect(serializeManifest(result.manifest)).toBe(serializeManifest(afterManifest));
+    expect(result.doctor.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
+    expect(result.doctor.checks.find((check) => check.id === "receipt")?.status).toBe("pass");
+    expect(result.doctor.checks.find((check) => check.id === "opencode-schema")?.status).toBe("pass");
+
+    // Exact byte-for-byte preservation of every owned file and the receipt.
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfig)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, "opencode.jsonc")), beforeOpenCode)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+
+    // The receipt generation AND manifestDigest stay at the pre-transaction
+    // baseline — no generation advance, no digest rebind on a no-op.
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+  it("throws UPDATE_DOCTOR_FAILED and preserves every owned byte/receipt when the no-op branch fails doctor", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, () => undefined);
+    const beforeConfig = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeReceiptPath = await ownershipReceiptLocation(repository.root);
+    const beforeReceiptBytes = await readFile(beforeReceiptPath);
+    const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
+
+    // The `preNoopDoctor` seam fires BEFORE `doctor()` runs in the no-op
+    // branch. The test uses it to toggle the fake `opencode debug config`
+    // failure so `doctor()` returns a failing `opencode-schema` check,
+    // mirroring how the post-mutation tests force doctor to fail. The
+    // extracted `assertUpdateConfigDoctorGate` helper must then throw
+    // `UPDATE_DOCTOR_FAILED` with the same message and `report` details
+    // the post-mutation path has always thrown.
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    try {
+      await expect(
+        runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+          // The `preNoopDoctor` seam is the deterministic mechanism that
+          // makes the no-op doctor unhealthy. It fires immediately BEFORE
+          // `doctor()` runs in the no-op branch, so toggling the fake
+          // `opencode debug config` failure flag here guarantees doctor
+          // returns a failing `opencode-schema` check on this invocation.
+          // The extracted `assertUpdateConfigDoctorGate` helper then
+          // throws `UPDATE_DOCTOR_FAILED` with the same message and
+          // `report` details the post-mutation path has always thrown.
+          preNoopDoctor: () => {
+            process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: "UPDATE_DOCTOR_FAILED",
+        message: "Poiesis update --config did not pass doctor",
+      });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // The no-op branch NEVER writes a byte — every owned file and the
+    // receipt must match the pre-transaction baseline byte-for-byte, and
+    // the receipt generation/manifestDigest must stay unchanged.
+    expect(Buffer.compare(await readFile(join(repository.root, CONFIG_ROOT)), beforeConfig)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, "opencode.jsonc")), beforeOpenCode)).toBe(0);
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(Buffer.compare(await readFile(beforeReceiptPath), beforeReceiptBytes)).toBe(0);
+    const afterReceiptParsed = await readOwnershipReceipt(repository.root);
+    expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
+    expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
   it("rejects a config with an invalid tracker provider", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
