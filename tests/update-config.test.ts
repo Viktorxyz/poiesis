@@ -1,4 +1,5 @@
-import { readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -149,6 +150,19 @@ describe("update --config", () => {
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
+  // -- Helper: re-install the fake `opencode debug config` to fail AFTER a
+  //    fixed call threshold. Used by tests that need the preflight schema
+  //    call to succeed (count #2 — init consumed #1 during `install()`)
+  //    and the doctor gate schema call (count #3) to fail. A new temp
+  //    counter file is allocated per test so successive tests do not share
+  //    call-count state.
+  async function installStatefulFakeForDoctorFailure(threshold: number): Promise<void> {
+    const counterDir = await mkdtemp(join(tmpdir(), "poiesis-doctor-counter-"));
+    const counterFile = join(counterDir, "count");
+    env?.restore();
+    env = await installFakeOpenCode({ failAfterDebugCalls: { file: counterFile, threshold } });
+  }
+
   it("updates config and OpenCode projection with a single generation advance", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
@@ -281,18 +295,19 @@ describe("update --config", () => {
     // extracted `assertUpdateConfigDoctorGate` helper must then throw
     // `UPDATE_DOCTOR_FAILED` with the same message and `report` details
     // the post-mutation path has always thrown.
+    // The `preNoopDoctor` seam fires BEFORE `doctor()` runs in the no-op
+    // branch and toggles the fake `opencode debug config` failure so
+    // doctor returns a failing `opencode-schema` check, mirroring how the
+    // post-mutation tests force doctor to fail. The extracted
+    // `assertUpdateConfigDoctorGate` helper then throws
+    // `UPDATE_DOCTOR_FAILED` with the same message and `report` details
+    // the post-mutation path has always thrown. The finally block
+    // restores the default healthy fake so subsequent tests get a fresh
+    // state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     try {
       await expect(
         runUpdateConfigTransaction(repository.root, candidatePath, {}, {
-          // The `preNoopDoctor` seam is the deterministic mechanism that
-          // makes the no-op doctor unhealthy. It fires immediately BEFORE
-          // `doctor()` runs in the no-op branch, so toggling the fake
-          // `opencode debug config` failure flag here guarantees doctor
-          // returns a failing `opencode-schema` check on this invocation.
-          // The extracted `assertUpdateConfigDoctorGate` helper then
-          // throws `UPDATE_DOCTOR_FAILED` with the same message and
-          // `report` details the post-mutation path has always thrown.
           preNoopDoctor: () => {
             process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
           },
@@ -304,6 +319,8 @@ describe("update --config", () => {
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     // The no-op branch NEVER writes a byte — every owned file and the
@@ -786,13 +803,19 @@ describe("update --config", () => {
     const beforeBytes = await snapshotOwnedBytes(repository);
     // Force the doctor gate to fail AFTER all writes complete by flipping the fake
     // opencode `debug config` exit to non-zero.
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
     const afterBytes = await snapshotOwnedBytes(repository);
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
@@ -820,13 +843,19 @@ describe("update --config", () => {
     const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
     const beforeBytes = await snapshotOwnedBytes(repository);
 
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     // Every owned byte, including the receipts generation and digest,
@@ -889,13 +918,19 @@ describe("update --config", () => {
     const beforeReceiptBytes = await readFile(beforeReceiptPath);
     const beforeReceiptParsed = await readOwnershipReceipt(repository.root);
 
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     // The rollback must restore the EXACT preimage bytes (no newline
@@ -944,8 +979,12 @@ describe("update --config", () => {
       )}\n`,
     );
 
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(
         runUpdateConfigTransaction(repository.root, candidatePath, {}, {
@@ -961,6 +1000,8 @@ describe("update --config", () => {
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     expect(Buffer.compare(await readFile(manifestPath), foreignManifestBytes)).toBe(0);
@@ -1002,8 +1043,12 @@ describe("update --config", () => {
       )}\n`,
     );
 
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(
         runUpdateConfigTransaction(repository.root, candidatePath, {}, {
@@ -1022,6 +1067,8 @@ describe("update --config", () => {
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     // Foreign manifest bytes survive: the rollback path did not see the
@@ -1051,8 +1098,12 @@ describe("update --config", () => {
     const foreignReceiptBytes = Buffer.from(
       `{"schema":1,"commonDir":"/dev/null","workspace":"/dev/null","installationId":"foreign","manifestDigest":"deadbeef","generation":9999}\n`);
 
+    // Re-install the fake `opencode debug config` with a fail-after threshold so
+    // the preflight schema call (count #2 — init already consumed #1) passes
+    // and the doctor gate schema call (count #3) fails. After the assertion,
+    // restore the default healthy fake so subsequent tests get a fresh state.
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
-    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    await installStatefulFakeForDoctorFailure(1);
     try {
       await expect(
         runUpdateConfigTransaction(repository.root, candidatePath, {}, {
@@ -1068,6 +1119,8 @@ describe("update --config", () => {
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+      env?.restore();
+      env = await installFakeOpenCode();
     }
 
     expect(Buffer.compare(await readFile(receiptPath), foreignReceiptBytes)).toBe(0);
@@ -1242,4 +1295,47 @@ describe("update --config", () => {
     const afterBytes = await snapshotOwnedBytes(repository);
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
   }, 30_000);
+  // -- Ticket #37: the preflight OpenCode schema validation must run before
+  //    any owned byte is mutated. When the fake `opencode debug config`
+  //    rejects the projected payload, the transaction fails closed with
+  //    ZERO writes to the Poiesis config, the OpenCode config, the manifest,
+  //    or the ownership receipt, and ZERO generation advance. The flag
+  //    toggle happens AFTER `install()` so init's own schema validation
+  //    pass-through still succeeds; the preflight is the next `opencode
+  //    debug config` call the transaction makes.
+  it("rejects preflight OpenCode schema validation before any write when fake opencode rejects the projected payload", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const beforeBytes = await snapshotOwnedBytes(repository);
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      // The preflight schema call is the first `opencode debug config`
+      // invocation after `install()`. Toggling the rejection flag at
+      // this point catches ONLY the preflight; init's earlier
+      // validateOpenCodeConfigPayload already passed (call #1 under
+      // failAfterDebugCalls counting).
+      await expect(updateFromConfig(repository.root, candidatePath)).rejects.toThrow();
+    } finally {
+      env?.restore();
+      env = await installFakeOpenCode();
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes);
+
+    // Belt-and-braces: explicitly assert no receipt generation advance.
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+  }, 30_000);
+
 });

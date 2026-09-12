@@ -6,6 +6,7 @@ import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { parseJsonc, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import type { ConfigPatch } from "./manifest.js";
+import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { run } from "./process.js";
 
 export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
@@ -315,29 +316,22 @@ export async function applyOpenCodeConfig(
     });
   }
   if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config);
-  const original = parseJsonc<JsonObject>(content, configPath);
-  const patches: ConfigPatch[] = [];
-  for (const desired of desiredOpenCodePatches(config)) {
-    const previous = getAtPath(original, desired.path);
-    patches.push({
-      file: relative(root, configPath),
-      path: desired.path,
-      previousExists: previous.exists,
-      ...(previous.exists ? { previous: previous.value } : {}),
-      installed: desired.value,
-    });
-    content = applyEdits(
-      content,
-      modify(content, desired.path, desired.value, {
-        formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" },
-      }),
-    );
-  }
-  const serialized = content.endsWith("\n") ? content : `${content}\n`;
+  // The pure projection loop (parse original → for each desired patch compute
+  // provenance + apply jsonc edits → emit serialized payload) is delegated to
+  // `projectOpenCodePayload` so the transaction-time preflight in
+  // `runUpdateConfigTransaction` can compute the EXACT same payload
+  // deterministically before any owned byte is mutated. The returned
+  // `configPatches` are byte-for-byte identical to the previous inline loop.
+  const { serialized, configPatches } = projectOpenCodePayload({
+    root,
+    configPath,
+    currentContent: content,
+    patches: desiredOpenCodePatches(config),
+  });
   if (present) await atomicWrite(configPath, serialized);
   else await atomicCreate(configPath, serialized);
   options.onWritten?.(serialized);
-  return patches;
+  return configPatches;
 }
 
 export async function reverseOpenCodeConfig(root: string, patches: ConfigPatch[]): Promise<string[]> {

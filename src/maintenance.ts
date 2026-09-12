@@ -431,7 +431,7 @@ async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise
   }
 }
 
-async function validateOpenCodeConfigPayload(content: string): Promise<void> {
+export async function validateOpenCodeConfigPayload(content: string): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "poiesis-opencode-config-check-"));
   try {
     await atomicCreate(join(directory, "opencode.jsonc"), content);

@@ -35,11 +35,13 @@ import {
 import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
 import {
   applyOpenCodeConfig,
+  desiredOpenCodePatches,
   OPENCODE_ADAPTER_VERSION,
   SUPPORTED_OPENCODE_VERSION,
   SUPPORTED_OPENCODE_VERSIONS,
   verifyOpenCodeVersion,
 } from "./opencode.js";
+import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { poiesisPath } from "./paths.js";
 import { createDeliveryAdapter } from "./adapters.js";
 import type { DoctorReport, UpdateResult } from "./maintenance.js";
@@ -233,6 +235,7 @@ export async function runUpdateConfigTransaction(
     doctor,
     isRegularManagedFile,
     packageVersion,
+    validateOpenCodeConfigPayload,
     verifyDeliveryConfiguration,
     verifyGitRepository,
     verifyModels,
@@ -309,9 +312,7 @@ export async function runUpdateConfigTransaction(
   await verifyTracker(resolvedRoot, resolvedConfigWithDefaults);
   verifyDeliveryConfiguration(resolvedRoot, resolvedConfigWithDefaults);
 
-  // 5. Compute the new content + patch projection in memory for the no-op check,
-  //    using the resolved config so discovered defaults are reflected in the
-  //    serialized bytes and the OpenCode projection.
+  // 5. Snapshot everything we are about to mutate.
   const newConfigContent = serializeConfig(resolvedConfigWithDefaults);
   const newConfigHash = hashContent(newConfigContent);
   const openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
@@ -320,7 +321,28 @@ export async function runUpdateConfigTransaction(
   const currentOpenCodeJson = parseJsonc<JsonObject>(currentOpenCodeContentString, openCodeConfigPath);
   const openCodeManifestRecord = manifest.files.find((file) => file.path === openCodeRelativePath);
 
-  // 5. No-op detection: comparing BYTE hashes of every state the transaction
+  // 5a. PREFLIGHT OpenCode projection against the OpenCode schema. The pure
+  //    projection helper is called with the SAME current snapshot and the
+  //    SAME desired patches the apply step (below) will use, so the
+  //    resulting serialized bytes are deterministic. The bytes are validated
+  //    in a temp directory via the maintenance helper imported above. The
+  //    preflight fails closed BEFORE any owned byte is mutated; schema
+  //    rejection here surfaces the same `OPENCODE_*` error the doctor gate
+  //    would later raise, raised earlier. The captured `preflightSerialized`
+  //    bytes are used below to assert the apply path's `onWritten` callback
+  //    matches byte-for-byte before the manifest write, which guarantees the
+  //    projection is deterministic and a concurrent foreign write cannot
+  //    sneak a different snapshot in between preflight and apply.
+  const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults);
+  const { serialized: preflightSerialized } = projectOpenCodePayload({
+    root: resolvedRoot,
+    configPath: openCodeConfigPath,
+    currentContent: currentOpenCodeContentString,
+    patches: desiredOpenCodeProjectionPatches,
+  });
+  await validateOpenCodeConfigPayload(preflightSerialized);
+
+  // 6. No-op detection: comparing BYTE hashes of every state the transaction
   //    would touch is sufficient — when the Poiesis config bytes AND the OpenCode
   //    config bytes match their recorded manifest hashes, the proposed transaction
   //    cannot observably change anything. Do NOT advance generation; return the
@@ -343,7 +365,8 @@ export async function runUpdateConfigTransaction(
     return { manifest, doctor: report };
   }
 
-  // 6. Snapshot everything we are about to mutate.
+  // 7. Snapshot everything we are about to mutate further (manifest bytes
+  //    for the fail-closed rollback below).
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const manifestBackup = await readFile(manifestPath);
   let openCodeWrittenHash: string | undefined;
@@ -352,7 +375,7 @@ export async function runUpdateConfigTransaction(
   let nextReceipt: OwnershipReceipt | undefined;
 
   try {
-    // 7. Write the new Poiesis config atomically.
+    // 8. Write the new Poiesis config atomically.
     await hooks?.prePoiesisConfigWrite?.();
     await atomicWrite(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH), newConfigContent);
     poiesisConfigWrittenHash = await hashFile(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH));
@@ -364,7 +387,7 @@ export async function runUpdateConfigTransaction(
       });
     }
 
-    // 8. Apply the new OpenCode projection. We pass `requireAvailable: false` because
+    // 9. Apply the new OpenCode projection. We pass `requireAvailable: false` because
     //    (a) every recorded patch is already asserted owned above via
     //    `assertConfigPatchesOwned`, and (b) the desired patches only ever ADD or
     //    REPLACE values that the manifest already proves we own. Passing
@@ -374,11 +397,20 @@ export async function runUpdateConfigTransaction(
     //    snapshot and the atomic write are caught via the
     //    `expectedContent` snapshot that `applyOpenCodeConfig` enforces. The
     //    projection uses the resolved config so discovered defaults are
-    //    reflected in the merged patches and the next manifest entry.
+    //    reflected in the merged patches and the next manifest entry. The
+    //    `onWritten` callback asserts BYTE equality with the preflight
+    //    serialized bytes captured in step 5a; any drift here means the apply
+    //    path observed a different snapshot than the preflight, which is an
+    //    invariant violation that rejects before manifest write.
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
       expectedContent: openCodeConfigCurrentBytes,
       onWritten: (content) => {
+        if (content !== preflightSerialized) {
+          throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config projection drifted between preflight and apply", {
+            file: openCodeRelativePath,
+          });
+        }
         openCodeWrittenHash = hashContent(content);
       },
     });
@@ -394,11 +426,11 @@ export async function runUpdateConfigTransaction(
       });
     }
 
-    // 9. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
-    //    values are preserved across updates.
+    // 10. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
+    //     values are preserved across updates.
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
 
-    // 10. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
+    // 11. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
     //     config hash is taken from the on-disk write; every other file keeps its prior hash.
     const nextManifest: Manifest = {
       schema: 1,
@@ -432,12 +464,12 @@ export async function runUpdateConfigTransaction(
     manifestWrittenHash = nextManifestHash;
     await hooks?.postManifestWrite?.();
 
-    // 11. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
+    // 12. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
     await hooks?.preReceiptReplace?.();
     nextReceipt = await replaceOwnershipReceipt(resolvedRoot, nextManifest, receipt);
     await hooks?.postReceiptReplace?.();
 
-    // 12. Doctor gate: pass or roll back everything. The transaction is config-only
+    // 13. Doctor gate: pass or roll back everything. The transaction is config-only
     //     so skills health is unrelated to the change under transaction; ignore
     //     `skills` check failures that pre-date this transaction by inspecting
     //     whether the manifest had a `skills` array that fully populated defaults.
@@ -445,7 +477,7 @@ export async function runUpdateConfigTransaction(
     assertUpdateConfigDoctorGate(report, manifest);
     return { manifest: nextManifest, doctor: report };
   } catch (error) {
-    // 13. Exact rollback: restore each mutated artifact only if its post-write
+    // 14. Exact rollback: restore each mutated artifact only if its post-write
     //     hash still matches what we wrote, AND restore the EXACT preimage
     //     bytes (no newline normalization, no lossy string conversions). The
     //     preimage is a Buffer; we pass it to `atomicWrite` as raw bytes so
