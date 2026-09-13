@@ -5,21 +5,22 @@ import { describe, expect, it } from "vitest";
 /**
  * Canonical package guidance for bounded final-review evidence gathering.
  *
- * Tickets #39 and #40 acceptance criteria: final review dispatches provide
- * bounded project-local evidence, final Reviewers never widen discovery to
- * fallback/external locations, and each review may use at most one bounded
- * Explore child only when genuinely necessary.
+ * Tickets #39 through #41 acceptance criteria: final review dispatches provide
+ * bounded candidate-local filesystem evidence, external canonical Spec and
+ * verification evidence is copied inline instead of named by path, final
+ * Reviewers never widen discovery to fallback/external locations, and each
+ * review may use at most one bounded Explore child only when genuinely
+ * necessary.
  *
- * The dispatcher constraint applies to the Poiesis Reviewer role and the
- * installed projection used by the reasoning-model final reviewer. The
- * guidance surfaces are POIESIS_ROLE_REVIEWER.md (read by both the ticket
- * Reviewer and the final Reviewer) and OPENCODE_AGENT_FINAL_REVIEWER.md
- * (installed/generated projection for the reasoning-model final reviewer).
+ * The contract spans the Poiesis dispatcher and final Reviewer roles plus
+ * their installed/generated projections: POIESIS_ROLE_POIESIS.md,
+ * OPENCODE_AGENT_POIESIS.md, POIESIS_ROLE_REVIEWER.md, and
+ * OPENCODE_AGENT_FINAL_REVIEWER.md.
  *
  * Any guidance that softens these phrasings is a regression: it lets the
- * final reviewer walk outside the supplied project/evidence roots to
- * compensate for missing material, which is the failure mode this
- * criterion is designed to prevent.
+ * final reviewer walk outside the exact candidate workspace to compensate for
+ * missing material, which is the failure mode this criterion is designed to
+ * prevent.
  */
 
 const REPO_ROOT = join(import.meta.dirname, "..");
@@ -29,6 +30,9 @@ async function readRepoFile(relativePath: string): Promise<string> {
 }
 
 const BOUNDED_HEADER = "Bounded evidence gathering (final review)";
+const CANDIDATE_WORKSPACE = "exact candidate workspace";
+const CLOSED_FILESYSTEM_ALLOWLIST = "closed filesystem allowlist";
+const INLINE_DISPATCH = "bounded inline dispatch content";
 const PARENT_FORBIDDEN = "parent-directory discovery";
 const EXTERNAL_FORBIDDEN = "broad external-directory discovery";
 const ONE_CHILD_CEILING = "at most one bounded Explore child";
@@ -62,10 +66,12 @@ describe("bounded final-review evidence guidance", () => {
     expect(reviewer).toMatch(MISSING_REPORT_CROSS_LINE);
   });
 
-  it("POIESIS_ROLE_REVIEWER.md scopes evidence gathering to the supplied project root and supplied evidence roots", async () => {
+  it("POIESIS_ROLE_REVIEWER.md makes the exact candidate workspace the closed filesystem allowlist", async () => {
     const reviewer = await readRepoFile("POIESIS_ROLE_REVIEWER.md");
-    expect(reviewer).toMatch(/supplied project root/);
-    expect(reviewer).toMatch(/supplied evidence roots/);
+    expect(reviewer).toContain(CANDIDATE_WORKSPACE);
+    expect(reviewer).toContain(CLOSED_FILESYSTEM_ALLOWLIST);
+    expect(reviewer).toMatch(/only[^.]*filesystem[^.]*exact candidate workspace|exact candidate workspace[^.]*only[^.]*filesystem/i);
+    expect(reviewer).toMatch(/outside the exact candidate workspace[^.]*even if[^.]*supplied or inferred/i);
   });
 
   it("OPENCODE_AGENT_FINAL_REVIEWER.md (installed/generated projection) carries the bounded evidence rule", async () => {
@@ -73,7 +79,9 @@ describe("bounded final-review evidence guidance", () => {
     expect(finalReviewer).toMatch(/Bounded evidence/);
     expect(finalReviewer).toContain(PARENT_FORBIDDEN);
     expect(finalReviewer).toContain(EXTERNAL_FORBIDDEN);
-    expect(finalReviewer).toMatch(/supplied project root|supplied evidence roots/);
+    expect(finalReviewer).toContain(CANDIDATE_WORKSPACE);
+    expect(finalReviewer).toContain(CLOSED_FILESYSTEM_ALLOWLIST);
+    expect(finalReviewer).toMatch(/outside the exact candidate workspace[^.]*even if[^.]*supplied or inferred/i);
     expect(finalReviewer).toMatch(/report it as missing|report missing evidence|missing evidence/i);
   });
 
@@ -82,8 +90,10 @@ describe("bounded final-review evidence guidance", () => {
       readRepoFile("POIESIS_ROLE_REVIEWER.md"),
       readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
     ]);
-    expect(reviewer).toMatch(/supplied project root/);
-    expect(finalReviewer).toMatch(/supplied project root/);
+    expect(reviewer).toContain(CANDIDATE_WORKSPACE);
+    expect(finalReviewer).toContain(CANDIDATE_WORKSPACE);
+    expect(reviewer).toContain(CLOSED_FILESYSTEM_ALLOWLIST);
+    expect(finalReviewer).toContain(CLOSED_FILESYSTEM_ALLOWLIST);
     expect(reviewer).toContain(PARENT_FORBIDDEN);
     expect(reviewer).toContain(EXTERNAL_FORBIDDEN);
     expect(finalReviewer).toContain(PARENT_FORBIDDEN);
@@ -122,28 +132,60 @@ describe("bounded final-review evidence guidance", () => {
       readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
     ]);
     for (const guidance of [reviewer, finalReviewer]) {
-      expect(guidance).toMatch(/exact candidate root/i);
-      expect(guidance).toMatch(/exact project root/i);
-      expect(guidance).toMatch(/exact\s+evidence roots/i);
+      expect(guidance).toMatch(/exact\s+candidate\s+root/i);
+      expect(guidance).toMatch(/exact candidate workspace/i);
       expect(guidance).toMatch(/conventional fallback evidence paths/i);
-      expect(guidance).toMatch(/package-source paths/i);
+      expect(guidance).toMatch(/package-source\s+paths/i);
       expect(guidance).toMatch(/broad [`]?\/tmp/i);
       expect(guidance).toMatch(MISSING_REPORT_CROSS_LINE);
     }
   });
 
-  it("requires Poiesis final-review dispatches to supply exact roots without inviting outside search", async () => {
+  it("requires every final-review filesystem path to stay within the exact candidate workspace", async () => {
     const [role, agent] = await Promise.all([
       readRepoFile("POIESIS_ROLE_POIESIS.md"),
       readRepoFile("OPENCODE_AGENT_POIESIS.md"),
     ]);
     for (const guidance of [role, agent]) {
       expect(guidance).toMatch(/final-review dispatch/i);
-      expect(guidance).toMatch(/exact candidate root/i);
-      expect(guidance).toMatch(/exact project root/i);
-      expect(guidance).toMatch(/exact\s+evidence roots/i);
+      expect(guidance).toMatch(/exact\s+candidate\s+root/i);
+      expect(guidance).toContain(CANDIDATE_WORKSPACE);
+      expect(guidance).toContain(CLOSED_FILESYSTEM_ALLOWLIST);
+      expect(guidance).toMatch(/every filesystem path[^.]*contained within the exact candidate workspace/i);
+      expect(guidance).toMatch(/do not\s+name\s+any\s+path\s+outside the exact candidate workspace/i);
       expect(guidance).toMatch(/do\s+not invite[\s\S]*outside/i);
-      expect(guidance).toMatch(/missing evidence/i);
+      expect(guidance).toMatch(/missing\s+evidence/i);
+      expect(guidance).not.toMatch(/exact project root|exact evidence roots/i);
+    }
+  });
+
+  it("requires external canonical Spec and verification evidence as bounded inline dispatch content", async () => {
+    const guidanceFiles = await Promise.all([
+      readRepoFile("POIESIS_ROLE_POIESIS.md"),
+      readRepoFile("OPENCODE_AGENT_POIESIS.md"),
+      readRepoFile("POIESIS_ROLE_REVIEWER.md"),
+      readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
+    ]);
+    for (const guidance of guidanceFiles) {
+      expect(guidance).toMatch(/canonical Spec/i);
+      expect(guidance).toMatch(/verification evidence/i);
+      expect(guidance).toContain(INLINE_DISPATCH);
+      expect(guidance).toMatch(/outside the exact candidate workspace[\s\S]*inline|inline[\s\S]*outside the exact candidate workspace/i);
+      expect(guidance).toMatch(/not (?:an? )?external filesystem path|never name[^.]*external filesystem path/i);
+    }
+  });
+
+  it("preserves exact candidate identity and independent Spec and Standards review", async () => {
+    const [role, agent] = await Promise.all([
+      readRepoFile("POIESIS_ROLE_POIESIS.md"),
+      readRepoFile("OPENCODE_AGENT_POIESIS.md"),
+    ]);
+    for (const guidance of [role, agent]) {
+      expect(guidance).toMatch(/exact candidate identity/i);
+      expect(guidance).toContain("candidateSha");
+      expect(guidance).toContain("candidateTree");
+      expect(guidance).toMatch(/separate fresh independent\s+final Reviewer/i);
+      expect(guidance).toMatch(/Spec Review[\s\S]*Standards Review/i);
     }
   });
 });

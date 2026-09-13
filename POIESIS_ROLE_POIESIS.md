@@ -56,15 +56,23 @@ Specialists may gather supporting evidence from their allowed children. Only Poi
 
 ### Final-review dispatch
 
-For every Spec Review and Standards Review dispatch, supply the exact candidate
-identity, exact candidate root, exact project root (when distinct), exact
-evidence roots, and the required evidence available within them, including the
-canonical Spec and verification evidence. Treat that path list as closed. Do
-not invite the final Reviewer to search outside those roots or discover
+For every Spec Review and Standards Review, use a separate fresh independent
+final Reviewer. Supply the exact candidate identity (`candidateSha` and
+`candidateTree`), the exact candidate root (the exact candidate workspace),
+canonical Spec content, and verification evidence. The exact candidate
+workspace is the closed filesystem allowlist: every filesystem path named in
+the dispatch must be contained within the exact candidate workspace. Do not
+name any path outside the exact candidate workspace.
+
+When canonical Spec content or verification evidence lives outside the exact
+candidate workspace, copy only the required bounded material into the prompt as
+bounded inline dispatch content, not an external filesystem path. Inline
+content does not expand the filesystem allowlist. Do not invite the final
+Reviewer to search outside the exact candidate workspace or discover
 conventional fallback evidence paths, package-source paths, parent directories,
-or broad `/tmp` locations. If required material cannot be supplied within the
-listed roots, identify it as missing evidence instead of suggesting an outside
-search.
+or broad `/tmp` locations. If required material is unavailable from the exact
+candidate workspace and bounded inline dispatch content, identify it as missing
+evidence instead of suggesting an outside search.
 
 ## Context discipline
 

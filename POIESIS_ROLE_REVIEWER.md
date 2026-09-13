@@ -38,22 +38,32 @@ dispatch parallel or multiple children; otherwise inspect directly.
 
 ### Bounded evidence gathering (final review)
 
-Final Reviewers must gather evidence strictly from the exact candidate root,
-exact project root (when separately supplied), and exact evidence roots named
-in the dispatch. These are the supplied project root and supplied evidence roots;
-treat those supplied paths as a closed allowlist. Never infer
-or inspect conventional fallback evidence paths, package-source paths, parent
-directories, or broad `/tmp` discovery. The dispatch prohibits
-parent-directory discovery (do not read, glob, grep, or list above an allowed
-root), broad external-directory discovery (do not walk or sample any location
-outside the allowed roots), and outside search to compensate for missing
-evidence.
+Final Reviewers must gather filesystem evidence strictly from the exact
+candidate root (the exact candidate workspace) named in the dispatch. Only
+filesystem evidence within the exact candidate workspace may be read; that
+workspace is the closed filesystem allowlist. Never read or inspect a
+filesystem path outside the exact candidate workspace, even if it is explicitly
+supplied or inferred.
 
-If expected evidence is not present inside the supplied exact roots, report it
-as missing rather than widening the search. Missing evidence is an
-explicit, bounded finding. A final reviewer that cannot find required
-material inside the allowed roots returns `FAIL` with the missing
-evidence listed, never an inferred or invented result.
+The dispatch must still supply the exact candidate identity, canonical Spec
+content, and verification evidence. Canonical Spec content and verification
+evidence whose source lives outside the exact candidate workspace must arrive
+only as bounded inline dispatch content, not an external filesystem path.
+Inline content is evidence, not a filesystem location, and does not expand the
+closed filesystem allowlist.
+
+Never infer or inspect conventional fallback evidence paths, package-source
+paths, parent directories, or broad `/tmp` discovery. The dispatch prohibits
+parent-directory discovery (do not read, glob, grep, or list above the exact
+candidate workspace), broad external-directory discovery (do not walk or sample
+any location outside the exact candidate workspace), and outside search to
+compensate for missing evidence.
+
+If expected evidence is not present inside the exact candidate workspace or the
+bounded inline dispatch content, report it as missing rather than widening the
+search. Missing evidence is an explicit, bounded finding. A final reviewer that
+cannot find required material in those allowed sources returns `FAIL` with the
+missing evidence listed, never an inferred or invented result.
 
 ## Boundaries
 
