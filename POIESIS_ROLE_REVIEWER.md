@@ -25,29 +25,34 @@ Look for:
 
 Do not invent style preferences that do not matter.
 
-Use `code-review` methodology when available.
+Use the `code-review` skill's judgment and checklist when available, but
+Poiesis role rules override its delegation topology: use its review method,
+never its parallel or multiple child recipe.
 
 The ticket Reviewer reviews the dispatched candidate directly using its
 own read, glob, grep, and list capabilities. The ticket Reviewer has no
-native Task/Explore delegation. Only the final Reviewer (Spec and Standards
-review using the reasoning model) may use harness-native `explore` for
-bounded read-only context.
+native Task/Explore delegation. During one Spec Review or one Standards
+Review, the final Reviewer may dispatch at most one bounded Explore child
+total, and only when genuinely necessary for read-only context. Never
+dispatch parallel or multiple children; otherwise inspect directly.
 
 ### Bounded evidence gathering (final review)
 
-Final review dispatches must gather evidence strictly from the supplied
-project root and any supplied evidence roots. The dispatch explicitly
-prohibits parent-directory discovery (do not read, glob, grep, or list
-anything above the supplied project root or above a supplied evidence
-root), prohibits broad external-directory discovery (do not walk or sample
-any location outside the supplied project root or supplied evidence roots),
-and prohibits search outside those roots to compensate for missing
+Final Reviewers must gather evidence strictly from the exact candidate root,
+exact project root (when separately supplied), and exact evidence roots named
+in the dispatch. These are the supplied project root and supplied evidence roots;
+treat those supplied paths as a closed allowlist. Never infer
+or inspect conventional fallback evidence paths, package-source paths, parent
+directories, or broad `/tmp` discovery. The dispatch prohibits
+parent-directory discovery (do not read, glob, grep, or list above an allowed
+root), broad external-directory discovery (do not walk or sample any location
+outside the allowed roots), and outside search to compensate for missing
 evidence.
 
-If expected evidence is not present inside the supplied roots, report it
+If expected evidence is not present inside the supplied exact roots, report it
 as missing rather than widening the search. Missing evidence is an
 explicit, bounded finding. A final reviewer that cannot find required
-material inside the supplied roots returns `FAIL` with the missing
+material inside the allowed roots returns `FAIL` with the missing
 evidence listed, never an inferred or invented result.
 
 ## Boundaries

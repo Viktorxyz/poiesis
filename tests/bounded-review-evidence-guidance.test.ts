@@ -5,10 +5,10 @@ import { describe, expect, it } from "vitest";
 /**
  * Canonical package guidance for bounded final-review evidence gathering.
  *
- * Ticket #39 acceptance criterion: "Final review dispatches provide bounded
- * project-local evidence and explicitly prohibit parent-directory or broad
- * external-directory discovery; missing evidence is reported rather than
- * searched outside those roots."
+ * Tickets #39 and #40 acceptance criteria: final review dispatches provide
+ * bounded project-local evidence, final Reviewers never widen discovery to
+ * fallback/external locations, and each review may use at most one bounded
+ * Explore child only when genuinely necessary.
  *
  * The dispatcher constraint applies to the Poiesis Reviewer role and the
  * installed projection used by the reasoning-model final reviewer. The
@@ -31,6 +31,8 @@ async function readRepoFile(relativePath: string): Promise<string> {
 const BOUNDED_HEADER = "Bounded evidence gathering (final review)";
 const PARENT_FORBIDDEN = "parent-directory discovery";
 const EXTERNAL_FORBIDDEN = "broad external-directory discovery";
+const ONE_CHILD_CEILING = "at most one bounded Explore child";
+const CODE_REVIEW_OVERRIDE = "never its parallel or multiple child recipe";
 const MISSING_REPORT_PATTERN = /report\s+it\s+as\s+missing/i;
 // [\s\S] instead of . so we cross line breaks; the doc text wraps
 // "report it" and "as missing" across lines.
@@ -88,5 +90,60 @@ describe("bounded final-review evidence guidance", () => {
     expect(finalReviewer).toContain(EXTERNAL_FORBIDDEN);
     expect(reviewer).toMatch(MISSING_REPORT_CROSS_LINE);
     expect(finalReviewer).toMatch(MISSING_REPORT_CROSS_LINE);
+  });
+
+  it("caps each Spec or Standards Review at one genuinely necessary bounded Explore child", async () => {
+    const [reviewer, finalReviewer] = await Promise.all([
+      readRepoFile("POIESIS_ROLE_REVIEWER.md"),
+      readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
+    ]);
+    for (const guidance of [reviewer, finalReviewer]) {
+      expect(guidance).toContain(ONE_CHILD_CEILING);
+      expect(guidance).toMatch(/Spec Review[\s\S]*Standards Review|Spec or Standards Review/i);
+      expect(guidance).toMatch(/only when genuinely necessary/i);
+    }
+  });
+
+  it("overrides the code-review skill's parallel or multiple child topology", async () => {
+    const [reviewer, finalReviewer] = await Promise.all([
+      readRepoFile("POIESIS_ROLE_REVIEWER.md"),
+      readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
+    ]);
+    for (const guidance of [reviewer, finalReviewer]) {
+      expect(guidance).toMatch(/code-review/i);
+      expect(guidance).toContain(CODE_REVIEW_OVERRIDE);
+      expect(guidance).toMatch(/judgment|checklist/i);
+    }
+  });
+
+  it("forbids inferred fallback, package-source, parent, and broad /tmp discovery", async () => {
+    const [reviewer, finalReviewer] = await Promise.all([
+      readRepoFile("POIESIS_ROLE_REVIEWER.md"),
+      readRepoFile("OPENCODE_AGENT_FINAL_REVIEWER.md"),
+    ]);
+    for (const guidance of [reviewer, finalReviewer]) {
+      expect(guidance).toMatch(/exact candidate root/i);
+      expect(guidance).toMatch(/exact project root/i);
+      expect(guidance).toMatch(/exact\s+evidence roots/i);
+      expect(guidance).toMatch(/conventional fallback evidence paths/i);
+      expect(guidance).toMatch(/package-source paths/i);
+      expect(guidance).toMatch(/broad [`]?\/tmp/i);
+      expect(guidance).toMatch(MISSING_REPORT_CROSS_LINE);
+    }
+  });
+
+  it("requires Poiesis final-review dispatches to supply exact roots without inviting outside search", async () => {
+    const [role, agent] = await Promise.all([
+      readRepoFile("POIESIS_ROLE_POIESIS.md"),
+      readRepoFile("OPENCODE_AGENT_POIESIS.md"),
+    ]);
+    for (const guidance of [role, agent]) {
+      expect(guidance).toMatch(/final-review dispatch/i);
+      expect(guidance).toMatch(/exact candidate root/i);
+      expect(guidance).toMatch(/exact project root/i);
+      expect(guidance).toMatch(/exact\s+evidence roots/i);
+      expect(guidance).toMatch(/do\s+not invite[\s\S]*outside/i);
+      expect(guidance).toMatch(/missing evidence/i);
+    }
   });
 });

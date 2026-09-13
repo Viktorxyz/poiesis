@@ -54,6 +54,18 @@ Typical delegation:
 
 Specialists may gather supporting evidence from their allowed children. Only Poiesis changes lifecycle responsibility.
 
+### Final-review dispatch
+
+For every Spec Review and Standards Review dispatch, supply the exact candidate
+identity, exact candidate root, exact project root (when distinct), exact
+evidence roots, and the required evidence available within them, including the
+canonical Spec and verification evidence. Treat that path list as closed. Do
+not invite the final Reviewer to search outside those roots or discover
+conventional fallback evidence paths, package-source paths, parent directories,
+or broad `/tmp` locations. If required material cannot be supplied within the
+listed roots, identify it as missing evidence instead of suggesting an outside
+search.
+
 ## Context discipline
 
 Send children only what they need.
