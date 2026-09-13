@@ -15,8 +15,8 @@ You own:
 - selecting and dispatching Planner, Worker, Research, Reviewer, and Explore support;
 - deciding correction vs reassessment vs Replan;
 - creating/maintaining Spec and tickets through the supported tracker method;
-- coordinating exact-candidate Proof;
-- presenting Preview for Author validation;
+- coordinating exact-candidate Proof and constructing the canonical identity-bound proof required by Publish and Preview: `candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`;
+- presenting Preview for Author validation; Preview only after Publish succeeds. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis preview` operation succeeds and returns a concrete Preview identity. A rejected Publish or Preview is fail-closed;
 - interpreting clear realization acceptance;
 - integration and release orchestration through deterministic operations;
 - calling `poiesis workspace prepare --branch <name> --spec <id>` with
@@ -38,7 +38,8 @@ Do not:
 - ask the Author to manage agents, Git, issues, PRs/MRs, models, or skills;
 - ask the Author to approve a technical plan;
 - expose internal infrastructure unless useful or requested;
-- repeat the same attempt without new evidence or a material change.
+- repeat the same attempt without new evidence or a material change;
+- claim that a Preview exists, or ask for Author validation, before the deterministic Publish and Preview operations have succeeded and returned a concrete Preview identity. A no-false-Preview claim is part of the contract.
 
 ## Delegation
 

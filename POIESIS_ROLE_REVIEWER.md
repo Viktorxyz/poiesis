@@ -33,6 +33,23 @@ native Task/Explore delegation. Only the final Reviewer (Spec and Standards
 review using the reasoning model) may use harness-native `explore` for
 bounded read-only context.
 
+### Bounded evidence gathering (final review)
+
+Final review dispatches must gather evidence strictly from the supplied
+project root and any supplied evidence roots. The dispatch explicitly
+prohibits parent-directory discovery (do not read, glob, grep, or list
+anything above the supplied project root or above a supplied evidence
+root), prohibits broad external-directory discovery (do not walk or sample
+any location outside the supplied project root or supplied evidence roots),
+and prohibits search outside those roots to compensate for missing
+evidence.
+
+If expected evidence is not present inside the supplied roots, report it
+as missing rather than widening the search. Missing evidence is an
+explicit, bounded finding. A final reviewer that cannot find required
+material inside the supplied roots returns `FAIL` with the missing
+evidence listed, never an inferred or invented result.
+
 ## Boundaries
 
 Do not:

@@ -185,6 +185,16 @@ Run whole-change Proof in this order:
 2. fresh reasoning Spec Review;
 3. fresh reasoning Standards Review.
 
+The exact candidate identity that flows from Prove into Publish and Preview is one canonical proof object. It must carry:
+
+- `candidateSha`: the exact published candidate commit SHA;
+- `candidateTree`: the exact candidate tree hash for that SHA;
+- `verified: true` after deterministic Verify passed;
+- `specReview`: `{ verdict: PASS, reviewerIdentity }` from a fresh reasoning Spec Review;
+- `standardsReview`: `{ verdict: PASS, reviewerIdentity }` from a fresh reasoning Standards Review.
+
+Every required field must be present for the same clean candidate. Publish and Preview both consume that exact proof and refuse to operate without it.
+
 ### Verify
 
 Run the authoritative project checks against the exact candidate.
@@ -208,7 +218,7 @@ After a mutation:
 
 ## 11. Publish
 
-Only after whole-change Proof passes:
+Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`. Only after Publish succeeds:
 
 - push the Poiesis change branch;
 - create or update one PR/MR targeting the canonical integration branch;
@@ -216,9 +226,11 @@ Only after whole-change Proof passes:
 
 The Author does not operate the PR/MR.
 
+A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity.
+
 ## 12. Preview
 
-Create Preview from the exact proven candidate.
+Preview only after Publish succeeds. Pass the same canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis preview`. The deterministic `poiesis preview` operation must succeed and return a concrete Preview identity (`id`, `url`, and/or `artifact` matching `artifactIdentity`) before any Author-facing claim of Preview readiness is made.
 
 Preview always exists.
 
@@ -230,6 +242,8 @@ The concrete representation is project-appropriate, for example:
 - another safe Author-testable candidate representation.
 
 Tell the Author the feature is ready to try.
+
+A rejected Preview is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic operation succeeds and returns a concrete Preview identity. Do not invent or assume a Preview identity, URL, or artifact.
 
 The Author validates whether the realization matches their intent.
 

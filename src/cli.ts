@@ -44,8 +44,8 @@ Usage:
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>     # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>     # Preview only after Publish succeeds. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
