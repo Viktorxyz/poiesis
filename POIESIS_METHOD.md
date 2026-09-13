@@ -43,13 +43,13 @@ Before planning:
 2. Fetch and inspect the repository.
 3. Resolve the latest canonical integration base.
 4. Prepare an isolated Poiesis-owned workspace via
-   `poiesis workspace prepare --branch <name> --spec <id>`. The
-   `--path` argument may be omitted; in that case Poiesis derives a
-   traversal-safe path under `<root>/.poiesis/workspaces/<id>`. The
+   `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`;
+   the CLI then derives a
+   traversal-safe path under `<root>/.poiesis/workspaces/<derived-id>`. The
    default-path workspace area is gitignored so it never appears as
-   foreign work in the primary checkout. Poiesis must not pass an
-   arbitrary `/tmp/...` or other external path: external worktrees
-   can fall outside the harness-readable project root.
+   foreign work in the primary checkout. Poiesis must not pass any
+   external path such as `/tmp/...` or any location outside the project root:
+   external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 5. Run Capability Check.
 
 Required infrastructure includes:

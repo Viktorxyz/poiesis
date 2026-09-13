@@ -172,7 +172,7 @@ update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
 capability install      install one selected, revision-pinned skill
-workspace prepare       create an isolated owned branch/worktree (default path omits --path and lives under <root>/.poiesis/workspaces/<id>)
+workspace prepare       create an isolated owned branch/worktree (default omits --path and lives under <root>/.poiesis/workspaces/<derived-id>)
 checkpoint              commit an accepted reviewed ticket
 verify                  run checks against an exact clean SHA
 publish                 push and create/update a PR/MR after Proof
@@ -186,12 +186,9 @@ session cleanup         best-effort OpenCode child-session hygiene
 
 Every command emits structured JSON. Run `poiesis help` for command syntax.
 
-`workspace prepare` accepts `--path <absolute>` for specialized tests; the default
-omits `--path` and selects a deterministic, traversal-safe path under
-`<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is
-gitignored so it never appears as foreign work in the primary checkout. Direct
-calls from Poiesis should rely on the omitted-path form; the explicit `--path`
-form is for tests and special cases.
+`workspace prepare` is invoked as `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`; the CLI then selects a deterministic, traversal-safe workspace under `<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is gitignored so it never appears as foreign work in the primary checkout.
+
+Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 
 ## Safety
 

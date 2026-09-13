@@ -123,6 +123,27 @@ describe("CLI bin (symlink-aware main resolution)", () => {
     expect(result.stdout).toContain("poiesis update [--bootstrap-legacy-ownership]");
   });
 
+  it("package-installed HELP imperatively tells the operator to omit --path for ordinary Prepare", async () => {
+    if (!built) throw new Error("bin not built");
+    // Package-installed proof: the HELP that a consumer sees when running
+    // `.bin/poiesis --help` must imperatively direct operators to omit
+    // `--path` for ordinary Prepare. The default command shape must
+    // appear before any exceptional `--path` form.
+    const result = await run("node", [built.binPath, "--help"], { cwd: built.installDir });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout).toContain("Omit `--path`");
+    expect(result.stdout).toContain("default: Omit `--path`");
+    expect(result.stdout).toContain("exceptional only");
+    expect(result.stdout).toContain("Author explicitly supplied an exceptional path");
+    expect(result.stdout).toContain("compatibility recovery requires the exact pre-existing path");
+    // The exceptional --path form must appear strictly after the default
+    // form so an agent reading top-to-bottom sees the default first.
+    const defaultIdx = result.stdout.indexOf("poiesis workspace prepare --branch <name> --spec <id>");
+    const exceptionalIdx = result.stdout.indexOf("poiesis workspace prepare --branch <name> --path");
+    expect(defaultIdx).toBeGreaterThanOrEqual(0);
+    expect(exceptionalIdx).toBeGreaterThan(defaultIdx);
+  });
+
   it("executes a structured command (inspect) via .bin/poiesis", async () => {
     if (!built) throw new Error("bin not built");
     // `inspect` requires a git repository to produce its structured report,

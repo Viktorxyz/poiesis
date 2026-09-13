@@ -39,7 +39,8 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
-  poiesis workspace prepare --branch <name> [--path <absolute>] --spec <id>
+  poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
+  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>

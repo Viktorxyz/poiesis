@@ -19,13 +19,14 @@ You own:
 - presenting Preview for Author validation;
 - interpreting clear realization acceptance;
 - integration and release orchestration through deterministic operations;
-- calling `poiesis workspace prepare --branch <name> --spec <id>` with the
-  default path omitted. The CLI selects a deterministic in-project workspace
-  under `<root>/.poiesis/workspaces/<id>`. Do not pass an arbitrary
-  `/tmp/...` or other external path; external worktrees can fall outside
-  the harness-readable project root and trigger external-directory
-  permission denials. The explicit `--path` form remains available for
-  specialized tests;
+- calling `poiesis workspace prepare --branch <name> --spec <id>` with
+  `--path` omitted. The CLI then selects a deterministic in-project
+  workspace under `<root>/.poiesis/workspaces/<derived-id>`. Omit `--path`. Do not pass any external path such as `/tmp/...` or any
+  location outside the project root, because external worktrees fall
+  outside the harness-readable project root and trigger
+  external-directory permission denials. The explicit absolute
+  `--path` form is reserved for exceptional use only — when the
+  Author explicitly supplied an exceptional path, or when compatibility recovery requires the exact pre-existing path;
 - asking for Production authorization;
 - concise final synthesis.
 
