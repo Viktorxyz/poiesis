@@ -300,7 +300,7 @@ export async function runUpdateConfigTransaction(
   // bound predecessor manifest that reaches this path fails closed with
   // MANIFEST_AUTHORITY_INVALID before any write.
   await assertManifestAuthority(resolvedRoot, manifest, currentConfig);
-  const { content: currentConfigBytes, record: currentConfigRecord } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
+  const { content: currentConfigBytes } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot);
   await verifyOpenCodeVersion(resolvedRoot);
   const { relativePath: openCodeRelativePath, configPatches: openCodeConfigPatches } = await identifyManagedOpenCodeConfig(manifest);
@@ -359,9 +359,7 @@ export async function runUpdateConfigTransaction(
     });
   }
   const currentOpenCodeContentString = openCodeConfigCurrentBytes.toString("utf8");
-  const currentOpenCodeContentHash = hashContent(openCodeConfigCurrentBytes);
   const currentOpenCodeJson = parseJsonc<JsonObject>(currentOpenCodeContentString, openCodeConfigPath);
-  const openCodeManifestRecord = manifest.files.find((file) => file.path === openCodeRelativePath);
 
   // 5a. Validate every recorded config patch for the OpenCode config against
   //     the SINGLE parsed snapshot captured in step 5. Replaces the disk
@@ -395,16 +393,15 @@ export async function runUpdateConfigTransaction(
     patches: desiredOpenCodeProjectionPatches,
   });
 
-  // 7. No-op detection: comparing BYTE hashes of every state the transaction
-  //    would touch is sufficient — when the Poiesis config bytes AND the OpenCode
-  //    config bytes match their recorded manifest hashes, the proposed transaction
-  //    cannot observably change anything. Do NOT advance generation; return the
-  //    existing manifest unchanged.
-  const poiesisConfigBytesMatch = newConfigHash === currentConfigRecord.hash;
-  const openCodeBytesMatch =
-    openCodeManifestRecord === undefined
-      ? false
-      : currentOpenCodeContentHash === openCodeManifestRecord.hash;
+  // 7. No-op detection compares both captured serialized files directly with
+  //    the complete intended payloads. A pre-existing OpenCode config is owned
+  //    only through manifest config patches, so it deliberately has no
+  //    whole-file manifest record to consult here. Direct byte equality keeps
+  //    that patch-only ownership intact while recognizing that the projection
+  //    would write exactly the bytes already on disk. Do NOT advance generation;
+  //    return the existing manifest unchanged.
+  const poiesisConfigBytesMatch = currentConfigBytes.equals(Buffer.from(newConfigContent, "utf8"));
+  const openCodeBytesMatch = openCodeConfigCurrentBytes.equals(Buffer.from(preflightSerialized, "utf8"));
   if (poiesisConfigBytesMatch && openCodeBytesMatch) {
     // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
     // so tests can deterministically fail the gate (e.g. by toggling a
@@ -606,4 +603,3 @@ export async function runUpdateConfigTransaction(
     throw error;
   }
 }
-

@@ -229,6 +229,76 @@ describe("update --config", () => {
     expect(result.doctor.checks.find((check) => check.id === "receipt")?.status).toBe("pass");
   }, 30_000);
 
+  it("treats init over pre-existing JSONC as a no-op without adopting whole-file ownership", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    await writeFile(
+      openCodePath,
+      `{
+  // User-owned settings must survive Poiesis patching.
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "provider": { "custom": { "timeout": 45 } }
+}
+`,
+    );
+    await install(repository);
+
+    const installedManifest = await loadManifest(repository.root);
+    expect(installedManifest.files.some((file) => file.path === "opencode.jsonc")).toBe(false);
+    expect(installedManifest.configPatches.every((patch) => patch.file === "opencode.jsonc")).toBe(true);
+    const installedOpenCode = await readOpenCodeJson(repository);
+    expect(installedOpenCode.theme).toBe("system");
+    expect(installedOpenCode.provider).toEqual({ custom: { timeout: 45 } });
+
+    const candidatePath = await writeCandidateConfig(repository, () => undefined);
+    const before = await snapshotOwnedBytes(repository);
+    const result = await updateFromConfig(repository.root, candidatePath);
+    const after = await snapshotOwnedBytes(repository);
+
+    expectOwnedBytesUnchanged(before, after);
+    expect(serializeManifest(result.manifest)).toBe(before.manifest!.toString("utf8"));
+    expect(result.doctor.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
+    expect((await readOpenCodeJson(repository)).theme).toBe("system");
+    expect((await loadManifest(repository.root)).files.some((file) => file.path === "opencode.jsonc")).toBe(false);
+  }, 30_000);
+
+  it("preserves pre-existing JSONC bytes and patch ownership on a repeated identical update", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "opencode.jsonc"),
+      `{
+  "$schema": "https://opencode.ai/config.json",
+  "theme": "system",
+  "formatter": { "prettier": { "command": ["prettier", "--write", "$FILE"] } }
+}
+`,
+    );
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+
+    const receiptBeforeFirst = await readOwnershipReceipt(repository.root);
+    await updateFromConfig(repository.root, candidatePath);
+    const receiptAfterFirst = await readOwnershipReceipt(repository.root);
+    expect(receiptAfterFirst.generation).toBe(receiptBeforeFirst.generation + 1);
+    const beforeRepeat = await snapshotOwnedBytes(repository);
+
+    await updateFromConfig(repository.root, candidatePath);
+
+    const afterRepeat = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeRepeat, afterRepeat);
+    expect((await readOpenCodeJson(repository)).formatter).toEqual({
+      prettier: { command: ["prettier", "--write", "$FILE"] },
+    });
+    const manifest = await loadManifest(repository.root);
+    expect(manifest.files.some((file) => file.path === "opencode.jsonc")).toBe(false);
+    expect(manifest.configPatches.every((patch) => patch.file === "opencode.jsonc")).toBe(true);
+  }, 30_000);
+
   // -- Ticket #36: the no-op branch of `runUpdateConfigTransaction` must
   //    exercise the SAME doctor gate predicate the post-mutation branch
   //    already exercises (extracted as `assertUpdateConfigDoctorGate`).
