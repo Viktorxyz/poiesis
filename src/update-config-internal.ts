@@ -41,6 +41,7 @@ import {
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
+import type { ResolvedPoiesisConfig } from "./config.js";
 import type { DoctorReport, UpdateResult } from "./maintenance.js";
 import {
   acquireWorkspaceMutationLock,
@@ -221,6 +222,79 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
   const gateFailure = report.checks.find((check) => check.status === "fail" && !(skipSkillsGate && check.id === "skills"));
   if (gateFailure !== undefined) {
     throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update --config did not pass doctor", { report });
+  }
+}
+
+/**
+ * Adapter-fixture invariant for `update --config`. Mirrors
+ * `maintenance.ts::init` which requires `--allow-fixtures` to introduce
+ * a fixture tracker or fixture delivery; the same contract applies to
+ * any `update --config` that would introduce or alter the fixture
+ * tracker/delivery. The only escape is a byte-equal no-op update where
+ * the proposed config matches the current installed config — that path
+ * returns the existing manifest unchanged and is what canonical
+ * no-op tests already exercise. Any non-no-op proposed config that
+ * contains `provider: "fixture"` for tracker OR `adapter: "fixture"`
+ * for any delivery target fails closed BEFORE any write.
+ *
+ * `update --config` rejects the `allowFixtureAdapters` option up front,
+ * so this invariant is the only line of defense against an introduced
+ * or altered fixture configuration in this transaction.
+ */
+function detectFixtureAdapter(config: { tracker: { provider: string; project?: string | undefined }; delivery: Record<string, { adapter: string; path?: string | undefined }> }): { fixture: boolean; targets: string[]; signature: string } {
+  const targets: string[] = [];
+  const parts: string[] = [];
+  if (config.tracker.provider === "fixture") {
+    targets.push("tracker");
+    parts.push(`tracker=${config.tracker.provider}:${config.tracker.project ?? ""}`);
+  }
+  for (const target of ["preview", "staging", "production"] as const) {
+    const adapter = config.delivery[target];
+    if (adapter?.adapter === "fixture") {
+      targets.push(`delivery.${target}`);
+      parts.push(`delivery.${target}=${adapter.adapter}:${adapter.path ?? ""}`);
+    }
+  }
+  return { fixture: targets.length > 0, targets, signature: parts.join("|") };
+}
+
+function assertUpdateConfigNoFixtureIntroduceOrAlter(
+  proposed: ResolvedPoiesisConfig,
+  current: { tracker: { provider: string; project?: string | undefined }; delivery: Record<string, { adapter: string; path?: string | undefined }> },
+  poiesisConfigBytesMatch: boolean,
+  openCodeBytesMatch: boolean,
+): void {
+  // The no-op escape: if the proposed config bytes match the current
+  // installed bytes for both the Poiesis config and the OpenCode
+  // projection, the transaction is a no-op (no writes occur). Canonical
+  // no-op behavior must remain so already-installed fixture
+  // configurations can be re-asserted by an identical config.
+  if (poiesisConfigBytesMatch && openCodeBytesMatch) return;
+
+  const proposedFixture = detectFixtureAdapter(proposed);
+  const currentFixture = detectFixtureAdapter(current);
+
+  // Introduction: proposed has fixture, current does not.
+  const introduction = proposedFixture.fixture && !currentFixture.fixture;
+  // Alteration: both have fixture, but their fixture-specific fields
+  // (provider + project for tracker; adapter + path per delivery
+  // target) differ. Changing non-fixture fields while leaving the
+  // fixture signature byte-equal is permitted (canonical test
+  // consumers update other fields freely).
+  const alteration = proposedFixture.fixture && currentFixture.fixture
+    && proposedFixture.signature !== currentFixture.signature;
+
+  if (introduction || alteration) {
+    throw new PoiesisError(
+      "FIXTURE_ADAPTER_NOT_AUTHORIZED",
+      "update --config cannot introduce or alter fixture tracker/delivery without explicit allow-fixtures authorization",
+      {
+        proposedFixtureTargets: proposedFixture.targets,
+        currentFixtureTargets: currentFixture.targets,
+        introduced: introduction,
+        altered: alteration,
+      },
+    );
   }
 }
 
@@ -411,6 +485,20 @@ async function runLockedUpdateConfigTransaction(
   //    return the existing manifest unchanged.
   const poiesisConfigBytesMatch = currentConfigBytes.equals(Buffer.from(newConfigContent, "utf8"));
   const openCodeBytesMatch = openCodeConfigCurrentBytes.equals(Buffer.from(preflightSerialized, "utf8"));
+  // Adapter-fixture invariant. Must run AFTER the bytes are computed
+  // (so the no-op escape can be honored) but BEFORE the no-op branch
+  // returns — fail closed before any mutation, and before any
+  // no-op doctor gate that would otherwise silently let a fixture
+  // config through. The byte-equal comparison above is reused as
+  // the only escape (an already-installed fixture configuration
+  // may be re-asserted by an identical config; any non-no-op
+  // proposed config containing `adapter: "fixture"` is rejected).
+  assertUpdateConfigNoFixtureIntroduceOrAlter(
+    resolvedConfigWithDefaults,
+    currentConfig,
+    poiesisConfigBytesMatch,
+    openCodeBytesMatch,
+  );
   if (poiesisConfigBytesMatch && openCodeBytesMatch) {
     // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
     // so tests can deterministically fail the gate (e.g. by toggling a

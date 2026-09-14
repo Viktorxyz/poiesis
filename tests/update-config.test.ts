@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -1807,4 +1807,276 @@ describe("update --config", () => {
   }, 30_000);
 
 
+});
+
+// High-priority Spec Review blocker: `update --config` must reject any
+// non-no-op proposed config that introduces or alters the fixture
+// tracker/delivery. The only escape is a byte-equal no-op update of
+// an already-installed fixture configuration. The install helper
+// `install` above already installs with fixture adapters via
+// `init --allow-fixtures`; tests in this block exercise the
+// `assertUpdateConfigNoFixtureIntroduceOrAlter` invariant.
+describe("update --config fixture-adapter invariant", () => {
+  const repositories: TestRepository[] = [];
+  let restoreGhPath: (() => void) | undefined;
+  afterEach(async () => {
+    // Always restore the original `PATH` so unrelated tests after this
+    // describe block are not affected by the fake-`gh` prepend.
+    if (restoreGhPath !== undefined) {
+      restoreGhPath();
+      restoreGhPath = undefined;
+    }
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  // Alteration: change only the fixture-delivery path on an
+  // already-installed fixture installation. The proposed config is
+  // not byte-equal to the current, and contains fixture adapter, so
+  // the invariant rejects before any owned byte is mutated.
+  it("rejects an altered fixture delivery path", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+    const beforeManifest = await loadManifest(repository.root);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.delivery.preview = { adapter: "fixture", path: "/different/fixture/path/preview" } as never;
+      config.delivery.staging = { adapter: "fixture", path: "/different/fixture/path/staging" } as never;
+      config.delivery.production = { adapter: "fixture", path: "/different/fixture/path/production" } as never;
+    });
+
+    await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+      code: "FIXTURE_ADAPTER_NOT_AUTHORIZED",
+      details: expect.objectContaining({
+        proposedFixtureTargets: expect.arrayContaining(["delivery.preview", "delivery.staging", "delivery.production"]),
+      }),
+    });
+
+    // Owned bytes and receipt generation are preserved byte-for-byte.
+    expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
+    expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
+  }, 30_000);
+
+  // Alteration: change only the fixture-tracker project on an
+  // already-installed fixture installation. The invariant must
+  // reject independently of the delivery configuration.
+  it("rejects an altered fixture tracker project independently of delivery", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.tracker = { provider: "fixture", project: "/different/fixture/tracker" } as never;
+    });
+
+    await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+      code: "FIXTURE_ADAPTER_NOT_AUTHORIZED",
+      details: expect.objectContaining({
+        proposedFixtureTargets: expect.arrayContaining(["tracker"]),
+      }),
+    });
+
+    expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
+    expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);
+    expect((await readOwnershipReceipt(repository.root)).generation).toBe(beforeReceipt.generation);
+  }, 30_000);
+
+  // Canonical no-op preservation: a byte-equal fixture config does
+  // not throw and does not advance the receipt generation. This
+  // proves the invariant does NOT regress already-installed fixture
+  // consumers that re-assert the same configuration.
+  it("preserves a byte-equal fixture config as a no-op without advancing generation", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+
+    const candidatePath = await writeCandidateConfig(repository, () => undefined);
+    const result = await updateFromConfig(repository.root, candidatePath);
+    expect(result.manifest.poiesisVersion).toBe("1.0.3");
+    // Doctor report's `ok` may be false if the install used
+    // `skipSkills: true` (the `install` helper does so); the
+    // `skills` exemption is honored by the gate via
+    // `assertUpdateConfigDoctorGate`. What matters is the
+    // transaction succeeds without throwing and the receipt
+    // generation does not advance.
+    expect(result.doctor.checks.find((check) => check.id === "skills")?.status).toBe("fail");
+    expect(result.doctor.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
+    expect((await readOwnershipReceipt(repository.root)).generation).toBe(beforeReceipt.generation);
+  }, 30_000);
+
+  // Local fake-`gh` seam for the two non-fixture → fixture
+  // transition tests. The runtime's `verifyTracker` invokes
+  //   1. `gh auth status`  →  must succeed
+  //   2. `gh repo view <project> --json nameWithOwner`  →  must print
+  //      valid JSON with the `nameWithOwner` field
+  // both via the production process spawn. The fake binary lives in
+  // a `mkdtemp` directory prepended to `PATH` for the duration of the
+  // test only; `afterEach` restores the original PATH so unrelated
+  // tests are not affected. No production bypass env var is added.
+  async function installFakeGh(): Promise<() => void> {
+    const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-gh-"));
+    const bin = join(parent, "bin");
+    await mkdir(bin);
+    const script = join(bin, "gh");
+    // The repo view's last positional argument is the project name;
+    // the fake echoes it as a JSON object with `nameWithOwner` so
+    // every project name resolves consistently.
+    const body = `#!/bin/sh
+case "$1" in
+  auth)
+    if [ "$2" = "status" ]; then
+      printf 'Logged in to github.com\\n'
+      exit 0
+    fi
+    exit 0
+    ;;
+  repo)
+    if [ "$2" = "view" ]; then
+      project="$3"
+      printf '{"nameWithOwner":"%s"}\\n' "$project"
+      exit 0
+    fi
+    exit 1
+    ;;
+esac
+exit 0
+`;
+    await writeFile(script, body);
+    await chmod(script, 0o755);
+    const previousPath = process.env.PATH;
+    const nextPath = previousPath === undefined || previousPath === ""
+      ? bin
+      : `${bin}:${previousPath}`;
+    process.env.PATH = nextPath;
+    return () => {
+      process.env.PATH = previousPath;
+    };
+  }
+
+  // Installation helper for the non-fixture → fixture transition
+  // tests below. The proposed non-fixture config uses a github
+  // tracker and a `command` delivery with the canonical `{sha}`
+  // argument the runtime requires. `init` MUST succeed without
+  // `allowFixtureAdapters` because the proposed config carries no
+  // fixture adapter — this proves the non-fixture transition test
+  // setup is itself a valid production-shaped install. `verifyTracker`
+  // invokes the local fake `gh` above for `auth status` and
+  // `repo view <project> --json nameWithOwner`.
+  async function installProduction(repository: TestRepository): Promise<Manifest> {
+    const productionConfig: PoiesisConfig = {
+      schema: 1,
+      models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      tracker: { provider: "github", project: "poiesis-test/qualification" },
+      delivery: {
+        preview:    { adapter: "command", argv: ["echo", "preview",    "{sha}"] },
+        staging:    { adapter: "command", argv: ["echo", "staging",    "{sha}"] },
+        production: { adapter: "command", argv: ["echo", "production", "{sha}"] },
+      },
+      verification: { commands: ["test -f README.md"] },
+    };
+    return init(repository.root, productionConfig, { skipSkills: true });
+  }
+
+  // Introduction: a non-fixture installation cannot transition to
+  // fixture delivery via `update --config`. The invariant must
+  // detect the introduction and reject before any write.
+  it("rejects a transition from command delivery to fixture delivery", async () => {
+    restoreGhPath = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installProduction(repository);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+    const beforeManifest = await loadManifest(repository.root);
+
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.delivery = {
+        preview:    { adapter: "fixture", path: "/tmp/qualification/nofixture/preview" } as never,
+        staging:    { adapter: "fixture", path: "/tmp/qualification/nofixture/staging" } as never,
+        production: { adapter: "fixture", path: "/tmp/qualification/nofixture/production" } as never,
+      };
+    });
+
+    await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+      code: "FIXTURE_ADAPTER_NOT_AUTHORIZED",
+      details: expect.objectContaining({
+        proposedFixtureTargets: expect.arrayContaining(["delivery.preview", "delivery.staging", "delivery.production"]),
+        currentFixtureTargets: [],
+        introduced: true,
+        altered: false,
+      }),
+    });
+
+    // Owned bytes and receipt are preserved byte-for-byte; receipt
+    // generation/digest do not advance.
+    expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
+    expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
+  }, 30_000);
+
+  // Introduction: a non-fixture installation cannot transition to
+  // fixture tracker via `update --config`. The invariant must
+  // detect the introduction independently of delivery (which keeps
+  // its non-fixture `command` adapter in this test).
+  it("rejects a transition from github tracker to fixture tracker independently of delivery", async () => {
+    restoreGhPath = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installProduction(repository);
+    const beforeConfigBytes = await readFile(join(repository.root, CONFIG_ROOT));
+    const beforeOpenCode = await readFile(join(repository.root, "opencode.jsonc"));
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+    const beforeManifest = await loadManifest(repository.root);
+
+    // Build the candidate explicitly so the proposed config keeps
+    // the install's `command` delivery and only the tracker
+    // transitions to fixture.
+    const candidateConfig: PoiesisConfig = {
+      schema: 1,
+      models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      tracker: { provider: "fixture", project: "/tmp/qualification/nofixture/tracker" },
+      delivery: {
+        preview:    { adapter: "command", argv: ["echo", "preview",    "{sha}"] },
+        staging:    { adapter: "command", argv: ["echo", "staging",    "{sha}"] },
+        production: { adapter: "command", argv: ["echo", "production", "{sha}"] },
+      },
+      verification: { commands: ["test -f README.md"] },
+    };
+    const candidatePath = join(repository.parent, "candidate-tracker-intro.jsonc");
+    await writeFile(candidatePath, serializeConfig(candidateConfig));
+
+    await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
+      code: "FIXTURE_ADAPTER_NOT_AUTHORIZED",
+      details: expect.objectContaining({
+        proposedFixtureTargets: ["tracker"],
+        currentFixtureTargets: [],
+        introduced: true,
+        altered: false,
+      }),
+    });
+
+    // Owned bytes and receipt are preserved byte-for-byte; receipt
+    // generation/digest do not advance.
+    expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
+    expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
+  }, 30_000);
 });
