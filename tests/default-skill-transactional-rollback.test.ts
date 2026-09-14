@@ -48,6 +48,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   init,
   update,
+  type MaintenanceOptions,
 } from "../src/maintenance.js";
 import {
   runUpdateTransaction,
@@ -723,5 +724,117 @@ describe("ticket #46 — full update/bootstrap transaction integration", () => {
       expect(onDisk).toBe(`# ${name}\nseeded bootstrap preimage\n`);
     }
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
+  });
+});
+
+// Regression for the high-priority Standards Review blocker on the
+// ordinary-update and legacy-bootstrap post-transaction doctor gate.
+// `skipSkills: true` must exempt ONLY the skill-related doctor check
+// (so test/internal flows that have not installed default skills
+// still pass). Every other doctor failure must still trigger
+// `UPDATE_DOCTOR_FAILED` and drive the bounded journal's reverse
+// hash-gated rollback. Mirrors the gate semantics in
+// `src/update-config-internal.ts::assertUpdateConfigDoctorGate`.
+describe("skipSkills must not bypass non-skill doctor failures", () => {
+  const repositories: TestRepository[] = [];
+  afterEach(async () =>
+    Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))),
+  );
+
+  it("ordinary update with skipSkills:true still fails closed on a non-skill doctor failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // Install with skipSkills:true so the manifest has an empty `skills`
+    // array; this is the configuration where the previous
+    // `if (!options.skipSkills && !report.ok)` gate would silently let
+    // any doctor failure through.
+    await installPoiesis(repository);
+    const manifestBefore = await loadManifest(repository.root);
+    expect(manifestBefore.skills).toHaveLength(0);
+
+    // Force a non-skill doctor failure: fake opencode fails its `debug
+    // config` call (propagates to the doctor `opencode-schema` check).
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(
+        runUpdateTransaction(repository.root, { skipSkills: true } satisfies MaintenanceOptions, {}),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // Fail-closed rollback: the manifest on disk is restored to the
+    // preimage the journal captured before the first write.
+    const manifestAfter = await loadManifest(repository.root);
+    expect(manifestAfter.poiesisVersion).toBe(manifestBefore.poiesisVersion);
+    expect(manifestAfter.adapter).toEqual(manifestBefore.adapter);
+    expect(manifestAfter.skills).toHaveLength(0);
+  });
+
+  it("legacy bootstrap with skipSkills:true still fails closed on a non-skill doctor failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // init() then immediately strip the receipt and rewrite the
+    // manifest version to a 1.0.0 predecessor so the bootstrap path
+    // is the canonical 1.0.0 explicit bootstrap.
+    await installPoiesis(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.poiesisVersion = "1.0.0";
+    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    await removeOwnershipReceipt(repository.root);
+    expect(await ownershipReceiptExists(repository.root)).toBe(false);
+
+    const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
+    process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
+    try {
+      await expect(
+        runBootstrapLegacyOwnershipTransaction(
+          repository.root,
+          { skipSkills: true } satisfies MaintenanceOptions,
+          {},
+        ),
+      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+    } finally {
+      if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
+      else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
+    }
+
+    // The bootstrap transaction's rollback must leave the receipt
+    // absent (the preimage the journal captured was `exists:false`).
+    expect(await ownershipReceiptExists(repository.root)).toBe(false);
+  });
+
+  it("ordinary update with skipSkills:true does NOT throw when the only doctor failure is the skills check", async () => {
+    // After init with skipSkills:true, the manifest has an empty
+    // `skills` array, so the doctor skills check naturally reports
+    // `skills: fail`. The skipSkills gate must exempt that single
+    // failure while still requiring every other check to pass. This
+    // test asserts that legitimate skipSkills behavior is preserved:
+    // the transaction completes without throwing UPDATE_DOCTOR_FAILED.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installPoiesis(repository);
+
+    // Sanity-check that the only failing doctor check here is skills.
+    const { doctor } = await import("../src/maintenance.js");
+    const baselineReport = await doctor(repository.root);
+    expect(baselineReport.ok).toBe(false);
+    const failing = baselineReport.checks.filter((check) => check.status === "fail");
+    expect(failing.map((check) => check.id)).toEqual(["skills"]);
+
+    // No doctor failure injected: the only `fail` check is the skills
+    // check, which the skipSkills gate must exempt.
+    const result = await runUpdateTransaction(
+      repository.root,
+      { skipSkills: true } satisfies MaintenanceOptions,
+      {},
+    );
+    // The doctor's `ok` is still false because the skills check is in
+    // the report; the gate's only contract is that the transaction
+    // succeeds (no exception thrown). `result.doctor` is returned as
+    // observed; `result.manifest` carries the advanced generation.
+    expect(result.manifest.adapter).toBeDefined();
   });
 });

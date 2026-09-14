@@ -68,7 +68,7 @@ import {
 import { installDefaultSkills } from "./skills.js";
 import { templateMappings } from "./templates.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
-import type { MaintenanceOptions, UpdateResult } from "./maintenance.js";
+import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
 type JsonObject = Record<string, unknown>;
 
@@ -79,6 +79,27 @@ type JsonObject = Record<string, unknown>;
  * headroom for future Poiesis-managed files.
  */
 const TRANSACTION_JOURNAL_LIMIT = 32;
+
+/**
+ * Post-transaction doctor gate predicate shared by the ordinary `update`
+ * and the explicit 1.0.0 legacy bootstrap transaction. `skipSkills` may
+ * exempt only the skill-related doctor check needed by test/internal
+ * flows; every other doctor failure throws `UPDATE_DOCTOR_FAILED` to
+ * drive the bounded journal's reverse hash-gated rollback.
+ *
+ * Mirrors the no-op / non-no-op gate in
+ * `src/update-config-internal.ts::assertUpdateConfigDoctorGate` so the
+ * three transaction surfaces share the same fail-closed semantics for
+ * non-skill doctor failures regardless of `skipSkills`.
+ */
+function assertUpdateDoctorGate(report: DoctorReport, skipSkills: boolean): void {
+  const gateFailure = report.checks.find(
+    (check) => check.status === "fail" && !(skipSkills && check.id === "skills"),
+  );
+  if (gateFailure !== undefined) {
+    throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
+  }
+}
 
 const POIESIS_DEFAULT_PATH_GITIGNORE_HEADER =
   "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
@@ -558,9 +579,7 @@ async function runLockedUpdateTransaction(
     await hooks?.postReceiptReplace?.();
 
     const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
-    }
+    assertUpdateDoctorGate(report, options.skipSkills === true);
     // Ticket #46: the bounded journal's `commit()` removes every
     // journal-owned directory preimage backup AFTER every transaction
     // write has succeeded. Failures are swallowed inside `commit()`, so
@@ -852,9 +871,7 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     await hooks?.postReceiptReplace?.();
 
     const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
-    }
+    assertUpdateDoctorGate(report, options.skipSkills === true);
     // Ticket #46: commit the bounded journal after every transaction
     // write has succeeded so the journal-owned directory preimage
     // backups are removed only after commit. `commit()` swallows its
