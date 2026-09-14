@@ -74,8 +74,9 @@ type JsonObject = Record<string, unknown>;
 
 /**
  * Journal artifact limit. 13 template mappings + `.poiesis/config.jsonc`
- * + opencode config + manifest + receipt = 17 artifacts in the worst
- * case; 32 leaves comfortable headroom for future Poiesis-managed files.
+ * + opencode config + manifest + receipt + 11 default skill directories
+ * = 28 artifacts in the worst case (ticket #46); 32 leaves comfortable
+ * headroom for future Poiesis-managed files.
  */
 const TRANSACTION_JOURNAL_LIMIT = 32;
 
@@ -116,10 +117,30 @@ export interface UpdateBootstrapTransactionHooks {
   /** Called immediately before `installDefaultSkills` runs. */
   preSkillsInstall?: () => void | Promise<void>;
   /**
+   * Called immediately AFTER `installDefaultSkills` returns but BEFORE
+   * any further transactional write. Tests use this hook to land a
+   * concurrent foreign write to a skill directory between the
+   * transaction's recordDirectoryWrite binding and the next write.
+   * The bounded journal's hash-gated rollback must preserve the
+   * foreign write and report it via `RollbackDiagnostic` (reason
+   * `identity-mismatch`). Ticket #46.
+   */
+  postSkillsInstall?: () => void | Promise<void>;
+/**
+   * Optional pre-staged skill directory. When supplied, the update and
+   * bootstrap transactions route `installDefaultSkills` through this
+   * directory instead of running the network-bound `stageSkills` step.
+   * The directory MUST mirror the layout `.agents/skills/<name>/...`
+   * that `stageSkills` produces. Used by tests that exercise the
+   * transactional install/rollback contract without contacting the
+   * upstream registry. NOT part of the public surface.
+   */
+  preimageSkillDirectory?: string;
+  /**
    * Called immediately BEFORE the atomic write of each materialized file.
    * Receives the relative path of the file about to be written. The
    * transaction's pre-write identity is `hashContent(file.content)`; if
-   * the hook mutates the on-disk file before our `atomicWrite` runs,
+   * the hook mutates the on-disk file before our `atomic.write` runs,
    * the rollback still restores the original preimage because the
    * identity hash matches only what THIS transaction writes.
    */
@@ -380,9 +401,24 @@ async function runLockedUpdateTransaction(
 
   try {
     await hooks?.preSkillsInstall?.();
+    // Ticket #46: pass the bounded journal into installDefaultSkills so
+    // every default-skill preimage hash and transaction-written hash is
+    // captured into the same journal that owns every other owned
+    // artifact. The journal's `rollback()` is then the single source of
+    // truth for reverse hash-gated restoration: it preserves
+    // concurrent foreign writes and reports them via
+    // `RollbackDiagnostic` (reason `identity-mismatch`).
+    const skillOptions: { replaceOwned: boolean; journal: ArtifactJournal; preimageSkillDirectory?: string } = {
+      replaceOwned: true,
+      journal,
+    };
+    if (hooks?.preimageSkillDirectory !== undefined) {
+      skillOptions.preimageSkillDirectory = hooks.preimageSkillDirectory;
+    }
     const skills = options.skipSkills
       ? manifest.skills
-      : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
+      : await installDefaultSkills(resolvedRoot, manifest.skills, skillOptions);
+    await hooks?.postSkillsInstall?.();
 
     // 1. Materialized managed files: each file goes through `journal.replace`
     //    so the immediate pre-write identity guard and the reverse
@@ -525,6 +561,11 @@ async function runLockedUpdateTransaction(
     if (!options.skipSkills && !report.ok) {
       throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
     }
+    // Ticket #46: the bounded journal's `commit()` removes every
+    // journal-owned directory preimage backup AFTER every transaction
+    // write has succeeded. Failures are swallowed inside `commit()`, so
+    // a cleanup failure cannot turn a committed update into a failure.
+    await journal.commit();
     return { manifest: next, doctor: report };
   } catch (error) {
     // Fail-closed rollback: the bounded journal drives every owned
@@ -691,9 +732,23 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
 
   try {
     await hooks?.preSkillsInstall?.();
+    // Ticket #46: pass the bounded journal into installDefaultSkills so
+    // every default-skill preimage hash and transaction-written hash is
+    // captured into the same journal that owns every other owned
+    // artifact. The journal's `rollback()` is then the single source of
+    // truth for reverse hash-gated restoration, preserving concurrent
+    // foreign writes and reporting them via `RollbackDiagnostic`.
+    const skillOptions: { replaceOwned: boolean; journal: ArtifactJournal; preimageSkillDirectory?: string } = {
+      replaceOwned: true,
+      journal,
+    };
+    if (hooks?.preimageSkillDirectory !== undefined) {
+      skillOptions.preimageSkillDirectory = hooks.preimageSkillDirectory;
+    }
     const skills = options.skipSkills
       ? nextSkills
-      : await installDefaultSkills(resolvedRoot, nextSkills, { replaceOwned: true });
+      : await installDefaultSkills(resolvedRoot, nextSkills, skillOptions);
+    await hooks?.postSkillsInstall?.();
 
     for (const file of materialized) {
       const destination = join(resolvedRoot, file.path);
@@ -800,6 +855,12 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     if (!options.skipSkills && !report.ok) {
       throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
     }
+    // Ticket #46: commit the bounded journal after every transaction
+    // write has succeeded so the journal-owned directory preimage
+    // backups are removed only after commit. `commit()` swallows its
+    // own cleanup failures so they cannot turn a committed bootstrap
+    // into a failure.
+    await journal.commit();
     return { manifest: next, doctor: report };
   } catch (error) {
     // Fail-closed rollback: the bounded journal drives every owned

@@ -19,6 +19,7 @@ import {
   runBootstrapLegacyOwnershipTransaction,
 } from "./update-internal.js";
 import { hashContent, hashFile } from "./hash.js";
+import { ArtifactJournal } from "./mutation-transaction.js";
 import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -727,6 +728,13 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
   let installedSkillSnapshots: Map<string, string> | undefined;
+  // Ticket #46: bounded journal for default-skill mutations. The
+  // catch block uses `journal.rollback()` instead of the legacy
+  // destructive `removeOwnedSkills` path: foreign writes are
+  // preserved and reported via `RollbackDiagnostic` (reason
+  // `identity-mismatch`), and the journal owns the preimage backup
+  // lifecycle so cleanup is gated on commit/rollback.
+  const skillJournal: ArtifactJournal = new ArtifactJournal(32);
   // Ticket #45: exact canonical bytes of the receipt authored by THIS
   // `init()` invocation (set only after a successful `createOwnershipReceipt`),
   // or `undefined` if the receipt was never authored. The catch block uses
@@ -749,10 +757,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     }
     if (!options.skipSkills) {
       await assertDefaultSkillDestinationsAvailable(resolvedRoot, initialSkills);
-      managedSkills = await installDefaultSkills(resolvedRoot, [], {
+      // Ticket #46: hand the bounded skill journal to installDefaultSkills
+      // so every default-skill preimage hash and transaction-written
+      // hash is captured into the same journal that owns rollback.
+      // Ticket #46: `journal` is an internal-only seam widening the
+      // public SkillMaintenanceOptions. Build the options through a
+      // local widened type so the structural widening is explicit
+      // and the public dist declaration stays free of the transaction
+      // surface.
+      const initSkillOptions = {
         expectedPreexisting: initialSkills!,
         createdDirectories: createdInitDirectories,
-      });
+        journal: skillJournal,
+      };
+      managedSkills = await installDefaultSkills(resolvedRoot, [], initSkillOptions);
       installedSkillSnapshots = await assertDefaultSkillDestinationsAvailable(resolvedRoot);
     }
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -886,6 +904,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         });
       }
     }
+    // Ticket #46: commit the bounded skill journal after every init
+    // write has succeeded so the journal-owned preimage backups are
+    // removed only after commit. `commit()` swallows its own cleanup
+    // failures so they cannot turn a committed init into a failure.
+    await skillJournal.commit();
     return manifest;
   } catch (error) {
     const rollbackFailures: Array<Record<string, unknown>> = [];
@@ -909,10 +932,32 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         await unlink(manifestPath);
       }
     });
+    // Ticket #46: roll back default-skill mutations through the bounded
+    // journal FIRST (reverse write order via the journal's own loop),
+    // preserving concurrent foreign changes via `RollbackDiagnostic`.
+    // The non-skill portion of `rollbackInit` still runs after to
+    // restore managed files + OpenCode config from their snapshots.
+    await rollbackStep(rollbackFailures, "skills (journal)", async () => {
+      const diagnostics = await skillJournal.rollback();
+      if (diagnostics.length > 0) {
+        const preserved = diagnostics.map((diagnostic) => ({
+          path: relative(resolvedRoot, diagnostic.path),
+          reason: diagnostic.reason,
+        }));
+        throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Some default-skill mutations could not be rolled back", {
+          preserved,
+        });
+      }
+    });
+    // The skill journal now owns the per-skill preimage backup lifecycle,
+    // so the legacy `rollbackInit` call no longer needs to roll back
+    // skills via `removeOwnedSkills`. Pass an empty skills array so the
+    // non-skill rollback path still handles the rest of the init-owned
+    // surface.
     rollbackFailures.push(...await rollbackInit(
       resolvedRoot,
       managedFiles,
-      managedSkills,
+      [],
       openCodeConfigPath,
       initialOpenCodeConfigSnapshot,
       writtenOpenCodeConfigHash,
