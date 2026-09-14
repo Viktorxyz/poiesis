@@ -7,9 +7,12 @@ import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./proce
 import { resolveGitRoot } from "./paths.js";
 import {
   validateProofEvidence,
+  validatePublishEvidence,
   validateStagingEvidence,
   validateIntegrationEvidence,
   type IntegrationEvidence,
+  type PublishEvidence,
+  type PublishProvider,
 } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
@@ -132,8 +135,6 @@ export interface VerifyResult {
   commands: VerifyCommandResult[];
 }
 
-export type PublishProvider = "github" | "gitlab" | "fixture";
-
 export interface PublishOptions {
   cwd: string;
   ownershipId?: string;
@@ -146,13 +147,20 @@ export interface PublishOptions {
   title: string;
   body: string;
   proof: ProofPayload;
+  command?: readonly string[];
+  commandCwd?: string;
+  commandEnv?: Record<string, string>;
 }
 
 export interface PublishResult {
+  evidence: PublishEvidence;
   provider: PublishProvider;
   candidateSha: string;
+  candidateTree: string;
+  verified: true;
   branch: string;
   remoteRef: string;
+  publishedHeadSha: string;
   requestId: string | null;
   requestUrl: string | null;
   action: "created" | "updated" | "pushed";
@@ -639,20 +647,63 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   });
   await assertExactClean(owned.root, candidateSha);
 
+  let providerCompletion: ProviderCompletion;
   if (options.provider === "fixture") {
-    return {
-      provider: options.provider,
-      candidateSha,
-      branch,
-      remoteRef,
+    providerCompletion = {
       requestId: null,
       requestUrl: null,
       action: expectedRemote === null ? "pushed" : "updated",
     };
+  } else if (options.provider === "github") {
+    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+  } else if (options.provider === "gitlab") {
+    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+  } else {
+    providerCompletion = await publishCommand(
+      options,
+      branch,
+      candidateSha,
+      remoteRef,
+      owned.root,
+      expectedRemote === null,
+    );
   }
-  return options.provider === "github"
-    ? publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null)
-    : publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+
+  const evidence: PublishEvidence = {
+    candidateSha,
+    candidateTree,
+    verified: true,
+    branch,
+    remoteRef,
+    publishedHeadSha: publishedSha,
+    provider: options.provider,
+    action: providerCompletion.action,
+    changeRequest: {
+      id: providerCompletion.requestId,
+      url: providerCompletion.requestUrl,
+    },
+  };
+  validatePublishEvidence(evidence, candidateSha, candidateTree, branch, remoteRef);
+
+  return {
+    evidence,
+    provider: options.provider,
+    candidateSha,
+    candidateTree,
+    verified: true,
+    branch,
+    remoteRef,
+    publishedHeadSha: publishedSha,
+    requestId: providerCompletion.requestId,
+    requestUrl: providerCompletion.requestUrl,
+    action: providerCompletion.action,
+  };
+}
+
+interface ProviderCompletion {
+  requestId: string | null;
+  requestUrl: string | null;
+  action: "created" | "updated" | "pushed";
 }
 
 export async function integrate(options: IntegrateOptions): Promise<IntegrateResult> {
@@ -853,7 +904,7 @@ async function publishGitHub(
   remoteRef: string,
   cwd: string,
   _expectedBranchWasMissing: boolean,
-): Promise<PublishResult> {
+): Promise<ProviderCompletion> {
   const listed = await run(
     "gh",
     [
@@ -911,13 +962,16 @@ async function publishGitHub(
       ],
       { cwd },
     );
+    const verified = await verifyGitHubPullRequest(options, branch, candidateSha, cwd);
+    invariant(
+      verified !== null,
+      "PUBLISH_PROVIDER_INCOMPLETE",
+      "GitHub pull request edit did not produce a verifiable provider state",
+      { number, project: options.project, branch },
+    );
     return {
-      provider: "github",
-      candidateSha,
-      branch,
-      remoteRef,
       requestId: number,
-      requestUrl: jsonString(request, "url") ?? null,
+      requestUrl: jsonString(verified, "url") ?? null,
       action: "updated",
     };
   }
@@ -939,15 +993,52 @@ async function publishGitHub(
     ],
     { cwd },
   );
+  const verified = await verifyGitHubPullRequest(options, branch, candidateSha, cwd);
+  invariant(
+    verified !== null,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "GitHub pull request create did not produce a verifiable provider state",
+    { project: options.project, branch, ghOutput: bounded(created.stdout) },
+  );
+  const verifiedNumber = jsonIdentifier(verified, "number", "GitHub pull request");
   return {
-    provider: "github",
-    candidateSha,
-    branch,
-    remoteRef,
-    requestId: null,
-    requestUrl: extractUrl(created.stdout),
+    requestId: verifiedNumber,
+    requestUrl: jsonString(verified, "url") ?? extractUrl(created.stdout),
     action: "created",
   };
+}
+
+async function verifyGitHubPullRequest(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const listed = await run(
+    "gh",
+    [
+      "pr",
+      "list",
+      "--repo",
+      options.project,
+      "--state",
+      "open",
+      "--head",
+      branch,
+      "--base",
+      options.integrationBranch,
+      "--json",
+      "number,url,headRefOid,headRepository",
+      "--limit",
+      "100",
+    ],
+    { cwd },
+  );
+  const requests = parseJsonArray(listed.stdout, "GitHub pull request list");
+  const matched = requests.find((entry) => jsonString(entry, "headRefOid") === candidateSha);
+  if (matched === undefined) return null;
+  if (!isJsonRecord(matched)) return null;
+  return matched;
 }
 
 async function publishGitLab(
@@ -957,7 +1048,7 @@ async function publishGitLab(
   remoteRef: string,
   cwd: string,
   _expectedBranchWasMissing: boolean,
-): Promise<PublishResult> {
+): Promise<ProviderCompletion> {
   const listed = await run(
     "glab",
     [
@@ -1003,13 +1094,16 @@ async function publishGitLab(
       ],
       { cwd },
     );
+    const verified = await verifyGitLabMergeRequest(options, branch, candidateSha, cwd);
+    invariant(
+      verified !== null,
+      "PUBLISH_PROVIDER_INCOMPLETE",
+      "GitLab merge request update did not produce a verifiable provider state",
+      { iid, project: options.project, branch },
+    );
     return {
-      provider: "gitlab",
-      candidateSha,
-      branch,
-      remoteRef,
       requestId: iid,
-      requestUrl: jsonString(request, "web_url") ?? jsonString(request, "webUrl") ?? null,
+      requestUrl: jsonString(verified, "web_url") ?? jsonString(verified, "webUrl") ?? null,
       action: "updated",
     };
   }
@@ -1032,14 +1126,140 @@ async function publishGitLab(
     ],
     { cwd },
   );
+  const verified = await verifyGitLabMergeRequest(options, branch, candidateSha, cwd);
+  invariant(
+    verified !== null,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "GitLab merge request create did not produce a verifiable provider state",
+    { project: options.project, branch, glabOutput: bounded(created.stdout) },
+  );
+  const verifiedIid = jsonIdentifier(verified, "iid", "GitLab merge request");
   return {
-    provider: "gitlab",
-    candidateSha,
-    branch,
-    remoteRef,
-    requestId: null,
-    requestUrl: extractUrl(created.stdout),
+    requestId: verifiedIid,
+    requestUrl: jsonString(verified, "web_url") ?? jsonString(verified, "webUrl") ?? extractUrl(created.stdout),
     action: "created",
+  };
+}
+
+async function verifyGitLabMergeRequest(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const listed = await run(
+    "glab",
+    [
+      "mr",
+      "list",
+      "--repo",
+      options.project,
+      "--source-branch",
+      branch,
+      "--target-branch",
+      options.integrationBranch,
+      "--output",
+      "json",
+    ],
+    { cwd },
+  );
+  const requests = parseJsonArray(listed.stdout, "GitLab merge request list");
+  const matched = requests.find((entry) => {
+    const headSha = jsonString(entry, "sha") ?? jsonString(entry, "head_sha");
+    return headSha === undefined || headSha === candidateSha;
+  });
+  if (matched === undefined) return null;
+  if (!isJsonRecord(matched)) return null;
+  return matched;
+}
+
+async function publishCommand(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  remoteRef: string,
+  cwd: string,
+  expectedBranchWasMissing: boolean,
+): Promise<ProviderCompletion> {
+  invariant(
+    options.command !== undefined && options.command.length > 0,
+    "INVALID_PUBLISH_COMMAND",
+    "Publish command provider requires a non-empty command argv",
+    { provider: options.provider },
+  );
+  const argv = options.command;
+  const executable = argv[0]!;
+  const args = argv.slice(1);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(options.commandEnv ?? {}),
+    POIESIS_CANDIDATE_SHA: candidateSha,
+    POIESIS_CANDIDATE_TREE: options.candidateTree,
+    POIESIS_BRANCH: branch,
+    POIESIS_REMOTE_REF: remoteRef,
+    POIESIS_PUBLISH_PROJECT: options.project,
+    POIESIS_PUBLISH_TITLE: options.title,
+    POIESIS_PUBLISH_BODY: options.body,
+    POIESIS_PUBLISH_INTEGRATION_BRANCH: options.integrationBranch,
+    POIESIS_PUBLISH_REMOTE: options.remote,
+    POIESIS_PUBLISH_PROVIDER: options.provider,
+  };
+  const commandCwd = options.commandCwd ?? cwd;
+  const result = await run(executable, args, { cwd: commandCwd, env });
+  const output = parsePublishCommandOutput(result.stdout);
+  const requestId = typeof output.id === "string" && output.id.length > 0 ? output.id : null;
+  const requestUrl = typeof output.url === "string" && output.url.length > 0 ? output.url : null;
+  invariant(
+    output.candidateSha === undefined || output.candidateSha === candidateSha,
+    "PUBLISH_COMMAND_CANDIDATE_MISMATCH",
+    "Publish command reported a different candidate SHA",
+    { expected: candidateSha, actual: output.candidateSha },
+  );
+  invariant(
+    output.candidateTree === undefined || output.candidateTree === options.candidateTree,
+    "PUBLISH_COMMAND_TREE_MISMATCH",
+    "Publish command reported a different candidate tree",
+    { expected: options.candidateTree, actual: output.candidateTree },
+  );
+  invariant(
+    output.verified === true,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "Publish command must report verified: true after provider completion",
+    { exitCode: result.exitCode, output: bounded(result.stdout) },
+  );
+  const action = output.action === "created" || output.action === "updated"
+    ? output.action
+    : expectedBranchWasMissing
+      ? "created"
+      : "updated";
+  return { requestId, requestUrl, action };
+}
+
+function parsePublishCommandOutput(stdout: string): {
+  id?: string;
+  url?: string;
+  candidateSha?: string;
+  candidateTree?: string;
+  verified?: boolean;
+  action?: "created" | "updated";
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new PoiesisError("INVALID_PUBLISH_COMMAND_OUTPUT", "Publish command output was not valid JSON", {
+      cause: error instanceof Error ? error.message : String(error),
+      output: bounded(stdout),
+    });
+  }
+  invariant(isJsonRecord(parsed), "INVALID_PUBLISH_COMMAND_OUTPUT", "Publish command output must be a JSON object");
+  return parsed as {
+    id?: string;
+    url?: string;
+    candidateSha?: string;
+    candidateTree?: string;
+    verified?: boolean;
+    action?: "created" | "updated";
   };
 }
 
