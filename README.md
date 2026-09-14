@@ -42,11 +42,7 @@ pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
 
 `init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
 
-You can also point `init` at a discovered remote by hand:
-
-```bash
-pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc --remote origin --integration-branch main
-```
+The repository remote and integration branch are not CLI options — they are read from the `repository` block of the supplied config file (or auto-discovered from the Git repository when omitted; see the minimal config example below).
 
 `doctor` runs without mutation and verifies the same set of invariants any time:
 
@@ -96,10 +92,15 @@ those combinations with `INCOMPATIBLE_UPDATE_OPTIONS` before reaching the
 maintenance surface. The transaction is config-only: it does not bootstrap
 legacy ownership, install skills, or accept fixture adapters.
 
-If the proposed config bytes and the OpenCode config bytes already match
-their recorded manifest hashes, `update --config` is a **no-op**: it returns
-the existing manifest unchanged and does not advance the ownership receipt
-generation. A repeated identical config cannot double-advance.
+If the intended serialized Poiesis config bytes equal the bytes currently on
+disk for `.poiesis/config.jsonc` AND the intended projected OpenCode config
+bytes equal the bytes currently on disk for the OpenCode config, `update
+--config` is a **no-op**: it returns the existing manifest unchanged and
+does not advance the ownership receipt generation. (The OpenCode config is
+owned through per-field manifest config patches rather than a whole-file
+record, so the comparison is direct byte equality against the on-disk file,
+not against a single recorded hash.) A repeated identical config cannot
+double-advance.
 
 If any write step fails after the transaction has started, `update --config`
 runs **transactional rollback**: each mutated artifact is restored to its
