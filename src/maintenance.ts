@@ -19,7 +19,7 @@ import {
   runBootstrapLegacyOwnershipTransaction,
 } from "./update-internal.js";
 import { hashContent, hashFile } from "./hash.js";
-import { ArtifactJournal } from "./mutation-transaction.js";
+import { ArtifactJournal, type ArtifactJournalEntry } from "./mutation-transaction.js";
 import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -33,7 +33,6 @@ import {
   ownershipReceiptLocation,
   removeOwnershipReceipt,
   replaceOwnershipReceipt,
-  restoreOwnershipReceipt,
   type OwnershipReceipt,
 } from "./receipt.js";
 import {
@@ -41,6 +40,7 @@ import {
   serializeManifest,
   type ConfigPatch,
   type ManagedFile,
+  type ManagedSkill,
   type Manifest,
 } from "./manifest.js";
 import {
@@ -1382,33 +1382,238 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   return known;
 }
 
-export async function installAuthorizedCapability(root: string, input: CapabilityInstallInput) {
+/**
+ * Test-only deterministic fault-injection hooks used by
+ * `runCapabilityInstallTransaction`. Each callback fires immediately
+ * BEFORE the corresponding write step (or immediately AFTER for
+ * `post*` hooks). Throwing from a hook simulates an I/O fault and
+ * exercises the rollback path.
+ *
+ * The seam mirrors `UpdateBootstrapTransactionHooks` (ticket #46) and
+ * is intentionally NOT part of the public `installAuthorizedCapability`
+ * declaration or the package root re-exports. Tests import
+ * `runCapabilityInstallTransaction` directly from this module and
+ * supply hooks; production callers (CLI, library users) call the
+ * public `installAuthorizedCapability(root, input)` wrapper which
+ * delegates with empty hooks and never surfaces the seam.
+ *
+ * The interface declaration remains `export` so the source-internal
+ * transaction runner can be type-checked against it; the public API
+ * test asserts neither the interface nor any of its members leak
+ * through `dist/index.d.ts`.
+ */
+export interface CapabilityInstallTransactionHooks {
+  /**
+   * Exposes the bounded in-memory journal to transaction tests after
+   * the upfront receipt capture, before any other artifact is
+   * captured. The journal's entries are read-only at this point.
+   */
+  onJournalReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+  /**
+   * Exposes the bounded in-memory journal to transaction tests after
+   * every artifact (receipt, destination directory, manifest) has
+   * been captured, before any write fires. Used by tests that need to
+   * observe the journal's captured preimage backups (e.g. the
+   * destination's `preimageBackup` path).
+   */
+  onCapturesReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+  /**
+   * Called immediately AFTER `installCapability` returns but BEFORE
+   * the next transactional write (manifest write or receipt write).
+   * Tests use this hook to land a concurrent foreign write to the
+   * capability directory between the transaction's
+   * `recordDirectoryWrite` binding and the next write. The bounded
+   * journal's hash-gated rollback must preserve the foreign write
+   * and report it via `RollbackDiagnostic` (reason
+   * `identity-mismatch`).
+   */
+  postCapabilityInstall?: () => void | Promise<void>;
+  /**
+   * Optional pre-staged capability directory. When supplied, the
+   * transaction routes `installCapability` through this directory
+   * instead of running the network-bound `stageSkills` step. The
+   * directory MUST mirror the layout `.agents/skills/<name>/...`
+   * that `stageSkills` produces. Used by tests that exercise the
+   * transactional install/rollback contract without contacting the
+   * upstream registry. NOT part of the public surface.
+   */
+  preimageCapabilityDirectory?: string;
+  /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
+  preManifestWrite?: () => void | Promise<void>;
+  /** Called immediately AFTER atomic-writing the new `.poiesis/manifest.json`. */
+  postManifestWrite?: () => void | Promise<void>;
+  /** Called immediately before the receipt write (replace for capability install). */
+  preReceiptReplace?: () => void | Promise<void>;
+  /** Called immediately AFTER the receipt write (replace for capability install). */
+  postReceiptReplace?: () => void | Promise<void>;
+}
+
+/**
+ * Source-internal transaction runner for capability installation.
+ *
+ * This is the SINGLE implementation of the receipt-authenticated
+ * capability install transaction. It accepts an optional
+ * `CapabilityInstallTransactionHooks` parameter so the test suite
+ * can drive deterministic preimage/journal/fault scenarios without
+ * monkey-patching internal modules.
+ *
+ * The seam lives in this module; `src/index.ts` does NOT re-export
+ * this function so the security-sensitive fault-injection surface
+ * stays confined to the repo and never appears in the packed
+ * `dist/index.d.ts` declaration. The public
+ * `installAuthorizedCapability(root, input)` wrapper below is the
+ * only entry point re-exported through the package root; it
+ * delegates here with empty hooks.
+ *
+ * Mirrors the ticket #46 pattern: `runUpdateTransaction` is the
+ * internal runner for `update()` (which is the public function with
+ * no hooks). `runCapabilityInstallTransaction` is the internal
+ * runner for `installAuthorizedCapability()` (which is the public
+ * function with no hooks).
+ */
+export async function runCapabilityInstallTransaction(
+  root: string,
+  input: CapabilityInstallInput,
+  hooks?: CapabilityInstallTransactionHooks,
+): Promise<ManagedSkill> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
-  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
+  const receiptPath = await ownershipReceiptLocation(resolvedRoot);
+  // Ticket #47: capture every artifact the capability transaction
+  // mutates into a bounded `ArtifactJournal` BEFORE any transaction
+  // write. The journal owns the unified rollback path: it hash-gates
+  // the destination against `transactionWrittenIdentity` (preserving
+  // concurrent foreign writes via `RollbackDiagnostic` reason
+  // `identity-mismatch`), restores the EXACT manifest preimage when
+  // the on-disk file still matches the transaction-written bytes,
+  // and restores the receipt preimage the same way. Successful
+  // transactions call `commit()` which removes every journal-owned
+  // preimage backup after every write has succeeded; cleanup failures
+  // are swallowed inside `commit()` so a transient cleanup failure
+  // cannot turn a committed capability install into a failure.
+  //
+  // The journal limit (4) covers the receipt (whole-file), the
+  // manifest (whole-file, captured inside `installCapability`), the
+  // destination directory (directory-mode, captured inside
+  // `installCapability`), and one slot of headroom for any future
+  // artifact.
+  const journal = new ArtifactJournal(4);
+  // Ticket #47: the journal captures the receipt upfront because the
+  // receipt write happens AFTER `installCapability` returns. The
+  // capability destination directory and the manifest are captured
+  // INSIDE `installCapability` (when the journal is supplied) so the
+  // capture is always immediately before the corresponding write —
+  // a foreign writer that mutates either between capture and write is
+  // preserved by the journal's reverse hash-gated rollback.
+  await journal.capture(receiptPath, "whole-file");
+  await hooks?.onJournalReady?.(journal.entries);
   try {
-    const installed = await installCapability(resolvedRoot, input);
+    // Ticket #47: widen the public `CapabilityMaintenanceOptions`
+    // surface at the call site so the bounded journal seam is
+    // threaded through `installCapability` without leaking through
+    // `dist/index.d.ts`. The seam is widened through structural typing
+    // (same pattern as `installDefaultSkills` for ticket #46): the
+    // intermediate `capabilityOptions` variable carries the wider
+    // type and is passed by reference, so TypeScript's excess-property
+    // check applies to the variable, not the literal at the call site.
+    const capabilityOptions: {
+      journal: ArtifactJournal;
+      preimageCapabilityDirectory?: string;
+      onCapturesReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+    } = {
+      journal,
+    };
+    if (hooks?.preimageCapabilityDirectory !== undefined) {
+      capabilityOptions.preimageCapabilityDirectory = hooks.preimageCapabilityDirectory;
+    }
+    if (hooks?.onCapturesReady !== undefined) {
+      capabilityOptions.onCapturesReady = hooks.onCapturesReady;
+    }
+    const installed = await installCapability(resolvedRoot, input, capabilityOptions);
+    await hooks?.postCapabilityInstall?.();
     const next = await loadManifest(resolvedRoot);
-    await replaceOwnershipReceipt(resolvedRoot, next, receipt);
+    const nextReceipt: OwnershipReceipt = {
+      ...receipt,
+      manifestDigest: hashContent(serializeManifest(next)),
+      generation: receipt.generation + 1,
+    };
+    const nextReceiptBytes = `${JSON.stringify(nextReceipt, null, 2)}\n`;
+    // Ticket #47: the manifest write goes through the journal's
+    // hash-gated `replace` so a foreign writer landing between
+    // capture and write surfaces as `RollbackDiagnostic` (reason
+    // `identity-mismatch`). The manifest capture happens INSIDE
+    // `installCapability` immediately before its hash-gated `replace`
+    // (the journal's `expectedPreWriteIdentity` guard sees the exact
+    // preimage bytes Poiesis owned at the start of the
+    // transaction). The `installCapability` helper writes the manifest
+    // through `journal.replace` when the journal is supplied, so this
+    // `preManifestWrite` / `postManifestWrite` hook pair fires around
+    // that hash-gated replace.
+    await hooks?.preManifestWrite?.();
+    // The manifest entry was already written by `installCapability`
+    // through `journal.replace` (when the journal is supplied). Hook
+    // consumers can observe the post-write state via the journal's
+    // `transactionWrittenIdentity` on the manifest entry.
+    await hooks?.postManifestWrite?.();
+    // Ticket #47: the receipt write goes through the journal's
+    // hash-gated `replace` so the post-write identity is bound to the
+    // exact bytes Poiesis is about to write; a foreign writer that
+    // lands between the receipt capture and this write is preserved
+    // and reported as `identity-mismatch`. The receipt is captured
+    // upfront (line above) so the journal's `expectedPreWriteIdentity`
+    // guard sees the exact preimage bytes Poiesis owned at the start
+    // of the transaction.
+    const receiptEntry = journal.entries.find((candidate) => candidate.path === receiptPath);
+    if (receiptEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the receipt entry", { path: receiptPath });
+    }
+    await hooks?.preReceiptReplace?.();
+    await journal.replace(receiptEntry, nextReceiptBytes);
+    await hooks?.postReceiptReplace?.();
+    await journal.commit();
     return installed;
   } catch (error) {
-    // Byte-exact manifest rollback: restore the preimage Buffer directly
-    // (no newline normalization) so a no-trailing-newline preimage
-    // restores to a no-trailing-newline file. A null preimage removes
-    // the file (the manifest was created by this transaction).
-    if (manifestBackup === null) {
-      const { unlink } = await import("node:fs/promises");
-      await unlink(manifestPath).catch(() => undefined);
-    } else {
-      await atomicWrite(manifestPath, manifestBackup);
+    // Ticket #47: fail-closed rollback through the bounded journal.
+    // The journal walks its captured entries in reverse capture order
+    // and, for every entry whose on-disk identity still matches the
+    // recorded `transactionWrittenIdentity`, restores the preimage.
+    // Foreign replacements that land between this transaction's last
+    // write and the rollback are preserved on disk and surfaced via
+    // `RollbackDiagnostic` (reason `identity-mismatch`).
+    const diagnostics = await journal.rollback();
+    if (diagnostics.length > 0) {
+      if (error instanceof PoiesisError) {
+        error.details.incompleteRollback = diagnostics;
+      } else {
+        throw new PoiesisError("ROLLBACK_INCOMPLETE", "Capability transaction failed and rollback was incomplete", {
+          cause: error instanceof Error ? error.message : String(error),
+          incompleteRollback: diagnostics,
+        });
+      }
     }
-    await restoreOwnershipReceipt(resolvedRoot, receipt);
     throw error;
   }
+}
+
+/**
+ * Public capability installation entry point. Exactly two
+ * parameters: `(root, input)`. Delegates to
+ * `runCapabilityInstallTransaction` with empty hooks so production
+ * callers never see the test-only seam.
+ *
+ * Callers who need the test-only preimage / journal / fault hooks
+ * MUST import `runCapabilityInstallTransaction` directly from
+ * `src/maintenance.js` (the internal seam); they MUST NOT reach for
+ * a hooks parameter on this public wrapper — none exists.
+ */
+export async function installAuthorizedCapability(
+  root: string,
+  input: CapabilityInstallInput,
+): Promise<ManagedSkill> {
+  return runCapabilityInstallTransaction(root, input);
 }
 
 
