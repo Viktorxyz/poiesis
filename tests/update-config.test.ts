@@ -22,6 +22,7 @@ import { createTestRepository, testConfig, type TestRepository } from "./helpers
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 import type { DoctorReport } from "../src/maintenance.js";
 import { PoiesisError } from "../src/errors.js";
+import type { ArtifactJournalEntry } from "../src/mutation-transaction.js";
 
 const CONFIG_ROOT = ".poiesis/config.jsonc";
 
@@ -1070,7 +1071,15 @@ describe("update --config", () => {
             await writeFile(manifestPath, foreignManifestBytes);
           },
         }),
-      ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
+      ).rejects.toMatchObject({
+        code: "UPDATE_DOCTOR_FAILED",
+        details: {
+          incompleteRollback: [expect.objectContaining({
+            path: manifestPath,
+            reason: "identity-mismatch",
+          })],
+        },
+      });
     } finally {
       if (prevFail === undefined) delete process.env.POIESIS_TEST_OPENCODE_FAIL;
       else process.env.POIESIS_TEST_OPENCODE_FAIL = prevFail;
@@ -1685,6 +1694,116 @@ describe("update --config", () => {
     const afterReceiptParsed = await readOwnershipReceipt(repository.root);
     expect(afterReceiptParsed.generation).toBe(beforeReceiptParsed.generation);
     expect(afterReceiptParsed.manifestDigest).toBe(beforeReceiptParsed.manifestDigest);
+  }, 30_000);
+
+  it.each([
+    ["Poiesis config", "prePoiesisConfigWrite", CONFIG_ROOT],
+    ["OpenCode config", "preOpenCodeApply", "opencode.jsonc"],
+    ["manifest", "preManifestWrite", ".poiesis/manifest.json"],
+    ["receipt", "preReceiptReplace", "receipt"],
+  ] as const)("rejects drift immediately before the %s replacement without overwriting it", async (_name, hookName, relativePath) => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const before = await snapshotOwnedBytes(repository);
+    const target = relativePath === "receipt" ? await ownershipReceiptLocation(repository.root) : join(repository.root, relativePath);
+    const foreign = Buffer.from(`foreign-${hookName}\n`);
+    const hooks: UpdateTransactionHooks = {
+      [hookName]: async () => { await writeFile(target, foreign); },
+    };
+
+    await expect(runUpdateConfigTransaction(repository.root, candidatePath, {}, hooks)).rejects.toMatchObject({
+      code: "ARTIFACT_IDENTITY_DRIFT",
+    });
+
+    expect(await readFile(target)).toEqual(foreign);
+    const after = relativePath === "receipt" ? {
+      ...before,
+      poiesisConfig: await readFile(join(repository.root, CONFIG_ROOT)),
+      openCodeConfig: await readFile(join(repository.root, "opencode.jsonc")),
+      manifest: await readFile(join(repository.root, ".poiesis/manifest.json")),
+    } : await snapshotOwnedBytes(repository);
+    if (relativePath !== CONFIG_ROOT) expect(after.poiesisConfig).toEqual(before.poiesisConfig);
+    if (relativePath !== "opencode.jsonc") expect(after.openCodeConfig).toEqual(before.openCodeConfig);
+    if (relativePath !== ".poiesis/manifest.json") expect(after.manifest).toEqual(before.manifest);
+    if (relativePath !== "receipt") expect(after.receipt).toEqual(before.receipt);
+  }, 30_000);
+
+  it.each([
+    ["Poiesis config", "postPoiesisConfigWrite"],
+    ["OpenCode config", "postOpenCodeApply"],
+    ["manifest", "postManifestWrite"],
+    ["receipt", "postReceiptReplace"],
+  ] as const)("restores every exact preimage after failure following the %s mutation", async (_name, hookName) => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const before = await snapshotOwnedBytes(repository);
+    const hooks: UpdateTransactionHooks = {
+      [hookName]: () => { throw new Error(`injected after ${hookName}`); },
+    };
+
+    await expect(runUpdateConfigTransaction(repository.root, candidatePath, {}, hooks)).rejects.toThrow(`injected after ${hookName}`);
+    expectOwnedBytesUnchanged(before, await snapshotOwnedBytes(repository));
+  }, 30_000);
+
+  it("records the four bounded artifacts with physical preimages, ownership modes, and write identities", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    const installedManifest = await loadManifest(repository.root);
+    const expectedOpenCodeOwnership = installedManifest.files.some((file) => file.path === "opencode.jsonc")
+      ? "whole-file"
+      : "patch";
+    let entries: readonly ArtifactJournalEntry[] = [];
+
+    await runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+      onJournalReady: (value) => { entries = value; },
+    });
+
+    expect(entries).toHaveLength(4);
+    expect(entries.map((entry) => entry.ownershipMode)).toEqual(["whole-file", expectedOpenCodeOwnership, "whole-file", "whole-file"]);
+    for (const entry of entries) {
+      expect(entry.physicalExists).toBe(true);
+      expect(entry.preimage).toBeInstanceOf(Buffer);
+      expect(entry.expectedPreWriteIdentity).toMatchObject({ exists: true, kind: "file", hash: expect.any(String) });
+      expect(entry.transactionWrittenIdentity).toMatchObject({ exists: true, kind: "file", hash: expect.any(String) });
+    }
+  }, 30_000);
+
+  it("rejects a cooperating config updater while the workspace mutation lock is held", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const candidatePath = await writeCandidateConfig(repository, (config) => {
+      config.models.execution = "minimax/MiniMax-M3-alt";
+    });
+    let releaseFirst!: () => void;
+    let signalHeld!: () => void;
+    const held = new Promise<void>((resolve) => { signalHeld = resolve; });
+    const release = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const first = runUpdateConfigTransaction(repository.root, candidatePath, {}, {
+      postLockAcquired: async () => {
+        signalHeld();
+        await release;
+      },
+    });
+    await held;
+
+    await expect(runUpdateConfigTransaction(repository.root, candidatePath, {}, {})).rejects.toMatchObject({
+      code: "POIESIS_MUTATION_LOCKED",
+    });
+    releaseFirst();
+    await expect(first).resolves.toBeDefined();
   }, 30_000);
 
 

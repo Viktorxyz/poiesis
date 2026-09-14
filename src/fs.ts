@@ -39,8 +39,18 @@ async function prepareTemporaryFile(path: string, content: string | Buffer): Pro
 }
 
 export async function atomicWrite(path: string, content: string | Buffer): Promise<void> {
+  await atomicWriteGuarded(path, content, async () => undefined);
+}
+
+/** Prepare and fsync replacement bytes, then run the guard immediately before rename. */
+export async function atomicWriteGuarded(
+  path: string,
+  content: string | Buffer,
+  preReplaceGuard: () => void | Promise<void>,
+): Promise<void> {
   const temporary = await prepareTemporaryFile(path, content);
   try {
+    await preReplaceGuard();
     await rename(temporary, path);
   } catch (error) {
     throw error;

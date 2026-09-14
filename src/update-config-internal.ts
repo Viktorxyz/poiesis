@@ -22,19 +22,16 @@ import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { loadConfig, parseJsonc, serializeConfig, validateConfig, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
-import { atomicWrite, exists, readUtf8 } from "./fs.js";
-import { hashContent, hashFile } from "./hash.js";
+import { exists, readUtf8 } from "./fs.js";
+import { hashContent } from "./hash.js";
 import { assertManifestAuthority, nextAdapterPatches } from "./authority.js";
 import {
   assertOwnershipReceipt,
   ownershipReceiptLocation,
-  replaceOwnershipReceipt,
-  restoreOwnershipReceipt,
   type OwnershipReceipt,
 } from "./receipt.js";
 import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
 import {
-  applyOpenCodeConfig,
   desiredOpenCodePatches,
   OPENCODE_ADAPTER_VERSION,
   SUPPORTED_OPENCODE_VERSION,
@@ -43,9 +40,13 @@ import {
 } from "./opencode.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
 import { poiesisPath } from "./paths.js";
-import { createDeliveryAdapter } from "./adapters.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { DoctorReport, UpdateResult } from "./maintenance.js";
+import {
+  acquireWorkspaceMutationLock,
+  ArtifactJournal,
+  type ArtifactJournalEntry,
+} from "./mutation-transaction.js";
 // Maintenance helpers are accessed via delayed dynamic import inside
 // `runUpdateConfigTransaction` to avoid a top-level runtime circular
 // import between this module and `maintenance.ts`. Only the types
@@ -68,10 +69,18 @@ const POIESIS_CONFIG_RELATIVE_PATH = ".poiesis/config.jsonc";
  * and `runUpdateConfigTransaction` directly from this internal module.
  */
 export interface UpdateTransactionHooks {
+  /** Called after the exclusive per-workspace mutation lock is acquired. */
+  postLockAcquired?: () => void | Promise<void>;
+  /** Exposes the bounded in-memory journal to transaction tests. */
+  onJournalReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
   /** Called immediately before atomic-writing the new `.poiesis/config.jsonc`. */
   prePoiesisConfigWrite?: () => void | Promise<void>;
+  /** Called immediately after writing the new Poiesis config. */
+  postPoiesisConfigWrite?: () => void | Promise<void>;
   /** Called immediately before applying the OpenCode projection to the managed config. */
   preOpenCodeApply?: () => void | Promise<void>;
+  /** Called immediately after writing the new OpenCode config. */
+  postOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
   preManifestWrite?: () => void | Promise<void>;
   /** Called immediately before `replaceOwnershipReceipt` advances generation. */
@@ -254,7 +263,7 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
  * `assertUpdateConfigDoctorGate` predicate below). Both paths therefore
  * converge on `UPDATE_DOCTOR_FAILED` for production callers.
  */
-export async function runUpdateConfigTransaction(
+async function runLockedUpdateConfigTransaction(
   root: string,
   configPath: string,
   options: UpdateConfigOptions,
@@ -386,7 +395,7 @@ export async function runUpdateConfigTransaction(
   //    invocation at this step (the pure projection does not need a debug
   //    probe). The schema validation is moved to step 8 below.
   const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults);
-  const { serialized: preflightSerialized } = projectOpenCodePayload({
+  const { serialized: preflightSerialized, configPatches: projectedOpenCodePatches } = projectOpenCodePayload({
     root: resolvedRoot,
     configPath: openCodeConfigPath,
     currentContent: currentOpenCodeContentString,
@@ -441,81 +450,51 @@ export async function runUpdateConfigTransaction(
   //    validation so the rollback target is never captured for a transaction
   //    that fails before the first write (nothing has changed yet, so a
   //    rollback preimage would be unnecessary).
+  const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await readFile(manifestPath);
-  let openCodeWrittenHash: string | undefined;
-  let poiesisConfigWrittenHash: string | undefined;
-  let manifestWrittenHash: string | undefined;
-  let nextReceipt: OwnershipReceipt | undefined;
+  const receiptPath = await ownershipReceiptLocation(resolvedRoot);
+  const journal = new ArtifactJournal(4);
+  const poiesisConfigArtifact = await journal.capture(poiesisConfigPath, "whole-file");
+  const openCodeArtifact = await journal.capture(
+    openCodeConfigPath,
+    manifest.files.some((file) => file.path === openCodeRelativePath) ? "whole-file" : "patch",
+  );
+  const manifestArtifact = await journal.capture(manifestPath, "whole-file");
+  const receiptArtifact = await journal.capture(receiptPath, "whole-file");
+  const expectedSnapshots: Array<[ArtifactJournalEntry, Buffer]> = [
+    [poiesisConfigArtifact, currentConfigBytes],
+    [openCodeArtifact, openCodeConfigCurrentBytes],
+  ];
+  for (const [artifact, expected] of expectedSnapshots) {
+    if (artifact.preimage === undefined || !artifact.preimage.equals(expected)) {
+      throw new PoiesisError("ARTIFACT_IDENTITY_DRIFT", "Artifact changed while preparing the transaction journal", {
+        path: artifact.path,
+      });
+    }
+  }
+  await hooks.onJournalReady?.(journal.entries);
 
   try {
     // 10. Write the new Poiesis config atomically.
     await hooks?.prePoiesisConfigWrite?.();
-    await atomicWrite(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH), newConfigContent);
-    poiesisConfigWrittenHash = await hashFile(join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH));
-    if (poiesisConfigWrittenHash !== newConfigHash) {
-      throw new PoiesisError("INSTALL_PATH_CONFLICT", "Poiesis config changed after write", {
-        path: POIESIS_CONFIG_RELATIVE_PATH,
-        expected: newConfigHash,
-        actual: poiesisConfigWrittenHash,
-      });
-    }
+    await journal.replace(poiesisConfigArtifact, newConfigContent);
+    await hooks.postPoiesisConfigWrite?.();
 
-    // 11. Apply the new OpenCode projection. `applyOpenCodeConfig` internally
-    //    (a) reads the file, (b) checks expectedContent byte-identity, (c)
-    //    re-reads the file immediately before `atomicWrite` (the strengthened
-    //    TOCTOU guard inside `applyOpenCodeConfig`), and (d) calls
-    //    `onWritten(content)` after the atomic write. We pass
-    //    `expectedContent: openCodeConfigCurrentBytes` so any concurrent
-    //    foreign write that landed between step 5 and step 11 is caught by
-    //    BOTH the head-of-function check and the pre-write TOCTOU check. The
-    //    `onWritten` callback's projection-drift equality check uses the
-    //    preflight's serialized bytes as the expected value (drift is
-    //    impossible under the current pure helper, but the check is
-    //    defensive — see step 11b below). The `onWritten` callback records
-    //    `openCodeWrittenHash` BEFORE the equality check so the rollback
-    //    path retains rollback identity even when the drift throw occurs
-    //    (the bytes were deterministically written, so they are still safe
-    //    to identify for restoration).
+    // 11. Write the already validated, deterministic OpenCode projection
+    //     through the same journal guard used for every other artifact.
     await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
-      expectedContent: openCodeConfigCurrentBytes,
-      onWritten: (content) => {
-        // 11b. Drift handling. Assign `openCodeWrittenHash` FIRST so that
-        //      even when the throw below fires, `openCodeWrittenHash`
-        //      captures the exact bytes applyOpenCodeConfig wrote; the
-        //      rollback path can therefore identify the on-disk hash and
-        //      restore the preimage byte-for-byte. Note that drift between
-        //      preflight and apply is impossible today (both paths call
-        //      the same pure helper with the same inputs) — the equality
-        //      check is a defensive guard that retains rollback identity
-        //      even if a future refactor introduces non-determinism.
-        //      The `injectDriftedOnWrittenContent` hook is an internal
-        //      test seam that lets the drift-regression test force this
-        //      branch deterministically without monkey-patching.
-        const driftOverride = hooks?.injectDriftedOnWrittenContent?.(content);
-        openCodeWrittenHash = hashContent(content);
-        const expected = driftOverride ?? preflightSerialized;
-        if (content !== expected) {
-          throw new PoiesisError(
-            "INSTALL_PATH_CONFLICT",
-            "OpenCode config projection drifted between preflight and apply",
-            { file: openCodeRelativePath },
-          );
-        }
-      },
-    });
-    if (openCodeWrittenHash === undefined) {
-      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config write did not record a final hash", {
-        file: openCodeRelativePath,
-      });
+    await journal.replace(openCodeArtifact, preflightSerialized);
+    await hooks.postOpenCodeApply?.();
+    const driftOverride = hooks.injectDriftedOnWrittenContent?.(preflightSerialized);
+    if (driftOverride !== undefined && driftOverride !== preflightSerialized) {
+      throw new PoiesisError(
+        "INSTALL_PATH_CONFLICT",
+        "OpenCode config projection drifted between preflight and apply",
+        { file: openCodeRelativePath },
+      );
     }
-    const onDiskOpenCodeHash = await hashFile(openCodeConfigPath);
-    if (onDiskOpenCodeHash !== openCodeWrittenHash) {
-      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config changed after write", {
-        file: openCodeRelativePath,
-      });
-    }
+    const appliedPatches = projectedOpenCodePatches;
+    const openCodeWrittenHash = hashContent(preflightSerialized);
 
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
@@ -551,13 +530,17 @@ export async function runUpdateConfigTransaction(
     // identity, and the post-write `hashFile` re-read is removed.
     const nextManifestBytes = serializeManifest(nextManifest);
     const nextManifestHash = hashContent(nextManifestBytes);
-    await atomicWrite(manifestPath, nextManifestBytes);
-    manifestWrittenHash = nextManifestHash;
+    await journal.replace(manifestArtifact, nextManifestBytes);
     await hooks?.postManifestWrite?.();
 
     // 14. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.
     await hooks?.preReceiptReplace?.();
-    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, nextManifest, receipt);
+    const nextReceipt: OwnershipReceipt = {
+      ...receipt,
+      manifestDigest: nextManifestHash,
+      generation: receipt.generation + 1,
+    };
+    await journal.replace(receiptArtifact, `${JSON.stringify(nextReceipt, null, 2)}\n`);
     await hooks?.postReceiptReplace?.();
 
     // 15. Doctor gate: pass or roll back everything. The transaction is config-only
@@ -568,38 +551,46 @@ export async function runUpdateConfigTransaction(
     assertUpdateConfigDoctorGate(report, manifest);
     return { manifest: nextManifest, doctor: report };
   } catch (error) {
-    // 16. Exact rollback: restore each mutated artifact only if its post-write
-    //     hash still matches what we wrote, AND restore the EXACT preimage
-    //     bytes (no newline normalization, no lossy string conversions). The
-    //     preimage is a Buffer; we pass it to `atomicWrite` as raw bytes so
-    //     a no-newline preimage restores to a no-newline file. The fail-closed
-    //     hash gate from #10/#11 still preserves foreign writes that landed
-    //     between our last write and the rollback. The drift-throw path
-    //     retains rollback identity because `openCodeWrittenHash` is set
-    //     before the equality check throws (see step 11b).
-    if ((await exists(openCodeConfigPath)) && openCodeWrittenHash !== undefined && (await hashFile(openCodeConfigPath)) === openCodeWrittenHash) {
-      await atomicWrite(openCodeConfigPath, openCodeConfigCurrentBytes);
-    }
-    const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
-    if ((await exists(poiesisConfigPath)) && poiesisConfigWrittenHash !== undefined && (await hashFile(poiesisConfigPath)) === poiesisConfigWrittenHash) {
-      await atomicWrite(poiesisConfigPath, currentConfigBytes);
-    }
-    // Manifest fail-closed rollback: restore the preimage only if the on-disk
-    // manifest still matches the post-write identity we recorded above. A
-    // foreign writer between our write and the rollback leaves the manifest
-    // untouched.
-    if (manifestWrittenHash !== undefined && (await exists(manifestPath)) && (await hashFile(manifestPath)) === manifestWrittenHash) {
-      await atomicWrite(manifestPath, manifestBackup);
-    }
-    // Receipt fail-closed rollback: restore the preimage only if the on-disk
-    // receipt still matches the post-write identity we last observed (nextReceipt
-    // if we wrote it, else the pre-transaction receipt). A foreign writer
-    // between our write and the rollback leaves the receipt untouched.
-    const expectedReceiptHash = hashContent(`${JSON.stringify(nextReceipt ?? receipt, null, 2)}\n`);
-    const onDiskReceiptPath = await ownershipReceiptLocation(resolvedRoot);
-    if ((await exists(onDiskReceiptPath)) && hashContent(await readFile(onDiskReceiptPath)) === expectedReceiptHash) {
-      await restoreOwnershipReceipt(resolvedRoot, receipt);
+    // 16. Exact rollback is journal-driven and always runs in reverse write
+    //     order. Foreign replacements are preserved and reported explicitly.
+    const diagnostics = await journal.rollback();
+    if (diagnostics.length > 0) {
+      if (error instanceof PoiesisError) {
+        error.details.incompleteRollback = diagnostics;
+      } else {
+        throw new PoiesisError("ROLLBACK_INCOMPLETE", "Transaction failed and rollback was incomplete", {
+          cause: error instanceof Error ? error.message : String(error),
+          incompleteRollback: diagnostics,
+        });
+      }
     }
     throw error;
+  }
+}
+
+export async function runUpdateConfigTransaction(
+  root: string,
+  configPath: string,
+  options: UpdateConfigOptions,
+  hooks: UpdateTransactionHooks,
+): Promise<UpdateResult> {
+  assertCompatibleUpdateConfigOptions(options);
+  const lock = await acquireWorkspaceMutationLock(resolve(root));
+  let transactionError: unknown;
+  try {
+    await hooks.postLockAcquired?.();
+    return await runLockedUpdateConfigTransaction(root, configPath, options, hooks);
+  } catch (error) {
+    transactionError = error;
+    throw error;
+  } finally {
+    try {
+      await lock.release();
+    } catch (releaseError) {
+      if (transactionError === undefined) throw releaseError;
+      if (transactionError instanceof PoiesisError) {
+        transactionError.details.lockRelease = releaseError instanceof Error ? releaseError.message : String(releaseError);
+      }
+    }
   }
 }
