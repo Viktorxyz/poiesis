@@ -600,6 +600,33 @@ async function rollbackInitGitignore(path: string, snapshot: Buffer | null | und
 }
 
 /**
+ * Conditional init receipt cleanup. The init catch block calls this helper
+ * in place of `removeOwnershipReceipt`. It removes the on-disk receipt
+ * ONLY when the failed `init()` invocation recorded a successful
+ * `createOwnershipReceipt` AND the on-disk bytes still equal exactly what
+ * that invocation wrote. The helper never weakens receipt authority:
+ * pre-existing receipts are preserved byte-for-byte, foreign concurrent
+ * replacements are preserved byte-for-byte, and an absent receipt is left
+ * absent. Ticket #45.
+ */
+async function rollbackInitOwnershipReceipt(
+  root: string,
+  authoredReceiptBytes: string | undefined,
+): Promise<void> {
+  if (authoredReceiptBytes === undefined) return;
+  const path = await ownershipReceiptLocation(root);
+  let current: Buffer;
+  try {
+    current = await readFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (Buffer.compare(current, Buffer.from(authoredReceiptBytes, "utf8")) !== 0) return;
+  await unlink(path);
+}
+
+/**
  * Transactional default-path `.gitignore` seam.
  *
  * Receipt-bearing normal `update` and explicit 1.0.0 `bootstrap` MUST
@@ -700,6 +727,13 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
   let installedSkillSnapshots: Map<string, string> | undefined;
+  // Ticket #45: exact canonical bytes of the receipt authored by THIS
+  // `init()` invocation (set only after a successful `createOwnershipReceipt`),
+  // or `undefined` if the receipt was never authored. The catch block uses
+  // it to gate receipt removal: pre-existing and concurrently replaced
+  // receipts survive byte-for-byte; only this invocation's authored
+  // bytes are unlinked on failure.
+  let authoredReceiptBytes: string | undefined;
 
   try {
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -832,7 +866,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const manifestContent = serializeManifest(manifest);
     await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
     writtenManifestHash = hashContent(manifestContent);
-    await createOwnershipReceipt(resolvedRoot, manifest);
+    // Ticket #45: capture the receipt authored by THIS invocation BEFORE
+    // any subsequent step so the catch block can gate removal on exact
+    // identity. `createOwnershipReceipt` returns the canonical
+    // `OwnershipReceipt` object; the on-disk bytes are the canonical
+    // `${JSON.stringify(receipt, null, 2)}\n` form emitted by
+    // `writeReceipt` in `src/receipt.ts`.
+    const authoredReceipt = await createOwnershipReceipt(resolvedRoot, manifest);
+    authoredReceiptBytes = `${JSON.stringify(authoredReceipt, null, 2)}\n`;
     if (!options.skipSkills) {
       const report = await doctor(resolvedRoot);
       if (!report.ok) {
@@ -849,8 +890,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   } catch (error) {
     const rollbackFailures: Array<Record<string, unknown>> = [];
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+    // Ticket #45: receipt cleanup is identity-gated. The helper only
+    // unlinks the receipt when THIS `init()` invocation authored it AND
+    // the on-disk bytes still equal those exact authored bytes.
+    // Pre-existing and concurrently replaced receipts survive
+    // byte-for-byte; receipt authority is never weakened by a partial
+    // init rollback.
     await rollbackStep(rollbackFailures, "ownership receipt", async () => {
-      await removeOwnershipReceipt(resolvedRoot);
+      await rollbackInitOwnershipReceipt(resolvedRoot, authoredReceiptBytes);
     });
     await rollbackStep(rollbackFailures, ".poiesis/manifest.json", async () => {
       if (
