@@ -29,21 +29,40 @@
  * pulling `maintenance.ts` into the same load cycle. The types
  * `MaintenanceOptions` and `UpdateResult` are imported via `import type`
  * and erased at compile time, so they contribute nothing to runtime.
+ *
+ * Ticket #44: both runners share the bounded `ArtifactJournal` and the
+ * exclusive per-workspace mutation lock introduced for `update --config`
+ * (ticket #43). Every owned write goes through `journal.replace`, which
+ * runs the immediate pre-write identity guard (re-checks
+ * `expectedPreWriteIdentity` against the on-disk file immediately before
+ * the rename) and the reverse hash-gated rollback. The OpenCode config
+ * is captured into the journal as a `patch`-mode entry so its physical
+ * existence and exact preimage are recorded independently of whole-file
+ * manifest ownership; the actual write still uses `applyOpenCodeConfig`
+ * (which carries its own `expectedContent` pre-write guard and the
+ * `onWritten` callback that binds `transactionWrittenIdentity`). The
+ * transactional `.gitignore` rule keeps its own hash-gated atomic update
+ * + rollback helper because it is not a Poiesis-owned artifact under
+ * the journal's contract.
  */
 import { exists, atomicWrite } from "./fs.js";
 import { readFile, unlink } from "node:fs/promises";
-import { join, resolve, relative } from "node:path";
+import { join, resolve } from "node:path";
 import { PoiesisError } from "./errors.js";
 import { hashContent } from "./hash.js";
 import { loadManifest, serializeManifest, type Manifest } from "./manifest.js";
 import { applyOpenCodeConfig, OPENCODE_ADAPTER_VERSION, SUPPORTED_OPENCODE_VERSION, SUPPORTED_OPENCODE_VERSIONS, verifyOpenCodeVersion } from "./opencode.js";
+import { assertOpenCodeOwnershipAgainstSnapshot } from "./opencode-preflight.js";
 import { ownedPath, poiesisPath } from "./paths.js";
+import { parseJsonc } from "./config.js";
+import {
+  acquireWorkspaceMutationLock,
+  ArtifactJournal,
+  type ArtifactJournalEntry,
+} from "./mutation-transaction.js";
 import {
   assertOwnershipReceipt,
   ownershipReceiptLocation,
-  replaceOwnershipReceipt,
-  removeOwnershipReceipt,
-  createOwnershipReceipt,
   type OwnershipReceipt,
 } from "./receipt.js";
 import { installDefaultSkills } from "./skills.js";
@@ -51,13 +70,29 @@ import { templateMappings } from "./templates.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import type { MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
+type JsonObject = Record<string, unknown>;
+
+/**
+ * Journal artifact limit. 13 template mappings + `.poiesis/config.jsonc`
+ * + opencode config + manifest + receipt = 17 artifacts in the worst
+ * case; 32 leaves comfortable headroom for future Poiesis-managed files.
+ */
+const TRANSACTION_JOURNAL_LIMIT = 32;
+
 const POIESIS_DEFAULT_PATH_GITIGNORE_HEADER =
   "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
 const POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
-const POIESIS_DEFAULT_PATH_GITIGNORE_RULES: readonly string[] = [
-  POIESIS_DEFAULT_PATH_GITIGNORE_HEADER,
-  POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN,
-];
+
+/**
+ * Captured state for the transactional `.gitignore` rule so the
+ * rollback path can restore the EXACT preimage byte-for-byte. The
+ * journal does NOT cover the gitignore because the file is not a
+ * Poiesis-owned artifact under the journal's contract.
+ */
+interface GitignoreTransactionState {
+  snapshot: Buffer | null;
+  writtenHash: string | undefined;
+}
 
 /**
  * Test-only deterministic fault-injection hooks used by
@@ -72,6 +107,12 @@ const POIESIS_DEFAULT_PATH_GITIGNORE_RULES: readonly string[] = [
  * directly from this internal module.
  */
 export interface UpdateBootstrapTransactionHooks {
+  /**
+   * Exposes the bounded in-memory journal to transaction tests after
+   * every artifact has been captured and validated, before any write
+   * fires. The journal's entries are read-only at this point.
+   */
+  onJournalReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
   /** Called immediately before `installDefaultSkills` runs. */
   preSkillsInstall?: () => void | Promise<void>;
   /**
@@ -149,28 +190,87 @@ async function snapshotFile(path: string): Promise<Buffer | null> {
   return readFile(path);
 }
 
-async function snapshotFileIfOwned(
-  path: string,
-  root: string,
-  records: Manifest["files"],
-): Promise<Buffer | null> {
-  const relativePath = relative(root, path);
-  const record = records.find((entry) => entry.path === relativePath);
-  if (record === undefined) return null;
-  if (!(await exists(path))) return null;
-  return readFile(path);
+/**
+ * Capture every artifact the transaction will mutate into a bounded
+ * `ArtifactJournal` and validate the OpenCode `configPatches` against
+ * the captured on-disk JSON. The journal is built in the exact write
+ * order of the transaction so its reverse-order rollback equals reverse
+ * write order. Validation MUST run before capture: a recorded patch
+ * that disagrees with the captured snapshot is a fail-closed ownership
+ * violation and must abort before the journal commits to any state.
+ */
+async function captureTransactionArtifacts(args: {
+  resolvedRoot: string;
+  materialized: ReadonlyArray<{ path: string; kind: "canonical" | "generated" }>;
+  openCodeConfigRelativePath: string;
+  openCodeConfigCurrentBytes: Buffer | null;
+  openCodeConfigPatches: Manifest["configPatches"];
+  receiptPath: string;
+  journalLimit: number;
+}): Promise<ArtifactJournal> {
+  const journal = new ArtifactJournal(args.journalLimit);
+  for (const file of args.materialized) {
+    await journal.capture(join(args.resolvedRoot, file.path), "whole-file");
+  }
+  await journal.capture(join(args.resolvedRoot, args.openCodeConfigRelativePath), "patch");
+  await journal.capture(join(args.resolvedRoot, ".poiesis/manifest.json"), "whole-file");
+  await journal.capture(args.receiptPath, "whole-file");
+  // Validate every recorded OpenCode patch against the captured on-disk
+  // JSON snapshot. Replaces the disk re-read that the maintenance helper
+  // `assertConfigPatchesOwned` previously performed for the OpenCode
+  // config path. Throws `CONFIG_OWNERSHIP_LOST` on first mismatch —
+  // before any helper call, any capture, and any schema validation.
+  // Production callers will only ever need this check when a malicious
+  // or out-of-band writer has tampered with the OpenCode config between
+  // the last receipt and the current transaction; the check fails
+  // closed without mutating any owned byte.
+  if (args.openCodeConfigCurrentBytes !== null) {
+    const openCodeConfigPath = join(args.resolvedRoot, args.openCodeConfigRelativePath);
+    const openCodeConfigParsed = parseJsonc<JsonObject>(
+      args.openCodeConfigCurrentBytes.toString("utf8"),
+      openCodeConfigPath,
+    );
+    assertOpenCodeOwnershipAgainstSnapshot({
+      root: args.resolvedRoot,
+      configPath: openCodeConfigPath,
+      parsedSnapshot: openCodeConfigParsed,
+      patches: args.openCodeConfigPatches,
+    });
+  }
+  return journal;
 }
 
-async function readMaterializedFilesIntoSnapshot(
+/**
+ * Common body for both transaction runners: acquire the exclusive
+ * per-workspace mutation lock, run the inner transaction, and release
+ * the lock in `finally`. The release-error policy mirrors
+ * `runUpdateConfigTransaction`: if `release()` throws and no
+ * transaction error is in flight, the release error is the rethrown
+ * value; if a transaction error is already in flight, the release
+ * message is attached to `PoiesisError.details.lockRelease` and the
+ * transaction error is rethrown unchanged.
+ */
+async function withWorkspaceMutationLock<T extends UpdateResult>(
   root: string,
-  paths: string[],
-): Promise<Map<string, Buffer>> {
-  const snapshots = new Map<string, Buffer>();
-  for (const filePath of paths) {
-    const path = join(root, filePath);
-    if (await exists(path)) snapshots.set(filePath, await readFile(path));
+  run: () => Promise<T>,
+): Promise<T> {
+  const lock = await acquireWorkspaceMutationLock(resolve(root));
+  let transactionError: unknown;
+  try {
+    return await run();
+  } catch (error) {
+    transactionError = error;
+    throw error;
+  } finally {
+    try {
+      await lock.release();
+    } catch (releaseError) {
+      if (transactionError === undefined) throw releaseError;
+      if (transactionError instanceof PoiesisError) {
+        transactionError.details.lockRelease = releaseError instanceof Error ? releaseError.message : String(releaseError);
+      }
+    }
   }
-  return snapshots;
 }
 
 /**
@@ -187,6 +287,14 @@ async function readMaterializedFilesIntoSnapshot(
  * do not change production behavior when omitted.
  */
 export async function runUpdateTransaction(
+  root: string,
+  options: MaintenanceOptions,
+  hooks: UpdateBootstrapTransactionHooks,
+): Promise<UpdateResult> {
+  return withWorkspaceMutationLock(root, () => runLockedUpdateTransaction(root, options, hooks));
+}
+
+async function runLockedUpdateTransaction(
   root: string,
   options: MaintenanceOptions,
   hooks: UpdateBootstrapTransactionHooks,
@@ -245,49 +353,104 @@ export async function runUpdateTransaction(
   }
   const openCodeConfig = managedConfigFiles[0]!;
   const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
   const openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
-  const fileSnapshots = await readMaterializedFilesIntoSnapshot(
-    resolvedRoot,
-    materialized.map((file) => file.path),
-  );
+  if (!Buffer.from(openCodeConfigCurrentBytes.toString("utf8"), "utf8").equals(openCodeConfigCurrentBytes)) {
+    throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not valid UTF-8", {
+      file: openCodeConfig,
+    });
+  }
 
-  // Preimage snapshots for the transactional artifacts.
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
-  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
-  const receiptSnapshot = await snapshotFile(await ownershipReceiptLocation(resolvedRoot));
+  const receiptPath = await ownershipReceiptLocation(resolvedRoot);
+  const journal = await captureTransactionArtifacts({
+    resolvedRoot,
+    materialized,
+    openCodeConfigRelativePath: openCodeConfig,
+    openCodeConfigCurrentBytes,
+    openCodeConfigPatches: manifest.configPatches,
+    receiptPath,
+    journalLimit: TRANSACTION_JOURNAL_LIMIT,
+  });
+  await hooks?.onJournalReady?.(journal.entries);
 
-  // Pre-write identity for each artifact (captured BEFORE the write so a
-  // foreign replacement in the write window cannot be adopted as ours).
-  let materializedWrittenHashes: Map<string, string | undefined> = new Map();
-  let openCodeWrittenHash: string | undefined;
-  let gitignoreWrittenHash: string | undefined;
-  let manifestWrittenHash: string | undefined;
-  let receiptWrittenBytes: Buffer | undefined;
-  let nextReceipt: OwnershipReceipt | undefined;
-
-  let skills = manifest.skills;
+  // Gitignore state is captured at the write site and used by the catch
+  // block's rollback. Declared here so the catch block can close over
+  // the locals without re-reading the file.
+  let gitignore: GitignoreTransactionState = { snapshot: null, writtenHash: undefined };
 
   try {
     await hooks?.preSkillsInstall?.();
-    skills = options.skipSkills
+    const skills = options.skipSkills
       ? manifest.skills
       : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
 
+    // 1. Materialized managed files: each file goes through `journal.replace`
+    //    so the immediate pre-write identity guard and the reverse
+    //    hash-gated rollback apply uniformly. The preimage captured by
+    //    `journal.capture` is the EXACT preimage bytes; the rollback
+    //    restores them byte-for-byte.
     for (const file of materialized) {
       const destination = join(resolvedRoot, file.path);
-      const writtenHash = hashContent(file.content);
-      materializedWrittenHashes.set(file.path, writtenHash);
+      const entry = journal.entries.find((candidate) => candidate.path === destination);
+      if (entry === undefined) {
+        throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the materialized file entry", { path: file.path });
+      }
       await hooks?.preMaterializedFileWrite?.(file.path);
-      await atomicWrite(destination, file.content);
+      await journal.replace(entry, file.content);
       await hooks?.postMaterializedFileWrite?.(file.path);
     }
 
+    // 2. Transactional `.gitignore` rule: keep the existing hash-gated
+    //    helper because the file is NOT a Poiesis-owned artifact under
+    //    the journal's contract — the rule is appended to whatever the
+    //    user has on disk.
+    gitignore = { snapshot: await snapshotFile(join(resolvedRoot, ".gitignore")), writtenHash: undefined };
     await hooks?.preDefaultPathGitignoreEnsure?.();
-    ({ writtenHash: gitignoreWrittenHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
+    const result = await ensureDefaultPathGitignore(resolvedRoot, gitignore.snapshot);
+    gitignore = { snapshot: gitignore.snapshot, writtenHash: result.writtenHash };
     await hooks?.postDefaultPathGitignoreEnsure?.();
 
+    // 3. OpenCode config: captured as `patch`-mode entry so physical
+    //    existence and exact preimage are recorded independently of
+    //    whole-file ownership. The actual write uses `applyOpenCodeConfig`
+    //    because it owns the projection logic AND carries its own
+    //    `expectedContent` pre-write guard. The `onWritten` callback
+    //    binds `transactionWrittenIdentity` to the bytes we just wrote,
+    //    so `journal.rollback` hash-gates against the transaction's own
+    //    bytes (preserves any foreign replacement that races between
+    //    the apply and the rollback).
+    const openCodeEntry = journal.entries.find((candidate) => candidate.path === openCodeConfigPath);
+    if (openCodeEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
+    }
+    await hooks?.preOpenCodeApply?.();
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
+      expectedContent: openCodeConfigCurrentBytes,
+      onWritten: (content: string) => {
+        openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
+      },
+    });
+    await hooks?.postOpenCodeApply?.();
+    // Defensive fail-closed check (unchanged from #32): confirm the
+    // on-disk OpenCode config still matches the exact bytes captured by
+    // the onWritten callback before any manifest/receipt materialization.
+    // A concurrent replacement that lands between the callback and this
+    // check would otherwise produce a manifest hash derived from foreign
+    // bytes; the check rejects here so the next manifest's OpenCode
+    // record is always derived from this transaction's callback bytes
+    // (never a later mutable-path reread).
+    if (openCodeEntry.transactionWrittenIdentity !== undefined && (await exists(openCodeConfigPath))) {
+      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
+      const expectedOpenCodeHash = openCodeEntry.transactionWrittenIdentity.hash;
+      if (expectedOpenCodeHash !== undefined && hashContent(currentOpenCodeBytes) !== expectedOpenCodeHash) {
+        throw new PoiesisError(
+          "OPENCODE_CONFIG_CHANGED",
+          "OpenCode config changed between transaction write and manifest materialization",
+          { path: openCodeConfig },
+        );
+      }
+    }
+    const configPatches = nextAdapterPatches(manifest, appliedPatches);
     const nextFiles = nextAdapterFiles(
       manifest,
       materialized.map((file) => ({
@@ -297,47 +460,18 @@ export async function runUpdateTransaction(
         durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
       })),
     );
-    await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
-      expectedContent: openCodeConfigCurrentBytes,
-      onWritten: (content: string) => {
-        openCodeWrittenHash = hashContent(content);
-      },
-    });
-    await hooks?.postOpenCodeApply?.();
-    // Defensive fail-closed check: confirm the on-disk OpenCode config still
-    // matches the exact bytes captured by the onWritten callback before any
-    // manifest/receipt materialization. A concurrent replacement that lands
-    // between the callback and this check would produce a manifest hash
-    // derived from foreign bytes; the receipt auth + doctor gate would only
-    // detect it after the fact. Catch the race here so the next manifest's
-    // OpenCode record is always derived from this transaction's callback
-    // bytes (never a later mutable-path reread) and a foreign replacement
-    // fails closed instead of being silently adopted.
-    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
-      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
-      if (hashContent(currentOpenCodeBytes) !== openCodeWrittenHash) {
-        throw new PoiesisError(
-          "OPENCODE_CONFIG_CHANGED",
-          "OpenCode config changed between transaction write and manifest materialization",
-          { path: openCodeConfig },
-        );
-      }
-    }
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null && openCodeWrittenHash !== undefined) {
+    if (openCodeEntry.transactionWrittenIdentity?.hash !== undefined) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
         // Bind the next manifest's OpenCode file hash to the EXACT
         // transaction-written bytes captured by the onWritten callback.
-        // Never re-read the mutable path: a foreign replacement in the
-        // post-write window must not be adopted as this transaction's
-        // identity (the check above has already failed closed on that
-        // path; this branch only executes when the file still matches
-        // our callback bytes).
+        // Never re-read the mutable path: the defensive check above has
+        // already failed closed on any post-write foreign replacement;
+        // this branch only executes when the file still matches our
+        // callback bytes.
         nextFiles[nextRecord] = {
           ...nextFiles[nextRecord]!,
-          hash: openCodeWrittenHash,
+          hash: openCodeEntry.transactionWrittenIdentity.hash,
         };
       }
     }
@@ -359,18 +493,32 @@ export async function runUpdateTransaction(
     // adopted as our identity.
     const nextManifestBytes = serializeManifest(next);
     const nextManifestHash = hashContent(nextManifestBytes);
+    const manifestEntry = journal.entries.find((candidate) => candidate.path === manifestPath);
+    if (manifestEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
+    }
     await hooks?.preManifestWrite?.();
-    await atomicWrite(manifestPath, nextManifestBytes);
-    manifestWrittenHash = nextManifestHash;
+    await journal.replace(manifestEntry, nextManifestBytes);
     await hooks?.postManifestWrite?.();
 
-    await hooks?.preReceiptReplace?.();
-    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, next, receipt);
+    // Advance generation by exactly ONE and bind to the new manifest digest.
     // The receipt's exact written bytes match `writeReceipt`'s canonical
-    // serialization (see `./receipt.ts`). Capture them BEFORE the doctor
-    // gate so the rollback hash-gate compares against this in-memory
-    // identity rather than re-reading the receipt.
-    receiptWrittenBytes = Buffer.from(`${JSON.stringify(nextReceipt, null, 2)}\n`);
+    // serialization (see `./receipt.ts`); they are derived from the
+    // advanced receipt object BEFORE `journal.replace` so the
+    // `transactionWrittenIdentity` recorded by the journal equals the
+    // bytes on disk.
+    const nextReceipt: OwnershipReceipt = {
+      ...receipt,
+      manifestDigest: nextManifestHash,
+      generation: receipt.generation + 1,
+    };
+    const nextReceiptBytes = `${JSON.stringify(nextReceipt, null, 2)}\n`;
+    const receiptEntry = journal.entries.find((candidate) => candidate.path === receiptPath);
+    if (receiptEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the receipt entry", { path: receiptPath });
+    }
+    await hooks?.preReceiptReplace?.();
+    await journal.replace(receiptEntry, nextReceiptBytes);
     await hooks?.postReceiptReplace?.();
 
     const report = await doctor(resolvedRoot);
@@ -379,70 +527,23 @@ export async function runUpdateTransaction(
     }
     return { manifest: next, doctor: report };
   } catch (error) {
-    // Fail-closed rollback: restore each mutated artifact only if its
-    // post-write identity still matches what THIS transaction wrote, AND
-    // restore the EXACT preimage bytes (no newline normalization, no lossy
-    // string conversions). Each branch is hash-gated against the captured
-    // identity; a concurrent foreign replacement that lands between this
-    // transaction's last write and the rollback is left intact because
-    // the comparison simply fails.
-    // 1. Receipt (last write before the doctor gate). Restore raw
-    //    preimage Buffer via atomicWrite so a no-final-newline or
-    //    differently-indented preimage is restored byte-for-byte. For
-    //    bootstrap the preimage is null and the receipt is removed iff
-    //    the on-disk file is still the one we wrote.
-    const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-    if (receiptWrittenBytes !== undefined && (await exists(receiptPath))) {
-      const currentReceipt = await readFile(receiptPath);
-      if (hashContent(currentReceipt) === hashContent(receiptWrittenBytes)) {
-        if (receiptSnapshot === null) {
-          await removeOwnershipReceipt(resolvedRoot);
-        } else {
-          await atomicWrite(receiptPath, receiptSnapshot);
-        }
-      }
-    }
-    // 2. Manifest (second to last write before the doctor gate).
-    if (manifestWrittenHash !== undefined && (await exists(manifestPath))) {
-      const currentManifest = await readFile(manifestPath);
-      if (hashContent(currentManifest) === manifestWrittenHash) {
-        if (manifestBackup === null) {
-          await unlink(manifestPath);
-        } else {
-          await atomicWrite(manifestPath, manifestBackup);
-        }
-      }
-    }
-    // 3. OpenCode config (third to last write before the doctor gate).
-    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
-      const currentOpenCode = await readFile(openCodeConfigPath);
-      if (hashContent(currentOpenCode) === openCodeWrittenHash) {
-        if (openCodeConfigSnapshot === null) {
-          await unlink(openCodeConfigPath);
-        } else {
-          await atomicWrite(openCodeConfigPath, openCodeConfigSnapshot);
-        }
-      }
-    }
-    // 4. Materialized managed files (in reverse write order). Pre-write
-    //    identity was captured as `hashContent(file.content)` above, so
-    //    the comparison is a pure function of the bytes we wrote.
-    for (const file of [...materialized].reverse()) {
-      const destination = join(resolvedRoot, file.path);
-      const snapshot = fileSnapshots.get(file.path);
-      const writtenHash = materializedWrittenHashes.get(file.path);
-      if (writtenHash === undefined) continue;
-      if (!(await exists(destination))) continue;
-      const currentMaterial = await readFile(destination);
-      if (hashContent(currentMaterial) !== writtenHash) continue;
-      if (snapshot === undefined) {
-        await unlink(destination);
-      } else {
-        await atomicWrite(destination, snapshot);
-      }
-    }
+    // Fail-closed rollback: the bounded journal drives every owned
+    // artifact's reverse hash-gated restoration in reverse write order.
+    // Foreign replacements that land between this transaction's last
+    // write and the rollback are preserved and reported explicitly.
+    const diagnostics = await journal.rollback();
     // 5. Transactional `.gitignore` (last shared helper, byte-exact already).
-    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, gitignoreWrittenHash);
+    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignore.snapshot, gitignore.writtenHash);
+    if (diagnostics.length > 0) {
+      if (error instanceof PoiesisError) {
+        error.details.incompleteRollback = diagnostics;
+      } else {
+        throw new PoiesisError("ROLLBACK_INCOMPLETE", "Transaction failed and rollback was incomplete", {
+          cause: error instanceof Error ? error.message : String(error),
+          incompleteRollback: diagnostics,
+        });
+      }
+    }
     throw error;
   }
 }
@@ -465,11 +566,18 @@ export async function runBootstrapLegacyOwnershipTransaction(
   options: MaintenanceOptions,
   hooks: UpdateBootstrapTransactionHooks,
 ): Promise<UpdateResult> {
+  return withWorkspaceMutationLock(root, () => runLockedBootstrapLegacyOwnershipTransaction(root, options, hooks));
+}
+
+async function runLockedBootstrapLegacyOwnershipTransaction(
+  root: string,
+  options: MaintenanceOptions,
+  hooks: UpdateBootstrapTransactionHooks,
+): Promise<UpdateResult> {
   const { doctor, isRegularManagedFile, packageVersion, resolveConfigForRoot, verifyGitRepository } = await import("./maintenance.js");
-  const { ownershipReceiptExists } = await import("./receipt.js");
-  const { hashOwnedSkillDirectory } = await import("./skills.js");
+  const { ownershipReceiptExists, buildOwnershipReceipt } = await import("./receipt.js");
+  const { hashOwnedSkillDirectory, loadDefaultSkills } = await import("./skills.js");
   const { hashDirectory } = await import("./hash.js");
-  const { loadDefaultSkills } = await import("./skills.js");
 
   const resolvedRoot = resolve(root);
   if (await ownershipReceiptExists(resolvedRoot)) {
@@ -546,29 +654,40 @@ export async function runBootstrapLegacyOwnershipTransaction(
     throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest does not identify an OpenCode config");
   }
   const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-  const openCodeConfigCurrentBytes = openCodeConfigSnapshot === null ? null : openCodeConfigSnapshot;
-  const fileSnapshots = await readMaterializedFilesIntoSnapshot(
-    resolvedRoot,
-    materialized.map((file) => file.path),
-  );
+  // Capture the OpenCode config bytes unconditionally: a 1.0.0 install
+  // always created the file (the legacy init wrote it), but the journal
+  // needs the physical preimage to drive the exact-bytes rollback path.
+  // The read may ENOENT for an exotic install; treat that as "absent"
+  // and skip the patch-ownership validation step.
+  let openCodeConfigCurrentBytes: Buffer | null = null;
+  if (await exists(openCodeConfigPath)) {
+    openCodeConfigCurrentBytes = await readFile(openCodeConfigPath);
+    if (!Buffer.from(openCodeConfigCurrentBytes.toString("utf8"), "utf8").equals(openCodeConfigCurrentBytes)) {
+      throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config is not valid UTF-8", {
+        file: openCodeConfig,
+      });
+    }
+  }
 
-  // Preimage snapshots for the transactional artifacts. The bootstrap
-  // entry assumes no receipt; if the user pre-seeded one we still take
-  // a Buffer snapshot so the rollback can detect a foreign receipt that
-  // appeared after our `createOwnershipReceipt`.
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
-  const gitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
-  const receiptSnapshot = await snapshotFile(await ownershipReceiptLocation(resolvedRoot));
+  const receiptPath = await ownershipReceiptLocation(resolvedRoot);
+  // Bootstrap preimage snapshots are required by the journal to
+  // restore byte-for-byte on rollback. The receipt snapshot is
+  // intentionally captured as `null` (path is initially absent); the
+  // journal records `physicalExists: false` and the rollback removes
+  // the file only on a transaction-written-identity match.
+  const journal = await captureTransactionArtifacts({
+    resolvedRoot,
+    materialized,
+    openCodeConfigRelativePath: openCodeConfig,
+    openCodeConfigCurrentBytes,
+    openCodeConfigPatches: openCodeConfigCurrentBytes === null ? [] : manifest.configPatches,
+    receiptPath,
+    journalLimit: TRANSACTION_JOURNAL_LIMIT,
+  });
+  await hooks?.onJournalReady?.(journal.entries);
 
-  // Pre-write identity for each artifact.
-  let materializedWrittenHashes: Map<string, string | undefined> = new Map();
-  let openCodeWrittenHash: string | undefined;
-  let gitignoreWrittenHash: string | undefined;
-  let manifestWrittenHash: string | undefined;
-  let receiptWrittenBytes: Buffer | undefined;
-  let nextReceipt: OwnershipReceipt | undefined;
+  let gitignore: GitignoreTransactionState = { snapshot: null, writtenHash: undefined };
 
   try {
     await hooks?.preSkillsInstall?.();
@@ -578,17 +697,49 @@ export async function runBootstrapLegacyOwnershipTransaction(
 
     for (const file of materialized) {
       const destination = join(resolvedRoot, file.path);
-      const writtenHash = hashContent(file.content);
-      materializedWrittenHashes.set(file.path, writtenHash);
+      const entry = journal.entries.find((candidate) => candidate.path === destination);
+      if (entry === undefined) {
+        throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the materialized file entry", { path: file.path });
+      }
       await hooks?.preMaterializedFileWrite?.(file.path);
-      await atomicWrite(destination, file.content);
+      await journal.replace(entry, file.content);
       await hooks?.postMaterializedFileWrite?.(file.path);
     }
 
+    gitignore = { snapshot: await snapshotFile(join(resolvedRoot, ".gitignore")), writtenHash: undefined };
     await hooks?.preDefaultPathGitignoreEnsure?.();
-    ({ writtenHash: gitignoreWrittenHash } = await ensureDefaultPathGitignore(resolvedRoot, gitignoreSnapshot));
+    const result = await ensureDefaultPathGitignore(resolvedRoot, gitignore.snapshot);
+    gitignore = { snapshot: gitignore.snapshot, writtenHash: result.writtenHash };
     await hooks?.postDefaultPathGitignoreEnsure?.();
 
+    const openCodeEntry = journal.entries.find((candidate) => candidate.path === openCodeConfigPath);
+    if (openCodeEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
+    }
+    await hooks?.preOpenCodeApply?.();
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
+      ...(openCodeConfigCurrentBytes !== null ? { expectedContent: openCodeConfigCurrentBytes } : {}),
+      onWritten: (content: string) => {
+        openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
+      },
+    });
+    await hooks?.postOpenCodeApply?.();
+    // Defensive fail-closed check (bootstrap parity with ordinary update):
+    // confirm the on-disk OpenCode config still matches the exact bytes
+    // captured by the onWritten callback before any manifest/receipt
+    // materialization.
+    if (openCodeEntry.transactionWrittenIdentity !== undefined && (await exists(openCodeConfigPath))) {
+      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
+      const expectedOpenCodeHash = openCodeEntry.transactionWrittenIdentity.hash;
+      if (expectedOpenCodeHash !== undefined && hashContent(currentOpenCodeBytes) !== expectedOpenCodeHash) {
+        throw new PoiesisError(
+          "OPENCODE_CONFIG_CHANGED",
+          "OpenCode config changed between transaction write and manifest materialization",
+          { path: openCodeConfig },
+        );
+      }
+    }
+    const configPatches = nextAdapterPatches(manifest, appliedPatches);
     const nextFiles = nextAdapterFiles(
       manifest,
       materialized.map((file) => ({
@@ -598,43 +749,10 @@ export async function runBootstrapLegacyOwnershipTransaction(
         durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
       })),
     );
-    await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
-      ...(openCodeConfigCurrentBytes !== null ? { expectedContent: openCodeConfigCurrentBytes } : {}),
-      onWritten: (content: string) => {
-        openCodeWrittenHash = hashContent(content);
-      },
-    });
-    await hooks?.postOpenCodeApply?.();
-    // Defensive fail-closed check (bootstrap parity with ordinary update):
-    // confirm the on-disk OpenCode config still matches the exact bytes
-    // captured by the onWritten callback before any manifest/receipt
-    // materialization. A concurrent replacement that lands between the
-    // callback and this check would otherwise produce a manifest hash
-    // derived from foreign bytes; we reject it here so the next manifest
-    // record is always bound to this transaction's callback bytes and a
-    // foreign replacement fails closed.
-    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
-      const currentOpenCodeBytes = await readFile(openCodeConfigPath);
-      if (hashContent(currentOpenCodeBytes) !== openCodeWrittenHash) {
-        throw new PoiesisError(
-          "OPENCODE_CONFIG_CHANGED",
-          "OpenCode config changed between transaction write and manifest materialization",
-          { path: openCodeConfig },
-        );
-      }
-    }
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null && openCodeWrittenHash !== undefined) {
+    if (openCodeEntry.transactionWrittenIdentity?.hash !== undefined) {
       const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
       if (nextRecord >= 0) {
-        // Bind the next manifest's OpenCode file hash to the EXACT
-        // transaction-written bytes captured by the onWritten callback.
-        // Never re-read the mutable path: the defensive check above has
-        // already failed closed on any post-write foreign replacement;
-        // this branch only executes when the file still matches our
-        // callback bytes.
-        nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: openCodeWrittenHash };
+        nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: openCodeEntry.transactionWrittenIdentity.hash };
       }
     }
     const next: Manifest = {
@@ -652,14 +770,30 @@ export async function runBootstrapLegacyOwnershipTransaction(
     };
     const nextManifestBytes = serializeManifest(next);
     const nextManifestHash = hashContent(nextManifestBytes);
+    const manifestEntry = journal.entries.find((candidate) => candidate.path === manifestPath);
+    if (manifestEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
+    }
     await hooks?.preManifestWrite?.();
-    await atomicWrite(manifestPath, nextManifestBytes);
-    manifestWrittenHash = nextManifestHash;
+    await journal.replace(manifestEntry, nextManifestBytes);
     await hooks?.postManifestWrite?.();
 
+    // Bootstrap creates the receipt; generation=1, bound to the new
+    // manifest digest. The bytes passed to `journal.replace` mirror the
+    // canonical `${JSON.stringify(nextReceipt, null, 2)}\n` serialization
+    // that `writeReceipt` emits in `src/receipt.ts`. The journal's
+    // pre-write identity guard (`expectedPreWriteIdentity` captured as
+    // `{ exists: false, kind: "absent" }` because the receipt path is
+    // initially absent) catches any foreign receipt that races the
+    // transaction before this write.
+    const nextReceipt = await buildOwnershipReceipt(resolvedRoot, next);
+    const nextReceiptBytes = `${JSON.stringify(nextReceipt, null, 2)}\n`;
+    const receiptEntry = journal.entries.find((candidate) => candidate.path === receiptPath);
+    if (receiptEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the receipt entry", { path: receiptPath });
+    }
     await hooks?.preReceiptReplace?.();
-    nextReceipt = await createOwnershipReceipt(resolvedRoot, next);
-    receiptWrittenBytes = Buffer.from(`${JSON.stringify(nextReceipt, null, 2)}\n`);
+    await journal.replace(receiptEntry, nextReceiptBytes);
     await hooks?.postReceiptReplace?.();
 
     const report = await doctor(resolvedRoot);
@@ -668,61 +802,23 @@ export async function runBootstrapLegacyOwnershipTransaction(
     }
     return { manifest: next, doctor: report };
   } catch (error) {
-    // Bootstrap rollback: a newly created receipt is removed only if it
-    // still matches what THIS transaction wrote (preserves foreign
-    // receipt bytes). The manifest, OpenCode config, and materialized
-    // files use the same hash-gated preimage restoration as the
-    // ordinary `update` path.
-    const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-    if (receiptWrittenBytes !== undefined && (await exists(receiptPath))) {
-      const currentReceipt = await readFile(receiptPath);
-      if (hashContent(currentReceipt) === hashContent(receiptWrittenBytes)) {
-        if (receiptSnapshot === null) {
-          await removeOwnershipReceipt(resolvedRoot);
-        } else {
-          // Defensive: a foreign receipt appeared between preimage
-          // capture and `createOwnershipReceipt`. The hash gate above
-          // would have prevented us from reaching this branch, so this
-          // path is unreachable in practice; keep it for symmetry.
-          await atomicWrite(receiptPath, receiptSnapshot);
-        }
-      }
-    }
-    if (manifestWrittenHash !== undefined && (await exists(manifestPath))) {
-      const currentManifest = await readFile(manifestPath);
-      if (hashContent(currentManifest) === manifestWrittenHash) {
-        if (manifestBackup === null) {
-          await unlink(manifestPath);
-        } else {
-          await atomicWrite(manifestPath, manifestBackup);
-        }
-      }
-    }
-    if (openCodeWrittenHash !== undefined && (await exists(openCodeConfigPath))) {
-      const currentOpenCode = await readFile(openCodeConfigPath);
-      if (hashContent(currentOpenCode) === openCodeWrittenHash) {
-        if (openCodeConfigSnapshot === null) {
-          await unlink(openCodeConfigPath);
-        } else {
-          await atomicWrite(openCodeConfigPath, openCodeConfigSnapshot);
-        }
-      }
-    }
-    for (const file of [...materialized].reverse()) {
-      const destination = join(resolvedRoot, file.path);
-      const snapshot = fileSnapshots.get(file.path);
-      const writtenHash = materializedWrittenHashes.get(file.path);
-      if (writtenHash === undefined) continue;
-      if (!(await exists(destination))) continue;
-      const currentMaterial = await readFile(destination);
-      if (hashContent(currentMaterial) !== writtenHash) continue;
-      if (snapshot === undefined) {
-        await unlink(destination);
+    // Fail-closed rollback: the bounded journal drives every owned
+    // artifact's reverse hash-gated restoration in reverse write order.
+    // The transactional `.gitignore` rule retains its own hash-gated
+    // rollback (NOT in the journal) because the file is not a
+    // Poiesis-owned artifact.
+    const diagnostics = await journal.rollback();
+    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignore.snapshot, gitignore.writtenHash);
+    if (diagnostics.length > 0) {
+      if (error instanceof PoiesisError) {
+        error.details.incompleteRollback = diagnostics;
       } else {
-        await atomicWrite(destination, snapshot);
+        throw new PoiesisError("ROLLBACK_INCOMPLETE", "Transaction failed and rollback was incomplete", {
+          cause: error instanceof Error ? error.message : String(error),
+          incompleteRollback: diagnostics,
+        });
       }
     }
-    await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignoreSnapshot, gitignoreWrittenHash);
     throw error;
   }
 }
