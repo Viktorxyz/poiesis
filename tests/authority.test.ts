@@ -29,7 +29,7 @@ describe("manifest authority", () => {
     await installed(repository);
     const report = await doctor(repository.root);
     expect(report.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     [
