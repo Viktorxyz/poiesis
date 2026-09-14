@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, workspacePrepare } from "../src/git.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
   return resolveTree(repository.root, sha);
@@ -82,7 +82,7 @@ describe("deterministic Git lifecycle", () => {
     ).resolves.toMatchObject({ action: "updated" });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: treeA, proof: proofShell(accepted.sha, treeA) });
+    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: treeA, proof: proofShell(accepted.sha, treeA), publish: publishEvidence(accepted.sha, treeA, "poiesis/spec-1"), remote: "origin" });
     const staging = await delivery.promote({
       sha: accepted.sha,
       target: "staging",
@@ -239,7 +239,7 @@ describe("deterministic Git lifecycle", () => {
     });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: candidate.sha, candidateTree: treeB, proof: proofShell(candidate.sha, treeB) });
+    const preview = await delivery.preview({ sha: candidate.sha, candidateTree: treeB, proof: proofShell(candidate.sha, treeB), publish: publishEvidence(candidate.sha, treeB, "poiesis/stale"), remote: "origin" });
     const staging = await delivery.promote({ sha: candidate.sha, target: "staging", candidateTree: treeB, identity: preview });
 
     await writeFile(join(repository.root, "base-change.txt"), "new base\n");
@@ -421,7 +421,7 @@ describe("deterministic Git lifecycle", () => {
       proof: proofShell(accepted.sha, tree),
     });
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree) });
+    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree), publish: publishEvidence(accepted.sha, tree, "poiesis/greeting-command"), remote: "origin" });
     const staging = await delivery.promote({
       sha: accepted.sha,
       target: "staging",

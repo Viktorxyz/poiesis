@@ -240,6 +240,73 @@ export function validatePublishEvidence(
   );
 }
 
+/**
+ * Ticket #49 — Require Publish evidence before Preview.
+ *
+ * Preview must consume the same canonical, candidate-bound Publish
+ * evidence that drove the successful Publish operation, never a
+ * reconstructed or fabricated substitute. This validator enforces
+ * every contract surface that a downstream Preview call relies on:
+ *
+ *   - the schema-shape and verified:true contract from
+ *   `validatePublishEvidence`, anchored to the exact candidate SHA and
+ *   tree passed to Preview;
+ *   - cross-consistency between `branch` and `remoteRef`
+ *   (`refs/heads/<branch>`), preventing a tampered ref string from
+ *   hiding an unrelated change branch;
+ *   - an explicit allow-list of publish providers, rejecting evidence
+ *   that names an unknown or fabricated provider;
+ *   - the action allow-list (`created` | `updated` | `pushed`),
+ *   refusing any state that signals a failed, closed, or otherwise
+ *   non-success Publish operation;
+ *   - the changeRequest id/url string-or-null contract, rejecting
+ *   evidence that fabricates non-string placeholders for the change
+ *   request coordinates;
+ *   - rejection of empty/whitespace identifiers in any string
+ *   identity field, refusing evidence that smuggles in a
+ *   human-readable-but-unverifiable placeholder.
+ *
+ * The remote change-branch head is revalidated separately against the
+ * repository so that a force-pushed or rebased branch cannot be used
+ * to back-date a Preview claim; that revalidation lives in the
+ * adapter to keep this function pure.
+ */
+export function validatePreviewPublishEvidence(
+  evidence: PublishEvidence,
+  candidateSha: string,
+  candidateTree: string,
+): void {
+  invariant(isRecord(evidence), "INVALID_PUBLISH_EVIDENCE", "Preview requires matching Publish evidence");
+  validatePublishEvidence(evidence, candidateSha, candidateTree, evidence.branch, evidence.remoteRef);
+  const expectedRemoteRef = `refs/heads/${evidence.branch}`;
+  invariant(
+    evidence.remoteRef === expectedRemoteRef,
+    "PUBLISH_REMOTE_REF_INCONSISTENT",
+    "Publish evidence remoteRef must equal refs/heads/<branch>",
+    { expected: expectedRemoteRef, actual: evidence.remoteRef, branch: evidence.branch },
+  );
+  invariant(
+    typeof evidence.provider === "string" && PUBLISH_PROVIDERS.includes(evidence.provider as PublishProvider),
+    "PUBLISH_PROVIDER_INVALID",
+    "Publish evidence provider is not a supported publish provider",
+    { provider: evidence.provider },
+  );
+  invariant(
+    typeof evidence.branch === "string" && evidence.branch.trim().length > 0,
+    "PUBLISH_BRANCH_MISSING",
+    "Publish evidence branch must be a non-empty string",
+    { branch: evidence.branch },
+  );
+  invariant(
+    typeof evidence.publishedHeadSha === "string" && evidence.publishedHeadSha.trim().length > 0,
+    "PUBLISH_HEAD_MISSING",
+    "Publish evidence publishedHeadSha must be a non-empty string",
+    { publishedHeadSha: evidence.publishedHeadSha },
+  );
+}
+
+const PUBLISH_PROVIDERS: readonly PublishProvider[] = ["github", "gitlab", "fixture", "command"];
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }

@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, workspaceCleanup, workspacePrepare } from "../src/git.js";
 import { run } from "../src/process.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 /**
  * Default-path workspace lifecycle.
@@ -213,7 +213,7 @@ describe("workspace prepare default path", () => {
       proof: proofShell(accepted.sha, tree),
     });
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree) });
+    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree), publish: publishEvidence(accepted.sha, tree, "poiesis/default-path-lifecycle"), remote: "origin" });
     const staging = await delivery.promote({
       sha: accepted.sha,
       target: "staging",

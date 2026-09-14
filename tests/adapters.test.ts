@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { createFixtureDeliveryAdapter, createFixtureTrackerAdapter } from "../src/adapters.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 describe("tracker and delivery adapters", () => {
   const repositories: TestRepository[] = [];
@@ -42,13 +42,16 @@ describe("tracker and delivery adapters", () => {
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
-    await expect(adapter.preview({ sha: "a".repeat(40), candidateTree: tree, proof: proofShell("a".repeat(40), tree) })).rejects.toMatchObject({ code: "DELIVERY_CANDIDATE_NOT_FOUND" });
-    await expect(adapter.preview({ sha, candidateTree: "c".repeat(40), proof: proofShell(sha, "c".repeat(40)) })).rejects.toMatchObject({ code: "CANDIDATE_TREE_MISMATCH" });
-    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, "c".repeat(40)) })).rejects.toThrow();
+    const branch = "poiesis/adapters-test";
+    await run("git", ["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`], { cwd: repository.root });
+    const publish = publishEvidence(sha, tree, branch);
+    await expect(adapter.preview({ sha: "a".repeat(40), candidateTree: tree, proof: proofShell("a".repeat(40), tree), publish, remote: "origin" })).rejects.toMatchObject({ code: "DELIVERY_CANDIDATE_NOT_FOUND" });
+    await expect(adapter.preview({ sha, candidateTree: "c".repeat(40), proof: proofShell(sha, "c".repeat(40)), publish, remote: "origin" })).rejects.toMatchObject({ code: "CANDIDATE_TREE_MISMATCH" });
+    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, "c".repeat(40)), publish, remote: "origin" })).rejects.toThrow();
     await run("git", ["commit", "--quiet", "--allow-empty", "-m", "same tree"], { cwd: repository.root });
     const sameTreeSha = (await run("git", ["rev-parse", "HEAD"], { cwd: repository.root })).stdout;
-    await expect(adapter.preview({ sha: sameTreeSha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
-    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
+    await expect(adapter.preview({ sha: sameTreeSha, candidateTree: tree, proof: proofShell(sha, tree), publish, remote: "origin" })).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
+    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree), publish, remote: "origin" });
     const staging = await adapter.promote({
       sha,
       target: "staging",
@@ -138,7 +141,9 @@ describe("tracker and delivery adapters", () => {
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
-    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
+    const branch = "poiesis/adapters-integration";
+    await run("git", ["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`], { cwd: repository.root });
+    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" });
     const staging = await adapter.promote({ sha, target: "staging", candidateTree: tree, identity: preview });
 
     await writeFile(`${repository.root}/README.md`, "different integration tree\n");

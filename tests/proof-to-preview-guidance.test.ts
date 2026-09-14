@@ -201,7 +201,7 @@ describe("proof-to-preview package guidance", () => {
     const cliTs = await readRepoFile("src/cli.ts");
     const help = extractHelpBlock(cliTs);
     const publishIdx = help.indexOf("poiesis publish --sha <sha> --candidate-tree <tree> --proof <json>");
-    const previewIdx = help.indexOf("poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>");
+    const previewIdx = help.indexOf("poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>");
     expect(publishIdx).toBeGreaterThanOrEqual(0);
     expect(previewIdx).toBeGreaterThan(publishIdx);
   });

@@ -4,7 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { previewDelivery } from "../src/adapters.js";
 import { resolveTree } from "../src/git.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { run } from "../src/process.js";
+import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 /**
  * Fail-closed Preview behavior.
@@ -13,6 +14,12 @@ import { createTestRepository, proofShell, type TestRepository } from "./helpers
  * fail-closed; Poiesis must not claim that a Preview exists or ask for
  * Author validation until the deterministic operation succeeds and
  * returns a concrete Preview identity.
+ *
+ * Ticket #49 acceptance criterion: Preview must consume the same
+ * canonical, candidate-bound Publish evidence that drove the successful
+ * Publish operation. These tests exercise the runtime invariants that
+ * make that contract enforceable alongside the proof-only fail-closed
+ * invariants inherited from ticket #39.
  *
  * These tests exercise the runtime invariants that make that contract
  * enforceable.
@@ -31,6 +38,12 @@ async function writeDeliveryScript(fixturesDir: string, body: string): Promise<s
   return scriptPath;
 }
 
+async function publishBaseSha(repository: TestRepository, branch: string): Promise<void> {
+  await run("git", ["push", "--quiet", "origin", `${repository.baseSha}:refs/heads/${branch}`], {
+    cwd: repository.root,
+  });
+}
+
 describe("preview fail-closed invariants", () => {
   it("rejects a delivery command that returns verified:false", async () => {
     const repository = await createTestRepository();
@@ -39,6 +52,8 @@ describe("preview fail-closed invariants", () => {
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-verified-false";
+    await publishBaseSha(repository, branch);
     const script = await writeDeliveryScript(
       fixtures,
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: false, artifactIdentity: \"should-be-rejected\", id: \"should-be-rejected\" }) + \"\\n\");",
@@ -49,7 +64,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", script, "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: proofShell(sha, tree) },
+        { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_VERIFICATION_FAILED" });
@@ -62,6 +77,8 @@ describe("preview fail-closed invariants", () => {
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-no-artifact";
+    await publishBaseSha(repository, branch);
     const script = await writeDeliveryScript(
       fixtures,
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: true, id: \"only-id\" }) + \"\\n\");",
@@ -72,7 +89,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", script, "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: proofShell(sha, tree) },
+        { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_ARTIFACT_IDENTITY_MISSING" });
@@ -85,6 +102,8 @@ describe("preview fail-closed invariants", () => {
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-delivery-exit";
+    await publishBaseSha(repository, branch);
     const script = await writeDeliveryScript(
       fixtures,
       "#!/usr/bin/env node\nprocess.stderr.write(\"preview infrastructure unavailable\\n\");\nprocess.exit(2);",
@@ -95,7 +114,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", script, "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: proofShell(sha, tree) },
+        { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toThrow();
@@ -112,7 +131,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", "/nonexistent", "{sha}", "{target}"],
         },
-        { sha: fakeSha, candidateTree: tree, proof: proofShell(fakeSha, tree) },
+        { sha: fakeSha, candidateTree: tree, proof: proofShell(fakeSha, tree), publish: publishEvidence(fakeSha, tree, "poiesis/failclosed-missing"), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_CANDIDATE_NOT_FOUND" });
@@ -123,6 +142,8 @@ describe("preview fail-closed invariants", () => {
     repositories.push(repository);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-no-spec-identity";
+    await publishBaseSha(repository, branch);
     const brokenProof = {
       candidateSha: sha,
       candidateTree: tree,
@@ -136,7 +157,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", "/nonexistent", "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: brokenProof },
+        { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_REVIEW_IDENTITY_MISSING" });
@@ -147,6 +168,8 @@ describe("preview fail-closed invariants", () => {
     repositories.push(repository);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-standards-fail";
+    await publishBaseSha(repository, branch);
     const brokenProof = {
       candidateSha: sha,
       candidateTree: tree,
@@ -160,7 +183,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", "/nonexistent", "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: brokenProof },
+        { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_REVIEW_FAILED" });
@@ -171,6 +194,8 @@ describe("preview fail-closed invariants", () => {
     repositories.push(repository);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-proof-mismatch";
+    await publishBaseSha(repository, branch);
     const brokenProof = {
       candidateSha: "a".repeat(40),
       candidateTree: tree,
@@ -184,7 +209,7 @@ describe("preview fail-closed invariants", () => {
           adapter: "command",
           command: ["node", "/nonexistent", "{sha}", "{target}"],
         },
-        { sha, candidateTree: tree, proof: brokenProof },
+        { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
         repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
@@ -197,6 +222,8 @@ describe("preview fail-closed invariants", () => {
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/failclosed-ok";
+    await publishBaseSha(repository, branch);
     const identity = "https://preview.example/" + sha;
     const script = await writeDeliveryScript(
       fixtures,
@@ -207,7 +234,7 @@ describe("preview fail-closed invariants", () => {
         adapter: "command",
         command: ["node", script, "{sha}", "{target}"],
       },
-      { sha, candidateTree: tree, proof: proofShell(sha, tree) },
+      { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
       repository.root,
     );
     expect(preview.sha).toBe(sha);

@@ -24,7 +24,7 @@ import {
 } from "./adapters.js";
 import { cleanupOpenCodeSession } from "./session.js";
 import { PoiesisError } from "./errors.js";
-import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, StagingEvidence } from "./evidence.js";
+import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, PublishEvidence, StagingEvidence } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
 type Values = Record<string, string | boolean | string[] | undefined>;
@@ -45,7 +45,7 @@ Usage:
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
   poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>     # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>     # Preview only after Publish succeeds. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>     # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
@@ -318,6 +318,7 @@ async function commandPreview(args: string[]): Promise<void> {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
     proof: { type: "string" },
+    publish: { type: "string" },
     cwd: { type: "string" },
   });
   const cwd = cwdOf(values);
@@ -332,6 +333,8 @@ async function commandPreview(args: string[]): Promise<void> {
         sha: required(values, "sha"),
         candidateTree: required(values, "candidate-tree"),
         proof: json<ProofPayload>(required(values, "proof"), "proof"),
+        publish: json<PublishEvidence>(required(values, "publish"), "publish"),
+        remote: config.repository.remote,
       },
       repoRoot,
     ),
