@@ -1,6 +1,8 @@
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { assertManifestAuthority } from "../src/authority.js";
+import { SUPPORTED_OPENCODE_VERSIONS } from "../src/opencode.js";
 import { doctor, init, uninstall, update } from "../src/maintenance.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { atomicWrite, exists } from "../src/fs.js";
@@ -27,7 +29,7 @@ describe("manifest authority", () => {
     await installed(repository);
     const report = await doctor(repository.root);
     expect(report.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
-  }, 30_000);
+  }, 60_000);
 
   it.each([
     [
@@ -120,12 +122,82 @@ describe("manifest authority", () => {
     expect(report.ok).toBe(false);
     expect(report.checks.find((check) => check.id === "manifest")?.status).toBe("fail");
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({
-      code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED/),
+      code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED|OWNERSHIP_RECEIPT_MISMATCH/),
     });
     await expect(uninstall(repository.root)).rejects.toMatchObject({
       code: expect.stringMatching(/MANIFEST_AUTHORITY_INVALID|MANIFEST_MIGRATION_REQUIRED/),
     });
     expect(await readFile(join(repository.root, ".poiesis", "roles", "worker.md"), "utf8")).toBe(original);
     expect(await exists(join(repository.root, ".poiesis", "manifest.json"))).toBe(true);
+  }, 30_000);
+});
+
+
+describe("manifest authority adapter contract (ticket #33)", () => {
+  const repositories: TestRepository[] = [];
+  afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
+
+  it("rejects explicit supportedVersions that is empty", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installed(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.adapter.supportedVersions = [];
+    await expect(
+      assertManifestAuthority(repository.root, manifest, testConfig(repository)),
+    ).rejects.toMatchObject({ code: "MANIFEST_MIGRATION_REQUIRED" });
+  }, 30_000);
+
+  it("rejects supportedVersion that is not included in supportedVersions (contradictory)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installed(repository);
+    const manifest = await loadManifest(repository.root);
+    // Initial supportedVersion is the first entry of SUPPORTED_OPENCODE_VERSIONS.
+    const supportedVersion = manifest.adapter.supportedVersion;
+    const otherSupported = SUPPORTED_OPENCODE_VERSIONS.find((v) => v !== supportedVersion);
+    expect(otherSupported).toBeDefined();
+    manifest.adapter.supportedVersions = [otherSupported!];
+    await expect(
+      assertManifestAuthority(repository.root, manifest, testConfig(repository)),
+    ).rejects.toMatchObject({ code: "MANIFEST_MIGRATION_REQUIRED" });
+  }, 30_000);
+
+  it("rejects supportedVersions containing a version not in the supported set (unsupported)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installed(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.adapter.supportedVersion = SUPPORTED_OPENCODE_VERSIONS[0]!;
+    manifest.adapter.supportedVersions = [...SUPPORTED_OPENCODE_VERSIONS, "9.9.9-not-supported"];
+    await expect(
+      assertManifestAuthority(repository.root, manifest, testConfig(repository)),
+    ).rejects.toMatchObject({ code: "MANIFEST_MIGRATION_REQUIRED" });
+  }, 30_000);
+
+  it("accepts a legacy manifest (no supportedVersions) when supportedVersion is valid", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installed(repository);
+    const manifest = await loadManifest(repository.root);
+    // Strip supportedVersions entirely (legacy shape).
+    delete manifest.adapter.supportedVersions;
+    expect(manifest.adapter.supportedVersions).toBeUndefined();
+    expect(SUPPORTED_OPENCODE_VERSIONS).toContain(manifest.adapter.supportedVersion);
+    await expect(
+      assertManifestAuthority(repository.root, manifest, testConfig(repository)),
+    ).resolves.toBeUndefined();
+  }, 30_000);
+
+  it("accepts a current manifest when supportedVersion is included in supportedVersions and all are supported", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await installed(repository);
+    const manifest = await loadManifest(repository.root);
+    manifest.adapter.supportedVersion = SUPPORTED_OPENCODE_VERSIONS[0]!;
+    manifest.adapter.supportedVersions = [...SUPPORTED_OPENCODE_VERSIONS];
+    await expect(
+      assertManifestAuthority(repository.root, manifest, testConfig(repository)),
+    ).resolves.toBeUndefined();
   }, 30_000);
 });

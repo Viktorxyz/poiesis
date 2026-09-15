@@ -3,13 +3,16 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
-import { bounded, run } from "./process.js";
+import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
 import {
   validateProofEvidence,
+  validatePublishEvidence,
   validateStagingEvidence,
   validateIntegrationEvidence,
   type IntegrationEvidence,
+  type PublishEvidence,
+  type PublishProvider,
 } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
@@ -70,7 +73,7 @@ export interface WorkspacePrepareOptions {
   remote: string;
   integrationBranch: string;
   branch: string;
-  workspacePath: string;
+  workspacePath?: string;
   specId: string;
 }
 
@@ -113,6 +116,7 @@ export interface VerifyOptions {
   cwd: string;
   candidateSha: string;
   commands: string[];
+  timeoutMs?: number;
   outputLimit?: number;
   env?: NodeJS.ProcessEnv;
 }
@@ -131,8 +135,6 @@ export interface VerifyResult {
   commands: VerifyCommandResult[];
 }
 
-export type PublishProvider = "github" | "gitlab" | "fixture";
-
 export interface PublishOptions {
   cwd: string;
   ownershipId?: string;
@@ -145,13 +147,20 @@ export interface PublishOptions {
   title: string;
   body: string;
   proof: ProofPayload;
+  command?: readonly string[];
+  commandCwd?: string;
+  commandEnv?: Record<string, string>;
 }
 
 export interface PublishResult {
+  evidence: PublishEvidence;
   provider: PublishProvider;
   candidateSha: string;
+  candidateTree: string;
+  verified: true;
   branch: string;
   remoteRef: string;
+  publishedHeadSha: string;
   requestId: string | null;
   requestUrl: string | null;
   action: "created" | "updated" | "pushed";
@@ -304,7 +313,9 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
   );
 
   const baseSha = await fetchIntegrationBase(root, options.remote, options.integrationBranch);
-  const workspacePath = await canonicalProspectivePath(options.workspacePath);
+  const workspacePath = options.workspacePath !== undefined
+    ? await canonicalProspectivePath(options.workspacePath)
+    : await deriveDefaultWorkspacePath(root, options.specId, options.branch);
   const commonDir = await gitCommonDir(root);
   const markers = await readMarkers(commonDir);
   invariant(
@@ -337,12 +348,22 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
   });
 
   const worktrees = await listWorktrees(root);
+  // The primary checkout (root) is always listed by `git worktree list`.
+  // A default-path workspace is intentionally nested inside
+  // `<root>/.poiesis/workspaces/`, so we must not treat that nesting
+  // as a worktree collision against the primary checkout. The nested
+  // area is reserved for Poiesis; only non-primary worktrees that
+  // overlap the workspace path are real collisions.
+  const nestedInProjectWorkspaces = isWithin(
+    join(root, ".poiesis", "workspaces"),
+    workspacePath,
+  );
   invariant(
     !worktrees.some(
       (worktree) =>
         worktree.branch === options.branch ||
         worktree.path === workspacePath ||
-        isWithin(worktree.path, workspacePath) ||
+        (!nestedInProjectWorkspaces && isWithin(worktree.path, workspacePath)) ||
         isWithin(workspacePath, worktree.path),
     ),
     "WORKTREE_COLLISION",
@@ -500,12 +521,25 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   const results: VerifyCommandResult[] = [];
   let failed: VerifyCommandResult | null = null;
 
+  const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
+  // run() only rejects after it has terminated the spawned process tree
+  // (see process.ts settle()). The workspace state is therefore safe to
+  // observe immediately after a rejection, so the exact-SHA clean-after
+  // check below can run unconditionally.
+  let runError: unknown = null;
   for (const command of options.commands) {
-    const result = await run("/bin/sh", ["-c", command], {
-      cwd: root,
-      allowFailure: true,
-      ...(options.env === undefined ? {} : { env: options.env }),
-    });
+    let result: RunResult;
+    try {
+      result = await run("/bin/sh", ["-c", command], {
+        cwd: root,
+        allowFailure: true,
+        timeoutMs,
+        ...(options.env === undefined ? {} : { env: options.env }),
+      });
+    } catch (error) {
+      runError = error;
+      break;
+    }
     const evidence = {
       command,
       exitCode: result.exitCode,
@@ -519,7 +553,38 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
     }
   }
 
-  await assertExactClean(root, candidateSha);
+  // Exact-SHA clean-after must always run, even after a run() rejection or a
+  // non-zero exit. The verify invocation is the only writer of the candidate
+  // workspace, so any residue is the deterministic footprint of the verify
+  // command. A non-empty residue fails closed with DIRTY_CANDIDATE
+  // regardless of how the loop ended; otherwise the original COMMAND_TIMEOUT
+  // or VERIFICATION_FAILED is preserved unchanged.
+  let dirtyStatus: string[] | null = null;
+  try {
+    await assertExactClean(root, candidateSha);
+  } catch (cleanError) {
+    if (cleanError instanceof PoiesisError && cleanError.code === "DIRTY_CANDIDATE") {
+      const status = cleanError.details.status;
+      dirtyStatus = Array.isArray(status) ? (status as string[]) : [];
+    } else {
+      throw cleanError;
+    }
+  }
+
+  if (dirtyStatus !== null) {
+    throw new PoiesisError(
+      "DIRTY_CANDIDATE",
+      "Verify invocation left the exact candidate workspace dirty",
+      {
+        candidateSha,
+        commands: results,
+        runError: runError === null ? null : errorForEvidence(runError),
+        status: dirtyStatus.map(statusEntryForEvidence),
+      },
+    );
+  }
+
+  if (runError !== null) throw runError;
   if (failed !== null) {
     throw new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
       candidateSha,
@@ -582,20 +647,63 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   });
   await assertExactClean(owned.root, candidateSha);
 
+  let providerCompletion: ProviderCompletion;
   if (options.provider === "fixture") {
-    return {
-      provider: options.provider,
-      candidateSha,
-      branch,
-      remoteRef,
+    providerCompletion = {
       requestId: null,
       requestUrl: null,
       action: expectedRemote === null ? "pushed" : "updated",
     };
+  } else if (options.provider === "github") {
+    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+  } else if (options.provider === "gitlab") {
+    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+  } else {
+    providerCompletion = await publishCommand(
+      options,
+      branch,
+      candidateSha,
+      remoteRef,
+      owned.root,
+      expectedRemote === null,
+    );
   }
-  return options.provider === "github"
-    ? publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null)
-    : publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+
+  const evidence: PublishEvidence = {
+    candidateSha,
+    candidateTree,
+    verified: true,
+    branch,
+    remoteRef,
+    publishedHeadSha: publishedSha,
+    provider: options.provider,
+    action: providerCompletion.action,
+    changeRequest: {
+      id: providerCompletion.requestId,
+      url: providerCompletion.requestUrl,
+    },
+  };
+  validatePublishEvidence(evidence, candidateSha, candidateTree, branch, remoteRef);
+
+  return {
+    evidence,
+    provider: options.provider,
+    candidateSha,
+    candidateTree,
+    verified: true,
+    branch,
+    remoteRef,
+    publishedHeadSha: publishedSha,
+    requestId: providerCompletion.requestId,
+    requestUrl: providerCompletion.requestUrl,
+    action: providerCompletion.action,
+  };
+}
+
+interface ProviderCompletion {
+  requestId: string | null;
+  requestUrl: string | null;
+  action: "created" | "updated" | "pushed";
 }
 
 export async function integrate(options: IntegrateOptions): Promise<IntegrateResult> {
@@ -796,7 +904,7 @@ async function publishGitHub(
   remoteRef: string,
   cwd: string,
   _expectedBranchWasMissing: boolean,
-): Promise<PublishResult> {
+): Promise<ProviderCompletion> {
   const listed = await run(
     "gh",
     [
@@ -854,13 +962,16 @@ async function publishGitHub(
       ],
       { cwd },
     );
+    const verified = await verifyGitHubPullRequest(options, branch, candidateSha, cwd);
+    invariant(
+      verified !== null,
+      "PUBLISH_PROVIDER_INCOMPLETE",
+      "GitHub pull request edit did not produce a verifiable provider state",
+      { number, project: options.project, branch },
+    );
     return {
-      provider: "github",
-      candidateSha,
-      branch,
-      remoteRef,
       requestId: number,
-      requestUrl: jsonString(request, "url") ?? null,
+      requestUrl: jsonString(verified, "url") ?? null,
       action: "updated",
     };
   }
@@ -882,15 +993,52 @@ async function publishGitHub(
     ],
     { cwd },
   );
+  const verified = await verifyGitHubPullRequest(options, branch, candidateSha, cwd);
+  invariant(
+    verified !== null,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "GitHub pull request create did not produce a verifiable provider state",
+    { project: options.project, branch, ghOutput: bounded(created.stdout) },
+  );
+  const verifiedNumber = jsonIdentifier(verified, "number", "GitHub pull request");
   return {
-    provider: "github",
-    candidateSha,
-    branch,
-    remoteRef,
-    requestId: null,
-    requestUrl: extractUrl(created.stdout),
+    requestId: verifiedNumber,
+    requestUrl: jsonString(verified, "url") ?? extractUrl(created.stdout),
     action: "created",
   };
+}
+
+async function verifyGitHubPullRequest(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const listed = await run(
+    "gh",
+    [
+      "pr",
+      "list",
+      "--repo",
+      options.project,
+      "--state",
+      "open",
+      "--head",
+      branch,
+      "--base",
+      options.integrationBranch,
+      "--json",
+      "number,url,headRefOid,headRepository",
+      "--limit",
+      "100",
+    ],
+    { cwd },
+  );
+  const requests = parseJsonArray(listed.stdout, "GitHub pull request list");
+  const matched = requests.find((entry) => jsonString(entry, "headRefOid") === candidateSha);
+  if (matched === undefined) return null;
+  if (!isJsonRecord(matched)) return null;
+  return matched;
 }
 
 async function publishGitLab(
@@ -900,7 +1048,7 @@ async function publishGitLab(
   remoteRef: string,
   cwd: string,
   _expectedBranchWasMissing: boolean,
-): Promise<PublishResult> {
+): Promise<ProviderCompletion> {
   const listed = await run(
     "glab",
     [
@@ -946,13 +1094,16 @@ async function publishGitLab(
       ],
       { cwd },
     );
+    const verified = await verifyGitLabMergeRequest(options, branch, candidateSha, cwd);
+    invariant(
+      verified !== null,
+      "PUBLISH_PROVIDER_INCOMPLETE",
+      "GitLab merge request update did not produce a verifiable provider state",
+      { iid, project: options.project, branch },
+    );
     return {
-      provider: "gitlab",
-      candidateSha,
-      branch,
-      remoteRef,
       requestId: iid,
-      requestUrl: jsonString(request, "web_url") ?? jsonString(request, "webUrl") ?? null,
+      requestUrl: jsonString(verified, "web_url") ?? jsonString(verified, "webUrl") ?? null,
       action: "updated",
     };
   }
@@ -975,14 +1126,140 @@ async function publishGitLab(
     ],
     { cwd },
   );
+  const verified = await verifyGitLabMergeRequest(options, branch, candidateSha, cwd);
+  invariant(
+    verified !== null,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "GitLab merge request create did not produce a verifiable provider state",
+    { project: options.project, branch, glabOutput: bounded(created.stdout) },
+  );
+  const verifiedIid = jsonIdentifier(verified, "iid", "GitLab merge request");
   return {
-    provider: "gitlab",
-    candidateSha,
-    branch,
-    remoteRef,
-    requestId: null,
-    requestUrl: extractUrl(created.stdout),
+    requestId: verifiedIid,
+    requestUrl: jsonString(verified, "web_url") ?? jsonString(verified, "webUrl") ?? extractUrl(created.stdout),
     action: "created",
+  };
+}
+
+async function verifyGitLabMergeRequest(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  const listed = await run(
+    "glab",
+    [
+      "mr",
+      "list",
+      "--repo",
+      options.project,
+      "--source-branch",
+      branch,
+      "--target-branch",
+      options.integrationBranch,
+      "--output",
+      "json",
+    ],
+    { cwd },
+  );
+  const requests = parseJsonArray(listed.stdout, "GitLab merge request list");
+  const matched = requests.find((entry) => {
+    const headSha = jsonString(entry, "sha") ?? jsonString(entry, "head_sha");
+    return headSha === undefined || headSha === candidateSha;
+  });
+  if (matched === undefined) return null;
+  if (!isJsonRecord(matched)) return null;
+  return matched;
+}
+
+async function publishCommand(
+  options: PublishOptions,
+  branch: string,
+  candidateSha: string,
+  remoteRef: string,
+  cwd: string,
+  expectedBranchWasMissing: boolean,
+): Promise<ProviderCompletion> {
+  invariant(
+    options.command !== undefined && options.command.length > 0,
+    "INVALID_PUBLISH_COMMAND",
+    "Publish command provider requires a non-empty command argv",
+    { provider: options.provider },
+  );
+  const argv = options.command;
+  const executable = argv[0]!;
+  const args = argv.slice(1);
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ...(options.commandEnv ?? {}),
+    POIESIS_CANDIDATE_SHA: candidateSha,
+    POIESIS_CANDIDATE_TREE: options.candidateTree,
+    POIESIS_BRANCH: branch,
+    POIESIS_REMOTE_REF: remoteRef,
+    POIESIS_PUBLISH_PROJECT: options.project,
+    POIESIS_PUBLISH_TITLE: options.title,
+    POIESIS_PUBLISH_BODY: options.body,
+    POIESIS_PUBLISH_INTEGRATION_BRANCH: options.integrationBranch,
+    POIESIS_PUBLISH_REMOTE: options.remote,
+    POIESIS_PUBLISH_PROVIDER: options.provider,
+  };
+  const commandCwd = options.commandCwd ?? cwd;
+  const result = await run(executable, args, { cwd: commandCwd, env });
+  const output = parsePublishCommandOutput(result.stdout);
+  const requestId = typeof output.id === "string" && output.id.length > 0 ? output.id : null;
+  const requestUrl = typeof output.url === "string" && output.url.length > 0 ? output.url : null;
+  invariant(
+    output.candidateSha === undefined || output.candidateSha === candidateSha,
+    "PUBLISH_COMMAND_CANDIDATE_MISMATCH",
+    "Publish command reported a different candidate SHA",
+    { expected: candidateSha, actual: output.candidateSha },
+  );
+  invariant(
+    output.candidateTree === undefined || output.candidateTree === options.candidateTree,
+    "PUBLISH_COMMAND_TREE_MISMATCH",
+    "Publish command reported a different candidate tree",
+    { expected: options.candidateTree, actual: output.candidateTree },
+  );
+  invariant(
+    output.verified === true,
+    "PUBLISH_PROVIDER_INCOMPLETE",
+    "Publish command must report verified: true after provider completion",
+    { exitCode: result.exitCode, output: bounded(result.stdout) },
+  );
+  const action = output.action === "created" || output.action === "updated"
+    ? output.action
+    : expectedBranchWasMissing
+      ? "created"
+      : "updated";
+  return { requestId, requestUrl, action };
+}
+
+function parsePublishCommandOutput(stdout: string): {
+  id?: string;
+  url?: string;
+  candidateSha?: string;
+  candidateTree?: string;
+  verified?: boolean;
+  action?: "created" | "updated";
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(stdout);
+  } catch (error) {
+    throw new PoiesisError("INVALID_PUBLISH_COMMAND_OUTPUT", "Publish command output was not valid JSON", {
+      cause: error instanceof Error ? error.message : String(error),
+      output: bounded(stdout),
+    });
+  }
+  invariant(isJsonRecord(parsed), "INVALID_PUBLISH_COMMAND_OUTPUT", "Publish command output must be a JSON object");
+  return parsed as {
+    id?: string;
+    url?: string;
+    candidateSha?: string;
+    candidateTree?: string;
+    verified?: boolean;
+    action?: "created" | "updated";
   };
 }
 
@@ -1511,4 +1788,110 @@ function isJsonRecord(value: unknown): value is Record<string, unknown> {
 function errorForEvidence(error: unknown): string | null {
   if (error === undefined) return null;
   return error instanceof Error ? error.message : String(error);
+}
+
+async function assertSafeManagedParentChain(root: string, components: string[]): Promise<void> {
+  // lstat-style no-follow validation: walk each existing component of
+  // the managed parent chain under `root` and refuse to follow any
+  // symlink or treat a non-directory as a directory. mkdir(..., {
+  // recursive: true }) would otherwise follow an attacker-placed
+  // symlink at any level and create the workspace at an external
+  // target. Missing components are fine — they will be created by the
+  // caller and re-validated.
+  let current = root;
+  for (const part of components) {
+    current = join(current, part);
+    let stat: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stat = await lstat(current);
+    } catch (error) {
+      if (isJsonRecord(error) && error.code === "ENOENT") continue;
+      throw error;
+    }
+    if (stat.isSymbolicLink()) {
+      throw new PoiesisError(
+        "WORKSPACE_PARENT_UNSAFE",
+        "Refusing to traverse a symlinked workspace parent",
+        { path: relative(root, current) },
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw new PoiesisError(
+        "WORKSPACE_PARENT_UNSAFE",
+        "Workspace parent must be a regular directory",
+        { path: relative(root, current) },
+      );
+    }
+  }
+}
+
+/**
+ * Resolve the in-project workspace directory used when `workspace prepare`
+ * is invoked without an explicit `--path`. The directory lives under
+ * `<root>/.poiesis/workspaces/<derived-id>` so the workspace stays inside
+ * the harness-readable project root, never under `/tmp` or another
+ * external location that the harness cannot access. The returned path
+ * is treated like any other candidate workspace path: the marker, base,
+ * checkpoint, publish, cleanup, and rollback semantics are unchanged.
+ *
+ * The parent chain `<root>/.poiesis` and `<root>/.poiesis/workspaces`
+ * is validated with lstat-style no-follow semantics before any
+ * mkdir/realpath/write. A hostile symlink at any of these components
+ * would otherwise be followed by mkdir and let the default path
+ * escape the project root and mutate an external target.
+ */
+export async function deriveDefaultWorkspacePath(
+  root: string,
+  specId: string,
+  branch: string,
+): Promise<string> {
+  validateText(specId, "specId");
+  validateText(branch, "branch");
+  const branchLeaf = branch.split("/").pop() ?? branch;
+  const safeSpec = sanitizeWorkspaceIdSegment(specId, "specId");
+  const safeBranch = sanitizeWorkspaceIdSegment(branchLeaf, "branch");
+  const directory = join(root, ".poiesis", "workspaces", `${safeSpec}__${safeBranch}`);
+  // Defence-in-depth: even after sanitization the result must stay
+  // inside the repository root. `relative` returns ".." or an absolute
+  // path when the candidate escapes the root, which would indicate a
+  // sanitization bug rather than user input.
+  const inside = relative(root, directory);
+  invariant(
+    !isAbsolute(inside) && inside !== ".." && !inside.startsWith(`..${sep}`),
+    "WORKSPACE_ID_TRAVERSAL_FORBIDDEN",
+    "Derived workspace id escapes the repository root",
+    { inside, specId, branch },
+  );
+  // Validate the parent chain with lstat-style no-follow semantics
+  // before any mkdir/realpath/write. A hostile symlink at `.poiesis`
+  // or `.poiesis/workspaces` would otherwise be followed by mkdir
+  // and let the default path escape the project root.
+  await assertSafeManagedParentChain(root, [".poiesis", "workspaces"]);
+  // `git worktree add` requires the parent directory to exist. The
+  // nested `.poiesis/workspaces/` area is gitignored so this directory
+  // never appears as foreign work in the primary checkout.
+  await mkdir(join(root, ".poiesis", "workspaces"), { recursive: true, mode: 0o700 });
+  // Re-validate the parent chain after mkdir to close the
+  // validate-mutate-create TOCTOU window (a concurrent attacker could
+  // swap a regular directory for a symlink between the two checks).
+  await assertSafeManagedParentChain(root, [".poiesis", "workspaces"]);
+  return directory;
+}
+
+function sanitizeWorkspaceIdSegment(value: string, field: string): string {
+  invariant(!value.includes("\0"), "INVALID_ARGUMENT", `${field} must not contain null bytes`, { field });
+  invariant(
+    !value.includes("..") && !value.includes("/") && !value.includes(sep) && !value.includes("\\"),
+    "WORKSPACE_ID_TRAVERSAL_FORBIDDEN",
+    `${field} cannot contain traversal segments`,
+    { field, value },
+  );
+  const safe = value.replace(/[^A-Za-z0-9._-]/g, "-");
+  invariant(
+    safe.length > 0 && safe !== "." && safe !== "..",
+    "WORKSPACE_ID_INVALID",
+    `${field} cannot be sanitized to a usable identifier`,
+    { field, value },
+  );
+  return safe;
 }

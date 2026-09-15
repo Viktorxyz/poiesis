@@ -37,6 +37,14 @@ export const manifestSchema = z.strictObject({
     harness: z.literal("opencode"),
     adapterVersion: z.string().min(1),
     supportedVersion: z.string().min(1),
+    /**
+     * Optional explicit set of OpenCode versions the manifest was authored
+     * against. Absent on legacy manifests; when present every entry must
+     * be a member of the adapter-version-1 supported set. Authority also
+     * accepts a manifest whose `supportedVersion` alone is a member of the
+     * supported set so pre-1.0.3 manifests remain valid under 1.0.3.
+     */
+    supportedVersions: z.array(z.string().min(1)).optional(),
   }),
   files: z.array(managedFileSchema),
   skills: z.array(skillSchema),

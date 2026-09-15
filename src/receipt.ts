@@ -134,6 +134,28 @@ export async function createOwnershipReceipt(root: string, manifest: Manifest): 
   return receipt;
 }
 
+/**
+ * Construct a fresh canonical `OwnershipReceipt` (generation=1) for the
+ * given root without writing it to disk. Used by the bounded
+ * `ArtifactJournal` bootstrap path so the journal's `replace` is the
+ * sole atomic writer; the journal's pre-write identity guard
+ * (`expectedPreWriteIdentity` captured as `{ exists: false, kind: "absent" }`
+ * for an initially-absent receipt path) then provides the same
+ * fail-closed foreign-receipt protection that `atomicCreate` would.
+ */
+export async function buildOwnershipReceipt(root: string, manifest: Manifest): Promise<OwnershipReceipt> {
+  const workspace = await realpath(root);
+  const { commonDir } = await receiptPath(root);
+  return {
+    schema: 1,
+    commonDir,
+    workspace,
+    installationId: randomUUID(),
+    manifestDigest: manifestDigest(manifest),
+    generation: 1,
+  };
+}
+
 export async function replaceOwnershipReceipt(
   root: string,
   manifest: Manifest,

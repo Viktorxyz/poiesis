@@ -1,15 +1,29 @@
 import { isDeepStrictEqual } from "node:util";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { applyEdits, modify, parseTree, type Node as JsonNode } from "jsonc-parser";
+import { applyEdits, modify } from "jsonc-parser";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { parseJsonc, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import type { ConfigPatch } from "./manifest.js";
+import { assertNoDuplicateProperties as assertNoDuplicatePropertiesShared } from "./opencode-config-validator.js";
+import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { run } from "./process.js";
 
 export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
+/**
+ * The explicit, ordered set of OpenCode versions the V1 adapter contract
+ * applies to. Both `1.18.29` and `1.18.30` lower the same adapter-version-1
+ * config schema and use identical action keys and session endpoints; the
+ * 1.18.30 release changes are provider/model-only. Newer releases MUST
+ * NOT be added here without explicit contract verification.
+ */
+export const SUPPORTED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30"];
 export const OPENCODE_ADAPTER_VERSION = "1";
+
+export function isSupportedOpenCodeVersion(version: string): boolean {
+  return SUPPORTED_OPENCODE_VERSIONS.includes(version);
+}
 
 type JsonObject = Record<string, unknown>;
 
@@ -111,7 +125,6 @@ function permissions(config: PoiesisConfig): Record<string, JsonObject> {
         grep: "allow",
         list: "allow",
         skill: { "code-review": "allow" },
-        task: { explore: "allow" },
       },
     },
     "poiesis-final-reviewer": {
@@ -190,29 +203,12 @@ function getAtPath(value: unknown, path: string[]): { exists: boolean; value?: u
 }
 
 function assertNoDuplicateProperties(content: string, configPath: string): void {
-  const root = parseTree(content);
-  function visit(node: JsonNode): void {
-    if (node.type === "object") {
-      const keys = new Set<string>();
-      for (const property of node.children ?? []) {
-        const key = property.children?.[0]?.value;
-        if (typeof key === "string") {
-          if (keys.has(key)) {
-            throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config contains duplicate properties", {
-              file: configPath,
-              property: key,
-            });
-          }
-          keys.add(key);
-        }
-        const value = property.children?.[1];
-        if (value !== undefined) visit(value);
-      }
-      return;
-    }
-    for (const child of node.children ?? []) visit(child);
-  }
-  if (root !== undefined) visit(root);
+  // Implemented by the small internal validator module
+  // (`src/opencode-config-validator.ts`) that owns the duplicate-property
+  // recursion. Kept as a thin pass-through here so init-side callers
+  // (`assertOpenCodeContentAvailable`) reuse the same canonical helper
+  // without exporting it from this module's public surface.
+  assertNoDuplicatePropertiesShared(content, configPath);
 }
 
 function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig): void {
@@ -304,29 +300,42 @@ export async function applyOpenCodeConfig(
     });
   }
   if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config);
-  const original = parseJsonc<JsonObject>(content, configPath);
-  const patches: ConfigPatch[] = [];
-  for (const desired of desiredOpenCodePatches(config)) {
-    const previous = getAtPath(original, desired.path);
-    patches.push({
-      file: relative(root, configPath),
-      path: desired.path,
-      previousExists: previous.exists,
-      ...(previous.exists ? { previous: previous.value } : {}),
-      installed: desired.value,
-    });
-    content = applyEdits(
-      content,
-      modify(content, desired.path, desired.value, {
-        formattingOptions: { insertSpaces: true, tabSize: 2, eol: "\n" },
-      }),
-    );
+  // The pure projection loop (parse original → for each desired patch compute
+  // provenance + apply jsonc edits → emit serialized payload) is delegated to
+  // `projectOpenCodePayload` so the transaction-time preflight in
+  // `runUpdateConfigTransaction` can compute the EXACT same payload
+  // deterministically before any owned byte is mutated. The returned
+  // `configPatches` are byte-for-byte identical to the previous inline loop.
+  const { serialized, configPatches } = projectOpenCodePayload({
+    root,
+    configPath,
+    currentContent: content,
+    patches: desiredOpenCodePatches(config),
+  });
+  // Strengthened apply: re-read the on-disk bytes immediately before the
+  // atomicWrite and compare against `options.expectedContent`. This is a TOCTOU
+  // pre-write byte equality check — POSIX does not offer a portable file-CAS
+  // primitive across filesystems (e.g. network mounts may silently rewrite),
+  // so this guard is explicitly NOT called a compare-and-swap. A mismatch
+  // here is the same kind of foreign-writer race the original
+  // `expectedContent.equals(...)` check at the head of this function detects;
+  // adding a second sample at the moment of the write raises the probability
+  // of catching a foreign writer that slipped in between the head check and
+  // the write without changing the caller's contract.
+  if (present && options.expectedContent !== undefined && options.expectedContent !== null) {
+    const rereadBeforeWrite = await readFile(configPath);
+    if (!rereadBeforeWrite.equals(options.expectedContent)) {
+      throw new PoiesisError(
+        "INSTALL_PATH_CONFLICT",
+        "OpenCode config changed between expected-content check and atomic write",
+        { path: relative(root, configPath) },
+      );
+    }
   }
-  const serialized = content.endsWith("\n") ? content : `${content}\n`;
   if (present) await atomicWrite(configPath, serialized);
   else await atomicCreate(configPath, serialized);
   options.onWritten?.(serialized);
-  return patches;
+  return configPatches;
 }
 
 export async function reverseOpenCodeConfig(root: string, patches: ConfigPatch[]): Promise<string[]> {
@@ -378,10 +387,10 @@ export async function verifyOpenCodeVersion(root: string): Promise<string> {
   if (result.exitCode !== 0) {
     throw new PoiesisError("OPENCODE_UNAVAILABLE", "OpenCode is not available", { stderr: result.stderr });
   }
-  if (result.stdout !== SUPPORTED_OPENCODE_VERSION) {
+  if (!isSupportedOpenCodeVersion(result.stdout)) {
     throw new PoiesisError("OPENCODE_VERSION_UNSUPPORTED", "Installed OpenCode version is not supported", {
       installed: result.stdout,
-      supported: SUPPORTED_OPENCODE_VERSION,
+      supported: [...SUPPORTED_OPENCODE_VERSIONS],
     });
   }
   return result.stdout;

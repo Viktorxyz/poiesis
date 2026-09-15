@@ -16,7 +16,7 @@ import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
 import { atomicCreate } from "../src/fs.js";
 import { ensureGitignore } from "../src/templates.js";
-import { createTestRepository, proofShell } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence } from "./helpers.js";
 
 const fixtures: string[] = [];
 afterEach(async () => {
@@ -172,6 +172,8 @@ describe("CommandDeliveryAdapter", () => {
     const root = repository.root;
     const sha = repository.baseSha;
     const tree = await resolveTree(root, sha);
+    const branch = "poiesis/unit-cmd-preview";
+    await run("git", ["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`], { cwd: root });
     const receiptScript = join(parent, "delivery-receipt.sh");
     await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"status\":\"created\",\"url\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"https://example.com/$POIESIS_DELIVERY_TARGET/$POIESIS_CANDIDATE_SHA\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"candidateTree\":\"$POIESIS_CANDIDATE_TREE\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
     await chmod(receiptScript, 0o755);
@@ -179,7 +181,7 @@ describe("CommandDeliveryAdapter", () => {
       { adapter: "command", command: [receiptScript, "deploy", "{target}", "{sha}"] },
       root,
     );
-    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) });
+    const preview = await adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" });
     expect(preview.url).toBe(`https://example.com/preview/${sha}`);
     expect(preview.artifactIdentity).toBe(preview.url);
   });
@@ -189,6 +191,8 @@ describe("CommandDeliveryAdapter", () => {
     fixtures.push(repository.parent);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const branch = "poiesis/unit-cmd-receipts";
+    await run("git", ["push", "--quiet", "origin", `${sha}:refs/heads/${branch}`], { cwd: repository.root });
     const receiptScript = join(repository.parent, "incomplete-delivery-receipt.sh");
     await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"id\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
     await chmod(receiptScript, 0o755);
@@ -197,12 +201,12 @@ describe("CommandDeliveryAdapter", () => {
       repository.root,
     );
 
-    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({
+    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" })).rejects.toMatchObject({
       code: "DELIVERY_TREE_MISMATCH",
     });
 
     await writeFile(receiptScript, "#!/bin/sh\ncat <<JSON\n{\"id\":\"artifact-$POIESIS_CANDIDATE_SHA\",\"artifactIdentity\":\"different-artifact\",\"sha\":\"$POIESIS_CANDIDATE_SHA\",\"candidateTree\":\"$POIESIS_CANDIDATE_TREE\",\"target\":\"$POIESIS_DELIVERY_TARGET\",\"verified\":true}\nJSON\n");
-    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree) })).rejects.toMatchObject({
+    await expect(adapter.preview({ sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" })).rejects.toMatchObject({
       code: "DELIVERY_ARTIFACT_IDENTITY_MISMATCH",
     });
   });

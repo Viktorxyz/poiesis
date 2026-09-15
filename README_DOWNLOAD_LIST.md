@@ -18,9 +18,10 @@ The implementation agent will use `POIESIS_INSTALL_LAYOUT.md` to project them in
 
 ## Installer/config sources
 - `POIESIS_CONFIG_TEMPLATE.jsonc`
-- `POIESIS_MANIFEST_TEMPLATE.json`
 - `POIESIS_SKILLS.json`
 - `POIESIS_INSTALL_LAYOUT.md`
+
+`POIESIS_MANIFEST_TEMPLATE.json` is a legacy design reference only — the runtime programmatically constructs the `Manifest` object inside the `init` flow in `src/maintenance.ts` (around `materializeFiles(config)` and the per-file `managedFiles.push({ ..., hash: hashContent(file.content) })` loop), where each managed file's bytes are read from the live `templateMappings` (via `src/templates.ts::templateMappings`) and the resulting `Manifest` literal is later stringified for write via `src/manifest.ts::serializeManifest()`. The template is not consumed by `src/templates.ts`, not listed in `package.json::files[]`, and not shipped in the published package. Keep it in the bundle for human readers only.
 
 ## OpenCode adapter sources
 - `OPENCODE_AGENT_POIESIS.md`

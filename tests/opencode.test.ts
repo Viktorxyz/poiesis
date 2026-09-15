@@ -8,6 +8,7 @@ import {
   detectOpenCodeConfigForInit,
   reverseOpenCodeConfig,
 } from "../src/opencode.js";
+import { readTemplate } from "../src/templates.js";
 import { parseJsonc } from "../src/config.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
@@ -95,6 +96,108 @@ describe("OpenCode adapter", () => {
       },
     });
     expect(patches["agent.poiesis"]?.permission).not.toHaveProperty("task.build");
+  });
+
+  it("strips native Task/Explore delegation from the ticket Reviewer projection", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+        patch.path.join("."),
+        patch.value as Record<string, unknown>,
+      ]),
+    );
+    const reviewer = patches["agent.poiesis-reviewer"] as { permission: Record<string, unknown> };
+    expect(reviewer.permission).not.toHaveProperty("task");
+    expect(reviewer.permission).not.toHaveProperty("bash");
+  });
+
+  it("keeps direct read/glob/grep/list and code-review on the ticket Reviewer", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+        patch.path.join("."),
+        patch.value as Record<string, unknown>,
+      ]),
+    );
+    const reviewer = patches["agent.poiesis-reviewer"] as { permission: Record<string, unknown> };
+    expect(reviewer.permission).toMatchObject({
+      "*": "deny",
+      read: "allow",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      skill: { "code-review": "allow" },
+    });
+  });
+
+  it("preserves required native child routes on the other specialists", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+        patch.path.join("."),
+        patch.value as Record<string, unknown>,
+      ]),
+    );
+    expect((patches["agent.poiesis-final-reviewer"] as { permission: Record<string, unknown> }).permission).toMatchObject({
+      task: { explore: "allow" },
+    });
+    expect((patches["agent.poiesis-worker"] as { permission: Record<string, unknown> }).permission).toMatchObject({
+      task: { explore: "allow" },
+    });
+    expect((patches["agent.poiesis-planner"] as { permission: Record<string, unknown> }).permission).toMatchObject({
+      task: { explore: "allow", "poiesis-research": "allow" },
+    });
+    expect((patches["agent.poiesis"] as { permission: Record<string, unknown> }).permission).toMatchObject({
+      task: {
+        explore: "allow",
+        "poiesis-planner": "allow",
+        "poiesis-worker": "allow",
+        "poiesis-research": "allow",
+        "poiesis-reviewer": "allow",
+        "poiesis-final-reviewer": "allow",
+      },
+    });
+    expect((patches["agent.poiesis-research"] as { permission: Record<string, unknown> }).permission).not.toHaveProperty(
+      "task",
+    );
+  });
+
+  it("strips ticket Reviewer Explore delegation from the V2 design template while keeping other agent subagent routes", async () => {
+    const template = await readTemplate("OPENCODE_CONFIG_PATCH_V2.jsonc");
+    const parsed = parseJsonc<{
+      agents: Record<string, { model: string; permissions: Array<{ action: string; resource: string; effect: string }> }>;
+    }>(template, "OPENCODE_CONFIG_PATCH_V2.jsonc");
+    const reviewerPermissions = parsed.agents["poiesis-reviewer"]!.permissions;
+    expect(reviewerPermissions).toContainEqual({ action: "read", resource: "*", effect: "allow" });
+    expect(reviewerPermissions).toContainEqual({ action: "glob", resource: "*", effect: "allow" });
+    expect(reviewerPermissions).toContainEqual({ action: "grep", resource: "*", effect: "allow" });
+    expect(reviewerPermissions).toContainEqual({ action: "list", resource: "*", effect: "allow" });
+    expect(reviewerPermissions).toContainEqual({ action: "skill", resource: "code-review", effect: "allow" });
+    expect(reviewerPermissions.some((rule) => rule.action === "subagent")).toBe(false);
+
+    expect(parsed.agents["poiesis-final-reviewer"]!.permissions).toContainEqual({
+      action: "subagent",
+      resource: "explore",
+      effect: "allow",
+    });
+    expect(parsed.agents["poiesis-worker"]!.permissions).toContainEqual({
+      action: "subagent",
+      resource: "explore",
+      effect: "allow",
+    });
+    expect(parsed.agents["poiesis-planner"]!.permissions).toContainEqual({
+      action: "subagent",
+      resource: "explore",
+      effect: "allow",
+    });
+    expect(parsed.agents["poiesis-planner"]!.permissions).toContainEqual({
+      action: "subagent",
+      resource: "poiesis-research",
+      effect: "allow",
+    });
   });
 
   it.each([
@@ -200,5 +303,36 @@ describe("OpenCode adapter", () => {
       }),
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
     expect(await readFile(path, "utf8")).toBe('{ "share": "changed" }\n');
+  });
+
+  it("never projects an external_directory permission key on any specialist", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config = testConfig(repository);
+    const patches = desiredOpenCodePatches(config);
+    for (const patch of patches) {
+      const value = patch.value as Record<string, unknown> | string | number | boolean | undefined;
+      expect(patch.path).not.toContain("external_directory");
+      expect(patch.path).not.toContain("externalDirectory");
+      expect(value).not.toHaveProperty("external_directory");
+      expect(value).not.toHaveProperty("externalDirectory");
+    }
+    // Also assert that the installed opencode.jsonc contains no
+    // external_directory key on any agent, after the managed config
+    // has been written.
+    const path = join(repository.root, "opencode.jsonc");
+    await writeFile(path, "{}\n");
+    await applyOpenCodeConfig(repository.root, config, path);
+    const installed = parseJsonc<Record<string, unknown>>(await readFile(path, "utf8"), path);
+    const agents = (installed.agent ?? {}) as Record<string, unknown>;
+    for (const agent of Object.values(agents)) {
+      const permission = (agent as { permission?: Record<string, unknown> }).permission;
+      if (permission !== undefined) {
+        expect(permission).not.toHaveProperty("external_directory");
+        expect(permission).not.toHaveProperty("externalDirectory");
+      }
+    }
+    expect(JSON.stringify(installed)).not.toContain("external_directory");
+    expect(JSON.stringify(installed)).not.toContain("externalDirectory");
   });
 });

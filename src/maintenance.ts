@@ -13,15 +13,26 @@ import {
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
-import { hashContent, hashDirectory, hashFile } from "./hash.js";
-import { assertManifestAuthority, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
+import { runUpdateConfigTransaction } from "./update-config-internal.js";
+import {
+  runUpdateTransaction,
+  runBootstrapLegacyOwnershipTransaction,
+} from "./update-internal.js";
+import { hashContent, hashFile } from "./hash.js";
+import { ArtifactJournal, type ArtifactJournalEntry } from "./mutation-transaction.js";
+import {
+  assertManifestAuthority,
+  assertManifestAuthorityToleratingPredecessor,
+  nextAdapterFiles,
+  nextAdapterPatches,
+} from "./authority.js";
 import {
   assertOwnershipReceipt,
   createOwnershipReceipt,
   ownershipReceiptExists,
+  ownershipReceiptLocation,
   removeOwnershipReceipt,
   replaceOwnershipReceipt,
-  restoreOwnershipReceipt,
   type OwnershipReceipt,
 } from "./receipt.js";
 import {
@@ -29,6 +40,7 @@ import {
   serializeManifest,
   type ConfigPatch,
   type ManagedFile,
+  type ManagedSkill,
   type Manifest,
 } from "./manifest.js";
 import {
@@ -39,10 +51,11 @@ import {
   detectOpenCodeConfigForInit,
   OPENCODE_ADAPTER_VERSION,
   SUPPORTED_OPENCODE_VERSION,
+  SUPPORTED_OPENCODE_VERSIONS,
   validateOpenCodeConfig,
   verifyOpenCodeVersion,
 } from "./opencode.js";
-import { packageRoot, poiesisPath } from "./paths.js";
+import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
@@ -105,7 +118,7 @@ interface MaterializedFile {
 
 type JsonObject = Record<string, unknown>;
 
-function assertResolvedConfig(config: PoiesisConfig): void {
+export function assertResolvedConfig(config: PoiesisConfig): void {
   const unresolved: string[] = [];
   function visit(value: unknown, path: string): void {
     if (typeof value === "string" && /<[^>]+>/.test(value)) unresolved.push(path);
@@ -128,22 +141,6 @@ function errorDetails(error: unknown): Record<string, unknown> {
   return { message: String(error) };
 }
 
-function isSafeRelativePath(path: string): boolean {
-  if (path.length === 0 || isAbsolute(path)) return false;
-  const parts = path.split(/[\\/]/);
-  return !parts.includes("") && !parts.includes(".") && !parts.includes("..");
-}
-
-function ownedPath(root: string, path: string): string {
-  if (!isSafeRelativePath(path)) {
-    throw new PoiesisError("UNSAFE_MANAGED_PATH", "Manifest contains an unsafe managed path", { path });
-  }
-  const destination = resolve(root, path);
-  if (destination !== root && !destination.startsWith(`${root}${sep}`)) {
-    throw new PoiesisError("UNSAFE_MANAGED_PATH", "Managed path escapes the repository", { path });
-  }
-  return destination;
-}
 
 async function pathEntryExists(path: string): Promise<boolean> {
   try {
@@ -173,12 +170,12 @@ async function assertSafeParents(root: string, destination: string): Promise<voi
   }
 }
 
-async function isRegularManagedFile(root: string, path: string): Promise<boolean> {
+export async function isRegularManagedFile(root: string, path: string): Promise<boolean> {
   await assertSafeParents(root, path);
   return isRegularFile(path);
 }
 
-async function packageVersion(): Promise<string> {
+export async function packageVersion(): Promise<string> {
   const path = join(packageRoot, "package.json");
   const value = parseJsonc<unknown>(await readUtf8(path), path);
   if (
@@ -193,7 +190,7 @@ async function packageVersion(): Promise<string> {
   return value.version;
 }
 
-async function autoResolveConfigDefaults(
+export async function autoResolveConfigDefaults(
   root: string,
   config: PoiesisConfig,
 ): Promise<{ config: ResolvedPoiesisConfig; discovered: { remote: boolean; integrationBranch: boolean; verificationCommands: boolean; tracker: boolean } }> {
@@ -353,7 +350,7 @@ async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile
   ];
 }
 
-async function verifyGitRepository(root: string, config?: ResolvedPoiesisConfig): Promise<void> {
+export async function verifyGitRepository(root: string, config?: ResolvedPoiesisConfig): Promise<void> {
   const version = await run("git", ["--version"], { cwd: root, allowFailure: true });
   if (version.exitCode !== 0 || !/^git version \d+\.\d+/.test(version.stdout)) {
     throw new PoiesisError("GIT_UNAVAILABLE", "Git is not available", { stderr: version.stderr });
@@ -411,7 +408,7 @@ async function verifyGitRepository(root: string, config?: ResolvedPoiesisConfig)
   }
 }
 
-async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promise<void> {
+export async function verifyModels(root: string, config: ResolvedPoiesisConfig): Promise<void> {
   const result = await run("opencode", ["models"], { cwd: root, allowFailure: true });
   if (result.exitCode !== 0) {
     throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {
@@ -435,7 +432,7 @@ async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise
   }
 }
 
-async function validateOpenCodeConfigPayload(content: string): Promise<void> {
+export async function validateOpenCodeConfigPayload(content: string): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "poiesis-opencode-config-check-"));
   try {
     await atomicCreate(join(directory, "opencode.jsonc"), content);
@@ -445,7 +442,8 @@ async function validateOpenCodeConfigPayload(content: string): Promise<void> {
   }
 }
 
-async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
+
+export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
@@ -457,7 +455,7 @@ async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promi
   return "verified";
 }
 
-function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
+export function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
   let fixture = false;
   for (const target of ["preview", "staging", "production"] as const) {
     const adapter = createDeliveryAdapter(config.delivery[target], root);
@@ -602,6 +600,87 @@ async function rollbackInitGitignore(path: string, snapshot: Buffer | null | und
   else await atomicWrite(path, snapshot.toString("utf8"));
 }
 
+/**
+ * Conditional init receipt cleanup. The init catch block calls this helper
+ * in place of `removeOwnershipReceipt`. It removes the on-disk receipt
+ * ONLY when the failed `init()` invocation recorded a successful
+ * `createOwnershipReceipt` AND the on-disk bytes still equal exactly what
+ * that invocation wrote. The helper never weakens receipt authority:
+ * pre-existing receipts are preserved byte-for-byte, foreign concurrent
+ * replacements are preserved byte-for-byte, and an absent receipt is left
+ * absent. Ticket #45.
+ */
+async function rollbackInitOwnershipReceipt(
+  root: string,
+  authoredReceiptBytes: string | undefined,
+): Promise<void> {
+  if (authoredReceiptBytes === undefined) return;
+  const path = await ownershipReceiptLocation(root);
+  let current: Buffer;
+  try {
+    current = await readFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw error;
+  }
+  if (Buffer.compare(current, Buffer.from(authoredReceiptBytes, "utf8")) !== 0) return;
+  await unlink(path);
+}
+
+/**
+ * Transactional default-path `.gitignore` seam.
+ *
+ * Receipt-bearing normal `update` and explicit 1.0.0 `bootstrap` MUST
+ * install the `.poiesis/workspaces/` ignore rule before any default-path
+ * workspace can leak into the primary checkout as foreign work. `init`
+ * installs the rule via the broader init gitignore call. `updateFromConfig`
+ * is the strict transactional path and intentionally does NOT mutate
+ * `.gitignore` to keep the receipt-authenticated transaction contract
+ * identical across the strict set of inputs.
+ *
+ * `ensureDefaultPathGitignore` only invokes `ensureGitignore` with the
+ * transactional rule. The caller is responsible for snapshotting the
+ * exact preimage (including absence) BEFORE the try block so any later
+ * failure can restore it byte-for-byte via `rollbackDefaultPathGitignore`.
+ * `ensureGitignore` returns its post-write content so the caller can
+ * capture the commit hash gate and detect concurrent user edits between
+ * the write and the rollback. Splitting snapshot + ensure keeps the
+ * gitignore mutation inside the transaction; the helper encapsulates
+ * only the "what rule to add" logic.
+ */
+const DEFAULT_PATH_GITIGNORE_HEADER =
+  "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
+const DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
+const DEFAULT_PATH_GITIGNORE_RULES: readonly string[] = [
+  DEFAULT_PATH_GITIGNORE_HEADER,
+  DEFAULT_PATH_GITIGNORE_PATTERN,
+];
+
+async function ensureDefaultPathGitignore(
+  root: string,
+  expected: Buffer | null,
+): Promise<{ writtenHash: string | undefined }> {
+  const written = await ensureGitignore(root, [...DEFAULT_PATH_GITIGNORE_RULES], expected);
+  return { writtenHash: written === undefined ? undefined : hashContent(written) };
+}
+
+async function rollbackDefaultPathGitignore(
+  path: string,
+  snapshot: Buffer | null,
+  writtenHash: string | undefined,
+): Promise<void> {
+  if (writtenHash === undefined) return;
+  if (!(await pathEntryExists(path))) return;
+  if (!(await isRegularFile(path)) || (await hashFile(path)) !== writtenHash) return;
+  if (snapshot === null) {
+    await unlink(path);
+    return;
+  }
+  // Byte-exact restoration: preserve the exact bytes that were snapshotted,
+  // including the precise trailing newline state (or absence thereof).
+  await atomicWrite(path, snapshot.toString("utf8"));
+}
+
 export async function init(root: string, config: PoiesisConfig, options: MaintenanceOptions = {}): Promise<Manifest> {
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
@@ -649,6 +728,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
   let installedSkillSnapshots: Map<string, string> | undefined;
+  // Ticket #46: bounded journal for default-skill mutations. The
+  // catch block uses `journal.rollback()` instead of the legacy
+  // destructive `removeOwnedSkills` path: foreign writes are
+  // preserved and reported via `RollbackDiagnostic` (reason
+  // `identity-mismatch`), and the journal owns the preimage backup
+  // lifecycle so cleanup is gated on commit/rollback.
+  const skillJournal: ArtifactJournal = new ArtifactJournal(32);
+  // Ticket #45: exact canonical bytes of the receipt authored by THIS
+  // `init()` invocation (set only after a successful `createOwnershipReceipt`),
+  // or `undefined` if the receipt was never authored. The catch block uses
+  // it to gate receipt removal: pre-existing and concurrently replaced
+  // receipts survive byte-for-byte; only this invocation's authored
+  // bytes are unlinked on failure.
+  let authoredReceiptBytes: string | undefined;
 
   try {
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -664,10 +757,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     }
     if (!options.skipSkills) {
       await assertDefaultSkillDestinationsAvailable(resolvedRoot, initialSkills);
-      managedSkills = await installDefaultSkills(resolvedRoot, [], {
+      // Ticket #46: hand the bounded skill journal to installDefaultSkills
+      // so every default-skill preimage hash and transaction-written
+      // hash is captured into the same journal that owns rollback.
+      // Ticket #46: `journal` is an internal-only seam widening the
+      // public SkillMaintenanceOptions. Build the options through a
+      // local widened type so the structural widening is explicit
+      // and the public dist declaration stays free of the transaction
+      // surface.
+      const initSkillOptions = {
         expectedPreexisting: initialSkills!,
         createdDirectories: createdInitDirectories,
-      });
+        journal: skillJournal,
+      };
+      managedSkills = await installDefaultSkills(resolvedRoot, [], initSkillOptions);
       installedSkillSnapshots = await assertDefaultSkillDestinationsAvailable(resolvedRoot);
     }
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -733,11 +836,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     }
     await assertGitignoreAvailable(resolvedRoot);
     const writtenGitignore = await ensureGitignore(resolvedRoot, [
-      `# Hide local Poiesis ownership snapshot`,
-      ...POIESIS_LOCAL_STATE_PATHS,
       `# Allow durable Poiesis project files to be tracked`,
       ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
       `!${".poiesis"}/`,
+      `# Hide local Poiesis state (added by \`poiesis init\` so the default-path workspace area and ownership snapshot never appear as foreign work)`,
+      ...POIESIS_LOCAL_STATE_PATHS,
     ], initialGitignoreSnapshot ?? null);
     if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -772,6 +875,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
         supportedVersion: SUPPORTED_OPENCODE_VERSION,
+        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
       },
       files: managedFiles,
       skills: managedSkills,
@@ -780,7 +884,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const manifestContent = serializeManifest(manifest);
     await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
     writtenManifestHash = hashContent(manifestContent);
-    await createOwnershipReceipt(resolvedRoot, manifest);
+    // Ticket #45: capture the receipt authored by THIS invocation BEFORE
+    // any subsequent step so the catch block can gate removal on exact
+    // identity. `createOwnershipReceipt` returns the canonical
+    // `OwnershipReceipt` object; the on-disk bytes are the canonical
+    // `${JSON.stringify(receipt, null, 2)}\n` form emitted by
+    // `writeReceipt` in `src/receipt.ts`.
+    const authoredReceipt = await createOwnershipReceipt(resolvedRoot, manifest);
+    authoredReceiptBytes = `${JSON.stringify(authoredReceipt, null, 2)}\n`;
     if (!options.skipSkills) {
       const report = await doctor(resolvedRoot);
       if (!report.ok) {
@@ -793,12 +904,23 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         });
       }
     }
+    // Ticket #46: commit the bounded skill journal after every init
+    // write has succeeded so the journal-owned preimage backups are
+    // removed only after commit. `commit()` swallows its own cleanup
+    // failures so they cannot turn a committed init into a failure.
+    await skillJournal.commit();
     return manifest;
   } catch (error) {
     const rollbackFailures: Array<Record<string, unknown>> = [];
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
+    // Ticket #45: receipt cleanup is identity-gated. The helper only
+    // unlinks the receipt when THIS `init()` invocation authored it AND
+    // the on-disk bytes still equal those exact authored bytes.
+    // Pre-existing and concurrently replaced receipts survive
+    // byte-for-byte; receipt authority is never weakened by a partial
+    // init rollback.
     await rollbackStep(rollbackFailures, "ownership receipt", async () => {
-      await removeOwnershipReceipt(resolvedRoot);
+      await rollbackInitOwnershipReceipt(resolvedRoot, authoredReceiptBytes);
     });
     await rollbackStep(rollbackFailures, ".poiesis/manifest.json", async () => {
       if (
@@ -810,10 +932,32 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         await unlink(manifestPath);
       }
     });
+    // Ticket #46: roll back default-skill mutations through the bounded
+    // journal FIRST (reverse write order via the journal's own loop),
+    // preserving concurrent foreign changes via `RollbackDiagnostic`.
+    // The non-skill portion of `rollbackInit` still runs after to
+    // restore managed files + OpenCode config from their snapshots.
+    await rollbackStep(rollbackFailures, "skills (journal)", async () => {
+      const diagnostics = await skillJournal.rollback();
+      if (diagnostics.length > 0) {
+        const preserved = diagnostics.map((diagnostic) => ({
+          path: relative(resolvedRoot, diagnostic.path),
+          reason: diagnostic.reason,
+        }));
+        throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Some default-skill mutations could not be rolled back", {
+          preserved,
+        });
+      }
+    });
+    // The skill journal now owns the per-skill preimage backup lifecycle,
+    // so the legacy `rollbackInit` call no longer needs to roll back
+    // skills via `removeOwnedSkills`. Pass an empty skills array so the
+    // non-skill rollback path still handles the rest of the init-owned
+    // surface.
     rollbackFailures.push(...await rollbackInit(
       resolvedRoot,
       managedFiles,
-      managedSkills,
+      [],
       openCodeConfigPath,
       initialOpenCodeConfigSnapshot,
       writtenOpenCodeConfigHash,
@@ -847,7 +991,7 @@ function patchKey(patch: Pick<ConfigPatch, "file" | "path">): string {
   return `${patch.file}\0${patch.path.join("\0")}`;
 }
 
-async function assertConfigPatchesOwned(root: string, patches: ConfigPatch[]): Promise<void> {
+export async function assertConfigPatchesOwned(root: string, patches: ConfigPatch[]): Promise<void> {
   for (const [file, filePatches] of groupPatchesByFile(patches)) {
     const path = ownedPath(root, file);
     if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
@@ -1181,234 +1325,18 @@ async function requireOwnedManagedFile(root: string, record: ManagedFile): Promi
   }
 }
 
-async function validateLegacySkillIdentity(root: string, skill: Manifest["skills"][number]): Promise<string> {
-  const destination = ownedPath(root, skill.path);
-  if (skill.preexisting) return hashOwnedSkillDirectory(destination);
-  if (skill.hash === undefined) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill is missing a hash", { path: skill.path });
-  }
-  const legacyHash = await hashDirectory(destination);
-  if (legacyHash !== skill.hash) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Owned legacy skill content does not match the 1.0.0 manifest", {
-      path: skill.path,
-      expected: skill.hash,
-      actual: legacyHash,
-    });
-  }
-  return hashOwnedSkillDirectory(destination);
-}
-
-async function validateLegacyInstallation(root: string, manifest: Manifest, config: ResolvedPoiesisConfig): Promise<void> {
-  if (manifest.poiesisVersion !== "1.0.0") {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_UNSUPPORTED", "Legacy bootstrap only accepts public Poiesis 1.0.0 installations", {
-      poiesisVersion: manifest.poiesisVersion,
-    });
-  }
-  await assertManifestAuthority(root, manifest, config);
-  for (const file of manifest.files) {
-    const path = ownedPath(root, file.path);
-    if (!(await exists(path)) || !(await isRegularManagedFile(root, path))) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file is missing or not a regular file", {
-        path: file.path,
-      });
-    }
-    const actual = await hashFile(path);
-    if (actual !== file.hash) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy managed file does not match the 1.0.0 manifest", {
-        path: file.path,
-        expected: file.hash,
-        actual,
-      });
-    }
-  }
-  const defaults = await loadDefaultSkills();
-  const defaultNames = new Set(defaults.map((skill) => skill.name));
-  for (const skill of manifest.skills) {
-    if (!defaultNames.has(skill.name) && !skill.preexisting) {
-      throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest claims an unknown owned skill", {
-        name: skill.name,
-      });
-    }
-    await validateLegacySkillIdentity(root, skill);
-  }
-}
-
-async function bootstrapLegacyOwnership(root: string, options: MaintenanceOptions): Promise<UpdateResult> {
-  const resolvedRoot = resolve(root);
-  if (await ownershipReceiptExists(resolvedRoot)) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Refusing to bootstrap over an existing ownership receipt");
-  }
-  const manifest = await loadManifest(resolvedRoot);
-  const config = await resolveConfigForRoot(resolvedRoot);
-  await validateLegacyInstallation(resolvedRoot, manifest, config);
-  await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
-
-  const nextSkills = await Promise.all(
-    manifest.skills.map(async (skill) => ({
-      ...skill,
-      hash: await validateLegacySkillIdentity(resolvedRoot, skill),
-    })),
-  );
-  const materialized = await materializeFiles(config);
-  const fileSnapshots = new Map<string, Buffer>();
-  for (const file of materialized) {
-    const path = join(resolvedRoot, file.path);
-    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
-  }
-  const openCodeConfig = manifest.configPatches[0]?.file;
-  if (openCodeConfig === undefined) {
-    throw new PoiesisError("LEGACY_BOOTSTRAP_REJECTED", "Legacy manifest does not identify an OpenCode config");
-  }
-  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
-  try {
-    const skills = options.skipSkills
-      ? nextSkills
-      : await installDefaultSkills(resolvedRoot, nextSkills, { replaceOwned: true });
-    for (const file of materialized) await atomicWrite(join(resolvedRoot, file.path), file.content);
-    const nextFiles = nextAdapterFiles(
-      manifest,
-      materialized.map((file) => ({
-        path: file.path,
-        kind: file.kind,
-        hash: hashContent(file.content),
-        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
-      })),
-    );
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
-      const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
-      if (nextRecord >= 0) nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: await hashFile(openCodeConfigPath) };
-    }
-    const next: Manifest = {
-      schema: 1,
-      poiesisVersion: await packageVersion(),
-      adapter: {
-        harness: "opencode",
-        adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-      },
-      files: nextFiles,
-      skills,
-      configPatches,
-    };
-    await atomicWrite(manifestPath, serializeManifest(next));
-    await createOwnershipReceipt(resolvedRoot, next);
-    const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Legacy ownership bootstrap did not pass doctor", { report });
-    }
-    return { manifest: next, doctor: report };
-  } catch (error) {
-    await restoreManifest(manifestPath, manifestBackup);
-    await removeOwnershipReceipt(resolvedRoot);
-    await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
-    await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
-    throw error;
-  }
-}
-
+/**
+ * Public entry point for the receipt-authenticated ordinary `update()`
+ * transaction and the explicit 1.0.0 bootstrap. The implementation is
+ * in `src/update-internal.ts`, which is NOT re-exported via `src/index.ts`,
+ * so the security-sensitive fault-injection surface stays confined to the
+ * repo and never appears in the packed `dist/index.d.ts` declaration.
+ */
 export async function update(root: string, options: MaintenanceOptions = {}): Promise<UpdateResult> {
-  if (options.bootstrapLegacyOwnership) return bootstrapLegacyOwnership(root, options);
-  const resolvedRoot = resolve(root);
-  const manifest = await loadManifest(resolvedRoot);
-  const config = await resolveConfigForRoot(resolvedRoot);
-  await assertManifestAuthority(resolvedRoot, manifest, config);
-  const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
-  await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
-
-  const materialized = await materializeFiles(config);
-  const records = new Map(manifest.files.map((file) => [file.path, file]));
-  for (const file of materialized) {
-    const record = records.get(file.path);
-    if (record === undefined || record.kind !== file.kind) {
-      throw new PoiesisError("FILE_OWNERSHIP_UNKNOWN", "Current manifest does not prove ownership of an update destination", {
-        path: file.path,
-      });
-    }
-    await requireOwnedManagedFile(resolvedRoot, record);
+  if (options.bootstrapLegacyOwnership) {
+    return runBootstrapLegacyOwnershipTransaction(root, options, {});
   }
-  await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
-
-  const managedConfigFiles = [...new Set(manifest.configPatches.map((patch) => patch.file))];
-  if (managedConfigFiles.length !== 1) {
-    throw new PoiesisError("CONFIG_OWNERSHIP_INVALID", "Manifest must identify exactly one managed OpenCode config", {
-      files: managedConfigFiles,
-    });
-  }
-  const openCodeConfig = managedConfigFiles[0]!;
-  const openCodeConfigPath = join(resolvedRoot, openCodeConfig);
-  const openCodeConfigSnapshot = await snapshotFileIfOwned(openCodeConfigPath, resolvedRoot, manifest.files);
-  const fileSnapshots = new Map<string, Buffer>();
-  for (const file of materialized) {
-    const path = join(resolvedRoot, file.path);
-    if (await exists(path)) fileSnapshots.set(file.path, await readFile(path));
-  }
-
-  let manifestPath: string | undefined;
-  let manifestBackup: Buffer | null = null;
-  let nextReceipt: OwnershipReceipt | undefined;
-  let skills = manifest.skills;
-  try {
-    skills = options.skipSkills
-      ? manifest.skills
-      : await installDefaultSkills(resolvedRoot, manifest.skills, { replaceOwned: true });
-    for (const file of materialized) {
-      await atomicWrite(join(resolvedRoot, file.path), file.content);
-    }
-    const nextFiles = nextAdapterFiles(
-      manifest,
-      materialized.map((file) => ({
-        path: file.path,
-        kind: file.kind,
-        hash: hashContent(file.content),
-        durable: templateMappings.find((mapping) => mapping.destination === file.path)?.trackInProject === true,
-      })),
-    );
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath);
-    const configPatches = nextAdapterPatches(manifest, appliedPatches);
-    if (openCodeConfigSnapshot !== null) {
-      const nextRecord = nextFiles.findIndex((file) => file.path === openCodeConfig);
-      if (nextRecord >= 0) {
-        nextFiles[nextRecord] = {
-          ...nextFiles[nextRecord]!,
-          hash: await hashFile(openCodeConfigPath),
-        };
-      }
-    }
-    const next: Manifest = {
-      schema: 1,
-      poiesisVersion: await packageVersion(),
-      adapter: {
-        harness: "opencode",
-        adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-      },
-      files: nextFiles,
-      skills,
-      configPatches,
-    };
-    manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-    manifestBackup = await snapshotFile(manifestPath);
-    await atomicWrite(manifestPath, serializeManifest(next));
-    nextReceipt = await replaceOwnershipReceipt(resolvedRoot, next, receipt);
-    const report = await doctor(resolvedRoot);
-    if (!options.skipSkills && !report.ok) {
-      throw new PoiesisError("UPDATE_DOCTOR_FAILED", "Poiesis update did not pass doctor", { report });
-    }
-    return { manifest: next, doctor: report };
-  } catch (error) {
-    if (manifestPath !== undefined) await restoreManifest(manifestPath, manifestBackup);
-    await restoreOwnershipReceipt(resolvedRoot, receipt);
-    await restoreOpenCodeConfig(openCodeConfigPath, openCodeConfigSnapshot);
-    await restoreMaterializedFiles(resolvedRoot, materialized, fileSnapshots);
-    throw error;
-  }
+  return runUpdateTransaction(root, options, {});
 }
 
 async function snapshotFile(path: string): Promise<Buffer | null> {
@@ -1428,32 +1356,6 @@ async function snapshotFileIfOwned(
   return readFile(path);
 }
 
-async function restoreOpenCodeConfig(path: string, snapshot: Buffer | null): Promise<void> {
-  if (snapshot === null) return;
-  await atomicWrite(path, snapshot.toString("utf8").endsWith("\n") ? snapshot.toString("utf8") : `${snapshot.toString("utf8")}\n`);
-}
-
-async function restoreManifest(path: string, snapshot: Buffer | null): Promise<void> {
-  if (snapshot === null) await rm(path, { force: true });
-  else await atomicWrite(path, snapshot.toString("utf8").endsWith("\n") ? snapshot.toString("utf8") : `${snapshot.toString("utf8")}\n`);
-}
-
-async function restoreMaterializedFiles(
-  root: string,
-  materialized: MaterializedFile[],
-  snapshots: Map<string, Buffer>,
-): Promise<void> {
-  for (const file of [...materialized].reverse()) {
-    const path = join(root, file.path);
-    const snapshot = snapshots.get(file.path);
-    if (snapshot === undefined) {
-      if (await exists(path)) await rm(path, { force: true });
-    } else {
-      const content = snapshot.toString("utf8");
-      await atomicWrite(path, content.endsWith("\n") ? content : `${content}\n`);
-    }
-  }
-}
 
 async function listTree(root: string, directory: string): Promise<string[]> {
   if (!(await exists(directory))) return [];
@@ -1480,24 +1382,269 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   return known;
 }
 
-export async function installAuthorizedCapability(root: string, input: CapabilityInstallInput) {
+/**
+ * Test-only deterministic fault-injection hooks used by
+ * `runCapabilityInstallTransaction`. Each callback fires immediately
+ * BEFORE the corresponding write step (or immediately AFTER for
+ * `post*` hooks). Throwing from a hook simulates an I/O fault and
+ * exercises the rollback path.
+ *
+ * The seam mirrors `UpdateBootstrapTransactionHooks` (ticket #46) and
+ * is intentionally NOT part of the public `installAuthorizedCapability`
+ * declaration or the package root re-exports. Tests import
+ * `runCapabilityInstallTransaction` directly from this module and
+ * supply hooks; production callers (CLI, library users) call the
+ * public `installAuthorizedCapability(root, input)` wrapper which
+ * delegates with empty hooks and never surfaces the seam.
+ *
+ * The interface declaration remains `export` so the source-internal
+ * transaction runner can be type-checked against it; the public API
+ * test asserts neither the interface nor any of its members leak
+ * through `dist/index.d.ts`.
+ */
+export interface CapabilityInstallTransactionHooks {
+  /**
+   * Exposes the bounded in-memory journal to transaction tests after
+   * the upfront receipt capture, before any other artifact is
+   * captured. The journal's entries are read-only at this point.
+   */
+  onJournalReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+  /**
+   * Exposes the bounded in-memory journal to transaction tests after
+   * every artifact (receipt, destination directory, manifest) has
+   * been captured, before any write fires. Used by tests that need to
+   * observe the journal's captured preimage backups (e.g. the
+   * destination's `preimageBackup` path).
+   */
+  onCapturesReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+  /**
+   * Called immediately AFTER `installCapability` returns but BEFORE
+   * the next transactional write (manifest write or receipt write).
+   * Tests use this hook to land a concurrent foreign write to the
+   * capability directory between the transaction's
+   * `recordDirectoryWrite` binding and the next write. The bounded
+   * journal's hash-gated rollback must preserve the foreign write
+   * and report it via `RollbackDiagnostic` (reason
+   * `identity-mismatch`).
+   */
+  postCapabilityInstall?: () => void | Promise<void>;
+  /**
+   * Optional pre-staged capability directory. When supplied, the
+   * transaction routes `installCapability` through this directory
+   * instead of running the network-bound `stageSkills` step. The
+   * directory MUST mirror the layout `.agents/skills/<name>/...`
+   * that `stageSkills` produces. Used by tests that exercise the
+   * transactional install/rollback contract without contacting the
+   * upstream registry. NOT part of the public surface.
+   */
+  preimageCapabilityDirectory?: string;
+  /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
+  preManifestWrite?: () => void | Promise<void>;
+  /** Called immediately AFTER atomic-writing the new `.poiesis/manifest.json`. */
+  postManifestWrite?: () => void | Promise<void>;
+  /** Called immediately before the receipt write (replace for capability install). */
+  preReceiptReplace?: () => void | Promise<void>;
+  /** Called immediately AFTER the receipt write (replace for capability install). */
+  postReceiptReplace?: () => void | Promise<void>;
+}
+
+/**
+ * Source-internal transaction runner for capability installation.
+ *
+ * This is the SINGLE implementation of the receipt-authenticated
+ * capability install transaction. It accepts an optional
+ * `CapabilityInstallTransactionHooks` parameter so the test suite
+ * can drive deterministic preimage/journal/fault scenarios without
+ * monkey-patching internal modules.
+ *
+ * The seam lives in this module; `src/index.ts` does NOT re-export
+ * this function so the security-sensitive fault-injection surface
+ * stays confined to the repo and never appears in the packed
+ * `dist/index.d.ts` declaration. The public
+ * `installAuthorizedCapability(root, input)` wrapper below is the
+ * only entry point re-exported through the package root; it
+ * delegates here with empty hooks.
+ *
+ * Mirrors the ticket #46 pattern: `runUpdateTransaction` is the
+ * internal runner for `update()` (which is the public function with
+ * no hooks). `runCapabilityInstallTransaction` is the internal
+ * runner for `installAuthorizedCapability()` (which is the public
+ * function with no hooks).
+ */
+export async function runCapabilityInstallTransaction(
+  root: string,
+  input: CapabilityInstallInput,
+  hooks?: CapabilityInstallTransactionHooks,
+): Promise<ManagedSkill> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
-  const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
-  const manifestBackup = await snapshotFile(manifestPath);
+  const receiptPath = await ownershipReceiptLocation(resolvedRoot);
+  // Ticket #47: capture every artifact the capability transaction
+  // mutates into a bounded `ArtifactJournal` BEFORE any transaction
+  // write. The journal owns the unified rollback path: it hash-gates
+  // the destination against `transactionWrittenIdentity` (preserving
+  // concurrent foreign writes via `RollbackDiagnostic` reason
+  // `identity-mismatch`), restores the EXACT manifest preimage when
+  // the on-disk file still matches the transaction-written bytes,
+  // and restores the receipt preimage the same way. Successful
+  // transactions call `commit()` which removes every journal-owned
+  // preimage backup after every write has succeeded; cleanup failures
+  // are swallowed inside `commit()` so a transient cleanup failure
+  // cannot turn a committed capability install into a failure.
+  //
+  // The journal limit (4) covers the receipt (whole-file), the
+  // manifest (whole-file, captured inside `installCapability`), the
+  // destination directory (directory-mode, captured inside
+  // `installCapability`), and one slot of headroom for any future
+  // artifact.
+  const journal = new ArtifactJournal(4);
+  // Ticket #47: the journal captures the receipt upfront because the
+  // receipt write happens AFTER `installCapability` returns. The
+  // capability destination directory and the manifest are captured
+  // INSIDE `installCapability` (when the journal is supplied) so the
+  // capture is always immediately before the corresponding write —
+  // a foreign writer that mutates either between capture and write is
+  // preserved by the journal's reverse hash-gated rollback.
+  await journal.capture(receiptPath, "whole-file");
+  await hooks?.onJournalReady?.(journal.entries);
   try {
-    const installed = await installCapability(resolvedRoot, input);
+    // Ticket #47: widen the public `CapabilityMaintenanceOptions`
+    // surface at the call site so the bounded journal seam is
+    // threaded through `installCapability` without leaking through
+    // `dist/index.d.ts`. The seam is widened through structural typing
+    // (same pattern as `installDefaultSkills` for ticket #46): the
+    // intermediate `capabilityOptions` variable carries the wider
+    // type and is passed by reference, so TypeScript's excess-property
+    // check applies to the variable, not the literal at the call site.
+    const capabilityOptions: {
+      journal: ArtifactJournal;
+      preimageCapabilityDirectory?: string;
+      onCapturesReady?: (entries: readonly ArtifactJournalEntry[]) => void | Promise<void>;
+    } = {
+      journal,
+    };
+    if (hooks?.preimageCapabilityDirectory !== undefined) {
+      capabilityOptions.preimageCapabilityDirectory = hooks.preimageCapabilityDirectory;
+    }
+    if (hooks?.onCapturesReady !== undefined) {
+      capabilityOptions.onCapturesReady = hooks.onCapturesReady;
+    }
+    const installed = await installCapability(resolvedRoot, input, capabilityOptions);
+    await hooks?.postCapabilityInstall?.();
     const next = await loadManifest(resolvedRoot);
-    await replaceOwnershipReceipt(resolvedRoot, next, receipt);
+    const nextReceipt: OwnershipReceipt = {
+      ...receipt,
+      manifestDigest: hashContent(serializeManifest(next)),
+      generation: receipt.generation + 1,
+    };
+    const nextReceiptBytes = `${JSON.stringify(nextReceipt, null, 2)}\n`;
+    // Ticket #47: the manifest write goes through the journal's
+    // hash-gated `replace` so a foreign writer landing between
+    // capture and write surfaces as `RollbackDiagnostic` (reason
+    // `identity-mismatch`). The manifest capture happens INSIDE
+    // `installCapability` immediately before its hash-gated `replace`
+    // (the journal's `expectedPreWriteIdentity` guard sees the exact
+    // preimage bytes Poiesis owned at the start of the
+    // transaction). The `installCapability` helper writes the manifest
+    // through `journal.replace` when the journal is supplied, so this
+    // `preManifestWrite` / `postManifestWrite` hook pair fires around
+    // that hash-gated replace.
+    await hooks?.preManifestWrite?.();
+    // The manifest entry was already written by `installCapability`
+    // through `journal.replace` (when the journal is supplied). Hook
+    // consumers can observe the post-write state via the journal's
+    // `transactionWrittenIdentity` on the manifest entry.
+    await hooks?.postManifestWrite?.();
+    // Ticket #47: the receipt write goes through the journal's
+    // hash-gated `replace` so the post-write identity is bound to the
+    // exact bytes Poiesis is about to write; a foreign writer that
+    // lands between the receipt capture and this write is preserved
+    // and reported as `identity-mismatch`. The receipt is captured
+    // upfront (line above) so the journal's `expectedPreWriteIdentity`
+    // guard sees the exact preimage bytes Poiesis owned at the start
+    // of the transaction.
+    const receiptEntry = journal.entries.find((candidate) => candidate.path === receiptPath);
+    if (receiptEntry === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the receipt entry", { path: receiptPath });
+    }
+    await hooks?.preReceiptReplace?.();
+    await journal.replace(receiptEntry, nextReceiptBytes);
+    await hooks?.postReceiptReplace?.();
+    await journal.commit();
     return installed;
   } catch (error) {
-    await restoreManifest(manifestPath, manifestBackup);
-    await restoreOwnershipReceipt(resolvedRoot, receipt);
+    // Ticket #47: fail-closed rollback through the bounded journal.
+    // The journal walks its captured entries in reverse capture order
+    // and, for every entry whose on-disk identity still matches the
+    // recorded `transactionWrittenIdentity`, restores the preimage.
+    // Foreign replacements that land between this transaction's last
+    // write and the rollback are preserved on disk and surfaced via
+    // `RollbackDiagnostic` (reason `identity-mismatch`).
+    const diagnostics = await journal.rollback();
+    if (diagnostics.length > 0) {
+      if (error instanceof PoiesisError) {
+        error.details.incompleteRollback = diagnostics;
+      } else {
+        throw new PoiesisError("ROLLBACK_INCOMPLETE", "Capability transaction failed and rollback was incomplete", {
+          cause: error instanceof Error ? error.message : String(error),
+          incompleteRollback: diagnostics,
+        });
+      }
+    }
     throw error;
   }
+}
+
+/**
+ * Public capability installation entry point. Exactly two
+ * parameters: `(root, input)`. Delegates to
+ * `runCapabilityInstallTransaction` with empty hooks so production
+ * callers never see the test-only seam.
+ *
+ * Callers who need the test-only preimage / journal / fault hooks
+ * MUST import `runCapabilityInstallTransaction` directly from
+ * `src/maintenance.js` (the internal seam); they MUST NOT reach for
+ * a hooks parameter on this public wrapper — none exists.
+ */
+export async function installAuthorizedCapability(
+  root: string,
+  input: CapabilityInstallInput,
+): Promise<ManagedSkill> {
+  return runCapabilityInstallTransaction(root, input);
+}
+
+
+/**
+ * Options accepted by `updateFromConfig`. The `bootstrapLegacyOwnership`,
+ * `skipSkills`, and `allowFixtureAdapters` keys are FORBIDDEN because
+ * `poiesis update --config <path>` is a narrowly scoped transaction that does
+ * not bootstrap legacy ownership, skip skills, or accept fixture adapters;
+ * setting any of these to `true` throws `INCOMPATIBLE_UPDATE_OPTIONS` before
+ * any side effect.
+ *
+ */
+export interface UpdateConfigOptions {
+  bootstrapLegacyOwnership?: boolean;
+  skipSkills?: boolean;
+  allowFixtureAdapters?: boolean;
+}
+
+/**
+ * Public entry point for the authenticated `poiesis update --config <file>`
+ * transaction. The implementation is in a sibling module that is not
+ * re-exported via `src/index.ts`, so the security-sensitive fault-injection
+ * surface stays confined to the repo and never appears in the packed
+ * `dist/index.d.ts` declaration.
+ */
+export async function updateFromConfig(
+  root: string,
+  configPath: string,
+  options: UpdateConfigOptions = {},
+): Promise<UpdateResult> {
+  return runUpdateConfigTransaction(root, configPath, options, {});
 }
 
 export async function uninstall(root: string): Promise<UninstallResult> {

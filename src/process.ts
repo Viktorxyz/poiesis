@@ -5,6 +5,7 @@ import { PoiesisError } from "./errors.js";
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
+export const DEFAULT_VERIFY_TIMEOUT_MS = 10 * 60_000;
 const MAX_TIMEOUT_MS = 30 * 60_000;
 const GRACEFUL_TIMEOUT_MS = 2_000;
 const TERMINATION_CONFIRM_MS = 2_000;
@@ -145,12 +146,17 @@ export async function run(command: string, args: string[], options: RunOptions):
       if (settled || !childExited || !stdoutClosed || !stderrClosed || !stdinClosed) return;
 
       if (timedOut && !terminationComplete) {
-        // On POSIX an empty process group proves there is nothing left to
-        // escalate. Otherwise settlement waits for the owned SIGKILL phase.
-        const groupExists =
-          ownedGroupMembers === null
-            ? processGroupId !== null && processGroupExists(processGroupId)
-            : processGroupId !== null && refreshOwnedProcessGroup(processGroupId, ownedGroupMembers);
+        // When an owned process-group snapshot exists, do not trust a single
+        // "PG appears empty" verdict during the grace period: a TERM-handler
+        // descendant that forks a TERM-resistant replacement can briefly
+        // hide that replacement from /proc (the new /proc entry is created
+        // at fork and populated across exec). Always wait for the forced
+        // SIGKILL phase so every TERM-resistant descendant, including
+        // TERM-handler-replacement descendants, is captured and killed
+        // before settlement. The "PG appears empty" verdict is still useful
+        // on non-owned-group paths where the snapshot is untracked.
+        if (ownedGroupMembers !== null) return;
+        const groupExists = processGroupId !== null && processGroupExists(processGroupId);
         if (processGroupId !== null && !groupExists) {
           if (graceTimer !== null) clearTimeout(graceTimer);
           graceTimer = null;
@@ -208,9 +214,20 @@ export async function run(command: string, args: string[], options: RunOptions):
     const forceTermination = async (): Promise<void> => {
       graceTimer = null;
       if (processGroupId !== null && ownedGroupMembers !== null) {
-        if (refreshOwnedProcessGroup(processGroupId, ownedGroupMembers)) {
-          signalOwnedProcesses(processGroupId, ownedGroupMembers, "SIGKILL");
+        refreshOwnedProcessGroup(processGroupId, ownedGroupMembers);
+        // Bounded-reliability safety net: even if the snapshot missed a
+        // TERM-handler-replacement descendant due to a /proc race,
+        // SIGKILL the entire group so every descendant is captured
+        // before settlement. The group was created by this runner via
+        // detached: true; every member is a descendant of the original
+        // child and is intended to be terminated.
+        try {
+          process.kill(-processGroupId, "SIGKILL");
+        } catch {
+          // The group may already be gone; the per-member signals below
+          // remain authoritative for PID-reuse verification.
         }
+        signalOwnedProcesses(processGroupId, ownedGroupMembers, "SIGKILL");
         await waitForOwnedProcessesExit(ownedGroupMembers, TERMINATION_CONFIRM_MS);
       } else {
         await terminateTree(child, processGroupId, true);

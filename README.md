@@ -15,7 +15,7 @@ Poiesis combines:
 
 - a harness-neutral method (Express → Understand → Authorize → Prepare → Capability Check → Plan → Specify → Tickets → Realize → Prove → Publish → Preview → Author validation → freshness → Staging → Integrate → Production authorization → Release → Complete);
 - a small TypeScript / Node.js CLI for exact mechanics (`init`, `doctor`, `update`, `uninstall`, `inspect`, `capability`, `workspace`, `checkpoint`, `verify`, `publish`, `preview`, `promote`, `integrate`, `tracker`, `session`);
-- a first OpenCode `1.18.29` adapter.
+- a first OpenCode `1.18.29` / `1.18.30` adapter (explicit adapter-version-1 supported set).
 
 Poiesis is not a workflow database, not an OpenCode plugin, and does not own your `AGENTS.md`.
 
@@ -23,7 +23,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 
 - Node.js `>=22.20.0`
 - Git
-- OpenCode `1.18.29`
+- OpenCode `1.18.29` or `1.18.30`
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
 - A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))
@@ -42,11 +42,7 @@ pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
 
 `init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
 
-You can also point `init` at a discovered remote by hand:
-
-```bash
-pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc --remote origin --integration-branch main
-```
+The repository remote and integration branch are not CLI options — they are read from the `repository` block of the supplied config file (or auto-discovered from the Git repository when omitted; see the minimal config example below).
 
 `doctor` runs without mutation and verifies the same set of invariants any time:
 
@@ -67,6 +63,57 @@ pnpm dlx poiesis-cli@latest update --bootstrap-legacy-ownership
 ```
 
 After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
+
+### Updating the managed config
+
+`.poiesis/config.jsonc` is a managed surface — Poiesis generated it from the
+original `init --config` input, and ordinary editing would create a stale
+configuration that nothing would reconcile. The supported update path is the
+intentional managed-config workflow:
+
+```bash
+pnpm dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
+```
+
+`update --config <path>` is the only sanctioned way to change the managed
+configuration after `init`. The command is narrowly scoped: it parses,
+validates, and resolves the proposed config first; authenticates the trusted
+ownership receipt; verifies the on-disk `.poiesis/config.jsonc` still matches
+the manifest's recorded hash; verifies every recorded OpenCode config patch is
+still owned; computes the new `.poiesis/config.jsonc` bytes and the new
+OpenCode projection in memory; and only then writes — atomically, in this
+fixed order: `.poiesis/config.jsonc`, then the OpenCode config, then
+`.poiesis/manifest.json`, then the ownership receipt — before `doctor` gates
+the result.
+
+`update --config` is deliberately incompatible with the registered
+`--skip-skills` and `--bootstrap-legacy-ownership` flags. The CLI rejects
+those combinations with `INCOMPATIBLE_UPDATE_OPTIONS` before reaching the
+maintenance surface. The transaction is config-only: it does not bootstrap
+legacy ownership, install skills, or accept fixture adapters.
+
+If the intended serialized Poiesis config bytes equal the bytes currently on
+disk for `.poiesis/config.jsonc` AND the intended projected OpenCode config
+bytes equal the bytes currently on disk for the OpenCode config, `update
+--config` is a **no-op**: it returns the existing manifest unchanged and
+does not advance the ownership receipt generation. (The OpenCode config is
+owned through per-field manifest config patches rather than a whole-file
+record, so the comparison is direct byte equality against the on-disk file,
+not against a single recorded hash.) A repeated identical config cannot
+double-advance.
+
+If any write step fails after the transaction has started, `update --config`
+runs **transactional rollback**: each mutated artifact is restored to its
+pre-write snapshot only if its post-write hash still matches what was written
+by the failing step. The Poiesis config, the OpenCode config, the manifest,
+and the ownership receipt are all restored, leaving the installation
+byte-for-byte identical to its pre-transaction state.
+
+Editing `.poiesis/config.jsonc` by hand is a **fail-closed manual edit**. The
+manifest records the hash that `init` (or the previous successful transaction)
+wrote; on the next `update --config` the maintenance surface refuses the
+transaction with `FILE_OWNERSHIP_LOST` and the proposed config is rejected
+before any side effect.
 
 `uninstall` removes only Poiesis-proven-owned state and preserves Git, tracker, PR/MR, and release history:
 
@@ -113,6 +160,8 @@ The delivery adapter is a deterministic command. The command must:
 
 Preview returns a candidate-bound receipt. Staging consumes that Preview receipt and returns a new Staging receipt; callers do not predeclare Staging success. Integration consumes the Staging receipt directly and returns its complete Integration evidence. Production accepts only a Staging-target receipt, preventing a Preview identity from being relabeled as Staging.
 
+Publish produces canonical candidate-bound evidence after a successful operation — every required Publish-evidence field (`candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef`, `publishedHeadSha`, `provider`, `action`, `changeRequest`) with the runtime-enforced equalities (`remoteRef = refs/heads/<branch>`, `publishedHeadSha = candidateSha`). Preview MUST receive the same `--proof`, the same dynamic `--candidate-tree`, and that exact successful Publish evidence unchanged as `--publish`; missing or mismatched proof, tree, or Publish evidence fails closed before any Preview identity is claimed.
+
 Production authorization is a structured JSON envelope binding explicit Author approval and identity to the candidate SHA/tree, Staging artifact identity, and integration SHA. Before invoking Production, Poiesis fetches the configured remote integration branch and requires that exact integration SHA to be its head with content equal to the accepted candidate tree. The orchestration layer remains responsible for asking the Author; the runtime prevents stale or cross-candidate authorization replay.
 
 For projects with no existing preview/staging infrastructure, Poiesis uses a fixture adapter (`adapter: "fixture"` plus an external path) that is test-only and requires `--allow-fixtures`.
@@ -126,7 +175,7 @@ update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
 capability install      install one selected, revision-pinned skill
-workspace prepare       create an isolated owned branch/worktree
+workspace prepare       create an isolated owned branch/worktree (default omits --path and lives under <root>/.poiesis/workspaces/<derived-id>)
 checkpoint              commit an accepted reviewed ticket
 verify                  run checks against an exact clean SHA
 publish                 push and create/update a PR/MR after Proof
@@ -139,6 +188,10 @@ session cleanup         best-effort OpenCode child-session hygiene
 ```
 
 Every command emits structured JSON. Run `poiesis help` for command syntax.
+
+`workspace prepare` is invoked as `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`; the CLI then selects a deterministic, traversal-safe workspace under `<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is gitignored so it never appears as foreign work in the primary checkout.
+
+Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 
 ## Safety
 

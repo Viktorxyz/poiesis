@@ -37,7 +37,10 @@ export const POIESIS_DURABLE_PATHS: readonly string[] = templateMappings
   .filter((mapping) => mapping.trackInProject === true)
   .map((mapping) => mapping.destination);
 
-export const POIESIS_LOCAL_STATE_PATHS: readonly string[] = [".poiesis/manifest.json"];
+export const POIESIS_LOCAL_STATE_PATHS: readonly string[] = [
+  ".poiesis/manifest.json",
+  ".poiesis/workspaces/",
+];
 
 export async function ensureGitignore(root: string, lines: string[], expected?: Buffer | null): Promise<string | undefined> {
   const gitignorePath = join(root, ".gitignore");

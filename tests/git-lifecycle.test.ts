@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, workspacePrepare } from "../src/git.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
   return resolveTree(repository.root, sha);
@@ -82,7 +82,7 @@ describe("deterministic Git lifecycle", () => {
     ).resolves.toMatchObject({ action: "updated" });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: treeA, proof: proofShell(accepted.sha, treeA) });
+    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: treeA, proof: proofShell(accepted.sha, treeA), publish: publishEvidence(accepted.sha, treeA, "poiesis/spec-1"), remote: "origin" });
     const staging = await delivery.promote({
       sha: accepted.sha,
       target: "staging",
@@ -239,7 +239,7 @@ describe("deterministic Git lifecycle", () => {
     });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
-    const preview = await delivery.preview({ sha: candidate.sha, candidateTree: treeB, proof: proofShell(candidate.sha, treeB) });
+    const preview = await delivery.preview({ sha: candidate.sha, candidateTree: treeB, proof: proofShell(candidate.sha, treeB), publish: publishEvidence(candidate.sha, treeB, "poiesis/stale"), remote: "origin" });
     const staging = await delivery.promote({ sha: candidate.sha, target: "staging", candidateTree: treeB, identity: preview });
 
     await writeFile(join(repository.root, "base-change.txt"), "new base\n");
@@ -353,5 +353,104 @@ describe("deterministic Git lifecycle", () => {
         proof: proofShell(acceptedV2.sha, treeV2),
       }),
     ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
+  }, 30_000);
+
+  it("accepts a default-path workspace on a normal branch (poiesis/greeting-command) and the primary checkout stays clean through prepare/cleanup", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // A normal-branch flow (no full Poiesis init) still needs the
+    // `.poiesis/workspaces/` ignore rule so the nested workspace area
+    // never appears as foreign work. The transactional gitignore seam
+    // installed by `poiesis init` or `poiesis update --bootstrap-legacy-ownership`
+    // provides this contract; mirror it here so the test exercises the
+    // post-install state.
+    await writeFile(
+      join(repository.root, ".gitignore"),
+      ".poiesis/manifest.json\n.poiesis/workspaces/\n",
+    );
+    await run("git", ["add", ".gitignore"], { cwd: repository.root });
+    await run("git", ["commit", "--quiet", "-m", "gitignore"], { cwd: repository.root });
+    await run("git", ["push", "--quiet", "origin", "main"], { cwd: repository.root });
+
+    // Add an unrelated foreign file so we can prove that default-path
+    // prepare/cleanup do not introduce any new foreign work.
+    await writeFile(join(repository.root, "foreign.txt"), "uncommitted user work\n");
+    const beforeStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
+    expect(beforeStatus.trim()).toBe("?? foreign.txt");
+
+    const workspace = await workspacePrepare({
+      cwd: repository.root,
+      remote: "origin",
+      integrationBranch: "main",
+      branch: "poiesis/greeting-command",
+      specId: "spec-greeting-command",
+    });
+    // The default path lives inside the project root so the harness can
+    // read it without external_directory escalation.
+    expect(workspace.path.startsWith(join(repository.root, ".poiesis", "workspaces"))).toBe(true);
+    expect(workspace.branch).toBe("poiesis/greeting-command");
+
+    // The nested default-path workspace area must NOT appear as foreign
+    // work in the primary checkout. `?? foreign.txt` is the only line.
+    const midStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
+    expect(midStatus.trim()).toBe("?? foreign.txt");
+
+    // Clean up via the owned-workspace seam so the marker and worktree go
+    // away. We need a delivered SHA to satisfy UNDELIVERED_COMMITS, so
+    // promote through integrate using the existing fixture adapter.
+    await writeFile(join(workspace.path, "greeting.txt"), "hello\n");
+    const accepted = await checkpoint({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      paths: ["greeting.txt"],
+      message: "greeting ticket",
+      review: { verdict: "PASS", reviewerIdentity: "review", evidence: "pass" },
+    });
+    const tree = await resolveTree(repository.root, accepted.sha);
+    await publish({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: accepted.sha,
+      candidateTree: tree,
+      provider: "fixture",
+      project: repository.fixtures,
+      title: "Greeting command",
+      body: "body",
+      proof: proofShell(accepted.sha, tree),
+    });
+    const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
+    const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree), publish: publishEvidence(accepted.sha, tree, "poiesis/greeting-command"), remote: "origin" });
+    const staging = await delivery.promote({
+      sha: accepted.sha,
+      target: "staging",
+      candidateTree: tree,
+      identity: preview,
+    });
+    const integrated = await integrate({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      expectedBaseSha: workspace.baseSha,
+      candidateSha: accepted.sha,
+      candidateTree: tree,
+      message: "default-path integrate",
+      proof: proofShell(accepted.sha, tree),
+      staging,
+      authorAcceptance: "accepted",
+    });
+    const cleaned = await workspaceCleanup({
+      cwd: workspace.path,
+      deliveredSha: integrated.integratedSha,
+    });
+    expect(cleaned.delivery).toBe("integrated-tree");
+    expect(cleaned.path).toBe(workspace.path);
+
+    // After cleanup the primary checkout is back to the original
+    // foreign-file-only status. No default-path residue leaks.
+    const afterStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
+    expect(afterStatus.trim()).toBe("?? foreign.txt");
   }, 30_000);
 });

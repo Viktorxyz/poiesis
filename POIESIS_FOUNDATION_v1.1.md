@@ -2153,6 +2153,15 @@ Deterministic `workspace prepare`:
 
 Dirty foreign checkout does not automatically block a separate worktree.
 
+`--path` MAY be omitted; in that case the CLI selects a deterministic
+traversal-safe path under `<root>/.poiesis/workspaces/<derived-id>` and
+ensures the nested `.poiesis/workspaces/` parent exists. The nested
+area is gitignored so it never appears as foreign work in the primary
+checkout. Poiesis MUST NOT pass an arbitrary `/tmp/...` or other
+external path: external worktrees fall outside the harness-readable
+project root and trigger external-directory permission denials. The
+explicit absolute `--path` form is preserved for specialized tests.
+
 ---
 
 ## 64. Workspace cleanup

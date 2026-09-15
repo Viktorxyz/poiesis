@@ -5,7 +5,23 @@ export * from "./evidence.js";
 export * from "./git.js";
 export * from "./hash.js";
 export * from "./inspect.js";
-export * from "./maintenance.js";
+export {
+  type MaintenanceOptions,
+  type DoctorCheckStatus,
+  type DoctorCheck,
+  type DoctorReport,
+  type UninstallResult,
+  type UpdateResult,
+  type UpdateConfigOptions,
+  init,
+  doctor,
+  update,
+  updateFromConfig,
+  uninstall,
+  resolveConfigForRoot,
+  resolveConfigRoot,
+  installAuthorizedCapability,
+} from "./maintenance.js";
 export * from "./manifest.js";
 export * from "./opencode.js";
 export * from "./session.js";

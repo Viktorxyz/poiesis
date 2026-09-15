@@ -66,6 +66,18 @@ export const proofShell = (sha: string, tree: string) => ({
   standardsReview: { verdict: "PASS" as const, reviewerIdentity: "standards-review-session" },
 });
 
+export const publishEvidence = (sha: string, tree: string, branch: string) => ({
+  candidateSha: sha,
+  candidateTree: tree,
+  verified: true as const,
+  branch,
+  remoteRef: `refs/heads/${branch}`,
+  publishedHeadSha: sha,
+  provider: "fixture" as const,
+  action: "pushed" as const,
+  changeRequest: { id: null, url: null },
+});
+
 export const integration = (candidateTree: string, integrationSha: string, integrationTree: string) => ({
   candidateTree,
   integrationSha,

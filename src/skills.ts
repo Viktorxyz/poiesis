@@ -12,6 +12,7 @@ import { packageRoot } from "./paths.js";
 import { poiesisPath } from "./paths.js";
 import { atomicWrite } from "./fs.js";
 import { run } from "./process.js";
+import type { ArtifactJournal, ArtifactJournalEntry } from "./mutation-transaction.js";
 
 export const SKILLS_CLI_VERSION = "1.5.24";
 export const SKILLS_DIRECTORY = ".agents/skills";
@@ -29,6 +30,72 @@ export interface SkillMaintenanceOptions {
   expectedPreexisting?: ReadonlyMap<string, string>;
   createdDirectories?: Set<string>;
 }
+
+/**
+ * Internal-only widening of {@link SkillMaintenanceOptions} with the
+ * transaction + test seams used by `update-internal.ts`, the
+ * `init` transaction in `maintenance.ts`, and the ticket #46 test
+ * fixture. NOT re-exported via `src/index.ts` or the packed
+ * `dist/index.d.ts`. Internal callers pass it to `installDefaultSkills`
+ * via structural typing at the call site; the public
+ * `SkillMaintenanceOptions` declaration stays free.
+ */
+type SkillMaintenanceInternalOptions = SkillMaintenanceOptions & {
+  journal?: ArtifactJournal;
+  preimageSkillDirectory?: string;
+};
+
+/**
+ * Internal-only widening of {@link CapabilityMaintenanceOptions} with the
+ * bounded-journal seam introduced by ticket #47. The seam mirrors
+ * `SkillMaintenanceInternalOptions`: callers pass the journal via
+ * structural typing at the call site so the public
+ * `CapabilityMaintenanceOptions` declaration stays free and the journal
+ * type does not leak through `dist/index.d.ts`.
+ *
+ * `preimageCapabilityDirectory` is the test-only pre-staging bypass.
+ * It is intentionally NOT exposed on the public
+ * `CapabilityMaintenanceOptions` declaration — internal callers
+ * (currently only `installAuthorizedCapability` in `maintenance.ts`
+ * and the ticket #47 test fixture) widen the type at the call site
+ * through this internal type so the field never appears in
+ * `dist/index.d.ts`.
+ */
+type CapabilityMaintenanceInternalOptions = CapabilityMaintenanceOptions & {
+  journal?: ArtifactJournal;
+  /**
+   * Test-only pre-staged capability directory. When supplied, the
+   * install routes through this directory instead of running the
+   * network-bound `stageSkills` step. The directory MUST mirror the
+   * layout `.agents/skills/<name>/...` that `stageSkills` produces.
+   * Used by tests that exercise the transactional install/rollback
+   * contract without contacting the upstream registry. NOT part of
+   * the public surface.
+   */
+  preimageCapabilityDirectory?: string;
+  /**
+   * Fires AFTER the destination + manifest captures but BEFORE the
+   * install writes. Tests use this hook to observe the journal's
+   * captured preimage backups (e.g. the destination's
+   * `preimageBackup` path) without leaking through the public
+   * surface. NOT part of the public CapabilityMaintenanceOptions
+   * declaration.
+   */
+  onCapturesReady?: (
+    entries: readonly ArtifactJournalEntry[],
+  ) => void | Promise<void>;
+};
+
+/**
+ * Public capability maintenance options. The ticket #47 bounded
+ * journal seam (`journal`), the test-only pre-staging bypass
+ * (`preimageCapabilityDirectory`), and the test-only captures hook
+ * (`onCapturesReady`) are intentionally absent from this declaration.
+ * They are widened through the internal-only
+ * `CapabilityMaintenanceInternalOptions` at the call site so they
+ * never appear in `dist/index.d.ts`.
+ */
+export interface CapabilityMaintenanceOptions {}
 
 export interface SkillRemovalResult {
   removed: string[];
@@ -341,6 +408,15 @@ export async function installDefaultSkills(
   previous: ManagedSkill[] = [],
   options: SkillMaintenanceOptions = {},
 ): Promise<ManagedSkill[]> {
+  // Internal callers (`update-internal.ts`, `maintenance.ts`, the
+  // ticket #46 test fixture) widen the public options with `journal`
+  // and `preimageSkillDirectory` via structural typing at the call
+  // site. The seams are NOT part of the public SkillMaintenanceOptions
+  // type so they do not leak through the packed `dist/index.d.ts`.
+  // The widened view is local to this function body; `ArtifactJournal`
+  // is only referenced inside the body and never appears in any
+  // exported declaration.
+  const internalOptions = options as SkillMaintenanceInternalOptions;
   const defaults = await loadDefaultSkills();
   const previousByName = new Map(previous.map((skill) => [skill.name, skill]));
   const toInstall: DefaultSkill[] = [];
@@ -392,8 +468,25 @@ export async function installDefaultSkills(
     }
   }
 
-  const staged = toInstall.length > 0 ? await stageSkills(toInstall) : undefined;
+  const staged = toInstall.length > 0
+  ? internalOptions.preimageSkillDirectory === undefined
+    ? await stageSkills(toInstall)
+    : { root: internalOptions.preimageSkillDirectory, cleanup: async () => undefined }
+  : undefined;
   const changed: Array<{ skill: DefaultSkill; previous?: string; installedHash: string }> = [];
+  // Ticket #46: when a bounded journal is supplied, every to-install skill
+  // is captured into the journal BEFORE the install runs so the unified
+  // rollback path is the single source of truth for default-skill
+  // mutations. The map is keyed by skill name and lets the install loop
+  // bind each post-write hash to the correct journal entry.
+  const journalEntries: Map<string, ArtifactJournalEntry> = new Map();
+  if (internalOptions.journal !== undefined) {
+    for (const skill of toInstall) {
+      const destination = skillPath(root, skill.name);
+      const entry = await internalOptions.journal.captureDirectory(destination);
+      journalEntries.set(skill.name, entry);
+    }
+  }
   try {
     if (staged !== undefined) {
       for (const skill of toInstall) {
@@ -402,11 +495,27 @@ export async function installDefaultSkills(
         const prior = previousByName.get(skill.name);
         const installedHash = await hashOwnedSkillDirectory(source);
         if (prior !== undefined && !prior.preexisting) {
-          const backup = join(staged.root, ".poiesis-backups", skill.name);
-          await mkdir(dirname(backup), { recursive: true });
-          await cp(destination, backup, { recursive: true, errorOnExist: true, force: false });
-          await replaceDirectoryAtomically(source, destination);
-          changed.push({ skill, previous: backup, installedHash });
+          if (internalOptions.journal === undefined) {
+            // Legacy self-rollback path: keep the staging-dir backup
+            // so the existing internal rollback can restore from it.
+            // The journal path records the preimage itself and does
+            // NOT need a parallel staging-dir backup.
+            const backup = join(staged.root, ".poiesis-backups", skill.name);
+            await mkdir(dirname(backup), { recursive: true });
+            await cp(destination, backup, { recursive: true, errorOnExist: true, force: false });
+            await replaceDirectoryAtomically(source, destination);
+            changed.push({ skill, previous: backup, installedHash });
+          } else {
+            await replaceDirectoryAtomically(source, destination);
+            // Ticket #46: bind the post-write hash to the journal entry
+            // IMMEDIATELY after the install so the journal's
+            // transactionWrittenIdentity is the bytes we just wrote.
+            // A foreign writer that lands between this binding and the
+            // rollback will hash-differ from the recorded identity and
+            // be preserved.
+            await internalOptions.journal.recordDirectoryWrite(journalEntries.get(skill.name)!, installedHash);
+            changed.push({ skill, installedHash });
+          }
         } else {
           await assertSafeSkillParents(root, destination);
           if (await pathEntryExists(destination)) {
@@ -415,6 +524,14 @@ export async function installDefaultSkills(
             });
           }
           await installDirectoryAtomically(source, destination, root, options.createdDirectories);
+          if (internalOptions.journal !== undefined) {
+            // Ticket #46: same post-write binding for newly installed
+            // skills. The journal captures physicalExists=false at
+            // captureDirectory time; the rollback unlinks the directory
+            // when the on-disk tree still matches the recorded
+            // transaction-written identity.
+            await internalOptions.journal.recordDirectoryWrite(journalEntries.get(skill.name)!, installedHash);
+          }
           changed.push({ skill, installedHash });
         }
       }
@@ -431,7 +548,19 @@ export async function installDefaultSkills(
       }
       const installed = changed.find((candidate) => candidate.skill.name === skill.name);
       const preexisting = prior?.preexisting ?? installed === undefined;
-      const hash = await hashOwnedSkillDirectory(destination);
+      // Ticket #46: when a journal recorded the post-write hash, bind
+      // the manifest's `hash` to that recorded identity so concurrent
+      // foreign writers cannot corrupt the manifest's transaction-
+      // written claim. The journal binding was captured immediately
+      // after the install; this is a structural guarantee that the
+      // manifest hash matches the transaction's bytes.
+      let hash: string;
+      const journalEntry = journalEntries.get(skill.name);
+      if (installed !== undefined && journalEntry?.transactionWrittenIdentity?.hash !== undefined) {
+        hash = journalEntry.transactionWrittenIdentity.hash;
+      } else {
+        hash = await hashOwnedSkillDirectory(destination);
+      }
       const expectedHash = options.expectedPreexisting?.get(skill.name);
       if (preexisting && expectedHash !== undefined && hash !== expectedHash) {
         throw new PoiesisError("SKILL_PATH_CONFLICT", "A preexisting default skill changed during initialization", {
@@ -450,6 +579,17 @@ export async function installDefaultSkills(
     managed.push(...previous.filter((skill) => !defaultNames.has(skill.name)));
     return managed;
   } catch (error) {
+    // Ticket #46: when a journal owns the rollback, the journal's
+    // `rollback()` is the single source of truth for default-skill
+    // mutation reversal: it hash-gates every entry against
+    // `transactionWrittenIdentity`, restores preimage directories via
+    // its own backup, and preserves concurrent foreign writes via
+    // `RollbackDiagnostic` (reason `identity-mismatch`). We delegate
+    // the entire rollback to the parent transaction's
+    // `journal.rollback()` rather than maintaining a parallel
+    // self-rolled-back code path. The legacy non-journal path keeps
+    // its own inverse-order rollback for backward compatibility.
+    if (internalOptions.journal !== undefined) throw error;
     const rollbackFailures: Array<Record<string, unknown>> = [];
     for (const change of [...changed].reverse()) {
       try {
@@ -521,7 +661,23 @@ export async function removeOwnedSkills(root: string, skills: ManagedSkill[]): P
   return result;
 }
 
-export async function installCapability(root: string, input: CapabilityInstallInput): Promise<ManagedSkill> {
+export async function installCapability(
+  root: string,
+  input: CapabilityInstallInput,
+  options: CapabilityMaintenanceOptions = {},
+): Promise<ManagedSkill> {
+  // Ticket #47: `installAuthorizedCapability` widens the public
+  // `CapabilityMaintenanceOptions` with a `journal` seam via structural
+  // typing at the call site (mirroring `installDefaultSkills`). When a
+  // bounded journal is supplied, the install is part of the parent
+  // transaction: the destination directory + manifest file are captured
+  // before any write, the post-write hashes are bound via
+  // `recordDirectoryWrite` / `replace`, and rollback delegates to the
+  // journal so the parent transaction owns the unified restoration
+  // path. Without a journal, the legacy ad-hoc backup + inline rollback
+  // path remains in effect for backward compatibility.
+  const internalOptions = options as CapabilityMaintenanceInternalOptions;
+  const journal = internalOptions.journal;
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.source)) {
     throw new PoiesisError("INVALID_SKILL_SOURCE", "Capability source must use owner/repository form", {
       source: input.source,
@@ -568,12 +724,50 @@ export async function installCapability(root: string, input: CapabilityInstallIn
       hash: await hashOwnedSkillDirectory(destination),
     };
     const next = { ...manifest, skills: [...manifest.skills, preexisting] };
-    await atomicWrite(poiesisPath(root, "manifest.json"), serializeManifest(next));
+    const nextBytes = serializeManifest(next);
+    if (journal !== undefined) {
+      // Ticket #47: when the install runs inside a parent transaction,
+      // the manifest write goes through the journal's hash-gated
+      // `replace` so a foreign writer landing between capture and write
+      // surfaces as a `RollbackDiagnostic` (reason
+      // `identity-mismatch`) rather than overwriting Poiesis-owned
+      // bytes. The preexisting manifest is captured here so the
+      // capture is always immediately before the write — a foreign
+      // writer that mutates the manifest between load and capture
+      // fails the `expectedPreWriteIdentity` guard inside `replace`.
+      const manifestPath = poiesisPath(root, "manifest.json");
+      const manifestEntry = await journal.capture(manifestPath, "whole-file");
+      await journal.replace(manifestEntry, nextBytes);
+    } else {
+      await atomicWrite(poiesisPath(root, "manifest.json"), nextBytes);
+    }
     return preexisting;
   }
 
+  // Ticket #47: capture the destination into the journal BEFORE any
+  // install write so the bounded journal is the single source of
+  // truth for capability rollback. The `captureDirectory` call records
+  // the EXACT preimage tree (when the directory already exists) and
+  // creates an isolated journal-owned preimage backup; `commit()` and
+  // `rollback()` own the backup lifecycle (it is NEVER cleaned up by
+  // the caller's `finally`).
+  let journalDirEntry: ArtifactJournalEntry | undefined;
+  let journalManifestEntry: ArtifactJournalEntry | undefined;
+  if (journal !== undefined) {
+    journalDirEntry = await journal.captureDirectory(destination);
+    // Pre-capture the manifest so the upcoming `replace` can hash-gate
+    // the write. `capture` records the EXACT preimage bytes (or
+    // `absent` for a never-existed manifest) — a concurrent foreign
+    // manifest writer between capture and replace is preserved by the
+    // journal's reverse hash-gated rollback.
+    journalManifestEntry = await journal.capture(poiesisPath(root, "manifest.json"), "whole-file");
+    await internalOptions.onCapturesReady?.(journal.entries);
+  }
+
   const selected: DefaultSkill = input;
-  const staged = await stageSkills([selected]);
+  const staged = internalOptions.preimageCapabilityDirectory === undefined
+    ? await stageSkills([selected])
+    : { root: internalOptions.preimageCapabilityDirectory, cleanup: async () => undefined };
   const source = skillPath(staged.root, input.name);
   const backup = join(staged.root, ".poiesis-backup", input.name);
   let changed = false;
@@ -597,15 +791,56 @@ export async function installCapability(root: string, input: CapabilityInstallIn
     const nextSkills = prior === undefined
       ? [...manifest.skills, installed]
       : manifest.skills.map((skill) => (skill.name === input.name ? installed : skill));
-    await atomicWrite(poiesisPath(root, "manifest.json"), serializeManifest({ ...manifest, skills: nextSkills }));
+    const nextManifestBytes = serializeManifest({ ...manifest, skills: nextSkills });
+    if (journal !== undefined) {
+      // Ticket #47: bind the post-write hash to the journal entry
+      // IMMEDIATELY after the install completes. The bounded journal's
+      // hash-gated rollback will only restore the preimage when the
+      // on-disk tree still equals the recorded
+      // `transactionWrittenIdentity`; a foreign writer that lands
+      // between recordDirectoryWrite and rollback preserves the
+      // foreign content and surfaces a `RollbackDiagnostic` (reason
+      // `identity-mismatch`).
+      if (journalDirEntry !== undefined) {
+        const installedHash = installed.hash;
+        if (installedHash === undefined) {
+          throw new PoiesisError("ARTIFACT_IDENTITY_INVALID", "Installed capability has no recorded hash", {
+            path: relative(root, destination),
+          });
+        }
+        await journal.recordDirectoryWrite(journalDirEntry, installedHash);
+      }
+      if (journalManifestEntry !== undefined) {
+        await journal.replace(journalManifestEntry, nextManifestBytes);
+      }
+    } else {
+      await atomicWrite(poiesisPath(root, "manifest.json"), nextManifestBytes);
+    }
     return installed;
   } catch (error) {
+    // Ticket #47: when a journal owns the rollback, the journal's
+    // `rollback()` is the single source of truth for capability
+    // mutation reversal: it hash-gates the destination directory
+    // against `transactionWrittenIdentity` (preserving concurrent
+    // foreign writes) and restores the manifest preimage when the
+    // on-disk file still matches the transaction-written bytes. We
+    // delegate the entire rollback to the parent transaction's
+    // `journal.rollback()` rather than maintaining a parallel
+    // self-rolled-back code path. The legacy non-journal path keeps
+    // its own best-effort rollback for backward compatibility.
+    if (journal !== undefined) throw error;
     if (changed && (await exists(destination))) {
       await rm(destination, { recursive: true, force: true });
       if (prior !== undefined && (await exists(backup))) await rename(backup, destination);
     }
     throw error;
   } finally {
-    await staged.cleanup();
+    // Non-authoritative staging cleanup: a staging failure cannot
+    // turn the surrounding transaction into a failure. The catch path
+    // has already delegated to the journal (so the directory is
+    // either untouched or restored) before the cleanup runs. The
+    // `catch(() => undefined)` matches the journal's commit/rollback
+    // cleanup contract: best-effort, non-authoritative.
+    await staged.cleanup().catch(() => undefined);
   }
 }

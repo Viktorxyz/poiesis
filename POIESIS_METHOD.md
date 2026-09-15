@@ -42,7 +42,14 @@ Before planning:
 1. Validate required project infrastructure.
 2. Fetch and inspect the repository.
 3. Resolve the latest canonical integration base.
-4. Prepare an isolated Poiesis-owned workspace.
+4. Prepare an isolated Poiesis-owned workspace via
+   `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`;
+   the CLI then derives a
+   traversal-safe path under `<root>/.poiesis/workspaces/<derived-id>`. The
+   default-path workspace area is gitignored so it never appears as
+   foreign work in the primary checkout. Poiesis must not pass any
+   external path such as `/tmp/...` or any location outside the project root:
+   external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 5. Run Capability Check.
 
 Required infrastructure includes:
@@ -178,6 +185,16 @@ Run whole-change Proof in this order:
 2. fresh reasoning Spec Review;
 3. fresh reasoning Standards Review.
 
+The exact candidate identity that flows from Prove into Publish and Preview is one canonical proof object. It must carry:
+
+- `candidateSha`: the exact published candidate commit SHA;
+- `candidateTree`: the exact candidate tree hash for that SHA;
+- `verified: true` after deterministic Verify passed;
+- `specReview`: `{ verdict: PASS, reviewerIdentity }` from a fresh reasoning Spec Review;
+- `standardsReview`: `{ verdict: PASS, reviewerIdentity }` from a fresh reasoning Standards Review.
+
+Every required field must be present for the same clean candidate. Publish and Preview both consume that exact proof and refuse to operate without it.
+
 ### Verify
 
 Run the authoritative project checks against the exact candidate.
@@ -201,7 +218,7 @@ After a mutation:
 
 ## 11. Publish
 
-Only after whole-change Proof passes:
+Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
 
 - push the Poiesis change branch;
 - create or update one PR/MR targeting the canonical integration branch;
@@ -209,9 +226,30 @@ Only after whole-change Proof passes:
 
 The Author does not operate the PR/MR.
 
+Canonical Publish evidence fields (runtime-required, equality invariants shown as `field = invariant`):
+
+- `candidateSha` — exact published candidate commit SHA.
+- `candidateTree` — exact published candidate tree hash.
+- `verified: true` — Verify passed.
+- `branch` — Poiesis-owned change branch.
+- `remoteRef = "refs/heads/<branch>"` — the remote ref for the published branch.
+- `publishedHeadSha = candidateSha` — the published remote head equals the candidate SHA.
+- `provider` — adapter provider identity.
+- `action` — one of `"created" | "updated" | "pushed"`.
+- `changeRequest.id` — string-or-null (provider change-request id, if any).
+- `changeRequest.url` — string-or-null (provider change-request URL, if any).
+
+A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
+
 ## 12. Preview
 
-Create Preview from the exact proven candidate.
+Preview only after Publish succeeds. Pass, to `poiesis preview`:
+
+- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`);
+- the same exact dynamic `--candidate-tree` that Publish just produced;
+- the exact successful canonical candidate-bound Publish evidence as `--publish` (the precise object returned by `poiesis publish`, carrying every field listed in §11 above).
+
+Preview fails closed if any of these three arguments is missing, the proof does not match the candidate, the tree does not match, or the publish evidence does not match the same candidate. The deterministic `poiesis preview` operation must succeed and return a concrete Preview identity (`id`, `url`, and/or `artifact` matching `artifactIdentity`) before any Author-facing claim of Preview readiness is made.
 
 Preview always exists.
 
@@ -223,6 +261,8 @@ The concrete representation is project-appropriate, for example:
 - another safe Author-testable candidate representation.
 
 Tell the Author the feature is ready to try.
+
+A rejected Preview is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic operation succeeds and returns a concrete Preview identity. Do not invent or assume a Preview identity, URL, or artifact.
 
 The Author validates whether the realization matches their intent.
 

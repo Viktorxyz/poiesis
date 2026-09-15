@@ -5,7 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -24,7 +24,7 @@ import {
 } from "./adapters.js";
 import { cleanupOpenCodeSession } from "./session.js";
 import { PoiesisError } from "./errors.js";
-import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, StagingEvidence } from "./evidence.js";
+import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, PublishEvidence, StagingEvidence } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
 
 type Values = Record<string, string | boolean | string[] | undefined>;
@@ -35,15 +35,17 @@ Usage:
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
+  poiesis update --config <file>
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
-  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>
+  poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
+  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json>
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>     # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>     # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
@@ -128,13 +130,35 @@ async function commandDoctor(args: string[]): Promise<void> {
   if (!report.ok) process.exitCode = 1;
 }
 
-async function commandUpdate(args: string[]): Promise<void> {
+export async function commandUpdate(args: string[]): Promise<void> {
   const values = options(args, {
     "skip-skills": { type: "boolean" },
     "bootstrap-legacy-ownership": { type: "boolean" },
+    config: { type: "string" },
     cwd: { type: "string" },
   });
   const root = await resolveGitRoot(cwdOf(values));
+  const configPath = values.config;
+  if (typeof configPath === "string" && configPath.trim().length > 0) {
+    // CLI-level guard: `--config` is incompatible with the other update options
+    // even though `updateFromConfig` also rejects them. Failing here keeps the
+    // dispatch surface auditable and lets the rejection be tested directly.
+    if (values["skip-skills"] === true || values["bootstrap-legacy-ownership"] === true) {
+      throw new PoiesisError(
+        "INCOMPATIBLE_UPDATE_OPTIONS",
+        "poiesis update --config cannot combine with --skip-skills or --bootstrap-legacy-ownership",
+        {
+          skipSkills: values["skip-skills"] === true,
+          bootstrapLegacyOwnership: values["bootstrap-legacy-ownership"] === true,
+        },
+      );
+    }
+    writeSuccess("update", await updateFromConfig(root, resolve(cwdOf(values), configPath)));
+    return;
+  }
+  if (typeof configPath !== "undefined") {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required --config", { key: "config" });
+  }
   writeSuccess(
     "update",
     await update(root, {
@@ -192,7 +216,7 @@ async function commandWorkspace(args: string[]): Promise<void> {
         remote: config.repository.remote,
         integrationBranch: config.repository.integrationBranch,
         branch: required(values, "branch"),
-        workspacePath: resolve(required(values, "path")),
+        ...optionalAbsoluteWorkspacePath(values.path),
         specId: required(values, "spec"),
       }),
     );
@@ -294,6 +318,7 @@ async function commandPreview(args: string[]): Promise<void> {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
     proof: { type: "string" },
+    publish: { type: "string" },
     cwd: { type: "string" },
   });
   const cwd = cwdOf(values);
@@ -308,6 +333,8 @@ async function commandPreview(args: string[]): Promise<void> {
         sha: required(values, "sha"),
         candidateTree: required(values, "candidate-tree"),
         proof: json<ProofPayload>(required(values, "proof"), "proof"),
+        publish: json<PublishEvidence>(required(values, "publish"), "publish"),
+        remote: config.repository.remote,
       },
       repoRoot,
     ),
@@ -531,4 +558,58 @@ function supersedeInput(values: Values): SupersedeInput {
   return { reason: required(values, "reason"), replacementIds: many(values, "replacement") ?? [] };
 }
 
-main(process.argv.slice(2)).catch(writeFailure);
+// Run `main` only when this module is the Node entry point. Tests import this
+// module for `commandUpdate` without intending to invoke `main`; without this
+// guard the CLI's bootstrap runs as soon as Vitest loads the module and emits
+// HELP/error JSON into the test output.
+//
+// The check is symlink-aware so the packaged bin resolves to "main" both when
+// invoked directly (`node dist/cli.js ...`) and through `node_modules/.bin/`
+// (which is a symlink to `dist/cli.js`). A naive `argv[1] === import.meta.url`
+// comparison fails through `.bin` because `argv[1]` is the symlink path while
+// `import.meta.url` is the real file path, so `main` never runs and the bin
+// silently exits 0. We compare realpath-normalized paths so both invocation
+// forms boot `main`; importing `src/cli.ts` from a test (where `argv[1]` is
+// the vitest bin, not `cli.ts`) still yields "not main".
+import { fileURLToPath } from "node:url";
+import { realpathSync } from "node:fs";
+import { resolve as resolvePath } from "node:path";
+
+function resolveEntryPath(argv1: string | undefined): string {
+  if (!argv1) return "";
+  try {
+    return resolvePath(argv1);
+  } catch {
+    return "";
+  }
+}
+
+function sameEntry(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  if (a === b) return true;
+  try {
+    return realpathSync(a) === realpathSync(b);
+  } catch {
+    return false;
+  }
+}
+
+function isMainEntry(argv1: string | undefined, moduleUrl: string): boolean {
+  try {
+    return sameEntry(resolveEntryPath(argv1), fileURLToPath(moduleUrl));
+  } catch {
+    return false;
+  }
+}
+
+const IS_MAIN_MODULE = isMainEntry(process.argv[1], import.meta.url);
+if (IS_MAIN_MODULE) {
+  main(process.argv.slice(2)).catch(writeFailure);
+}
+
+function optionalAbsoluteWorkspacePath(value: string | boolean | string[] | undefined): Record<string, string> {
+  if (typeof value !== "string") return {};
+  const trimmed = value.trim();
+  if (trimmed.length === 0) return {};
+  return { workspacePath: resolve(trimmed) };
+}

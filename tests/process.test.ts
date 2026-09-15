@@ -278,6 +278,160 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
     survivorPids.delete(descendantPid);
     survivorPids.delete(replacementPid);
   });
+
+  // Regression coverage for the early-settlement race behind the flaky
+  // TERM-handler replacement test: tryFinalize must not trust a single
+  // "PG appears empty" verdict during the grace period when an owned
+  // group has been snapshotted, because /proc can briefly miss a forked
+  // but not-yet-execed descendant. Repeat the scenario enough times that
+  // the window reliably surfaces if it is left unguarded.
+  it(
+    "captures every TERM-handler replacement across repeated concurrent settlement attempts",
+    { timeout: 60_000 },
+    async () => {
+      const repeats = 20;
+      for (let attempt = 0; attempt < repeats; attempt += 1) {
+        const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
+        fixtures.push(dir);
+        const parent = join(dir, "parent.sh");
+        const descendant = join(dir, "descendant.sh");
+        const replacement = join(dir, "replacement.sh");
+        const descendantPidFile = join(dir, "descendant.pid");
+        const replacementPidFile = join(dir, "replacement.pid");
+
+        await writeFile(
+          replacement,
+          [
+            "#!/bin/sh",
+            "trap '' TERM",
+            "exec 0</dev/null 1>/dev/null 2>/dev/null",
+            'printf "%s\\n" "$$" > "$1"',
+            "while :; do sleep 1; done",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        await writeFile(
+          descendant,
+          [
+            "#!/bin/sh",
+            'replacement="$1"',
+            'own_pid="$2"',
+            'replacement_pid="$3"',
+            `trap '"$replacement" "$replacement_pid" & exit 0' TERM`,
+            "exec 0</dev/null 1>/dev/null 2>/dev/null",
+            'printf "%s\\n" "$$" > "$own_pid"',
+            "while :; do sleep 1; done",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        await writeFile(
+          parent,
+          `#!/bin/sh\n"${descendant}" "${replacement}" "${descendantPidFile}" "${replacementPidFile}" &\nsleep 30\n`,
+          "utf8",
+        );
+        await chmod(replacement, 0o755);
+        await chmod(descendant, 0o755);
+        await chmod(parent, 0o755);
+
+        const invocation = run(parent, [], { cwd: dir, timeoutMs: 500 });
+        const descendantPid = await waitForPid(descendantPidFile);
+        const descendantStartTime = await processStartTime(descendantPid);
+        survivorPids.set(descendantPid, descendantStartTime);
+        const replacementPid = await waitForPid(replacementPidFile, 3_000);
+        const replacementStartTime = await processStartTime(replacementPid);
+        survivorPids.set(replacementPid, replacementStartTime);
+
+        await expect(invocation).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });
+        expect(await isSameProcess(descendantPid, descendantStartTime)).toBe(false);
+        expect(await isSameProcess(replacementPid, replacementStartTime)).toBe(false);
+        survivorPids.delete(descendantPid);
+        survivorPids.delete(replacementPid);
+      }
+    },
+  );
+
+  // Multiple TERM-handler descendants, each spawning its own TERM-resistant
+  // replacement. Increases the chance that at least one replacement is
+  // observed by the runner in the same grace period that another one is
+  // being forked, exercising the snapshot refresh path.
+  it(
+    "captures and kills multiple TERM-handler replacements before settlement",
+    { timeout: 20_000 },
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
+      fixtures.push(dir);
+      const replacement = join(dir, "replacement.sh");
+      const pidFiles: string[] = [];
+
+      await writeFile(
+        replacement,
+        [
+          "#!/bin/sh",
+          "trap '' TERM",
+          "exec 0</dev/null 1>/dev/null 2>/dev/null",
+          'printf "%s\\n" "$$" > "$1"',
+          "while :; do sleep 1; done",
+          "",
+        ].join("\n"),
+        "utf8",
+      );
+      await chmod(replacement, 0o755);
+
+      const descendantPaths: string[] = [];
+      for (let index = 0; index < 4; index += 1) {
+        const descendant = join(dir, `descendant-${index}.sh`);
+        const descendantPidFile = join(dir, `descendant-${index}.pid`);
+        const replacementPidFile = join(dir, `replacement-${index}.pid`);
+        pidFiles.push(descendantPidFile, replacementPidFile);
+        await writeFile(
+          descendant,
+          [
+            "#!/bin/sh",
+            'replacement="$1"',
+            'own_pid="$2"',
+            'replacement_pid="$3"',
+            `trap '"$replacement" "$replacement_pid" & exit 0' TERM`,
+            "exec 0</dev/null 1>/dev/null 2>/dev/null",
+            'printf "%s\\n" "$$" > "$own_pid"',
+            "while :; do sleep 1; done",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        await chmod(descendant, 0o755);
+        descendantPaths.push(descendant);
+      }
+
+      const parent = join(dir, "parent.sh");
+      const spawns = descendantPaths
+        .map((descendant, index) => {
+          const descendantPidFile = pidFiles[index * 2]!;
+          const replacementPidFile = pidFiles[index * 2 + 1]!;
+          return `"${descendant}" "${replacement}" "${descendantPidFile}" "${replacementPidFile}" &`;
+        })
+        .join("\n");
+      await writeFile(parent, `#!/bin/sh\n${spawns}\nsleep 30\n`, "utf8");
+      await chmod(parent, 0o755);
+
+      const invocation = run(parent, [], { cwd: dir, timeoutMs: 500 });
+
+      const trackedPids: Array<{ pid: number; startTime: string | null }> = [];
+      for (const file of pidFiles) {
+        const pid = await waitForPid(file, 3_000);
+        const startTime = await processStartTime(pid);
+        survivorPids.set(pid, startTime);
+        trackedPids.push({ pid, startTime });
+      }
+
+      await expect(invocation).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });
+      for (const { pid, startTime } of trackedPids) {
+        expect(await isSameProcess(pid, startTime)).toBe(false);
+        survivorPids.delete(pid);
+      }
+    },
+  );
 });
 
 describe("Windows termination seam", () => {

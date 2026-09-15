@@ -18,15 +18,16 @@ Do not ask the user to reorganize them.
 8. `POIESIS_ROLE_RESEARCH.md`
 9. `POIESIS_ROLE_REVIEWER.md`
 10. `POIESIS_CONFIG_TEMPLATE.jsonc`
-11. `POIESIS_MANIFEST_TEMPLATE.json`
-12. `POIESIS_SKILLS.json`
-13. `OPENCODE_AGENT_POIESIS.md`
-14. `OPENCODE_AGENT_PLANNER.md`
-15. `OPENCODE_AGENT_WORKER.md`
-16. `OPENCODE_AGENT_RESEARCH.md`
-17. `OPENCODE_AGENT_REVIEWER.md`
-18. `OPENCODE_AGENT_FINAL_REVIEWER.md`
-19. `OPENCODE_CONFIG_PATCH_V2.jsonc`
+11. `POIESIS_SKILLS.json`
+12. `OPENCODE_AGENT_POIESIS.md`
+13. `OPENCODE_AGENT_PLANNER.md`
+14. `OPENCODE_AGENT_WORKER.md`
+15. `OPENCODE_AGENT_RESEARCH.md`
+16. `OPENCODE_AGENT_REVIEWER.md`
+17. `OPENCODE_AGENT_FINAL_REVIEWER.md`
+18. `COMPATIBILITY.md` (qualified OpenCode adapter v1 contract)
+
+`POIESIS_MANIFEST_TEMPLATE.json` is a legacy design reference only — read it for documentation; it is not consumed by `src/templates.ts`, not listed in `package.json::files[]`, and not shipped in the published package. `OPENCODE_CONFIG_PATCH_V2.jsonc` is similarly design-intent only and is NOT copied into projects.
 
 Treat these as one specification.
 
@@ -58,15 +59,20 @@ No default `AGENTS.md` mutation.
 
 Before implementing OpenCode integration, verify the target installed/current OpenCode source/docs and schema.
 
-The bundle was prepared against the current OpenCode V2 design on 2026-09-07:
-- Markdown custom agents under `.opencode/agents/`;
-- Markdown body is agent `system`;
-- `mode: primary|subagent`;
-- ordered V2 `permissions` rules;
-- action names such as `shell`, `edit`, `subagent`, and `skill`;
-- `default_agent` in project config.
+The bundle targets the **OpenCode adapter-version-1** config schema, verified against supported OpenCode tags `1.18.29` and `1.18.30` (see `COMPATIBILITY.md` and `src/opencode.ts::SUPPORTED_OPENCODE_VERSIONS`). OpenCode-specific projection syntax below is **adapter-syntax**, not harness-neutral Poiesis semantics — Poiesis method, role files, and CLI surface remain harness-neutral and do not change shape per adapter.
 
-Do not use legacy V1 `permission`, `bash`, or `task` syntax in a V2 configuration.
+Qualified OpenCode 1.18.29 / 1.18.30 adapter v1 schema:
+- Markdown custom agents under `.opencode/agents/`;
+- Markdown body is the agent `system`;
+- `mode: primary|subagent`;
+- Singular `agent` map at the config root;
+- Each `agent.<name>` carries a singular `permission` object (NOT plural `permissions` rules, NOT ordered rule lists);
+- Permission keys are the singular V1 names `bash`, `task`, `skill`, `edit`, `read`, `glob`, `grep`, `list`, `webfetch`, `websearch`, `todowrite`, `question`;
+- The literal `"*"` key inside `permission` denies everything else;
+- `default_agent` in project config;
+- `subagent_depth` (integer) at the config root.
+
+Do not introduce the legacy plural `agents` / ordered `permissions` shape, and do not introduce legacy action names such as `shell` or `subagent` as keys inside `permission` — those are not accepted by the supported tags. (The legacy V2 names `shell` and `subagent` are replaced by the V1 names `bash` and `task`; `edit` is not a legacy name and is supported alongside `read`, `glob`, `grep`, `list`, `skill`, `webfetch`, `websearch`, `todowrite`, `question`.) The historical `OPENCODE_CONFIG_PATCH_V2.jsonc` remains in the source for traceability but is **not** the active patch.
 
 Important current caveat: do not treat per-target subagent permission filtering as a hard security boundary unless the target version is verified to enforce it. Prompt role boundaries remain required.
 
@@ -169,11 +175,9 @@ Preserve preexisting skills as user-owned.
 
 Generate the six Poiesis agent files from the `OPENCODE_AGENT_*.md` templates. `poiesis-reviewer` and `poiesis-final-reviewer` are adapter-only projections of the same canonical Reviewer role, required to route ticket review to the execution model and final reviews to the reasoning model.
 
-Merge the intent represented by `OPENCODE_CONFIG_PATCH_V2.jsonc` into the actual current project config.
+Generate the OpenCode config projection directly from `src/opencode.ts::desiredOpenCodePatches()` against the qualified adapter-version-1 schema (singular `agent` / `permission`, keys such as `bash`, `task`, `skill`, etc.). Do not copy or extend the legacy `OPENCODE_CONFIG_PATCH_V2.jsonc` — its plural `agents` / `permissions` shape and `shell` / `subagent` action names are not accepted by supported OpenCode `1.18.29` / `1.18.30`. Validate the projected payload with `opencode debug config` before write.
 
-Do not copy the patch file verbatim.
-
-Do not overwrite unrelated OpenCode config.
+Do not copy the patch file verbatim. Do not overwrite unrelated OpenCode config.
 
 Record every managed config mutation in manifest.
 

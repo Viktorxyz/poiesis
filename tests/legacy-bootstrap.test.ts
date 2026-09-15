@@ -6,6 +6,7 @@ import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { ownershipReceiptExists, readOwnershipReceipt, removeOwnershipReceipt } from "../src/receipt.js";
 import { run } from "../src/process.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode } from "./fake-opencode.js";
 
 async function asLegacy1000(root: string): Promise<void> {
   const manifest = await loadManifest(root);
@@ -27,11 +28,31 @@ describe("legacy 1.0.0 ownership bootstrap", () => {
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({ code: "OWNERSHIP_RECEIPT_MISSING" });
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
 
+    // Synthetic 1.0.0 legacy init wrote the pre-ticket #25 `.gitignore`
+    // contract, which did NOT include `.poiesis/workspaces/`. Strip the
+    // new rule so the bootstrap transaction has to install it.
+    const gitignorePath = join(repository.root, ".gitignore");
+    const beforeBytes = await readFile(gitignorePath);
+    const stripped = beforeBytes
+      .toString("utf8")
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== ".poiesis/workspaces/")
+      .filter((line) => !line.includes("default-path workspace area"))
+      .join("\n");
+    await writeFile(gitignorePath, stripped);
+    expect((await readFile(gitignorePath, "utf8"))).not.toContain(".poiesis/workspaces/");
+
     const result = await update(repository.root, { skipSkills: true, bootstrapLegacyOwnership: true });
     expect(result.manifest.poiesisVersion).not.toBe("1.0.0");
     const receipt = await readOwnershipReceipt(repository.root);
     expect(receipt.generation).toBe(1);
     expect(await doctor(repository.root).then((report) => report.checks.find((check) => check.id === "receipt")?.status)).toBe("pass");
+
+    // After bootstrap, the transactional gitignore seam installed the
+    // `.poiesis/workspaces/` rule so the default-path workspace area
+    // never appears as foreign work in the primary checkout.
+    const afterBootstrap = await readFile(gitignorePath, "utf8");
+    expect(afterBootstrap).toContain(".poiesis/workspaces/");
 
     await update(repository.root, { skipSkills: true });
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(2);
@@ -44,11 +65,25 @@ describe("legacy 1.0.0 ownership bootstrap", () => {
     repositories.push(repository);
     const configPath = join(repository.parent, "legacy-config.jsonc");
     await writeFile(configPath, `${JSON.stringify(testConfig(repository), null, 2)}\n`);
-    const installed = await run(
-      "pnpm",
-      ["dlx", "poiesis-cli@1.0.0", "init", "--config", configPath, "--allow-fixtures", "--cwd", repository.root],
-      { cwd: repository.root, allowFailure: true },
-    );
+    // The legacy poiesis-cli@1.0.0 init bundles SUPPORTED_OPENCODE_VERSION = "1.18.29"
+    // and fails closed against any other version. To exercise the real
+    // published legacy package on a host whose OpenCode is a later
+    // adapter-version-1 tag (e.g. 1.18.30), inject a fixture-local fake
+    // OpenCode that advertises 1.18.29 onto PATH for the duration of the
+    // legacy init. After the legacy init returns we restore PATH so the
+    // current compatible runtime that follows (update and doctor) runs
+    // against the real host OpenCode.
+    const fakeEnv = await installFakeOpenCode("1.18.29");
+    let installed;
+    try {
+      installed = await run(
+        "pnpm",
+        ["dlx", "poiesis-cli@1.0.0", "init", "--config", configPath, "--allow-fixtures", "--cwd", repository.root],
+        { cwd: repository.root, allowFailure: true },
+      );
+    } finally {
+      fakeEnv.restore();
+    }
     expect(installed.exitCode, installed.stderr || installed.stdout).toBe(0);
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
     await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({ code: "OWNERSHIP_RECEIPT_MISSING" });

@@ -8,18 +8,23 @@ import { atomicWrite, exists, readUtf8 } from "./fs.js";
 import { run } from "./process.js";
 import {
   validateIntegrationEvidence,
+  validatePreviewPublishEvidence,
   validateProductionAuthorization,
   validateProofEvidence,
+  validatePublishEvidence,
   validateStagingEvidence,
   type IntegrationEvidence,
   type ProductionAuthorization,
   type ProofEvidence,
+  type PublishEvidence,
   type StagingEvidence,
 } from "./evidence.js";
 
 export type TrackerProvider = "github" | "gitlab" | "fixture";
 export type TrackerItemKind = "spec" | "ticket";
 export type TrackerItemState = "open" | "closed" | "superseded";
+
+const SHA_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
 export interface TrackerConfig {
   provider: TrackerProvider;
@@ -719,6 +724,8 @@ export interface PreviewDeliveryInput {
   sha: string;
   candidateTree: string;
   proof: ProofPayload;
+  publish: PublishEvidence;
+  remote: string;
 }
 
 export interface StagingPromotionInput {
@@ -799,6 +806,8 @@ class CommandDeliveryAdapter implements DeliveryAdapter {
     const candidateTree = await resolveCandidateTree(this.cwd, sha);
     validateCandidateTree(input.candidateTree, candidateTree);
     validateProofEvidence(input.proof, sha, candidateTree);
+    validatePreviewPublishEvidence(input.publish, sha, candidateTree);
+    await revalidateRemoteChangeBranchHead(this.cwd, input.remote, input.publish);
     return this.execute(sha, candidateTree, "preview");
   }
 
@@ -924,6 +933,8 @@ class FixtureDeliveryAdapter implements DeliveryAdapter {
     const candidateTree = await resolveCandidateTree(this.root, sha);
     validateCandidateTree(input.candidateTree, candidateTree);
     validateProofEvidence(input.proof, sha, candidateTree);
+    validatePreviewPublishEvidence(input.publish, sha, candidateTree);
+    await revalidateRemoteChangeBranchHead(this.root, input.remote, input.publish);
     const artifact = resolve(this.fixturePath, "candidates", identityFilename(sha));
     const result: PreviewDeliveryResult = {
       sha,
@@ -1023,6 +1034,56 @@ function exactSha(sha: string): string {
   requiredText(sha, "candidate sha");
   invariant(sha === sha.trim() && !sha.includes("\0"), "INVALID_DELIVERY_IDENTITY", "Candidate sha is not exact text", { sha });
   return sha;
+}
+
+async function revalidateRemoteChangeBranchHead(
+  root: string,
+  remote: string,
+  publish: PublishEvidence,
+): Promise<void> {
+  requiredText(remote, "preview remote");
+  invariant(!remote.startsWith("-") && !remote.includes("\0"), "INVALID_REMOTE_NAME", "Preview remote is not a safe Git remote name", {
+    remote,
+  });
+  const remoteUrl = await run("git", ["remote", "get-url", remote], { cwd: root, allowFailure: true });
+  invariant(remoteUrl.exitCode === 0, "PREVIEW_REMOTE_NOT_FOUND", "Configured preview remote does not exist", { remote });
+  const branchCheck = await run("git", ["check-ref-format", "--branch", publish.branch], {
+    cwd: root,
+    allowFailure: true,
+  });
+  invariant(branchCheck.exitCode === 0, "PUBLISH_BRANCH_INVALID", "Publish evidence change branch is not a valid Git branch name", {
+    branch: publish.branch,
+  });
+  const remoteHead = await run("git", ["ls-remote", "--heads", remote, publish.remoteRef], { cwd: root, allowFailure: true });
+  invariant(
+    remoteHead.exitCode === 0,
+    "PUBLISH_EVIDENCE_REMOTE_UNAVAILABLE",
+    "Publish evidence remote change ref could not be fetched",
+    { remote, remoteRef: publish.remoteRef },
+  );
+  const records = remoteHead.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  invariant(
+    records.length >= 1,
+    "PUBLISH_EVIDENCE_STALE",
+    "Publish evidence no longer matches the configured remote change branch",
+    { remote, remoteRef: publish.remoteRef, expectedHeadSha: publish.publishedHeadSha, actualHeadSha: null },
+  );
+  const headSha = records[0]!.split(/\s+/, 1)[0];
+  invariant(
+    typeof headSha === "string" && SHA_PATTERN.test(headSha),
+    "INVALID_REMOTE_REF",
+    "Remote returned an invalid branch head for the published change branch",
+    { remote, remoteRef: publish.remoteRef, output: headSha ?? null },
+  );
+  invariant(
+    headSha === publish.publishedHeadSha,
+    "PUBLISH_EVIDENCE_STALE",
+    "Publish evidence no longer matches the configured remote change branch",
+    { remote, remoteRef: publish.remoteRef, expectedHeadSha: publish.publishedHeadSha, actualHeadSha: headSha },
+  );
 }
 
 async function validateCanonicalIntegration(
