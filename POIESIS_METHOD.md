@@ -218,7 +218,7 @@ After a mutation:
 
 ## 11. Publish
 
-Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`. Only after Publish succeeds:
+Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
 
 - push the Poiesis change branch;
 - create or update one PR/MR targeting the canonical integration branch;
@@ -226,11 +226,30 @@ Publish only after Verify, Spec Review, and Standards Review pass for the same c
 
 The Author does not operate the PR/MR.
 
-A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity.
+Canonical Publish evidence fields (runtime-required, equality invariants shown as `field = invariant`):
+
+- `candidateSha` — exact published candidate commit SHA.
+- `candidateTree` — exact published candidate tree hash.
+- `verified: true` — Verify passed.
+- `branch` — Poiesis-owned change branch.
+- `remoteRef = "refs/heads/<branch>"` — the remote ref for the published branch.
+- `publishedHeadSha = candidateSha` — the published remote head equals the candidate SHA.
+- `provider` — adapter provider identity.
+- `action` — one of `"created" | "updated" | "pushed"`.
+- `changeRequest.id` — string-or-null (provider change-request id, if any).
+- `changeRequest.url` — string-or-null (provider change-request URL, if any).
+
+A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
 ## 12. Preview
 
-Preview only after Publish succeeds. Pass the same canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis preview`. The deterministic `poiesis preview` operation must succeed and return a concrete Preview identity (`id`, `url`, and/or `artifact` matching `artifactIdentity`) before any Author-facing claim of Preview readiness is made.
+Preview only after Publish succeeds. Pass, to `poiesis preview`:
+
+- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`);
+- the same exact dynamic `--candidate-tree` that Publish just produced;
+- the exact successful canonical candidate-bound Publish evidence as `--publish` (the precise object returned by `poiesis publish`, carrying every field listed in §11 above).
+
+Preview fails closed if any of these three arguments is missing, the proof does not match the candidate, the tree does not match, or the publish evidence does not match the same candidate. The deterministic `poiesis preview` operation must succeed and return a concrete Preview identity (`id`, `url`, and/or `artifact` matching `artifactIdentity`) before any Author-facing claim of Preview readiness is made.
 
 Preview always exists.
 

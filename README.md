@@ -160,6 +160,8 @@ The delivery adapter is a deterministic command. The command must:
 
 Preview returns a candidate-bound receipt. Staging consumes that Preview receipt and returns a new Staging receipt; callers do not predeclare Staging success. Integration consumes the Staging receipt directly and returns its complete Integration evidence. Production accepts only a Staging-target receipt, preventing a Preview identity from being relabeled as Staging.
 
+Publish produces canonical candidate-bound evidence after a successful operation — every required Publish-evidence field (`candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef`, `publishedHeadSha`, `provider`, `action`, `changeRequest`) with the runtime-enforced equalities (`remoteRef = refs/heads/<branch>`, `publishedHeadSha = candidateSha`). Preview MUST receive the same `--proof`, the same dynamic `--candidate-tree`, and that exact successful Publish evidence unchanged as `--publish`; missing or mismatched proof, tree, or Publish evidence fails closed before any Preview identity is claimed.
+
 Production authorization is a structured JSON envelope binding explicit Author approval and identity to the candidate SHA/tree, Staging artifact identity, and integration SHA. Before invoking Production, Poiesis fetches the configured remote integration branch and requires that exact integration SHA to be its head with content equal to the accepted candidate tree. The orchestration layer remains responsible for asking the Author; the runtime prevents stale or cross-candidate authorization replay.
 
 For projects with no existing preview/staging infrastructure, Poiesis uses a fixture adapter (`adapter: "fixture"` plus an external path) that is test-only and requires `--allow-fixtures`.
