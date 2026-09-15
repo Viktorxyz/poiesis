@@ -1,11 +1,12 @@
 import { isDeepStrictEqual } from "node:util";
 import { lstat, readFile } from "node:fs/promises";
 import { dirname, join, relative } from "node:path";
-import { applyEdits, modify, parseTree, type Node as JsonNode } from "jsonc-parser";
+import { applyEdits, modify } from "jsonc-parser";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { parseJsonc, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import type { ConfigPatch } from "./manifest.js";
+import { assertNoDuplicateProperties as assertNoDuplicatePropertiesShared } from "./opencode-config-validator.js";
 import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { run } from "./process.js";
 
@@ -202,29 +203,12 @@ function getAtPath(value: unknown, path: string[]): { exists: boolean; value?: u
 }
 
 function assertNoDuplicateProperties(content: string, configPath: string): void {
-  const root = parseTree(content);
-  function visit(node: JsonNode): void {
-    if (node.type === "object") {
-      const keys = new Set<string>();
-      for (const property of node.children ?? []) {
-        const key = property.children?.[0]?.value;
-        if (typeof key === "string") {
-          if (keys.has(key)) {
-            throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config contains duplicate properties", {
-              file: configPath,
-              property: key,
-            });
-          }
-          keys.add(key);
-        }
-        const value = property.children?.[1];
-        if (value !== undefined) visit(value);
-      }
-      return;
-    }
-    for (const child of node.children ?? []) visit(child);
-  }
-  if (root !== undefined) visit(root);
+  // Implemented by the small internal validator module
+  // (`src/opencode-config-validator.ts`) that owns the duplicate-property
+  // recursion. Kept as a thin pass-through here so init-side callers
+  // (`assertOpenCodeContentAvailable`) reuse the same canonical helper
+  // without exporting it from this module's public surface.
+  assertNoDuplicatePropertiesShared(content, configPath);
 }
 
 function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig): void {

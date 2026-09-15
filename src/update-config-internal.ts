@@ -38,6 +38,7 @@ import {
   SUPPORTED_OPENCODE_VERSIONS,
   verifyOpenCodeVersion,
 } from "./opencode.js";
+import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
@@ -442,6 +443,19 @@ async function runLockedUpdateConfigTransaction(
     });
   }
   const currentOpenCodeContentString = openCodeConfigCurrentBytes.toString("utf8");
+  // Reject duplicate managed properties in the CURRENT OpenCode config
+  // bytes BEFORE the parse-snapshot ownership check, no-op detection,
+  // projection, or any writes. The canonical JSONC parser resolves
+  // duplicate object keys to the LAST occurrence; the manifest's
+  // recorded `installed` value may match that last occurrence, allowing
+  // an earlier (foreign) duplicate value to silently overwrite the
+  // owned patch on the next transaction without raising
+  // CONFIG_OWNERSHIP_LOST. Reuses the existing
+  // `assertNoDuplicateProperties` canonical validator (init-side uses
+  // the same helper via `assertOpenCodeContentAvailable`); fail-closed
+  // with the same `INSTALL_PATH_CONFLICT` code and the same `property`
+  // detail shape.
+  assertNoDuplicateProperties(currentOpenCodeContentString, openCodeConfigPath);
   const currentOpenCodeJson = parseJsonc<JsonObject>(currentOpenCodeContentString, openCodeConfigPath);
 
   // 5a. Validate every recorded config patch for the OpenCode config against

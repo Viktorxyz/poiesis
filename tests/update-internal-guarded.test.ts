@@ -228,6 +228,76 @@ describe("ticket #44 — ordinary update guarded transaction acceptance criteria
     expect(afterParsed.experimental).toBeDefined();
   }, 60_000);
 
+  // Regression for ticket #50: ordinary update must reject duplicate
+  // managed OpenCode properties BEFORE any write fires. The canonical
+  // JSONC parser resolves duplicate object keys to the LAST occurrence;
+  // the manifest's recorded `installed` value may match that last
+  // occurrence, allowing an earlier (foreign) duplicate value to
+  // silently overwrite the owned patch on the next transaction
+  // without raising CONFIG_OWNERSHIP_LOST. Reuses the canonical
+  // recursive `assertNoDuplicateProperties` validator
+  // (init-side uses the same helper via
+  // `assertOpenCodeContentAvailable`); fail-closed with the same
+  // `INSTALL_PATH_CONFLICT` code and the same `{ file, property }`
+  // detail shape, with NO owned bytes mutated and the receipt
+  // generation+digest preserved.
+  it("fails closed with INSTALL_PATH_CONFLICT when the current OpenCode config has duplicate managed properties whose final value matches the owned state", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    await seedDefaultSkillDirectoriesAsPreexisting(repository);
+
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforePoiesisConfig = await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8");
+    const beforeReceipt = await readOwnershipReceipt(repository.root);
+    const beforeManifest = await loadManifest(repository.root);
+
+    // Sanity: pre-tampered OpenCode is single-keyed and the manifest
+    // records `default_agent` as an owned `installed` value.
+    const original = await readFile(openCodePath, "utf8");
+    expect(original).toContain('"default_agent": "poiesis"');
+    expect(beforeManifest.configPatches.some((p) => JSON.stringify(p.path) === JSON.stringify(["default_agent"]))).toBe(true);
+
+    // Replace the OpenCode config bytes with a duplicate-managed-path
+    // document where:
+    //   - first occurrence is a foreign value
+    //   - last occurrence is the OWNED value (matching manifest)
+    //   - an unrelated property is preserved to prove the validator
+    //     is scoped to the duplicate, not a blanket rejection.
+    // The JSONC parser resolves to the LAST occurrence; the parse
+    // snapshot ownership check would silently PASS without the new
+    // preflight. The duplicate check must reject before any write.
+    const tamperedOpenCodeBytes = Buffer.from(
+      [
+        '{',
+        '  "$schema": "https://opencode.ai/config.json",',
+        '  "default_agent": "foreign-agent",',
+        '  "unrelated_property": "preserved",',
+        '  "subagent_depth": 2,',
+        '  "default_agent": "poiesis",',
+        '}',
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await writeFile(openCodePath, tamperedOpenCodeBytes);
+
+    await expect(update(repository.root, { skipSkills: true })).rejects.toMatchObject({
+      code: "INSTALL_PATH_CONFLICT",
+      details: expect.objectContaining({ property: "default_agent" }),
+    });
+
+    // Owned bytes preserved byte-for-byte; receipt generation+digest
+    // do not advance.
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8")).toBe(beforePoiesisConfig);
+    expect(await readFile(openCodePath)).toEqual(tamperedOpenCodeBytes);
+    const afterReceipt = await readOwnershipReceipt(repository.root);
+    expect(afterReceipt.generation).toBe(beforeReceipt.generation);
+    expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
+  }, 60_000);
+
   it("captures a pre-existing OpenCode config byte-for-byte and restores it on rollback", async () => {
     // Acceptance criterion #3 + #4: capture physical OpenCode existence
     // and exact bytes independently of whole-file ownership; rollback
@@ -460,6 +530,82 @@ describe("ticket #44 — bootstrap guarded transaction acceptance criteria", () 
     expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifest)).toBe(0);
     const { ownershipReceiptExists } = await import("../src/receipt.js");
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
+  }, 60_000);
+
+  // Regression for ticket #50: legacy bootstrap must reject duplicate
+  // managed OpenCode properties BEFORE any write fires. Same invariant
+  // and validator as the ordinary update path; exercised here so the
+  // legacy 1.0.0 bootstrap surface is independently covered.
+  it("fails closed with INSTALL_PATH_CONFLICT when the current OpenCode config has duplicate managed properties whose final value matches the owned state", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+
+    // Strip the receipt so the bootstrap path is reachable.
+    const manifest = await loadManifest(repository.root);
+    manifest.poiesisVersion = "1.0.0";
+    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+    await removeOwnershipReceipt(repository.root);
+    const beforePoiesisConfig = await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8");
+
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const original = await readFile(openCodePath, "utf8");
+    expect(original).toContain('"default_agent": "poiesis"');
+
+    // Duplicate managed property; last occurrence equals the owned
+    // value; unrelated property preserved to scope the validator.
+    const tamperedOpenCodeBytes = Buffer.from(
+      [
+        '{',
+        '  "$schema": "https://opencode.ai/config.json",',
+        '  "default_agent": "foreign-agent",',
+        '  "unrelated_property": "preserved",',
+        '  "subagent_depth": 2,',
+        '  "default_agent": "poiesis",',
+        '}',
+      ].join("\n") + "\n",
+      "utf8",
+    );
+    await writeFile(openCodePath, tamperedOpenCodeBytes);
+
+    // The bootstrap transaction's legacy `LEGACY_BOOTSTRAP_REJECTED`
+    // hash check runs BEFORE the new duplicate-property preflight. To
+    // reach the new preflight without that legacy check rejecting, the
+    // recorded `opencode.jsonc` hash must match the tampered bytes.
+    // Update the manifest's recorded hash to match the duplicate-
+    // property bytes. This proves the new preflight is what fails closed,
+    // not the legacy hash check.
+    {
+      const { hashContent } = await import("../src/hash.js");
+      const manifestForDup = await loadManifest(repository.root);
+      const openCodeFile = manifestForDup.files.find((f) => f.path === "opencode.jsonc");
+      if (openCodeFile !== undefined) openCodeFile.hash = hashContent(tamperedOpenCodeBytes);
+      await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifestForDup));
+    }
+    // Capture baseline AFTER the test-setup hash update so the
+    // transaction-rejection proves preservation of the post-update bytes.
+    const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
+    const beforeManifest = await loadManifest(repository.root);
+    expect(beforeManifest.configPatches.some((p) => JSON.stringify(p.path) === JSON.stringify(["default_agent"]))).toBe(true);
+
+    // The bootstrap transaction must reject the duplicate-managed-property
+    // BEFORE any write. Pre-write ownership validation does NOT cover
+    // this — the JSONC parser resolves duplicates to the last occurrence,
+    // and the last occurrence matches the manifest's owned value, so the
+    // only line of defense is the canonical duplicate-property validator
+    // invoked from `captureTransactionArtifacts`.
+    await expect(runBootstrapLegacyOwnershipTransaction(repository.root, {}, {})).rejects.toMatchObject({
+      code: "INSTALL_PATH_CONFLICT",
+      details: expect.objectContaining({ property: "default_agent" }),
+    });
+
+    // Exact byte preservation of every owned byte and the tampered
+    // OpenCode config (which is NOT a managed artifact — preserve it
+    // exactly as written so the user can diagnose the tampering).
+    expect(Buffer.compare(await readFile(join(repository.root, ".poiesis", "manifest.json")), beforeManifestBytes)).toBe(0);
+    expect(await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8")).toBe(beforePoiesisConfig);
+    expect(await readFile(openCodePath)).toEqual(tamperedOpenCodeBytes);
+    expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
   }, 60_000);
 
   it("rolls back a pre-existing user OpenCode file byte-for-byte when the bootstrap doctor gate fails", async () => {
