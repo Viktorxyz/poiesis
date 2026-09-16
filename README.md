@@ -34,7 +34,15 @@ Poiesis is published as the `poiesis-cli` npm package. The CLI binary is named `
 
 ### First-time init
 
-In a real Git repository:
+In a real Git repository, the human happy path is flagless:
+
+```bash
+pnpm dlx poiesis-cli@latest init
+```
+
+`poiesis init` with no flags runs the interactive TTY flow: it discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
+
+For CI / non-interactive use, pass the structured JSON explicitly:
 
 ```bash
 pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc

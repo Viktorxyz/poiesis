@@ -32,6 +32,7 @@ type Values = Record<string, string | boolean | string[] | undefined>;
 const HELP = `Poiesis deterministic runtime
 
 Usage:
+  poiesis init                                        # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
@@ -107,7 +108,7 @@ async function main(argv: string[]): Promise<void> {
   }
 }
 
-async function commandInit(args: string[]): Promise<void> {
+export async function commandInit(args: string[]): Promise<void> {
   const values = options(args, {
     config: { type: "string" },
     "allow-fixtures": { type: "boolean" },
@@ -115,14 +116,34 @@ async function commandInit(args: string[]): Promise<void> {
   });
   const cwd = cwdOf(values);
   const root = await resolveGitRoot(cwd);
-  const configPath = resolve(cwd, required(values, "config"));
-  const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
-  writeSuccess(
-    "init",
-    await init(root, config, {
-      allowFixtureAdapters: boolean(values, "allow-fixtures"),
-    }),
-  );
+  const configArg = values.config;
+  // --config still drives the structured-JSON install path (no flagless
+  // interactive flow; ticket #58 keeps `--config` working exactly as
+  // before for CI / non-TTY operators).
+  if (typeof configArg === "string" && configArg.trim().length > 0) {
+    const configPath = resolve(cwd, configArg);
+    const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
+    writeSuccess(
+      "init",
+      await init(root, config, {
+        allowFixtureAdapters: boolean(values, "allow-fixtures"),
+      }),
+    );
+    return;
+  }
+  // Flagless path: the interactive init TTY flow. Every TTY check,
+  // prompt, model-selector call, and auth probe is delegated to the
+  // dedicated module so this dispatcher stays a thin shell.
+  const { runInteractiveInit, createProductionInteractiveInitIO } = await import("./init-interactive.js");
+  const io = createProductionInteractiveInitIO();
+  if (!io.isTTY) {
+    throw new PoiesisError(
+      "NON_TTY_INIT",
+      "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
+      { hint: "use `poiesis init --config <path>` or run inside a TTY" },
+    );
+  }
+  writeSuccess("init", await runInteractiveInit({ root, io }));
 }
 
 async function commandDoctor(args: string[]): Promise<void> {
