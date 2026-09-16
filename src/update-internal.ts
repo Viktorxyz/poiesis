@@ -635,7 +635,7 @@ async function runLockedUpdateTransaction(
  *
  * The bootstrap path runs when `MaintenanceOptions.bootstrapLegacyOwnership`
  * is set: it demotes a 1.0.0 install (no receipt, manual managed files)
- * to a current-shape Poiesis 1.0.3 install with a generation=1 receipt
+ * to a current-shape Poiesis install with a generation=1 receipt
  * and the new default-path `.gitignore` rule.
  */
 export async function runBootstrapLegacyOwnershipTransaction(

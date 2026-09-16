@@ -75,7 +75,7 @@ async function rebindReceipt(repository: TestRepository): Promise<void> {
   await replaceOwnershipReceipt(repository.root, manifest, existing);
 }
 
-async function setup1_0_3Install(repository: TestRepository): Promise<Manifest> {
+async function setupCurrentInstall(repository: TestRepository): Promise<Manifest> {
   return init(repository.root, testConfig(repository), {
     skipSkills: true,
     allowFixtureAdapters: true,
@@ -91,7 +91,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     repositories.push(repository);
     const config = testConfig(repository);
     // Bootstrap a current install to get the canonical current projection.
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     const currentManifest = await loadManifest(repository.root);
 
     const currentReviewer = currentManifest.configPatches.find(
@@ -119,7 +119,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("isExactProjection rejects any drift from the predecessor projection", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     const config = testConfig(repository);
     const predecessor = predecessorProjectionV100V101V102(config);
     const currentManifest = await loadManifest(repository.root);
@@ -142,7 +142,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("strict authority rejects an exact predecessor manifest without a receipt", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1");
 
     await expect(
@@ -162,7 +162,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("strict authority rejects predecessor versions outside the accepted set", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.0");
     // Receipt-authenticated update only accepts 1.0.1 / 1.0.2, NOT 1.0.0.
     const config = testConfig(repository);
@@ -175,7 +175,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("receipt-gates the predecessor tolerance: 1.0.1 predecessor + fake receipt is rejected", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1");
 
     // No receipt at all: update fails at receipt-gate.
@@ -184,10 +184,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     });
   }, 60_000);
 
-  it("trusted 1.0.1 predecessor update: receipt-authenticated, transitions to 1.0.3, preserves previous provenance, advances receipt once, strict doctor passes", async () => {
+  it("trusted 1.0.1 predecessor update: receipt-authenticated, transitions to the current package version, preserves previous provenance, advances receipt once, strict doctor passes", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    const firstManifest = await setup1_0_3Install(repository);
+    const firstManifest = await setupCurrentInstall(repository);
     const initialReceipt = await readOwnershipReceipt(repository.root);
     expect(initialReceipt.generation).toBe(1);
 
@@ -207,7 +207,8 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(2);
 
     // Step 2: receipt-authenticated update accepts the predecessor, transitions
-    // to 1.0.3, drops the obsolete task field, advances the receipt once.
+    // to the installed package version, drops the obsolete task field, advances
+    // the receipt once.
     const beforeConfigBytes = await readFile(join(repository.root, ".poiesis", "config.jsonc"));
     const beforeOpenCodeBytes = await readFile(join(repository.root, "opencode.jsonc"));
     const beforeManifestBytes = await readFile(join(repository.root, ".poiesis", "manifest.json"));
@@ -216,7 +217,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     const result = await update(repository.root, { skipSkills: true });
 
     expect(result.manifest.poiesisVersion).not.toBe("1.0.1");
-    expect(result.manifest.poiesisVersion).toBe("1.0.3");
+    expect(result.manifest.poiesisVersion).toBe("1.1.0");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
 
@@ -232,7 +233,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(receiptAfterUpdate.manifestDigest).not.toBe(receiptBeforeUpdate.manifestDigest);
 
     // Strict doctor passes the strict manifest/receipt/hashes checks against
-    // the fresh 1.0.3 manifest. (Skill check is skipped because the test
+    // the fresh manifest. (Skill check is skipped because the test
     // installs with skipSkills:true; doctor.report.ok is not asserted because
     // it would also fail the unrelated skills gate.)
     const report = await doctor(repository.root);
@@ -253,7 +254,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("trusted 1.0.2 predecessor update behaves the same as 1.0.1", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     const predecessorManifest = await asPredecessorManifest(repository, "1.0.2", { keepReceipt: true });
     expect(predecessorManifest.poiesisVersion).toBe("1.0.2");
     await rebindReceipt(repository);
@@ -272,7 +273,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
 
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.0.3");
+    expect(result.manifest.poiesisVersion).toBe("1.1.0");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
     expect(reviewerAfter.previousExists).toBe(false);
@@ -287,7 +288,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("exact predecessor drift is rejected: any extra key in poiesis-reviewer.permission fails the migration", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     const manifest = await loadManifest(repository.root);
     const config = testConfig(repository);
     const predecessor = predecessorProjectionV100V101V102(config);
@@ -311,7 +312,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("exact predecessor drift is accepted only when it equals the strict current projection", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     const manifest = await loadManifest(repository.root);
     // Strip the task field, making the manifest match the current projection,
     // not the predecessor. The strict check accepts this, so the tolerant
@@ -322,10 +323,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     await rebindReceipt(repository);
 
     // The manifest equals the strict current projection, so update() succeeds.
-    // The result version advances to the installed package version (1.0.3)
+    // The result version advances to the installed package version (1.1.0)
     // because update() always bumps poiesisVersion on success.
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.0.3");
+    expect(result.manifest.poiesisVersion).toBe("1.1.0");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
   }, 60_000);
@@ -333,7 +334,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("rollback restores the predecessor manifest, receipt, and config bytes when update fails mid-transaction", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1", { keepReceipt: true });
     await rebindReceipt(repository);
 
@@ -370,7 +371,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("rollback restores the .gitignore preimage byte-for-byte when update fails mid-transaction", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1", { keepReceipt: true });
     await rebindReceipt(repository);
 
@@ -416,7 +417,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("doctor stays strict: predecessor manifest WITHOUT successful migration is reported as invalid", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1");
     // No update call. Doctor against the unchanged predecessor manifest must
     // still report the manifest check as failing (strict, current-only).
@@ -427,7 +428,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("uninstall and installCapability remain strict (not migration-aware)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1", { keepReceipt: true });
     await rebindReceipt(repository);
 
@@ -449,7 +450,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("bootstrap-legacy-ownership with 1.0.1 predecessor is rejected (bootstrap is 1.0.0 only)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await asPredecessorManifest(repository, "1.0.1");
 
     await expect(

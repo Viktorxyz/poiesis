@@ -87,7 +87,7 @@ async function seedDefaultSkillDirectoriesAsPreexisting(repository: TestReposito
   }
 }
 
-async function setup1_0_3Install(repository: TestRepository): Promise<Manifest> {
+async function setupCurrentInstall(repository: TestRepository): Promise<Manifest> {
   return init(repository.root, testConfig(repository), {
     skipSkills: true,
     allowFixtureAdapters: true,
@@ -140,7 +140,7 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
   it("receipt-authenticated normal update from stale 1.0.2 gitignore restores exact gitignore bytes plus all transaction state on post-write doctor failure", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
     // Rewrite the manifest into the exact v1.0.2 predecessor shape and
     // rebind the receipt so the receipt-authenticated update is the
@@ -259,7 +259,7 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
   it("explicit 1.0.0 bootstrap restores exact .gitignore preimage on post-write doctor failure (shared helper with update)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await setup1_0_3Install(repository);
+    await setupCurrentInstall(repository);
     // Demote the install to the 1.0.0 predecessor so explicit
     // --bootstrap-legacy-ownership is the path exercised by the test.
     const manifest = await loadManifest(repository.root);

@@ -60,7 +60,7 @@ Do not modify project `AGENTS.md` by default.
 
 ## OpenCode adapter v1 projection
 
-The OpenCode projection files in this bundle target the **adapter-version-1** OpenCode config schema, verified against supported OpenCode tags `1.18.29` and `1.18.30` (see `COMPATIBILITY.md` and `src/opencode.ts::SUPPORTED_OPENCODE_VERSIONS`). OpenCode-specific projection syntax below is **adapter-syntax**, not harness-neutral Poiesis semantics; the Poiesis method, role files, and CLI surface remain harness-neutral.
+The OpenCode projection files in this bundle target the **adapter-version-1** OpenCode config schema, verified against supported OpenCode tags `1.18.29`, `1.18.30`, and `1.18.31` (see `COMPATIBILITY.md` and `src/opencode.ts::SUPPORTED_OPENCODE_VERSIONS`). OpenCode-specific projection syntax below is **adapter-syntax**, not harness-neutral Poiesis semantics; the Poiesis method, role files, and CLI surface remain harness-neutral.
 
 `poiesis-reviewer` and `poiesis-final-reviewer` are two harness projections of the same canonical `.poiesis/roles/reviewer.md`: the first is execution-model ticket review; the second is reasoning-model final Spec/Standards review. This duplication exists only because current OpenCode binds model choice to the agent definition rather than allowing per-subagent-call model selection.
 
@@ -69,7 +69,7 @@ These projections target:
 - Singular `agent` map at the config root (NOT plural `agents`);
 - Each `agent.<name>` carries a singular `permission` object (NOT plural `permissions` rules, NOT ordered rule lists);
 - `mode` is `primary` or `subagent`;
-- Permission keys are the singular V1 names such as `bash`, `task`, `skill`, `edit`, `read`, `glob`, `grep`, `list`, `webfetch`, `websearch`, `todowrite`, `question` (NOT the V2 names `shell`, `subagent`, etc., which are not accepted by `1.18.29` / `1.18.30`);
+- Permission keys are the singular V1 names such as `bash`, `task`, `skill`, `edit`, `read`, `glob`, `grep`, `list`, `webfetch`, `websearch`, `todowrite`, `question` (NOT the V2 names `shell`, `subagent`, etc., which are not accepted by `1.18.29` / `1.18.30` / `1.18.31`);
 - The literal `"*"` entry inside `permission` denies everything else.
 
 The implementation must still validate the installed OpenCode version/schema before applying changes.

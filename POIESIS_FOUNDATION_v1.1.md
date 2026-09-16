@@ -2678,6 +2678,16 @@ PRE-FLIGHT
 → VALIDATE WITH DOCTOR
 ```
 
+### Modes
+
+`poiesis init` has two supported entry points and one explicit fail-closed outcome:
+
+- **Flagless interactive (TTY).** The default. Discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection; prompts only the remaining Author-owned choices; probes tracker auth; and then calls the existing ownership install transaction. This is the normal Author happy path.
+- **`init --config <path>` (automation only).** Accepts a fully resolved Poiesis config file and skips the interactive prompts. Reserved for non-TTY invocations (CI, scripts, reproducible automation). The repository remote and integration branch are still read from the Git repository directly.
+- **Non-TTY without `--config`.** Fails closed with `NON_TTY_INIT`. Poiesis does not guess the Author-owned decisions for a non-interactive caller.
+
+The `repository.remote` and `repository.integrationBranch` keys in the config file are accepted for completeness, but the Git repository is the source of truth. `--remote` and `--integration-branch` are NOT CLI options; they were never supported.
+
 ### Pre-flight validates
 
 - Git repo;
@@ -2700,9 +2710,12 @@ PRE-FLIGHT
 - manifest;
 - curated skills through upstream mechanism;
 - generated OpenCode adapter files;
-- minimal required OpenCode config projection.
+- minimal required OpenCode config projection;
+- a resolved `.poiesis/config.jsonc` that subsequent operations consume.
 
 Init does not modify application code.
+
+The resolved `.poiesis/config.jsonc` is the **output** of init, not the input. The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init).
 
 ---
 

@@ -32,7 +32,7 @@ type Values = Record<string, string | boolean | string[] | undefined>;
 const HELP = `Poiesis deterministic runtime
 
 Usage:
-  poiesis init                                        # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
+  poiesis init                                          # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
@@ -40,15 +40,15 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
-  poiesis model                                           # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
-  poiesis model set reasoning|execution <provider/model>     # ticket #56 deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
-  poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
-  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
+  poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
+  poiesis model set reasoning|execution <provider/model> # deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
+  poiesis workspace prepare --branch <name> --spec <id> # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
+  poiesis workspace prepare --branch <name> --path <absolute> --spec <id> # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>     # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>     # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>   # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
