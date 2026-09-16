@@ -64,12 +64,15 @@ import {
   type UpdateResult,
   type UninstallResult,
   type UpdateConfigOptions,
+  type ModelClassName,
+  type SetModelResult,
   type SkillMaintenanceOptions,
   type CapabilityMaintenanceOptions,
   init,
   doctor,
   update,
   updateFromConfig,
+  setModel,
   uninstall,
   resolveConfigForRoot,
   resolveConfigRoot,
@@ -100,6 +103,22 @@ const forbiddenFunctions = [
   // security-sensitive preimage/journal/fault surface never reaches
   // the package root.
   "runCapabilityInstallTransaction",
+  // Ticket #57: the read-only init discovery composer (`composeInitDiscovery`)
+  // lives in `src/init-discovery.ts` and is intentionally NOT re-exported by
+  // the package root. The future `poiesis init` TTY (ticket #58) will import
+  // the composer directly from the source module, but the package-published
+  // surface must not advertise it yet.
+  "composeInitDiscovery",
+  // Ticket #55: the interactive model selector (`runModelSelector`,
+  // `createProductionModelSelectorIO`) lives in `src/model-selector.ts`
+  // and is intentionally NOT re-exported by the package root. The
+  // future `poiesis init` TTY (ticket #58) and `poiesis model`
+  // command (ticket #59) will import the selector directly from the
+  // source module; promoting it through the public API would lock the
+  // TTY keypress seam before CLI wiring exists.
+  "runModelSelector",
+  "createProductionModelSelectorIO",
+  "DEFAULT_RECOMMENDED_MODEL_IDS",
 ] as const;
 
 const forbiddenTypes = [
@@ -116,6 +135,38 @@ const forbiddenTypes = [
   // Ticket #47: the capability-install transaction seam stays internal.
   "CapabilityInstallTransactionHooks",
   "CapabilityMaintenanceInternalOptions",
+  // Ticket #57: every composer detection / source type stays internal.
+  // The composer and its detection shapes are deliberate internal seams so the
+  // future `poiesis init` TTY (ticket #58) owns them; promoting them through
+  // the public API would lock the discovery contract before the TTY exists.
+  "InitDiscoveryResult",
+  "InitDiscoveryDetection",
+  "RemoteDetection",
+  "BranchDetection",
+  "VerificationDetection",
+  "TrackerDetection",
+  "DeliveryDetection",
+  "DeliveryDetectionTarget",
+  "RepoStateDetection",
+  "RemoteSource",
+  "BranchSource",
+  "VerificationSource",
+  "TrackerSource",
+  "DeliverySource",
+  // Ticket #55: every model-selector type stays internal. The selector
+  // is a deliberate internal seam so the future `poiesis init` TTY
+  // (ticket #58) and `poiesis model` command (ticket #59) own the
+  // IO/keypress contract directly; promoting any of these types
+  // through the public API would freeze that contract before CLI
+  // wiring exists.
+  "ModelClass",
+  "ModelIdentity",
+  "RecommendedModelIds",
+  "ModelSelectorKey",
+  "ModelSelectorIO",
+  "ModelSelectorRenderedRow",
+  "RunModelSelectorArgs",
+  "ProductionModelSelectorIOArgs",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
@@ -188,6 +239,7 @@ describe("public API declarations (type-level)", () => {
     void doctor;
     void update;
     void updateFromConfig;
+    void setModel;
     void uninstall;
     void resolveConfigForRoot;
     void resolveConfigRoot;
@@ -207,13 +259,17 @@ describe("public API declarations (type-level)", () => {
     type _UpdateResult = UpdateResult;
     type _UninstallResult = UninstallResult;
     type _UpdateConfigOptions = UpdateConfigOptions;
+    type _ModelClassName = ModelClassName;
+    type _SetModelResult = SetModelResult;
     void null as unknown as _MaintenanceOptions &
       _DoctorCheckStatus &
       _DoctorCheck &
       _DoctorReport &
       _UpdateResult &
       _UninstallResult &
-      _UpdateConfigOptions;
+      _UpdateConfigOptions &
+      _ModelClassName &
+      _SetModelResult;
   });
 
   it("ticket #46 internal seams do not leak through SkillMaintenanceOptions", () => {

@@ -1706,6 +1706,122 @@ export async function updateFromConfig(
   return runUpdateConfigTransaction(root, configPath, options, {});
 }
 
+/**
+ * Canonical user-facing model class identifiers. These are the only
+ * values `setModel` (and the matching CLI subcommand) accept; every
+ * other input is rejected fail-closed with `INVALID_MODEL_CLASS` before
+ * any side effect. Mirrors the user-facing classes documented in
+ * POIESIS_FOUNDATION_v1.1 §45 (User-facing model classes).
+ */
+export type ModelClassName = "reasoning" | "execution";
+
+/**
+ * `setModel` adds a structured `restart` notice to the standard
+ * `UpdateResult` shape. The notice tells the operator that OpenCode
+ * must be restarted for the new model configuration to take effect;
+ * Poiesis intentionally does NOT start, stop, or signal OpenCode on
+ * the operator's behalf (per ticket #56 constraint: "do not restart
+ * OpenCode"). The `started` flag is a literal `false` so the field is
+ * self-describing in the JSON payload — it is never set to `true`.
+ */
+export interface SetModelResult extends UpdateResult {
+  restart: { notice: string; started: false };
+}
+
+const MODEL_ID_FORMAT = /^[^/]+\/.+$/;
+const MODEL_INTERACTIVE_HINT =
+  "use `poiesis model set reasoning|execution <provider/model>` (TTY interactive model selection arrives in ticket #59)";
+
+/**
+ * Deterministic wrapper for `poiesis model set reasoning|execution <id>`.
+ *
+ * This is the THIN wrapper around `updateFromConfig` for ticket #56.
+ * It performs exactly three steps and nothing else:
+ *
+ *   1. Validate `className` and `modelId` against the canonical format
+ *      and probe the live OpenCode model inventory via `opencode models`.
+ *      A missing class throws `INVALID_MODEL_CLASS`, a missing ID format
+ *      throws `INVALID_MODEL_ID`, and an ID that is not in the live
+ *      inventory throws `MODEL_UNAVAILABLE` — all BEFORE any byte is
+ *      written and BEFORE the candidate config file is staged. There
+ *      is no model substitution (ticket #48: "no substitute").
+ *
+ *   2. Load the installed Poiesis config, mutate ONLY the requested
+ *      class field, and serialize the proposed candidate to a private
+ *      temp file under the system temp directory.
+ *
+ *   3. Hand the candidate file to `updateFromConfig` and return its
+ *      result plus the restart notice. Every transaction invariant
+ *      (receipt auth, no-op detection, doctor gate, fail-closed
+ *      rollback) stays the single source of truth — `setModel` adds
+ *      NO second config writer.
+ *
+ * The temp file is unlinked in a `finally` so a foreign-writer race
+ * or doctor-gate failure cannot leak the proposed candidate onto the
+ * repository filesystem after the transaction settles.
+ */
+export async function setModel(
+  root: string,
+  className: ModelClassName,
+  modelId: string,
+): Promise<SetModelResult> {
+  if (className !== "reasoning" && className !== "execution") {
+    throw new PoiesisError("INVALID_MODEL_CLASS", `Unknown model class: ${className}`, { className });
+  }
+  if (typeof modelId !== "string" || !MODEL_ID_FORMAT.test(modelId)) {
+    throw new PoiesisError(
+      "INVALID_MODEL_ID",
+      "Model ID must use provider/model format",
+      { modelId },
+    );
+  }
+
+  // Inventory probe runs BEFORE any write. Reuses the same parser
+  // `verifyModels` and `update --config` already use, so the
+  // trim/blank/dedupe semantics stay consistent. The error shape
+  // mirrors `verifyModels` so downstream tooling can reuse the same
+  // matcher.
+  const inventory = await run("opencode", ["models"], { cwd: root, allowFailure: true });
+  if (inventory.exitCode !== 0) {
+    throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {
+      stderr: inventory.stderr,
+    });
+  }
+  const available = parseOpenCodeModelInventory(inventory.stdout);
+  if (!available.has(modelId)) {
+    throw new PoiesisError("MODEL_UNAVAILABLE", "Configured OpenCode model is unavailable", {
+      missing: [modelId],
+    });
+  }
+
+  // Load the installed config, mutate ONLY the requested class, and
+  // route the proposed candidate through `updateFromConfig`. The
+  // wrapper MUST NOT add a second config writer — every other
+  // transaction invariant is reused.
+  const current = await loadConfig(root);
+  const proposed: PoiesisConfig = {
+    ...current,
+    models: { ...current.models, [className]: modelId },
+  };
+
+  const tempDir = await mkdtemp(join(tmpdir(), "poiesis-model-set-"));
+  const candidatePath = join(tempDir, "candidate-config.jsonc");
+  try {
+    await atomicWrite(candidatePath, serializeConfig(proposed));
+    const result = await updateFromConfig(root, candidatePath);
+    return {
+      manifest: result.manifest,
+      doctor: result.doctor,
+      restart: {
+        notice: "Restart OpenCode to apply the new model configuration. Poiesis did not restart OpenCode.",
+        started: false,
+      },
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
 export async function uninstall(root: string): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
   const manifest = await loadManifest(resolvedRoot);

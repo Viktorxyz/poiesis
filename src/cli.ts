@@ -5,7 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -39,6 +39,7 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
+  poiesis model set reasoning|execution <provider/model>     # ticket #56 deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
   poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
@@ -81,6 +82,8 @@ async function main(argv: string[]): Promise<void> {
       return commandInspect(rest);
     case "capability":
       return commandCapability(rest);
+    case "model":
+      return commandModel(rest);
     case "workspace":
       return commandWorkspace(rest);
     case "checkpoint":
@@ -195,6 +198,51 @@ async function commandCapability(args: string[]): Promise<void> {
       name: required(values, "name"),
       revision: required(values, "revision"),
     }),
+  );
+}
+
+/**
+ * CLI dispatch for `poiesis model ...` (ticket #56).
+ *
+ * Only `model set reasoning|execution <provider/model>` is wired.
+ * Bare `poiesis model` fails closed with `MODEL_INTERACTIVE_UNAVAILABLE`
+ * because the TTY interactive selector arrives in ticket #59; the
+ * hint in the error payload points operators at the deterministic
+ * command. Unknown subcommands error with `UNKNOWN_COMMAND` and
+ * explicitly list the supported set.
+ */
+export async function commandModel(args: string[]): Promise<void> {
+  if (args.length === 0) {
+    throw new PoiesisError(
+      "MODEL_INTERACTIVE_UNAVAILABLE",
+      "poiesis model without a subcommand requires an interactive TTY; TTY interactive model selection arrives in ticket #59",
+      { hint: "use `poiesis model set reasoning|execution <provider/model>`" },
+    );
+  }
+  const sub = args[0];
+  if (sub !== "set") {
+    throw new PoiesisError("UNKNOWN_COMMAND", `Unknown model subcommand: ${sub ?? ""}`, {
+      subcommand: sub ?? "",
+      supported: ["set"],
+    });
+  }
+  // Parse `set` arguments positionally: `<class> <id>` followed by
+  // `--cwd`. `parseArgs` rejects positionals in strict mode, so we
+  // slice them off the head and run the parser only on the flag tail.
+  const positional = args.slice(1, 3);
+  const className = positional[0];
+  const modelId = positional[1];
+  if (typeof className !== "string" || className.length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model class", { expected: "reasoning|execution" });
+  }
+  if (typeof modelId !== "string" || modelId.length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model ID", { expected: "<provider/model>" });
+  }
+  const values = options(args.slice(3), { cwd: { type: "string" } });
+  const root = await resolveGitRoot(cwdOf(values));
+  writeSuccess(
+    "model.set",
+    await setModel(root, className as ModelClassName, modelId),
   );
 }
 
