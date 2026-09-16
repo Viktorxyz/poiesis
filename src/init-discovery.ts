@@ -166,7 +166,10 @@ export async function composeInitDiscovery(
   if (trackerDetection.source === "missing" || trackerDetection.project === undefined) {
     unresolved.push("tracker.project");
   }
-  if (draft?.tracker.provider === undefined) {
+  if (
+    draft?.tracker.provider === undefined &&
+    trackerDetection.provider === undefined
+  ) {
     unresolved.push("tracker.provider");
   }
   if (draft?.models.reasoning === undefined || draft.models.reasoning.trim().length === 0) {

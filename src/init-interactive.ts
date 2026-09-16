@@ -292,17 +292,36 @@ async function resolveAuthorChoices(
   // The composer has the detection objects even when it could not
   // return a fully resolved config. Walk the unresolved paths in a
   // stable order.
-  const base: PoiesisConfig = draft ?? {
+  //
+  // The tracker block is seeded from the composer's discovery result
+  // when the remote URL uniquely identifies a supported provider
+  // (github.com or gitlab.com). The Author MUST NOT be prompted for a
+  // provider that the composer already knows — that would either push
+  // the Author toward a default that contradicts the remote (e.g.
+  // github for a gitlab.com host) or drop the discovered project.
+  // `tracker` is intentionally typed loosely here: when discovery did not
+  // fill the provider (unknown remote host), the provider field is omitted.
+  // The prompt below requires an explicit `github`|`gitlab` answer before
+  // `init()` runs, so the runtime config always carries a valid provider
+  // by the time it reaches the validation layer.
+  const base: PoiesisConfig = (draft ?? {
     schema: 1,
     models: { reasoning: "", execution: "" },
-    tracker: { provider: "github" },
+    tracker: {
+      ...(discovery.detections.tracker.provider !== undefined
+        ? { provider: discovery.detections.tracker.provider }
+        : {}),
+      ...(discovery.detections.tracker.project !== undefined
+        ? { project: discovery.detections.tracker.project }
+        : {}),
+    },
     delivery: {
       preview: { adapter: "command", command: ["<delivery-executable>", "preview", "{sha}"] },
       staging: { adapter: "command", command: ["<delivery-executable>", "staging", "{sha}"] },
       production: { adapter: "command", command: ["<delivery-executable>", "production", "{sha}"] },
     },
     verification: { commands: [] },
-  };
+  }) as PoiesisConfig;
 
   const next: PoiesisConfig = JSON.parse(JSON.stringify(base)) as PoiesisConfig;
 
@@ -349,16 +368,19 @@ async function resolveAuthorChoices(
   }
 
   // Tracker: provider may be missing when the remote host is unknown.
+  // The Author MUST supply an explicit `github` or `gitlab` answer — empty
+  // Enter or any other value fails closed. The composer refuses to invent
+  // a host, mirroring the discovery layer's no-guess rule.
   if (discovery.unresolved.includes("tracker.provider")) {
-    const answer = await promptWithDefault(io, "Tracker provider", "github");
-    if (answer !== "github" && answer !== "gitlab") {
+    const raw = (await io.promptLine("Tracker provider (github|gitlab)")).trim();
+    if (raw !== "github" && raw !== "gitlab") {
       throw new PoiesisError(
         "INVALID_TRACKER_PROVIDER",
-        "Unsupported tracker provider",
-        { provider: answer, supported: ["github", "gitlab"] },
+        "Unsupported tracker provider; only `github` or `gitlab` are accepted",
+        { provider: raw, supported: ["github", "gitlab"] },
       );
     }
-    next.tracker = { ...next.tracker, provider: answer };
+    next.tracker = { ...(next.tracker ?? {}), provider: raw };
   }
   if (discovery.unresolved.includes("tracker.project")) {
     const project = await promptWithDefault(io, "Tracker project", "");

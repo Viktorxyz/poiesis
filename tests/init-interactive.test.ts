@@ -419,7 +419,155 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(message).toContain("glab auth login");
   });
 
-  it("records the Author's tracker choice without ever restarting OpenCode from the init flow", async () => {
+  it("discovers tracker provider+project from a github.com remote WITHOUT a draft and never prompts for provider", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    // Point origin at a github.com URL so the composer resolves
+    // provider+project from the remote.
+    await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless-interactive.git"], { cwd: repo.root });
+    // No draft at all — flagless invocation. We still need to script the
+    // model selector answers because the composer leaves the models
+    // unresolved when no draft is provided.
+    const io = scriptedInitIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+      modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      promptAnswers: { "verification command": "test -f README.md" },
+    });
+    // The remote is not actually reachable; `init()` will eventually fail
+    // when `verifyGitRepository` runs `git ls-remote` against the github
+    // URL. The interesting behavior for this ticket is the prompt log
+    // BEFORE init() runs: the composer MUST NOT have asked the Author for
+    // the tracker provider or the tracker project. We catch any failure
+    // and assert on the prompt log.
+    let caught: unknown;
+    try {
+      await runInteractiveInit({ root: repo.root, io });
+    } catch (error) {
+      caught = error;
+    }
+    // The composer must NOT have prompted the Author for the provider,
+    // because the github.com URL is enough to infer it uniquely.
+    const providerPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker provider"));
+    expect(providerPrompt, "no tracker provider prompt is expected when the remote host is github.com").toBeUndefined();
+
+    // The Author's prompt log must not contain "Tracker project" either —
+    // the composer must copy the discovered project into the config rather
+    // than starting from `tracker: { provider: "github" }` with no project.
+    const projectPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker project"));
+    expect(projectPrompt, "no tracker project prompt is expected when the project is discovered from the github.com URL").toBeUndefined();
+
+    // The flow reached `init()`, which then failed on the unreachable
+    // github URL — that is the expected, documented verification path.
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe("GIT_REMOTE_UNAVAILABLE");
+  });
+
+  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft and never prompts for provider", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    await run("git", ["remote", "set-url", "origin", "https://gitlab.com/poiesis-test/flagless-gitlab-interactive.git"], { cwd: repo.root });
+    // No draft at all — flagless invocation.
+    const io = scriptedInitIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+      modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      promptAnswers: { "verification command": "test -f README.md" },
+    });
+    let caught: unknown;
+    try {
+      await runInteractiveInit({ root: repo.root, io });
+    } catch (error) {
+      caught = error;
+    }
+    // The composer must NOT have prompted the Author for the provider.
+    const providerPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker provider"));
+    expect(providerPrompt, "no tracker provider prompt is expected when the remote host is gitlab.com").toBeUndefined();
+
+    // The composer must NOT have prompted the Author for the project either.
+    const projectPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker project"));
+    expect(projectPrompt, "no tracker project prompt is expected when the project is discovered from the gitlab.com URL").toBeUndefined();
+
+    // The flow reached `init()`, which then failed on the unreachable
+    // gitlab URL — that is the expected, documented verification path.
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe("GIT_REMOTE_UNAVAILABLE");
+  });
+
+  it("still prompts the Author for the tracker provider (and does NOT guess github) when the remote host is unknown", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    // Use a remote URL whose host is unknown to the composer. We point it
+    // at the local bare remote shipped with the fixture so `git ls-remote`
+    // succeeds; the composer's tracker parser is the only thing that
+    // matters here.
+    await run("git", ["remote", "set-url", "origin", repo.remote], { cwd: repo.root });
+    // No draft at all — flagless invocation.
+    const io = scriptedInitIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+      modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      promptAnswers: {
+        "verification command": "test -f README.md",
+        "tracker provider": "github",
+        "tracker project": "example/project",
+      },
+    });
+    const manifest = await runInteractiveInit({ root: repo.root, io });
+    expect(manifest).toBeDefined();
+
+    // The composer must have prompted for the provider (unknown host).
+    const providerPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker provider"));
+    expect(providerPrompt, "tracker provider prompt is expected when the remote host is unknown").toBeDefined();
+
+    // The prompt must NOT advertise a silent default — unknown hosts must
+    // require an explicit github|gitlab answer. Empty Enter MUST fail closed.
+    // The previous shape was "Tracker provider [github]" (a default in
+    // `[...]`); that bracket-default must NOT be present anymore.
+    expect(providerPrompt?.prompt).not.toMatch(/\[github\]/);
+    expect(providerPrompt?.prompt).not.toMatch(/\[gitlab\]/);
+
+    // The Author's answer must be carried into the final config.
+    const installedConfigRaw = await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8");
+    expect(installedConfigRaw).toContain("example/project");
+  }, 30_000);
+
+  it("fails closed on an empty tracker-provider answer (no silent github default)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    // Remote host is unknown so the composer leaves tracker.provider unresolved.
+    await run("git", ["remote", "set-url", "origin", repo.remote], { cwd: repo.root });
+    // No draft at all — flagless invocation.
+    const io = scriptedInitIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+      modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      promptAnswers: {
+        "verification command": "test -f README.md",
+        // Empty Enter must fail closed; the composer MUST NOT silently
+        // default to github.
+        "tracker provider": "",
+      },
+    });
+    let caught: unknown;
+    try {
+      await runInteractiveInit({ root: repo.root, io });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught, "expected INVALID_TRACKER_PROVIDER but the empty answer was accepted").toBeDefined();
+    expect((caught as { code?: string }).code).toBe("INVALID_TRACKER_PROVIDER");
+    // The init() transaction must NOT have run — auth probe / install must
+    // short-circuit before any byte is written.
+    expect(io.authProbes).toEqual([]);
+    expect(io.prompts.some((p) => p.prompt.toLowerCase().includes("tracker project"))).toBe(false);
+  }, 30_000);
+
+it("records the Author's tracker choice without ever restarting OpenCode from the init flow", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await writeDeliveryScripts(repo.root);

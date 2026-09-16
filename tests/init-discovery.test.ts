@@ -331,7 +331,54 @@ describe("composeInitDiscovery", () => {
     // it must leave models as unresolved rather than fabricating them.
     expect(result.unresolved).toContain("models.reasoning");
     expect(result.unresolved).toContain("models.execution");
+    // The local bare-repo fixture is not a github.com / gitlab.com URL, so
+    // the composer cannot infer a tracker provider and must leave it
+    // unresolved (rather than guessing github).
     expect(result.unresolved).toContain("tracker.provider");
+  });
+
+  it("discovers tracker provider+project from a github.com remote WITHOUT a draft (flagless init)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless.git"], { cwd: repository.root });
+    // No draft at all — flagless invocation.
+    const result = await composeInitDiscovery(repository.root);
+    // The composer must NOT mark `tracker.provider` unresolved when it has
+    // already discovered the provider from the remote URL.
+    expect(result.unresolved).not.toContain("tracker.provider");
+    // The discovered detection carries both provider and project.
+    expect(result.detections.tracker.provider).toBe("github");
+    expect(result.detections.tracker.project).toBe("poiesis-test/flagless");
+    expect(result.detections.tracker.source).toBe("remote-github");
+  });
+
+  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft (flagless init)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await run("git", ["remote", "set-url", "origin", "https://gitlab.com/poiesis-test/flagless-gitlab.git"], { cwd: repository.root });
+    // No draft at all — flagless invocation.
+    const result = await composeInitDiscovery(repository.root);
+    // The composer must NOT mark `tracker.provider` unresolved when it has
+    // already discovered gitlab from the remote URL.
+    expect(result.unresolved).not.toContain("tracker.provider");
+    // The discovered detection carries gitlab + the discovered project.
+    expect(result.detections.tracker.provider).toBe("gitlab");
+    expect(result.detections.tracker.project).toBe("poiesis-test/flagless-gitlab");
+    expect(result.detections.tracker.source).toBe("remote-gitlab");
+  });
+
+  it("leaves tracker.provider unresolved (and does NOT guess github) when the remote host is unknown", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // Use a remote URL whose host is neither github.com nor gitlab.com.
+    await run("git", ["remote", "set-url", "origin", "https://example.com/some/repo.git"], { cwd: repository.root });
+    // No draft at all — flagless invocation.
+    const result = await composeInitDiscovery(repository.root);
+    // The composer must leave `tracker.provider` unresolved; it MUST NOT
+    // silently default to github.
+    expect(result.unresolved).toContain("tracker.provider");
+    expect(result.detections.tracker.provider).toBeUndefined();
+    expect(result.detections.tracker.source).toBe("missing");
   });
 
   it("honors an explicit tracker.project and reports source=explicit", async () => {
