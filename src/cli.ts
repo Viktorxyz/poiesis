@@ -40,6 +40,7 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
+  poiesis model                                           # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis model set reasoning|execution <provider/model>     # ticket #56 deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
   poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
@@ -223,22 +224,30 @@ async function commandCapability(args: string[]): Promise<void> {
 }
 
 /**
- * CLI dispatch for `poiesis model ...` (ticket #56).
+ * CLI dispatch for `poiesis model ...` (ticket #56 / #59).
  *
- * Only `model set reasoning|execution <provider/model>` is wired.
- * Bare `poiesis model` fails closed with `MODEL_INTERACTIVE_UNAVAILABLE`
- * because the TTY interactive selector arrives in ticket #59; the
- * hint in the error payload points operators at the deterministic
- * command. Unknown subcommands error with `UNKNOWN_COMMAND` and
- * explicitly list the supported set.
+ * `model set reasoning|execution <provider/model>` is the deterministic
+ * single-class set (ticket #56) and is unchanged. Bare `poiesis model`
+ * on a TTY now invokes the interactive flow (ticket #59) so the
+ * Author can change exactly one slot through the shared selector.
+ * Bare `poiesis model` on a non-TTY invocation fails closed with
+ * `NON_TTY_MODEL` and a hint pointing at the deterministic subcommand.
+ * Unknown subcommands error with `UNKNOWN_COMMAND` and explicitly list
+ * the supported set.
  */
 export async function commandModel(args: string[]): Promise<void> {
   if (args.length === 0) {
-    throw new PoiesisError(
-      "MODEL_INTERACTIVE_UNAVAILABLE",
-      "poiesis model without a subcommand requires an interactive TTY; TTY interactive model selection arrives in ticket #59",
-      { hint: "use `poiesis model set reasoning|execution <provider/model>`" },
+    const values = options(args, { cwd: { type: "string" } });
+    const root = await resolveGitRoot(cwdOf(values));
+    const { runInteractiveModel, createProductionInteractiveModelIO } = await import(
+      "./model-interactive.js"
     );
+    const io = createProductionInteractiveModelIO();
+    // The interactive flow refuses non-TTY itself with `NON_TTY_MODEL`
+    // (the canonical ticket #59 error code); the dispatch surface stays
+    // a thin shell.
+    writeSuccess("model.interactive", await runInteractiveModel({ root, io }));
+    return;
   }
   const sub = args[0];
   if (sub !== "set") {

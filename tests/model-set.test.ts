@@ -384,9 +384,14 @@ describe("commandModel (CLI)", () => {
     expect(payload.result.restart.notice).toMatch(/restart/i);
   }, 30_000);
 
-  it("fails closed when bare `poiesis model` is invoked (TTY interactive is ticket #59)", async () => {
+  it("fails closed when bare `poiesis model` is invoked in a non-TTY environment (interactive flow arrives in ticket #59)", async () => {
+    // Under Vitest `process.stdin.isTTY` is undefined → the production
+    // IO factory reports `isTTY: false` → the interactive flow refuses
+    // with `NON_TTY_MODEL` and the hint points at the deterministic
+    // subcommand. The ticket #59 TTY happy path is covered by
+    // `tests/model-interactive.test.ts`.
     await expect(commandModel([])).rejects.toMatchObject({
-      code: "MODEL_INTERACTIVE_UNAVAILABLE",
+      code: "NON_TTY_MODEL",
       details: expect.objectContaining({
         hint: expect.stringContaining("poiesis model set reasoning|execution"),
       }),

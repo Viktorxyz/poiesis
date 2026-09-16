@@ -1730,7 +1730,7 @@ export interface SetModelResult extends UpdateResult {
 
 const MODEL_ID_FORMAT = /^[^/]+\/.+$/;
 const MODEL_INTERACTIVE_HINT =
-  "use `poiesis model set reasoning|execution <provider/model>` (TTY interactive model selection arrives in ticket #59)";
+  "use `poiesis model` on a TTY for the interactive selector, or `poiesis model set reasoning|execution <provider/model>` for the deterministic single-class set";
 
 /**
  * Deterministic wrapper for `poiesis model set reasoning|execution <id>`.
