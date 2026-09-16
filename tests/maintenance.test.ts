@@ -1,7 +1,18 @@
 import { chmod, lstat, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { init, uninstall, update, resolveConfigForRoot } from "../src/maintenance.js";
+import { run } from "../src/process.js";
+import {
+  autoResolveConfigDefaults,
+  init,
+  resolveConfigForRoot,
+  uninstall,
+  update,
+  parseGitHubProject,
+  parseGitLabProject,
+  parseOpenCodeModelInventory,
+  parseTrackerFromUrl,
+} from "../src/maintenance.js";
 import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { atomicWrite, exists } from "../src/fs.js";
 import { hashOwnedSkillDirectory } from "../src/skills.js";
@@ -399,5 +410,274 @@ describe("maintenance ownership", () => {
     expect(resolved.repository.remote).toBe("origin");
     expect(resolved.repository.integrationBranch).toBe("main");
     expect(resolved.verification.commands).toEqual(["true"]);
+  });
+});
+
+describe("parseOpenCodeModelInventory (library seam)", () => {
+  it("returns a set of newline-trimmed, non-empty identities", () => {
+    const inventory = parseOpenCodeModelInventory(
+      "openai/gpt-5.6-sol\nminimax/MiniMax-M3\n\nminimax/MiniMax-M3-alt\n",
+    );
+    expect(inventory).toBeInstanceOf(Set);
+    expect([...inventory].sort()).toEqual([
+      "minimax/MiniMax-M3",
+      "minimax/MiniMax-M3-alt",
+      "openai/gpt-5.6-sol",
+    ]);
+  });
+
+  it("ignores whitespace-only lines and trims surrounding whitespace", () => {
+    const inventory = parseOpenCodeModelInventory("  openai/gpt-5.6-sol  \n   \n\tminimax/MiniMax-M3\t\n");
+    expect([...inventory]).toEqual(["openai/gpt-5.6-sol", "minimax/MiniMax-M3"]);
+  });
+
+  it("returns an empty set when the inventory is empty or whitespace", () => {
+    expect([...parseOpenCodeModelInventory("")]).toEqual([]);
+    expect([...parseOpenCodeModelInventory("   \n  \n")]).toEqual([]);
+  });
+
+  it("deduplicates repeated identities", () => {
+    const inventory = parseOpenCodeModelInventory("openai/gpt-5.6-sol\nopenai/gpt-5.6-sol\nminimax/MiniMax-M3\n");
+    expect(inventory.size).toBe(2);
+    expect(inventory.has("openai/gpt-5.6-sol")).toBe(true);
+    expect(inventory.has("minimax/MiniMax-M3")).toBe(true);
+  });
+});
+
+describe("parseGitHubProject (library seam)", () => {
+  it("parses HTTPS github.com URLs", () => {
+    expect(parseGitHubProject("https://github.com/owner/repo.git")).toBe("owner/repo");
+    expect(parseGitHubProject("https://github.com/owner/repo")).toBe("owner/repo");
+    expect(parseGitHubProject("http://github.com/owner/repo.git")).toBe("owner/repo");
+  });
+
+  it("parses SSH github.com URLs", () => {
+    expect(parseGitHubProject("git@github.com:owner/repo.git")).toBe("owner/repo");
+    expect(parseGitHubProject("git@github.com:owner/repo")).toBe("owner/repo");
+  });
+
+  it("trims surrounding whitespace before matching", () => {
+    expect(parseGitHubProject("  git@github.com:owner/repo.git  ")).toBe("owner/repo");
+    expect(parseGitHubProject(" https://github.com/owner/repo.git\n")).toBe("owner/repo");
+  });
+
+  it("returns null for non-github hosts", () => {
+    expect(parseGitHubProject("https://gitlab.com/owner/repo.git")).toBeNull();
+    expect(parseGitHubProject("https://git.example.com/owner/repo.git")).toBeNull();
+  });
+
+  it("returns null for malformed github URLs", () => {
+    expect(parseGitHubProject("https://github.com/single-segment")).toBeNull();
+    expect(parseGitHubProject("https://github.com/")).toBeNull();
+    expect(parseGitHubProject("not a url")).toBeNull();
+    expect(parseGitHubProject("")).toBeNull();
+  });
+});
+
+describe("parseGitLabProject (library seam)", () => {
+  it("parses HTTPS gitlab.com URLs with two segments", () => {
+    expect(parseGitLabProject("https://gitlab.com/owner/repo.git")).toBe("owner/repo");
+    expect(parseGitLabProject("https://gitlab.com/owner/repo")).toBe("owner/repo");
+    expect(parseGitLabProject("http://gitlab.com/owner/repo.git")).toBe("owner/repo");
+  });
+
+  it("parses SSH gitlab.com URLs with two segments", () => {
+    expect(parseGitLabProject("git@gitlab.com:owner/repo.git")).toBe("owner/repo");
+    expect(parseGitLabProject("git@gitlab.com:owner/repo")).toBe("owner/repo");
+  });
+
+  it("parses gitlab.com URLs with nested groups (HTTPS)", () => {
+    expect(parseGitLabProject("https://gitlab.com/group/subgroup/repo.git")).toBe("group/subgroup/repo");
+    expect(parseGitLabProject("https://gitlab.com/a/b/c/d/e/repo.git")).toBe("a/b/c/d/e/repo");
+    expect(parseGitLabProject("https://gitlab.com/group/subgroup/repo")).toBe("group/subgroup/repo");
+  });
+
+  it("parses gitlab.com URLs with nested groups (SSH)", () => {
+    expect(parseGitLabProject("git@gitlab.com:group/subgroup/repo.git")).toBe("group/subgroup/repo");
+    expect(parseGitLabProject("git@gitlab.com:a/b/c/d/e/repo.git")).toBe("a/b/c/d/e/repo");
+  });
+
+  it("returns null for a single-segment gitlab.com URL (group only, no project)", () => {
+    expect(parseGitLabProject("https://gitlab.com/single-segment")).toBeNull();
+    expect(parseGitLabProject("https://gitlab.com/single-segment.git")).toBeNull();
+    expect(parseGitLabProject("git@gitlab.com:single-segment.git")).toBeNull();
+  });
+
+  it("returns null for non-gitlab hosts", () => {
+    expect(parseGitLabProject("https://github.com/owner/repo.git")).toBeNull();
+    expect(parseGitLabProject("https://gitlab.example.com/owner/repo.git")).toBeNull();
+  });
+
+  it("returns null for malformed or empty URLs", () => {
+    expect(parseGitLabProject("https://gitlab.com/")).toBeNull();
+    expect(parseGitLabProject("https://gitlab.com")).toBeNull();
+    expect(parseGitLabProject("not a url")).toBeNull();
+    expect(parseGitLabProject("")).toBeNull();
+  });
+
+  it("does not match gitlab.com URLs with empty segments (e.g., trailing slash, double slash)", () => {
+    expect(parseGitLabProject("https://gitlab.com/group//repo.git")).toBeNull();
+    expect(parseGitLabProject("git@gitlab.com:group//repo.git")).toBeNull();
+  });
+});
+
+describe("parseTrackerFromUrl (library seam)", () => {
+  it("dispatches github.com URLs to the github provider", () => {
+    expect(parseTrackerFromUrl("https://github.com/owner/repo.git")).toEqual({
+      provider: "github",
+      project: "owner/repo",
+    });
+    expect(parseTrackerFromUrl("git@github.com:owner/repo.git")).toEqual({
+      provider: "github",
+      project: "owner/repo",
+    });
+  });
+
+  it("dispatches gitlab.com URLs to the gitlab provider with nested groups", () => {
+    expect(parseTrackerFromUrl("https://gitlab.com/group/subgroup/repo.git")).toEqual({
+      provider: "gitlab",
+      project: "group/subgroup/repo",
+    });
+    expect(parseTrackerFromUrl("git@gitlab.com:group/subgroup/repo.git")).toEqual({
+      provider: "gitlab",
+      project: "group/subgroup/repo",
+    });
+  });
+
+  it("does not invent a tracker provider for unknown / self-hosted hosts", () => {
+    expect(parseTrackerFromUrl("https://git.example.com/owner/repo.git")).toBeNull();
+    expect(parseTrackerFromUrl("https://gitlab.example.com/owner/repo.git")).toBeNull();
+    expect(parseTrackerFromUrl("ssh://git@internal/owner/repo.git")).toBeNull();
+    expect(parseTrackerFromUrl("git@github.example.com:owner/repo.git")).toBeNull();
+  });
+
+  it("does not invent a tracker provider for malformed URLs", () => {
+    expect(parseTrackerFromUrl("not a url")).toBeNull();
+    expect(parseTrackerFromUrl("")).toBeNull();
+    expect(parseTrackerFromUrl("https://github.com/")).toBeNull();
+    expect(parseTrackerFromUrl("https://gitlab.com/")).toBeNull();
+  });
+});
+
+describe("autoResolveConfigDefaults tracker discovery (library seam)", () => {
+  const repositories: TestRepository[] = [];
+  afterEach(async () =>
+    Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))),
+  );
+
+  async function setRemoteUrl(repository: TestRepository, url: string): Promise<void> {
+    await run("git", ["remote", "set-url", "origin", url], { cwd: repository.root });
+  }
+
+  function baseDraft(repository: TestRepository): Parameters<typeof autoResolveConfigDefaults>[1] {
+    return {
+      schema: 1,
+      models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      tracker: { provider: "github" },
+      delivery: {
+        preview: { adapter: "command", command: ["echo", "{sha}"] },
+        staging: { adapter: "command", command: ["echo", "{sha}"] },
+        production: { adapter: "command", command: ["echo", "{sha}"] },
+      },
+      verification: { commands: ["test -f README.md"] },
+    };
+  }
+
+  it("fills tracker.project from a github.com HTTPS remote when omitted", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://github.com/poiesis-test/qualification.git");
+    const draft = baseDraft(repository);
+    const result = await autoResolveConfigDefaults(repository.root, draft);
+    expect(result.config.tracker).toEqual({ provider: "github", project: "poiesis-test/qualification" });
+    expect(result.discovered.tracker).toBe(true);
+  });
+
+  it("fills tracker.project from a github.com SSH remote when omitted", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "git@github.com:poiesis-test/qualification.git");
+    const draft = baseDraft(repository);
+    const result = await autoResolveConfigDefaults(repository.root, draft);
+    expect(result.config.tracker).toEqual({ provider: "github", project: "poiesis-test/qualification" });
+    expect(result.discovered.tracker).toBe(true);
+  });
+
+  it("fills tracker.project from a gitlab.com HTTPS remote with nested groups when omitted", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://gitlab.com/poiesis-group/subgroup/repo.git");
+    const draft: Parameters<typeof autoResolveConfigDefaults>[1] = {
+      ...baseDraft(repository),
+      tracker: { provider: "gitlab" },
+    };
+    const result = await autoResolveConfigDefaults(repository.root, draft);
+    expect(result.config.tracker).toEqual({
+      provider: "gitlab",
+      project: "poiesis-group/subgroup/repo",
+    });
+    expect(result.discovered.tracker).toBe(true);
+  });
+
+  it("fills tracker.project from a gitlab.com SSH remote with nested groups when omitted", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "git@gitlab.com:poiesis-group/subgroup/repo.git");
+    const draft: Parameters<typeof autoResolveConfigDefaults>[1] = {
+      ...baseDraft(repository),
+      tracker: { provider: "gitlab" },
+    };
+    const result = await autoResolveConfigDefaults(repository.root, draft);
+    expect(result.config.tracker).toEqual({
+      provider: "gitlab",
+      project: "poiesis-group/subgroup/repo",
+    });
+    expect(result.discovered.tracker).toBe(true);
+  });
+
+  it("does not invent a tracker provider when the configured provider is github but the remote is gitlab", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://gitlab.com/some-group/repo.git");
+    const draft = baseDraft(repository);
+    await expect(autoResolveConfigDefaults(repository.root, draft)).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+    });
+  });
+
+  it("does not invent a tracker provider when the configured provider is gitlab but the remote is github", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://github.com/owner/repo.git");
+    const draft: Parameters<typeof autoResolveConfigDefaults>[1] = {
+      ...baseDraft(repository),
+      tracker: { provider: "gitlab" },
+    };
+    await expect(autoResolveConfigDefaults(repository.root, draft)).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+    });
+  });
+
+  it("does not invent a tracker provider when the remote host is unknown / self-hosted", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://git.example.com/owner/repo.git");
+    const draft = baseDraft(repository);
+    await expect(autoResolveConfigDefaults(repository.root, draft)).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+    });
+  });
+
+  it("preserves an explicitly configured tracker.project without re-discovering from the remote", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await setRemoteUrl(repository, "https://github.com/different-owner/different-repo.git");
+    const draft: Parameters<typeof autoResolveConfigDefaults>[1] = {
+      ...baseDraft(repository),
+      tracker: { provider: "github", project: "explicit/owner" },
+    };
+    const result = await autoResolveConfigDefaults(repository.root, draft);
+    expect(result.config.tracker).toEqual({ provider: "github", project: "explicit/owner" });
+    expect(result.discovered.tracker).toBe(false);
   });
 });

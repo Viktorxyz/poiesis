@@ -19,22 +19,22 @@ describe("OpenCode version gate", () => {
     // Per-test cleanup is handled inside each test that installs the fake.
   });
 
-  it("exposes 1.18.29 and 1.18.30 as the explicit adapter-v1 supported set", () => {
-    expect(SUPPORTED_OPENCODE_VERSIONS).toEqual(["1.18.29", "1.18.30"]);
+  it("exposes 1.18.29, 1.18.30 and 1.18.31 as the explicit adapter-v1 supported set", () => {
+    expect(SUPPORTED_OPENCODE_VERSIONS).toEqual(["1.18.29", "1.18.30", "1.18.31"]);
   });
 
-  it.each(["1.18.29", "1.18.30"])("accepts %s via isSupportedOpenCodeVersion", (version) => {
+  it.each(["1.18.29", "1.18.30", "1.18.31"])("accepts %s via isSupportedOpenCodeVersion", (version) => {
     expect(isSupportedOpenCodeVersion(version)).toBe(true);
   });
 
-  it.each(["1.18.28", "1.18.31", "0.0.0", "garbage"])(
+  it.each(["1.18.28", "0.0.0", "garbage"])(
     "rejects %s via isSupportedOpenCodeVersion",
     (version) => {
       expect(isSupportedOpenCodeVersion(version)).toBe(false);
     },
   );
 
-  it.each(["1.18.29", "1.18.30"])(
+  it.each(["1.18.29", "1.18.30", "1.18.31"])(
     "verifyOpenCodeVersion accepts the fake %s binary",
     async (version) => {
       const env = await installFakeOpenCode(version);
@@ -51,7 +51,7 @@ describe("OpenCode version gate", () => {
     try {
       await expect(verifyOpenCodeVersion("/")).rejects.toMatchObject({
         code: "OPENCODE_VERSION_UNSUPPORTED",
-        details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30"] },
+        details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30", "1.18.31"] },
       });
     } finally {
       env.restore();
@@ -96,6 +96,19 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
     expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
   }, 30_000);
 
+  it("init succeeds against a 1.18.31 fake binary and records the explicit supportedVersions set", async () => {
+    env?.restore();
+    env = await installFakeOpenCode("1.18.31");
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const manifest = await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    expect(manifest.adapter.supportedVersion).toBe(SUPPORTED_OPENCODE_VERSION);
+    expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+  }, 30_000);
+
   it("update preserves the explicit supportedVersions set on the next manifest", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
@@ -120,6 +133,27 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
     const opencodeVersion = report.checks.find((check) => check.id === "opencode-version");
     expect(opencodeVersion?.status).toBe("pass");
     expect(opencodeVersion?.details).toMatchObject({ installed: "1.18.30" });
+    const manifest = report.checks.find((check) => check.id === "manifest");
+    expect(manifest?.status).toBe("pass");
+    const receipt = report.checks.find((check) => check.id === "receipt");
+    expect(receipt?.status).toBe("pass");
+    const opencodeSchema = report.checks.find((check) => check.id === "opencode-schema");
+    expect(opencodeSchema?.status).toBe("pass");
+  }, 30_000);
+
+  it("doctor recognizes the 1.18.31 fake binary's version and authority against the manifest", async () => {
+    env?.restore();
+    env = await installFakeOpenCode("1.18.31");
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    const report = await doctor(repository.root);
+    const opencodeVersion = report.checks.find((check) => check.id === "opencode-version");
+    expect(opencodeVersion?.status).toBe("pass");
+    expect(opencodeVersion?.details).toMatchObject({ installed: "1.18.31" });
     const manifest = report.checks.find((check) => check.id === "manifest");
     expect(manifest?.status).toBe("pass");
     const receipt = report.checks.find((check) => check.id === "receipt");
@@ -152,7 +186,7 @@ describe("OpenCode adapter-v1 fail-closed against unsupported fake binary", () =
       }),
     ).rejects.toMatchObject({
       code: "OPENCODE_VERSION_UNSUPPORTED",
-      details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30"] },
+      details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30", "1.18.31"] },
     });
   }, 30_000);
 });

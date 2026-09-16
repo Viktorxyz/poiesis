@@ -259,13 +259,17 @@ export async function autoResolveConfigDefaults(
   let discoveredTracker = false;
   let trackerProvider = config.tracker.provider;
   let trackerProject = config.tracker.project ?? "";
-  if (trackerProvider === "github" && trackerProject.trim().length === 0 && remote !== undefined) {
+  if (
+    (trackerProvider === "github" || trackerProvider === "gitlab") &&
+    trackerProject.trim().length === 0 &&
+    remote !== undefined
+  ) {
     const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
     const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
     if (url !== undefined) {
-      const parsed = parseGitHubProject(url);
-      if (parsed !== null) {
-        trackerProject = parsed;
+      const parsed = parseTrackerFromUrl(url);
+      if (parsed !== null && parsed.provider === trackerProvider) {
+        trackerProject = parsed.project;
         discoveredTracker = true;
       }
     }
@@ -323,7 +327,7 @@ async function discoverVerificationCommands(root: string): Promise<string[]> {
   return out;
 }
 
-function parseGitHubProject(url: string): string | null {
+export function parseGitHubProject(url: string): string | null {
   const trimmed = url.trim();
   const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
   if (sshMatch !== null && sshMatch[1] !== undefined && sshMatch[2] !== undefined) {
@@ -333,6 +337,50 @@ function parseGitHubProject(url: string): string | null {
   if (httpsMatch !== null && httpsMatch[1] !== undefined && httpsMatch[2] !== undefined) {
     return `${httpsMatch[1]}/${httpsMatch[2]}`;
   }
+  return null;
+}
+
+export function parseGitLabProject(url: string): string | null {
+  const trimmed = url.trim();
+  // SSH: `git@gitlab.com:<group-path>` (with optional `.git` suffix).
+  // Group path may contain nested groups separated by `/`, and must
+  // contain at least two non-empty segments (group + project).
+  const sshMatch = trimmed.match(/^git@gitlab\.com:(.+?)(?:\.git)?$/);
+  if (sshMatch !== null && sshMatch[1] !== undefined) {
+    return normalizeGitLabProjectPath(sshMatch[1]);
+  }
+  // HTTPS / HTTP: `https?://gitlab.com/<group-path>` (with optional
+  // `.git` suffix). Same nested-group / minimum-two-segment rule as
+  // the SSH form.
+  const httpsMatch = trimmed.match(/^https?:\/\/gitlab\.com\/(.+?)(?:\.git)?$/);
+  if (httpsMatch !== null && httpsMatch[1] !== undefined) {
+    return normalizeGitLabProjectPath(httpsMatch[1]);
+  }
+  return null;
+}
+
+/**
+ * Normalize the captured GitLab project path: it must contain at least two
+ * non-empty slash-separated segments (namespace + project). Nested groups
+ * like `group/subgroup/project` are allowed; bare single-segment namespaces
+ * (e.g. `group.git`) and empty segments are rejected.
+ */
+function normalizeGitLabProjectPath(raw: string): string | null {
+  if (raw.length === 0) return null;
+  const segments = raw.split("/");
+  if (segments.length < 2) return null;
+  if (segments.some((segment) => segment.length === 0)) return null;
+  return raw;
+}
+
+export function parseTrackerFromUrl(url: string): { provider: "github" | "gitlab"; project: string } | null {
+  const githubProject = parseGitHubProject(url);
+  if (githubProject !== null) return { provider: "github", project: githubProject };
+  const gitlabProject = parseGitLabProject(url);
+  if (gitlabProject !== null) return { provider: "gitlab", project: gitlabProject };
+  // Unknown / self-hosted hosts and malformed URLs deliberately do NOT
+  // invent a tracker provider; the caller surfaces the unconfigured
+  // tracker.project as an explicit validation failure.
   return null;
 }
 
@@ -415,11 +463,22 @@ export async function verifyModels(root: string, config: ResolvedPoiesisConfig):
       stderr: result.stderr,
     });
   }
-  const available = new Set(result.stdout.split("\n").map((line) => line.trim()).filter(Boolean));
+  const available = parseOpenCodeModelInventory(result.stdout);
   const missing = [config.models.reasoning, config.models.execution].filter((model) => !available.has(model));
   if (missing.length > 0) {
     throw new PoiesisError("MODEL_UNAVAILABLE", "Configured OpenCode model is unavailable", { missing });
   }
+}
+
+/**
+ * Single canonical parse of an `opencode models` newline-separated
+ * provider/model inventory. Every caller (currently
+ * `verifyModels`, but available to future inventory consumers at the
+ * same library seam) MUST reuse this function so the trim / blank /
+ * dedupe semantics stay consistent.
+ */
+export function parseOpenCodeModelInventory(stdout: string): Set<string> {
+  return new Set(stdout.split("\n").map((line) => line.trim()).filter(Boolean));
 }
 
 async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise<void> {

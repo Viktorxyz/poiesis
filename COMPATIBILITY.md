@@ -2,13 +2,13 @@
 
 ## OpenCode
 
-The first adapter is built against the adapter-version-1 contract. That contract is verified against OpenCode `1.18.29` and `1.18.30`: both tags lower the same V1 config schema and expose the same action keys, permission shape, and session endpoints. The `1.18.30` release changes are provider/model-only. The runtime validates the installed version against this explicit set (`SUPPORTED_OPENCODE_VERSIONS = ["1.18.29", "1.18.30"]`) with `opencode --version` before applying changes. Any other installed version is rejected fail-closed.
+The first adapter is built against the adapter-version-1 contract. That contract is verified against OpenCode `1.18.29`, `1.18.30`, and `1.18.31`: all three tags lower the same V1 config schema, expose the same action keys, permission shape, and session endpoints, and accept the projected harness-native payload. The `1.18.30` and `1.18.31` release changes are provider/model-only — they do not alter `--version` (still a bare version string), the `models` inventory shape (still newline-delimited `provider/model`), or the `debug config` parser (still accepts the projected V1 schema). The runtime validates the installed version against this explicit set (`SUPPORTED_OPENCODE_VERSIONS = ["1.18.29", "1.18.30", "1.18.31"]`) with `opencode --version` before applying changes. Any other installed version is rejected fail-closed.
 
-The supported set is the smallest explicit list of tags, not a broad semver range. Newer OpenCode releases MUST NOT be added to `SUPPORTED_OPENCODE_VERSIONS` without explicit V1 contract verification.
+Inclusion in the supported set is gated on probe parity, not on being a newer release: `1.18.31` is supported because `--version`, `models`, and `debug config` behave identically to the already-verified `1.18.29` / `1.18.30` probes against the V1 projection. The supported set is the smallest explicit list of tags with verified V1 probe parity, not a broad semver range. Newer OpenCode releases MUST NOT be added to `SUPPORTED_OPENCODE_VERSIONS` without explicit V1 contract verification.
 
 ### Verified schema
 
-The adapter projects a harness-native schema accepted by OpenCode `1.18.29` and `1.18.30`:
+The adapter projects a harness-native schema accepted by OpenCode `1.18.29`, `1.18.30`, and `1.18.31`:
 
 ```text
 default_agent          string
@@ -20,9 +20,9 @@ agent                  object
   <name>.permission    object
 ```
 
-Action keys are the singular OpenCode `1.18.29` / `1.18.30` keys: `read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`. Permissions are an ordered object where the literal `"*"` denies everything else.
+Action keys are the singular OpenCode `1.18.29` / `1.18.30` / `1.18.31` keys: `read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`. Permissions are an ordered object where the literal `"*"` denies everything else.
 
-The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by either supported tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
+The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by any supported tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
 
 ### Subagent visibility
 

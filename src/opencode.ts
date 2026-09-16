@@ -13,12 +13,14 @@ import { run } from "./process.js";
 export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
 /**
  * The explicit, ordered set of OpenCode versions the V1 adapter contract
- * applies to. Both `1.18.29` and `1.18.30` lower the same adapter-version-1
- * config schema and use identical action keys and session endpoints; the
- * 1.18.30 release changes are provider/model-only. Newer releases MUST
- * NOT be added here without explicit contract verification.
+ * applies to. `1.18.29`, `1.18.30`, and `1.18.31` lower the same
+ * adapter-version-1 config schema and use identical action keys and
+ * session endpoints; the `1.18.30` and `1.18.31` release changes are
+ * provider/model-only. Newer releases MUST NOT be added here without
+ * explicit contract verification (probe parity for `--version`,
+ * `models`, and `debug config` against the projected V1 schema).
  */
-export const SUPPORTED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30"];
+export const SUPPORTED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30", "1.18.31"];
 export const OPENCODE_ADAPTER_VERSION = "1";
 
 export function isSupportedOpenCodeVersion(version: string): boolean {
