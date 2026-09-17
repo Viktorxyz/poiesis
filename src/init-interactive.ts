@@ -242,9 +242,9 @@ function printDetections(io: InteractiveInitIO, discovery: InitDiscoveryResult):
       "verification.commands": "verification command",
       "tracker.provider": "tracker provider",
       "tracker.project": "tracker project",
-      "delivery.preview": "preview delivery command (argv with {sha})",
-      "delivery.staging": "staging delivery command (argv with {sha})",
-      "delivery.production": "production delivery command (argv with {sha})",
+      "delivery.preview": "how this project creates Preview",
+      "delivery.staging": "how this project deploys to Staging",
+      "delivery.production": "how this project releases to Production",
     };
     for (const path of discovery.unresolved) {
       lines.push(`  - ${path}: ${labels[path] ?? path}`);
@@ -459,19 +459,36 @@ async function promptDeliveryCommand(
   io: InteractiveInitIO,
   label: string,
 ): Promise<readonly string[]> {
-  const prompt =
-    `${label} delivery command (space-separated argv, must contain the literal token {sha} — the candidate SHA is substituted at run time)`;
-  io.writeStderr(prompt);
-  io.writeStderr(`Example: ./scripts/poiesis-${label.toLowerCase()} {sha}`);
-  const raw = (await io.promptLine(`${label} argv (must include {sha})>`)).trim();
+  const lower = label.toLowerCase();
+  // Spirit of the unresolved Preview message (ticket #64): explain in
+  // product language BEFORE asking for the technical boundary. The
+  // Author understands what ${label} is for, why we cannot find it,
+  // what we are asking them to supply, and that Poiesis will pass the
+  // exact candidate SHA to it. The technical argv/{sha} rule is still
+  // enforced at validation time, but it never leads the Author-facing
+  // prompt. The word "adapter" is never used in Author-facing text.
+  io.writeStderr("");
+  io.writeStderr(`Poiesis could not determine how this project ${unresolvedDeliveryVerb(label)} ${label}.`);
+  io.writeStderr(`${label} ${unresolvedDeliveryRole(label)}`);
+  io.writeStderr(`No existing Poiesis ${lower} command was found.`);
+  io.writeStderr(`Provide the command this project should use for ${label}.`);
+  io.writeStderr(`Poiesis will pass the exact candidate SHA to it.`);
+  io.writeStderr("");
+  io.writeStderr(`Example: ./scripts/poiesis-${lower} {sha}`);
+  io.writeStderr("");
+  const raw = (await io.promptLine(`${label} command>`)).trim();
   const argv = raw.split(/\s+/).filter((entry) => entry.length > 0);
   if (argv.length === 0) {
-    throw new PoiesisError("INVALID_DELIVERY_ARGV", `${label} delivery argv must not be empty`, {});
+    throw new PoiesisError(
+      "INVALID_DELIVERY_ARGV",
+      `${label} delivery command must not be empty`,
+      {},
+    );
   }
   if (!argv.includes("{sha}")) {
     throw new PoiesisError(
       "INVALID_DELIVERY_ARGV",
-      `${label} delivery argv must contain the literal token {sha}`,
+      `${label} delivery command must contain the literal token {sha} so Poiesis can pass the exact candidate SHA`,
       { argv },
     );
   }
@@ -479,12 +496,37 @@ async function promptDeliveryCommand(
     if (FORBIDDEN_DELIVERY_ADAPTERS.has(entry)) {
       throw new PoiesisError(
         "INVALID_DELIVERY_ARGV",
-        `${label} delivery argv must be a real shell command line; "${entry}" is a hosting-provider identifier, not a command`,
+        `${label} delivery command must be a real shell command; "${entry}" is a hosting-provider name, not a command Poiesis can run`,
         { argv, forbidden: [...FORBIDDEN_DELIVERY_ADAPTERS] },
       );
     }
   }
   return argv;
+}
+
+/**
+ * Verb used in the unresolved-delivery explanation (ticket #64). The
+ * Author-facing text varies per target so the framing stays natural
+ * instead of repeating a single template.
+ */
+function unresolvedDeliveryVerb(label: string): string {
+  const lower = label.toLowerCase();
+  if (lower === "preview") return "creates";
+  if (lower === "staging") return "deploys to";
+  return "releases to";
+}
+
+/**
+ * One-line product role for the unresolved-delivery explanation.
+ * Preview produces a tryable candidate before integration; Staging
+ * validates the accepted candidate in a production-like target;
+ * Production releases the accepted release candidate after integration.
+ */
+function unresolvedDeliveryRole(label: string): string {
+  const lower = label.toLowerCase();
+  if (lower === "preview") return "must produce a real candidate you can try before integration.";
+  if (lower === "staging") return "must validate the accepted candidate in a production-like target.";
+  return "must release the accepted release candidate after integration.";
 }
 
 async function promptWithDefault(io: InteractiveInitIO, label: string, fallback: string): Promise<string> {

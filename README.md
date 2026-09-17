@@ -220,13 +220,16 @@ Do not pass any external path such as `/tmp/...` or any location outside the pro
 The normal Author experience is to ask Poiesis for something in natural language and let the visible primary agent orchestrate the work. The following prompt is a reusable, internal-mechanics-free recipe for handing a fresh coding agent a project plus Poiesis without teaching it adapter internals:
 
 ```text
-You are operating inside a real Git repository that is managed by Poiesis (a deterministic runtime for turning human intent into working, proven software). Treat the Poiesis CLI as the only supported interface to the method — do not write your own Poiesis config, do not edit `.poiesis/*.jsonc` by hand, and do not hand-roll an OpenCode agent or skill installation.
+You are operating inside a real Git repository that is being onboarded to Poiesis (a deterministic runtime for turning human intent into working, proven software). Treat the Poiesis CLI as the only supported interface — do not hand-write Poiesis config, do not invent an OpenCode agent or skill installation, and do not reimplement a Poiesis step the CLI already provides.
 
-When you need Poiesis to do something, run the supported Poiesis command rather than reimplementing the step. The normal Author happy path is:
-  1. Inspect: `pnpm exec poiesis inspect` for bounded project and Git facts.
-  2. Init: `pnpm exec poiesis init` (TTY) — discover remote, integration branch, verification scripts, OpenCode model inventory, and any preview/staging/production script hints; Poiesis prints every detection and prompts only the remaining Author-owned decisions. After success, tell the human to restart OpenCode.
-  3. Model: `pnpm exec poiesis model` (TTY) to change exactly one slot (reasoning or execution) from the live OpenCode inventory, or `pnpm exec poiesis model set reasoning|execution <provider/model>` for the deterministic scripted path.
-  4. Configured update after init: `pnpm exec poiesis update --config ./poiesis-config.jsonc` (the only sanctioned way to change the managed config).
+There are two phases. The bootstrap phase runs the published package through a package runner because Poiesis is not yet installed in this project. Once `init` succeeds, the local `poiesis` CLI is available and later commands can call it directly (or via `pnpm exec poiesis`).
+
+Bootstrap (Poiesis is not installed yet):
+  1. Run `pnpm dlx poiesis-cli@latest init` (TTY). Poiesis prints every detection and asks only the remaining Author-owned choices. After success, tell the human to restart OpenCode.
+
+After init (Poiesis is installed locally):
+  2. Inspect: `poiesis inspect` for bounded project and Git facts.
+  3. Change a model slot: `poiesis model` (TTY), or the deterministic `poiesis model set reasoning|execution <provider/model>` for scripted use.
 
 If a step needs authentication that Poiesis cannot perform on its own (e.g. signing in to `gh`, `glab`, or a delivery target), copy-paste the exact auth command Poiesis prints, run it, and re-run the Poiesis step — do not invent a different auth path.
 

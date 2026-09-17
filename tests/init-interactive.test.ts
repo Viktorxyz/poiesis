@@ -338,7 +338,7 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(remotePrompt?.answer).toBe("upstream");
   }, 30_000);
 
-  it("prompts the Author for real delivery command argv with {sha} for each unresolved target", async () => {
+  it("explains unresolved Preview/Staging/Production in product language BEFORE asking for a command (ticket #64)", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     // No scripts/poiesis-* exists → delivery stays unresolved → Author prompted.
@@ -353,7 +353,34 @@ describe("runInteractiveInit (ticket #58)", () => {
     const manifest = await runInteractiveInit({ root: repo.root, io, draft: baseDraft() });
     expect(manifest).toBeDefined();
 
-    // Each target must prompt for real command argv, not hosting-adapter IDs.
+    const stderr = io.stderrLines.join("\n");
+
+    // Each target must surface its own product-language explanation
+    // BEFORE the prompt is issued. The wording follows the Spirit of
+    // the unresolved Preview message: Poiesis could not determine how
+    // this project creates Preview; what this target is for; that no
+    // existing Poiesis preview command was found; what we are asking
+    // for; and that Poiesis will pass the exact candidate SHA to it.
+    expect(stderr).toContain("Poiesis could not determine how this project creates Preview.");
+    expect(stderr).toContain("Preview must produce a real candidate you can try before integration.");
+    expect(stderr).toContain("No existing Poiesis preview command was found.");
+    expect(stderr).toContain("Provide the command this project should use for Preview.");
+    expect(stderr).toContain("Poiesis will pass the exact candidate SHA to it.");
+
+    expect(stderr).toContain("Poiesis could not determine how this project deploys to Staging.");
+    expect(stderr).toContain("No existing Poiesis staging command was found.");
+    expect(stderr).toContain("Provide the command this project should use for Staging.");
+
+    expect(stderr).toContain("Poiesis could not determine how this project releases to Production.");
+    expect(stderr).toContain("No existing Poiesis production command was found.");
+    expect(stderr).toContain("Provide the command this project should use for Production.");
+
+    // An example command line is shown so the Author can pattern-match.
+    expect(stderr).toContain("./scripts/poiesis-preview {sha}");
+
+    // Each target is still prompted exactly once. The prompt itself
+    // does NOT lead with raw argv/{sha} jargon. The Author-owned
+    // choice stays "command", not "adapter".
     const promptTexts = io.prompts.map((p) => p.prompt);
     const previewPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("preview"));
     const stagingPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("staging"));
@@ -361,14 +388,104 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(previewPrompt).toBeDefined();
     expect(stagingPrompt).toBeDefined();
     expect(productionPrompt).toBeDefined();
+
+    // Old technical wording is gone.
     for (const p of [previewPrompt!, stagingPrompt!, productionPrompt!]) {
-      expect(p.prompt).toContain("{sha}");
-      // Forbidden hosting adapter IDs must NEVER appear in prompts.
-      expect(promptTexts.join(" ")).not.toMatch(/\b(vercel|netlify|cloudflare|gha|github-actions|pages)\b/);
-      // Forbidden hosting adapter IDs must NEVER appear as the Author's
-      // answer either — answers are parsed as shell argv.
+      expect(p.prompt).not.toMatch(/argv \(must include \{sha\}\)/);
+      expect(p.prompt).not.toMatch(/argv with \{sha\}/);
+      // The Author-facing prompt must not surface the word "adapter".
+      expect(p.prompt.toLowerCase()).not.toMatch(/\badapter\b/);
+    }
+
+    // The prompt itself is product-friendly ("Preview command>" etc.).
+    expect(previewPrompt!.prompt).toMatch(/Preview command/i);
+    expect(stagingPrompt!.prompt).toMatch(/Staging command/i);
+    expect(productionPrompt!.prompt).toMatch(/Production command/i);
+
+    // Forbidden hosting IDs must NEVER appear in prompts.
+    expect(promptTexts.join(" ")).not.toMatch(/\b(vercel|netlify|cloudflare|gha|github-actions|pages)\b/);
+    // Forbidden hosting IDs must NEVER appear as the Author's answer
+    // either — answers are still parsed as shell argv.
+    for (const p of [previewPrompt!, stagingPrompt!, productionPrompt!]) {
       expect(p.answer).not.toMatch(/\b(vercel|netlify|cloudflare|gha|github-actions|pages)\b/);
     }
+  }, 30_000);
+
+  it("auto-applies scripts/poiesis-{target} hints without an extra Author confirmation (ticket #64)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    // The Author supplied no scripted answers; the composer prefilled
+    // each delivery target from the script hint, so no delivery prompt
+    // should ever fire.
+    const io = scriptedInitIO({ isTTY: true });
+    const manifest = await runInteractiveInit({ root: repo.root, io, draft: baseDraft() });
+    expect(manifest).toBeDefined();
+
+    // No delivery prompt was issued.
+    const deliveryPrompt = io.prompts.find((p) =>
+      /preview|staging|production/i.test(p.prompt),
+    );
+    expect(deliveryPrompt, "auto-detected script hints must apply silently without a confirm prompt").toBeUndefined();
+
+    // Each target is reported as discovered, not as unresolved.
+    const stderr = io.stderrLines.join("\n");
+    expect(stderr).toContain("scripts/poiesis-preview");
+    expect(stderr).toContain("scripts/poiesis-staging");
+    expect(stderr).toContain("scripts/poiesis-production");
+  }, 30_000);
+
+  it("still stores argv containing {sha} when the Author supplies a custom command (fail-closed validation, ticket #64)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    // No scripts/poiesis-* exists → Author is prompted. Supply a custom
+    // command that omits the {sha} token to verify the validator still
+    // rejects and stays fail-closed.
+    const io = scriptedInitIO({
+      isTTY: true,
+      promptAnswers: {
+        preview: "scripts/run.sh preview",
+        staging: "scripts/run.sh staging {sha}",
+        production: "scripts/run.sh production {sha}",
+      },
+    });
+    let caught: unknown;
+    try {
+      await runInteractiveInit({ root: repo.root, io, draft: baseDraft() });
+    } catch (error) {
+      caught = error;
+    }
+    // The runtime refuses the missing-{sha} answer BEFORE init() runs.
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe("INVALID_DELIVERY_ARGV");
+    // Auth probe / install must short-circuit before any byte is written.
+    expect(io.authProbes).toEqual([]);
+  }, 30_000);
+
+  it("still rejects hosting-provider identifiers as custom delivery answers (ticket #64)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    // No scripts/poiesis-* exists → Author is prompted. Supply a
+    // hosting-provider identifier to verify the forbidden-adapter
+    // guard still fires.
+    const io = scriptedInitIO({
+      isTTY: true,
+      promptAnswers: {
+        preview: "vercel {sha}",
+        staging: "scripts/run.sh staging {sha}",
+        production: "scripts/run.sh production {sha}",
+      },
+    });
+    let caught: unknown;
+    try {
+      await runInteractiveInit({ root: repo.root, io, draft: baseDraft() });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeDefined();
+    expect((caught as { code?: string }).code).toBe("INVALID_DELIVERY_ARGV");
+    // Auth probe / install must short-circuit before any byte is written.
+    expect(io.authProbes).toEqual([]);
   }, 30_000);
 
   it("fails closed on GitHub auth unavailability and mentions `gh auth login` in the error", async () => {
