@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
+import { PassThrough } from "node:stream";
+import { emitKeypressEvents, type Key } from "node:readline";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
   createProductionModelSelectorIO,
   runModelSelector,
+  __test,
   type ModelSelectorIO,
   type ModelSelectorKey,
 } from "../src/model-selector.js";
@@ -290,5 +293,198 @@ describe("createProductionModelSelectorIO", () => {
     const io = createProductionModelSelectorIO({ stdin, stdout });
     io.write("hello world\n");
     expect(Buffer.concat(collected).toString("utf8")).toBe("hello world\n");
+  });
+});
+
+describe("ticket #65 — TTY keypress hardening", () => {
+  it("translateKeypress returns null for an undefined keypress chunk instead of throwing UNEXPECTED", () => {
+    const result = __test.translateKeypress(undefined);
+    expect(result).toBeNull();
+  });
+
+  it("translateKeypress returns null for a null keypress chunk instead of throwing UNEXPECTED", () => {
+    const result = __test.translateKeypress(null);
+    expect(result).toBeNull();
+  });
+
+  it("translateKeypress translates the Down arrow sequence \\x1b[B without a PTY", () => {
+    const key: Key = { sequence: "\u001b[B", name: "down" };
+    expect(__test.translateKeypress(key)).toEqual({ kind: "down" });
+  });
+
+  it("readKey resolves with {kind:'down'} when Down arrow bytes are pushed through a non-TTY Readable (no UNEXPECTED throw)", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    // Track setRawMode calls so we can assert restoration separately.
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    // The factory has already wired emitKeypressEvents, but the test
+    // stream must be parsed as keypress events too so the bytes become
+    // keypress chunks.
+    emitKeypressEvents(stdin);
+
+    const promise = io.readKey();
+
+    // Push the Down arrow CSI sequence in two chunks to mimic how a
+    // PTY fragment-ships ESC-prefixed sequences. The first write is a
+    // bare ESC, which Node's keypress parser emits as an undefined key
+    // chunk; the second write carries "[B" and resolves to { kind: "down" }.
+    stdin.write("\x1b");
+    stdin.write("[B");
+
+    const key = await promise;
+    expect(key).toEqual({ kind: "down" });
+    // Up/Down are NOT terminal keys, so raw mode must stay ON until the
+    // selector either receives enter / cancel or the stream closes.
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(true);
+  });
+
+  it("readKey keeps waiting when the first keypress chunk is undefined (does not reject)", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    emitKeypressEvents(stdin);
+
+    const promise = io.readKey();
+
+    // Push a bare ESC fragment first — the keypress event fires with
+    // an undefined Key (Node's behavior on incomplete CSI sequences).
+    stdin.write("\x1b");
+
+    // The promise must not resolve or reject yet; a follow-up keypress
+    // is still required.
+    let settled = false;
+    promise.then(
+      () => {
+        settled = true;
+      },
+      () => {
+        settled = true;
+      },
+    );
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(settled).toBe(false);
+
+    // Now complete the CSI sequence — Down arrow.
+    stdin.write("[B");
+    const key = await promise;
+    expect(key).toEqual({ kind: "down" });
+  });
+
+  it("restores setRawMode(false) after a successful enter resolution when raw mode was enabled", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    emitKeypressEvents(stdin);
+
+    // Sanity: factory turns raw mode ON at construction.
+    expect(rawModeCalls).toContain(true);
+
+    const promise = io.readKey();
+    // Emit CR (Enter).
+    stdin.write("\r");
+
+    const key = await promise;
+    expect(key).toEqual({ kind: "enter" });
+
+    // After enter the IO must restore raw mode to off.
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(false);
+  });
+
+  it("restores setRawMode(false) after a cancel resolution when raw mode was enabled", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    emitKeypressEvents(stdin);
+
+    const promise = io.readKey();
+    // Emit ESC alone — translated to cancel.
+    stdin.write("\x1b");
+
+    const key = await promise;
+    expect(key).toEqual({ kind: "cancel" });
+
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(false);
+  });
+
+  it("restores setRawMode(false) when the input stream closes mid-selector", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    emitKeypressEvents(stdin);
+
+    const promise = io.readKey();
+    stdin.end();
+
+    await expect(promise).rejects.toMatchObject({ code: "MODEL_SELECTOR_CANCELLED" });
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(false);
+  });
+
+  it("defaults the production output stream to process.stderr (not process.stdout)", () => {
+    // We can't observe process.stdout.write from here without patching,
+    // so we verify the structural default by inspecting the factory's
+    // docstring contract via the fact that the test infra wires
+    // process.stderr (not stdout) for the canonical CLI path.
+    //
+    // Concretely: when no explicit output stream is provided, the
+    // selector's write sink must be process.stderr. We assert this by
+    // patching process.stderr.write to record what the selector sends
+    // and confirming a sample write lands there (and NOT on stdout).
+    const stderrChunks: string[] = [];
+    const stdoutChunks: string[] = [];
+    const originalStderr = process.stderr.write.bind(process.stderr);
+    const originalStdout = process.stdout.write.bind(process.stdout);
+    let observedOnStderr = false;
+    let observedOnStdout = false;
+    (process.stderr.write as unknown) = (chunk: string | Uint8Array): boolean => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString();
+      stderrChunks.push(text);
+      if (text.includes("PROBE-SENTINEL")) observedOnStderr = true;
+      return true;
+    };
+    (process.stdout.write as unknown) = (chunk: string | Uint8Array): boolean => {
+      const text = typeof chunk === "string" ? chunk : chunk.toString();
+      stdoutChunks.push(text);
+      if (text.includes("PROBE-SENTINEL")) observedOnStdout = true;
+      return true;
+    };
+    try {
+      const io = createProductionModelSelectorIO();
+      io.write("PROBE-SENTINEL\n");
+    } finally {
+      process.stderr.write = originalStderr as typeof process.stderr.write;
+      process.stdout.write = originalStdout as typeof process.stdout.write;
+    }
+    expect(observedOnStderr).toBe(true);
+    expect(observedOnStdout).toBe(false);
   });
 });

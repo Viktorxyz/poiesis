@@ -248,14 +248,22 @@ function initialCursor(rows: ModelSelectorRenderedRow[], modelClass: ModelClass)
 
 /**
  * Production IO factory. Wires the selector to the supplied stream
- * pair (defaulting to `process.stdin` / `process.stdout` when omitted
- * so the typical CLI invocation stays a zero-argument call site).
+ * pair (defaulting to `process.stdin` / `process.stderr` when omitted
+ * so the typical CLI invocation stays a zero-argument call site and
+ * the selector's frames stay on the human-facing channel, not on the
+ * structured-JSON stdout reserved for `writeSuccess` / `writeFailure`).
  *
  * Uses Node 22 stdlib `readline.emitKeypressEvents` plus raw mode on
  * the input stream. Only the keypress events the selector needs are
  * surfaced through the `ModelSelectorKey` discriminated union, so the
  * selector never sees a raw `Key` object and tests cannot leak into
  * the production code path.
+ *
+ * Raw mode is enabled exactly once at construction and restored to
+ * `false` whenever the IO leaves the waiting state (terminal key
+ * resolution, stream end / close, or an unsupported-key error). This
+ * keeps the terminal in cooked mode after the selector returns so a
+ * stray Ctrl+C / EOF does not leave the user's TTY in raw mode.
  */
 export interface ProductionModelSelectorIOArgs {
   readonly stdin?: Readable;
@@ -266,28 +274,55 @@ export function createProductionModelSelectorIO(
   args: ProductionModelSelectorIOArgs = {},
 ): ModelSelectorIO {
   const stdin = args.stdin ?? process.stdin;
-  const stdout = args.stdout ?? process.stdout;
+  const stdout = args.stdout ?? process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
   emitKeypressEvents(stdin);
   const raw = stdin as Readable & { setRawMode?: (mode: boolean) => void };
-  if (typeof raw.setRawMode === "function") raw.setRawMode(true);
+  const canRawMode = typeof raw.setRawMode === "function";
+  if (canRawMode) raw.setRawMode!(true);
+  const restoreRawMode = (): void => {
+    if (canRawMode) raw.setRawMode!(false);
+  };
   const writer = (data: string): void => {
     stdout.write(data);
   };
   const readKey = (): Promise<ModelSelectorKey> =>
     new Promise((resolve, reject) => {
-      const onKey = (chunk: Key): void => {
+      // Node's `readline.emitKeypressEvents` listener signature is
+      // `(chunk, key)` where `chunk` is the raw byte sequence (often
+      // `undefined` for fragments that resolve into a multi-byte CSI
+      // sequence like arrow keys) and `key` is the parsed `Key`
+      // descriptor. The selector is interested in `key` — passing
+      // `chunk` is what produced the `Cannot read properties of
+      // undefined (reading 'sequence')` `UNEXPECTED` crash on the very
+      // first Down arrow reported by the Python-PTY dogfood. Per ticket
+      // #65 we forward `key` and keep waiting when it is undefined.
+      const onKey = (_chunk: string | undefined, key: Key | undefined): void => {
+        if (key === undefined) {
+          return;
+        }
         stdin.removeListener("keypress", onKey);
         stdin.removeListener("end", onEnd);
         stdin.removeListener("close", onEnd);
+        let resolved: ModelSelectorKey;
         try {
-          resolve(translateKeypress(chunk));
+          resolved = translateKeypress(key);
         } catch (error) {
+          restoreRawMode();
           reject(error instanceof Error ? error : new Error(String(error)));
+          return;
         }
+        // `enter` and `cancel` are the two selector-terminal keys; an
+        // `up` / `down` / `number` resolution keeps the loop alive so
+        // raw mode stays on until the next keypress.
+        if (resolved.kind === "enter" || resolved.kind === "cancel") {
+          restoreRawMode();
+        }
+        resolve(resolved);
       };
       const onEnd = (): void => {
         stdin.removeListener("keypress", onKey);
+        restoreRawMode();
         reject(
           new PoiesisError(
             "MODEL_SELECTOR_CANCELLED",
@@ -306,7 +341,24 @@ export function createProductionModelSelectorIO(
   };
 }
 
-function translateKeypress(chunk: Key): ModelSelectorKey {
+/**
+ * Translate a Node `Key` object (or an undefined / null chunk emitted
+ * for incomplete CSI fragments) into the selector's typed union. The
+ * undefined / null case is intentionally collapsed to `null` so the
+ * caller's keypress loop keeps waiting without throwing UNEXPECTED.
+ *
+ * The two signatures mirror the production read loop's two call
+ * shapes: production always passes a concrete `Key` (the narrowed
+ * second arg of the keypress event) and gets back a non-null typed
+ * key, while the regression suite (and any other defensive caller)
+ * can pass undefined / null and observe the `null` sentinel without a
+ * thrown `UNEXPECTED`.
+ */
+function translateKeypress(chunk: Key): ModelSelectorKey;
+function translateKeypress(chunk: undefined | null): null;
+function translateKeypress(chunk: Key | undefined | null): ModelSelectorKey | null;
+function translateKeypress(chunk: Key | undefined | null): ModelSelectorKey | null {
+  if (chunk === undefined || chunk === null) return null;
   if (chunk.sequence === "\u0003" || chunk.sequence === "\u001b" || chunk.name === "escape") {
     return { kind: "cancel" };
   }
@@ -331,3 +383,10 @@ function matchNumericKeypress(chunk: Key): number | null {
   if (!/^[0-9]$/.test(chunk.name)) return null;
   return Number.parseInt(chunk.name, 10);
 }
+
+/**
+ * Internal helpers exposed for the model-selector regression suite
+ * (ticket #65). Kept behind a `__test` namespace so the package-root
+ * re-exports never surface them to outside consumers.
+ */
+export const __test = { translateKeypress };
