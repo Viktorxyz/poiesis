@@ -222,20 +222,27 @@ async function refuseIfNotInstalled(root: string): Promise<void> {
 /**
  * Production IO factory. Wires the interactive model flow to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a zero-argument call site. The shared model-selector IO is
+ * stays a single-argument call site. The shared model-selector IO is
  * delegated to `createProductionModelSelectorIO` so the keypress loop
  * is reused byte-for-byte with `poiesis init`.
+ *
+ * The factory takes the resolved repository `root` (git toplevel of the
+ * repo the Author is editing) so every filesystem-touching seam —
+ * `loadConfig` and the `opencode models` child process — reads from
+ * the SAME root the transactional `setModel` write path uses. Bare
+ * `process.cwd()` would let the interactive flow see one repo while the
+ * mutation sees another when `poiesis model --cwd <path>` lands the CLI
+ * in a subdirectory of a different repo.
  *
  * `loadCurrentModels` reads the on-disk `.poiesis/config.jsonc` via
  * the maintenance surface; a missing file surfaces as the same typed
  * error the CLI would otherwise raise, so operators see a consistent
  * failure shape regardless of who reads the bytes.
  */
-export function createProductionInteractiveModelIO(): InteractiveModelIO {
+export function createProductionInteractiveModelIO(root: string): InteractiveModelIO {
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
-  const cwd = process.cwd();
 
   return {
     isTTY,
@@ -267,7 +274,13 @@ export function createProductionInteractiveModelIO(): InteractiveModelIO {
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
-      const result = await runChildProcess("opencode", ["models"], { cwd, allowFailure: true });
+      // Run `opencode models` from the repo root, NOT `process.cwd()`.
+      // CLI dispatch lands here when the Author passes
+      // `poiesis model --cwd <path>` from any subdirectory of the repo;
+      // the opencode config (`opencode.jsonc`) lives at the repo root,
+      // so a child process spawned from a sub-cwd could see a different
+      // (or no) OpenCode installation.
+      const result = await runChildProcess("opencode", ["models"], { cwd: root, allowFailure: true });
       if (result.exitCode !== 0) {
         throw new PoiesisError(
           "MODEL_INVENTORY_UNAVAILABLE",
@@ -291,8 +304,10 @@ export function createProductionInteractiveModelIO(): InteractiveModelIO {
       // bytes against the canonical schema. It throws when the file is
       // missing or the schema fails — the CLI layer translates that
       // into the typed `MODEL_NOT_INSTALLED` it would have raised
-      // anyway, so the production IO seam stays a thin read.
-      const config = await loadConfig(cwd);
+      // anyway, so the production IO seam stays a thin read. Read from
+      // `root` (the git toplevel) so the config we render matches the
+      // config `setModel` writes.
+      const config = await loadConfig(root);
       return { reasoning: config.models.reasoning, execution: config.models.execution };
     },
   };

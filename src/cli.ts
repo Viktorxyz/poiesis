@@ -224,7 +224,7 @@ async function commandCapability(args: string[]): Promise<void> {
 }
 
 /**
- * CLI dispatch for `poiesis model ...` (ticket #56 / #59).
+ * CLI dispatch for `poiesis model ...` (ticket #56 / #59 / #66).
  *
  * `model set reasoning|execution <provider/model>` is the deterministic
  * single-class set (ticket #56) and is unchanged. Bare `poiesis model`
@@ -234,22 +234,34 @@ async function commandCapability(args: string[]): Promise<void> {
  * `NON_TTY_MODEL` and a hint pointing at the deterministic subcommand.
  * Unknown subcommands error with `UNKNOWN_COMMAND` and explicitly list
  * the supported set.
+ *
+ * Ticket #66: `--cwd` is parsed up-front and stripped from the
+ * remaining args BEFORE the subcommand check, so
+ * `poiesis model --cwd <path>` (with no `set` subcommand) reaches the
+ * interactive flow against the supplied repo root instead of being
+ * rejected as `UNKNOWN_COMMAND`. The interactive IO factory is given
+ * that resolved git root so `loadConfig` and the `opencode models`
+ * child process read from the same root `setModel` writes to.
  */
 export async function commandModel(args: string[]): Promise<void> {
-  if (args.length === 0) {
-    const values = options(args, { cwd: { type: "string" } });
-    const root = await resolveGitRoot(cwdOf(values));
+  // Pull `--cwd <path>` pairs out up front. The remaining `rest`
+  // drives the subcommand decision: empty → interactive, `set …` →
+  // deterministic, anything else → UNKNOWN_COMMAND.
+  const { cwd, rest } = splitCwdArgs(args);
+  const root = await resolveGitRoot(resolve(typeof cwd === "string" ? cwd : process.cwd()));
+
+  if (rest.length === 0) {
     const { runInteractiveModel, createProductionInteractiveModelIO } = await import(
       "./model-interactive.js"
     );
-    const io = createProductionInteractiveModelIO();
+    const io = createProductionInteractiveModelIO(root);
     // The interactive flow refuses non-TTY itself with `NON_TTY_MODEL`
     // (the canonical ticket #59 error code); the dispatch surface stays
     // a thin shell.
     writeSuccess("model.interactive", await runInteractiveModel({ root, io }));
     return;
   }
-  const sub = args[0];
+  const sub = rest[0];
   if (sub !== "set") {
     throw new PoiesisError("UNKNOWN_COMMAND", `Unknown model subcommand: ${sub ?? ""}`, {
       subcommand: sub ?? "",
@@ -259,7 +271,7 @@ export async function commandModel(args: string[]): Promise<void> {
   // Parse `set` arguments positionally: `<class> <id>` followed by
   // `--cwd`. `parseArgs` rejects positionals in strict mode, so we
   // slice them off the head and run the parser only on the flag tail.
-  const positional = args.slice(1, 3);
+  const positional = rest.slice(1, 3);
   const className = positional[0];
   const modelId = positional[1];
   if (typeof className !== "string" || className.length === 0) {
@@ -268,12 +280,32 @@ export async function commandModel(args: string[]): Promise<void> {
   if (typeof modelId !== "string" || modelId.length === 0) {
     throw new PoiesisError("MISSING_ARGUMENT", "Missing required model ID", { expected: "<provider/model>" });
   }
-  const values = options(args.slice(3), { cwd: { type: "string" } });
-  const root = await resolveGitRoot(cwdOf(values));
   writeSuccess(
     "model.set",
     await setModel(root, className as ModelClassName, modelId),
   );
+}
+
+/**
+ * Pull every `--cwd <value>` pair out of `args` and return the value
+ * (last-wins, mirroring `parseArgs` semantics for repeated flags) plus
+ * the residual positional/flag tail. Used by `commandModel` so a bare
+ * `poiesis model --cwd <path>` reaches the interactive dispatcher
+ * instead of falling through to the `UNKNOWN_COMMAND` branch.
+ */
+function splitCwdArgs(args: string[]): { cwd: string | undefined; rest: string[] } {
+  let cwd: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const current = args[i];
+    if (current === "--cwd" && i + 1 < args.length) {
+      cwd = args[i + 1];
+      i++;
+      continue;
+    }
+    if (typeof current === "string") rest.push(current);
+  }
+  return { cwd, rest };
 }
 
 async function commandWorkspace(args: string[]): Promise<void> {

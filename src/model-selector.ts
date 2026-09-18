@@ -60,6 +60,16 @@ export interface ModelSelectorIO {
   readonly isTTY: boolean;
   write(data: string): void;
   readKey(): Promise<ModelSelectorKey>;
+  /**
+   * Optional lifecycle hook called by `runModelSelector` in a `finally`
+   * block so the production selector can restore any side effects it
+   * installed at construction (notably TTY raw mode). Production MUST
+   * provide this so a `MODEL_SELECTOR_NOT_TTY` /
+   * `MODEL_SELECTOR_NO_INVENTORY` throw BEFORE the first `readKey` still
+   * returns the terminal to cooked mode; tests that supply a scripted
+   * IO can omit it.
+   */
+  dispose?(): void;
 }
 
 export interface ModelSelectorRenderedRow {
@@ -168,69 +178,80 @@ export function renderModelSelectorFrame(args: {
 export async function runModelSelector(args: RunModelSelectorArgs): Promise<ModelIdentity> {
   const { io, inventory, modelClass } = args;
   const recommended = args.recommended ?? DEFAULT_RECOMMENDED_MODEL_IDS;
-  if (!io.isTTY) {
-    throw new PoiesisError(
-      "MODEL_SELECTOR_NOT_TTY",
-      "Interactive model selector requires a TTY; pass --non-tty or use a non-interactive workflow",
-    );
-  }
-  const identities = normalizeInventory(inventory);
-  if (identities.length === 0) {
-    throw new PoiesisError(
-      "MODEL_SELECTOR_NO_INVENTORY",
-      "OpenCode model inventory is empty; cannot offer a selection",
-    );
-  }
-  const rows = buildModelSelectorRows(identities, recommended);
-  const active = initialCursor(rows, modelClass);
-  const title = args.title ?? `Select a ${modelClass} model`;
-  const initial = renderModelSelectorFrame({ title, rows, active, inventorySize: identities.length });
-  io.write(initial);
+  // Always restore raw mode (or any other IO-installed side effect) on
+  // the way out, including throws that fire BEFORE the first `readKey`
+  // (`MODEL_SELECTOR_NOT_TTY`, `MODEL_SELECTOR_NO_INVENTORY`). The
+  // production factory enables raw mode at construction; without this
+  // finally the selector would leave the user's TTY in raw mode after a
+  // pre-flight rejection, and any subsequent interactive prompt would
+  // see escape sequences instead of normal keypresses.
+  try {
+    if (!io.isTTY) {
+      throw new PoiesisError(
+        "MODEL_SELECTOR_NOT_TTY",
+        "Interactive model selector requires a TTY; pass --non-tty or use a non-interactive workflow",
+      );
+    }
+    const identities = normalizeInventory(inventory);
+    if (identities.length === 0) {
+      throw new PoiesisError(
+        "MODEL_SELECTOR_NO_INVENTORY",
+        "OpenCode model inventory is empty; cannot offer a selection",
+      );
+    }
+    const rows = buildModelSelectorRows(identities, recommended);
+    const active = initialCursor(rows, modelClass);
+    const title = args.title ?? `Select a ${modelClass} model`;
+    const initial = renderModelSelectorFrame({ title, rows, active, inventorySize: identities.length });
+    io.write(initial);
 
-  // Cursor is a 0-based index into `rows`.
-  let cursor = active;
-  // Loop until the user confirms a selection or cancels.
-  // Each iteration re-renders the frame so the visible cursor reflects
-  // the latest keypress. We always re-render after a state change; the
-  // cost is trivial (a few dozen bytes) and avoids bespoke partial-frame
-  // bookkeeping in the production IO seam.
-  for (;;) {
-    const key = await io.readKey();
-    let moved = false;
-    switch (key.kind) {
-      case "up":
-        cursor = (cursor - 1 + rows.length) % rows.length;
-        moved = true;
-        break;
-      case "down":
-        cursor = (cursor + 1) % rows.length;
-        moved = true;
-        break;
-      case "number": {
-        const target = key.value - 1;
-        if (target >= 0 && target < rows.length) {
-          cursor = target;
+    // Cursor is a 0-based index into `rows`.
+    let cursor = active;
+    // Loop until the user confirms a selection or cancels.
+    // Each iteration re-renders the frame so the visible cursor reflects
+    // the latest keypress. We always re-render after a state change; the
+    // cost is trivial (a few dozen bytes) and avoids bespoke partial-frame
+    // bookkeeping in the production IO seam.
+    for (;;) {
+      const key = await io.readKey();
+      let moved = false;
+      switch (key.kind) {
+        case "up":
+          cursor = (cursor - 1 + rows.length) % rows.length;
           moved = true;
+          break;
+        case "down":
+          cursor = (cursor + 1) % rows.length;
+          moved = true;
+          break;
+        case "number": {
+          const target = key.value - 1;
+          if (target >= 0 && target < rows.length) {
+            cursor = target;
+            moved = true;
+          }
+          break;
         }
-        break;
-      }
-      case "enter": {
-        const chosen = rows[cursor];
-        if (chosen === undefined) {
-          throw new PoiesisError("MODEL_SELECTOR_NO_INVENTORY", "Selector cursor is out of bounds");
+        case "enter": {
+          const chosen = rows[cursor];
+          if (chosen === undefined) {
+            throw new PoiesisError("MODEL_SELECTOR_NO_INVENTORY", "Selector cursor is out of bounds");
+          }
+          return chosen.identity;
         }
-        return chosen.identity;
+        case "cancel":
+          throw new PoiesisError(
+            "MODEL_SELECTOR_CANCELLED",
+            "Model selection was cancelled by the user",
+            { modelClass },
+          );
       }
-      case "cancel":
-        throw new PoiesisError(
-          "MODEL_SELECTOR_CANCELLED",
-          "Model selection was cancelled by the user",
-          { modelClass },
-        );
+      if (moved) {
+        io.write(renderModelSelectorFrame({ title, rows, active: cursor, inventorySize: identities.length }));
+      }
     }
-    if (moved) {
-      io.write(renderModelSelectorFrame({ title, rows, active: cursor, inventorySize: identities.length }));
-    }
+  } finally {
+    io.dispose?.();
   }
 }
 
@@ -280,8 +301,15 @@ export function createProductionModelSelectorIO(
   const raw = stdin as Readable & { setRawMode?: (mode: boolean) => void };
   const canRawMode = typeof raw.setRawMode === "function";
   if (canRawMode) raw.setRawMode!(true);
+  // Track whether raw mode is currently armed so an idempotent
+  // `restoreRawMode` (and the `dispose()` seam) cannot double-toggle
+  // the TTY back to raw after a prior restore.
+  let rawModeActive = canRawMode;
   const restoreRawMode = (): void => {
-    if (canRawMode) raw.setRawMode!(false);
+    if (canRawMode && rawModeActive) {
+      raw.setRawMode!(false);
+      rawModeActive = false;
+    }
   };
   const writer = (data: string): void => {
     stdout.write(data);
@@ -338,6 +366,12 @@ export function createProductionModelSelectorIO(
     isTTY,
     write: writer,
     readKey,
+    // Ticket #66: `runModelSelector` invokes `dispose()` from a
+    // `finally` block so any pre-`readKey` rejection
+    // (`MODEL_SELECTOR_NOT_TTY`, `MODEL_SELECTOR_NO_INVENTORY`) still
+    // returns the TTY to cooked mode. Idempotent — safe to call after
+    // a successful keypress that already restored raw mode.
+    dispose: restoreRawMode,
   };
 }
 

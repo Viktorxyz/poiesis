@@ -296,6 +296,82 @@ describe("createProductionModelSelectorIO", () => {
   });
 });
 
+describe("ticket #66 — raw mode restoration on pre-readKey failures", () => {
+  it("restores setRawMode(false) when runModelSelector throws MODEL_SELECTOR_NO_INVENTORY before any readKey", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    // Sanity: factory turns raw mode ON at construction.
+    expect(rawModeCalls).toContain(true);
+
+    await expect(
+      runModelSelector({
+        io,
+        inventory: [],
+        modelClass: "reasoning",
+      }),
+    ).rejects.toMatchObject({ code: "MODEL_SELECTOR_NO_INVENTORY" });
+
+    // The selector's try/finally must have driven `dispose()` which
+    // restores raw mode, so the last call observed by the fake is
+    // `false` — proving the TTY returns to cooked mode even though
+    // `readKey` never ran.
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(false);
+  });
+
+  it("restores setRawMode(false) when runModelSelector throws MODEL_SELECTOR_NOT_TTY before any readKey", async () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    // Non-TTY stdin: factory still turns raw mode on (the constructor
+    // does not branch on isTTY), so the finally MUST still restore it.
+    (stdin as { isTTY?: boolean }).isTTY = false;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    expect(rawModeCalls).toContain(true);
+
+    await expect(
+      runModelSelector({
+        io,
+        inventory: ["openai/gpt-5.6-sol"],
+        modelClass: "reasoning",
+      }),
+    ).rejects.toMatchObject({ code: "MODEL_SELECTOR_NOT_TTY" });
+
+    const lastCall = rawModeCalls[rawModeCalls.length - 1];
+    expect(lastCall).toBe(false);
+  });
+
+  it("dispose() is idempotent — calling it twice does not re-toggle raw mode", () => {
+    const stdin = new PassThrough();
+    const stdout = new PassThrough();
+    (stdin as { isTTY?: boolean }).isTTY = true;
+    const rawModeCalls: boolean[] = [];
+    (stdin as unknown as { setRawMode: (mode: boolean) => void }).setRawMode = (mode: boolean) => {
+      rawModeCalls.push(mode);
+    };
+
+    const io = createProductionModelSelectorIO({ stdin, stdout });
+    expect(rawModeCalls).toEqual([true]);
+
+    io.dispose?.();
+    io.dispose?.();
+
+    // Exactly one `true` (constructor) and one `false` (first dispose).
+    expect(rawModeCalls).toEqual([true, false]);
+  });
+});
+
 describe("ticket #65 — TTY keypress hardening", () => {
   it("translateKeypress returns null for an undefined keypress chunk instead of throwing UNEXPECTED", () => {
     const result = __test.translateKeypress(undefined);

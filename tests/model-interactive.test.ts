@@ -451,4 +451,52 @@ describe("commandModel bare-args TTY wiring (ticket #59)", () => {
       (process.stdin as { isTTY?: boolean }).isTTY = saved;
     }
   });
+
+  it("dispatches `poiesis model --cwd <path>` to the interactive flow against the supplied repo (no UNKNOWN_COMMAND)", async () => {
+    // Ticket #66: `--cwd` must be parsed even when args contains no
+    // `set` subcommand, so the bare-args interactive flow can target a
+    // non-default repo root. The dispatch must NOT reject with
+    // `UNKNOWN_COMMAND` — instead it routes to the interactive flow,
+    // which then fails closed with `NON_TTY_MODEL` (Vitest stdin is
+    // not a TTY), proving we crossed the dispatcher boundary
+    // correctly and gave the IO factory the supplied git root.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+
+    const saved = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = false;
+    try {
+      await expect(commandModel(["--cwd", repo.root])).rejects.toMatchObject({
+        code: "NON_TTY_MODEL",
+      });
+    } finally {
+      (process.stdin as { isTTY?: boolean }).isTTY = saved;
+    }
+  });
+
+  it("dispatches `poiesis model set <class> <id> --cwd <path>` (set still honors --cwd after ticket #66 split)", async () => {
+    // Regression guard for ticket #66: the new `--cwd`-first split
+    // must NOT regress `set <class> <id> --cwd <path>`. We keep the
+    // invocation shape the existing set subcommand already supported
+    // and re-run the same happy-path semantics.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+
+    const captured: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await commandModel(["set", "reasoning", "openai/gpt-5.6-sol", "--cwd", repo.root]);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    const payload = JSON.parse(captured.join("")) as { ok: boolean; operation: string };
+    expect(payload.ok).toBe(true);
+    expect(payload.operation).toBe("model.set");
+  }, 30_000);
 });
