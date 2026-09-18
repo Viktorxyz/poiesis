@@ -1,28 +1,37 @@
 /**
- * Interactive model selector used later by `poiesis init` and
- * `poiesis model`. Tickets #55 introduces the shared selector. The
+ * Interactive model selector (ticket #73).
+ *
+ * Shared domain logic and the Clack adapter contract for the model
+ * selector that `poiesis init` and `poiesis model` both call. The
  * selector is intentionally kept out of the package-root re-exports
- * (`src/index.ts`); tickets #58 / #59 wire the CLI commands to call
- * `runModelSelector` once the public surface stabilizes.
+ * (`src/index.ts`); both interactive modules import `runModelSelector`
+ * directly from this source module.
  *
  * Design contract:
- *   - IO is injected: `isTTY`, `write`, and `readKey` are supplied by
- *     the caller. Production wires them through
- *     `createProductionModelSelectorIO`, which uses Node 22 stdlib
- *     `readline.emitKeypressEvents` plus raw mode on `process.stdin`.
- *   - Tests drive the selector with a scripted key queue; no PTY is
- *     ever required.
- *   - Non-TTY environments fail closed through a `PoiesisError` so
- *     CI / scripts never silently fall through to a default model.
- *   - The "Recommended" annotation and the initial cursor position are
- *     driven exclusively by the canonical recommended constants and
- *     only fire when the identity is actually present in the live
- *     inventory. There is no cousin / fuzzy substitute.
+ *   - The ONLY interactive list primitive is `@clack/prompts` `select`,
+ *     routed through the CLI-internal `runClackSelect` adapter. Clack
+ *     handles arrow / Enter / Esc / Ctrl+C keys and the visible
+ *     cursor; we never touch `readline.emitKeypressEvents`, raw mode,
+ *     or `setRawMode` ourselves.
+ *   - Domain option builders are library-free pure functions. The
+ *     row shape and the `initialValue` policy belong to Poiesis, not
+ *     to Clack — they never assume anything about Clack's internal
+ *     cursor placement or framing.
+ *   - Cancellation surfaces as a `PoiesisError` with the caller's
+ *     exact code (`MODEL_SELECTOR_CANCELLED` for identity,
+ *     `MODEL_CLASS_SELECTOR_CANCELLED` for the class selector). The
+ *     adapter translates Clack's `CANCEL_SYMBOL` into that typed
+ *     failure.
+ *   - Non-TTY and empty-inventory invocations fail closed through a
+ *     typed `PoiesisError` BEFORE any frame is rendered, so CI / scripts
+ *     never silently fall through to a default model.
+ *   - "Recommended" and "Current" are annotations on the row's hint.
+ *     Cursor highlight is Clack's. Cross-class recommendation MAY
+ *     appear as extra hint text; it NEVER sets `initialValue`.
  */
 
-import { emitKeypressEvents, type Key } from "node:readline";
-import type { Readable, Writable } from "node:stream";
 import { PoiesisError } from "./errors.js";
+import { runClackSelect, type ClackSelectRow } from "./clack-select.js";
 
 export type ModelClass = "reasoning" | "execution";
 
@@ -49,48 +58,117 @@ export const DEFAULT_RECOMMENDED_MODEL_IDS: RecommendedModelIds = {
   execution: "minimax/MiniMax-M3",
 };
 
-export type ModelSelectorKey =
-  | { kind: "up" }
-  | { kind: "down" }
-  | { kind: "enter" }
-  | { kind: "cancel" }
-  | { kind: "number"; value: number };
-
-export interface ModelSelectorIO {
-  readonly isTTY: boolean;
-  write(data: string): void;
-  readKey(): Promise<ModelSelectorKey>;
-  /**
-   * Optional lifecycle hook called by `runModelSelector` in a `finally`
-   * block so the production selector can restore any side effects it
-   * installed at construction (notably TTY raw mode). Production MUST
-   * provide this so a `MODEL_SELECTOR_NOT_TTY` /
-   * `MODEL_SELECTOR_NO_INVENTORY` throw BEFORE the first `readKey` still
-   * returns the terminal to cooked mode; tests that supply a scripted
-   * IO can omit it.
-   */
-  dispose?(): void;
-}
-
-export interface ModelSelectorRenderedRow {
-  readonly index: number;
-  readonly identity: ModelIdentity;
-  readonly number: number;
+/**
+ * Domain hint flags for a single identity row. The pure builder merges
+ * them into the `hint` string the Clack option carries; we keep the
+ * flag structure library-free so callers can assert on the row shape
+ * without depending on `@clack/prompts`.
+ */
+export interface ModelSelectorRowHints {
+  readonly isCurrent: boolean;
   readonly isRecommended: boolean;
   readonly recommendedFor: ModelClass | null;
 }
 
-export interface RunModelSelectorArgs {
-  readonly io: ModelSelectorIO;
-  readonly inventory: Iterable<string>;
-  readonly modelClass: ModelClass;
-  readonly recommended?: RecommendedModelIds;
-  readonly title?: string;
+/**
+ * Pure shape that `buildModelSelectorRows` produces and that the
+ * selector passes through to Clack. The library-free shape lets
+ * tests assert on the row set without importing Clack.
+ */
+export interface ModelSelectorRow {
+  readonly identity: ModelIdentity;
+  readonly hints: ModelSelectorRowHints;
 }
 
-const CURSOR = "\u276F"; // ❯
-const RECOMMENDED_LABEL = "Recommended";
-const NUMBER_PAD_WIDTH = 2;
+export interface BuildModelSelectorRowsArgs {
+  readonly identities: readonly ModelIdentity[];
+  readonly recommended: RecommendedModelIds;
+  readonly currentIdentity: ModelIdentity | null;
+}
+
+/**
+ * Build the rows the selector renders. Order matches the supplied
+ * inventory. The hint flags mark each row with exactly the
+ * information the operator needs:
+ *   - `isCurrent`        — this row is the operator's currently installed identity
+ *   - `isRecommended`    — this row matches a recommended constant
+ *   - `recommendedFor`   — the class whose recommended constant matched
+ *
+ * There is no cousin / fuzzy substitute. `recommendedFor` is `null`
+ * unless the row matches a recommended constant exactly.
+ */
+export function buildModelSelectorRows(args: BuildModelSelectorRowsArgs): ModelSelectorRow[] {
+  return args.identities.map((identity) => {
+    let recommendedFor: ModelClass | null = null;
+    if (identity === args.recommended.reasoning) recommendedFor = "reasoning";
+    else if (identity === args.recommended.execution) recommendedFor = "execution";
+    return {
+      identity,
+      hints: {
+        isCurrent: args.currentIdentity !== null && identity === args.currentIdentity,
+        isRecommended: recommendedFor !== null,
+        recommendedFor,
+      },
+    };
+  });
+}
+
+/**
+ * Render the canonical hint text for a row. The hint is the union of
+ * the row's flags:
+ *   - ""                            (no flags set)
+ *   - "Current"                     (isCurrent only)
+ *   - "Recommended"                 (isRecommended for the active class)
+ *   - "Current, Recommended"        (both, recommended for the active class)
+ *   - "Recommended (execution)"     (recommended for a CROSS class — extra hint text)
+ *   - "Current, Recommended (execution)" (both, recommended for a cross class)
+ *
+ * The active class is supplied by the caller because the same row
+ * shape is reused by both `reasoning` and `execution` selectors; the
+ * "(class)" suffix only fires when the recommendation does NOT match
+ * the active class, so cross-class annotations stay visible without
+ * polluting this-class rows. Empty string when neither flag is set.
+ */
+export function formatModelSelectorHint(
+  hints: ModelSelectorRowHints,
+  activeClass: ModelClass,
+): string {
+  if (!hints.isCurrent && !hints.isRecommended) return "";
+  const isCrossClass = hints.recommendedFor !== null && hints.recommendedFor !== activeClass;
+  const recommendedLabel = isCrossClass ? `Recommended (${hints.recommendedFor})` : "Recommended";
+  if (hints.isCurrent && hints.isRecommended) return `Current, ${recommendedLabel}`;
+  if (hints.isCurrent) return "Current";
+  return recommendedLabel;
+}
+
+/**
+ * Resolve the canonical `initialValue` policy for the identity
+ * selector:
+ *
+ *   1. The operator's current identity, if it appears in the live inventory.
+ *   2. The recommended constant for the active `modelClass`, if it
+ *      appears in the live inventory.
+ *   3. The first inventory row.
+ *
+ * Cross-class recommendations never set `initialValue`. The cursor
+ * placement this produces is a hint to Clack, NOT a write — the
+ * operator can still arrow anywhere before pressing Enter.
+ */
+export function resolveIdentityInitialValue(args: {
+  readonly inventory: readonly ModelIdentity[];
+  readonly currentIdentity: ModelIdentity | null;
+  readonly recommended: RecommendedModelIds;
+  readonly modelClass: ModelClass;
+}): ModelIdentity | undefined {
+  const identities = new Set(args.inventory);
+  if (args.currentIdentity !== null && identities.has(args.currentIdentity)) {
+    return args.currentIdentity;
+  }
+  const classRecommended = args.recommended[args.modelClass];
+  if (identities.has(classRecommended)) return classRecommended;
+  const first = args.inventory[0];
+  return first;
+}
 
 /**
  * Validate the inventory: drop blank lines, dedupe, return a stable
@@ -111,316 +189,65 @@ function normalizeInventory(inventory: Iterable<string>): ModelIdentity[] {
   return out;
 }
 
-/**
- * Build the rows the selector renders. The row preserves inventory
- * order and carries its `recommendedFor` annotation, which is null
- * unless the row matches one of the recommended constants for either
- * class.
- */
-export function buildModelSelectorRows(
-  identities: ModelIdentity[],
-  recommended: RecommendedModelIds,
-): ModelSelectorRenderedRow[] {
-  return identities.map((identity, index) => {
-    let recommendedFor: ModelClass | null = null;
-    if (identity === recommended.reasoning) recommendedFor = "reasoning";
-    else if (identity === recommended.execution) recommendedFor = "execution";
-    return {
-      index,
-      identity,
-      number: index + 1,
-      isRecommended: recommendedFor !== null,
-      recommendedFor,
-    };
-  });
-}
-
-function annotateRow(identity: string, recommendedFor: ModelClass | null): string {
-  if (recommendedFor === null) return "";
-  return `  [${RECOMMENDED_LABEL} (${recommendedFor})]`;
+export interface RunModelSelectorArgs {
+  readonly inventory: Iterable<string>;
+  readonly modelClass: ModelClass;
+  readonly recommended?: RecommendedModelIds;
+  readonly currentIdentity?: ModelIdentity | null;
+  readonly title?: string;
+  readonly cancelError?: PoiesisError;
 }
 
 /**
- * Render the complete frame to the supplied `write` sink. Returns the
- * exact byte sequence written so tests can compare against a known
- * canonical frame without depending on terminal escape rendering.
- */
-export function renderModelSelectorFrame(args: {
-  title: string;
-  rows: ModelSelectorRenderedRow[];
-  active: number;
-  inventorySize: number;
-}): string {
-  const lines: string[] = [];
-  lines.push(`${args.title}\n`);
-  lines.push("\n");
-  args.rows.forEach((row, i) => {
-    const cursor = i === args.active ? `${CURSOR} ` : "  ";
-    const number = String(row.number).padStart(NUMBER_PAD_WIDTH, " ");
-    const identity = row.identity.padEnd(40, " ");
-    const annotation = row.recommendedFor === null ? "" : annotateRow(row.identity, row.recommendedFor);
-    lines.push(`${cursor}${number}. ${identity}${annotation}\n`);
-  });
-  lines.push("\n");
-  lines.push("Use \u2191/\u2193 to move, Enter to select, Esc/q to cancel.\n");
-  return lines.join("");
-}
-
-/**
- * Run the interactive selector. Returns the chosen `ModelIdentity`.
+ * Run the model identity selector through the Clack adapter. Returns
+ * the chosen `ModelIdentity`.
  *
  * Failure modes (always `PoiesisError` so callers can branch on
  * `error.code`):
- *   - `MODEL_SELECTOR_NOT_TTY`     -- `io.isTTY === false`
+ *   - `MODEL_SELECTOR_NOT_TTY`     -- `process.stdin.isTTY === false`
  *   - `MODEL_SELECTOR_NO_INVENTORY` -- normalized inventory is empty
- *   - `MODEL_SELECTOR_CANCELLED`   -- user pressed Esc / q / Ctrl+C
+ *   - The caller-supplied `cancelError` (default
+ *     `MODEL_SELECTOR_CANCELLED`) -- operator pressed Esc / Ctrl+C
  */
 export async function runModelSelector(args: RunModelSelectorArgs): Promise<ModelIdentity> {
-  const { io, inventory, modelClass } = args;
+  if (process.stdin.isTTY !== true) {
+    throw new PoiesisError(
+      "MODEL_SELECTOR_NOT_TTY",
+      "Interactive model selector requires a TTY; pass --non-tty or use a non-interactive workflow",
+    );
+  }
+  const identities = normalizeInventory(args.inventory);
+  if (identities.length === 0) {
+    throw new PoiesisError(
+      "MODEL_SELECTOR_NO_INVENTORY",
+      "OpenCode model inventory is empty; cannot offer a selection",
+    );
+  }
   const recommended = args.recommended ?? DEFAULT_RECOMMENDED_MODEL_IDS;
-  // Always restore raw mode (or any other IO-installed side effect) on
-  // the way out, including throws that fire BEFORE the first `readKey`
-  // (`MODEL_SELECTOR_NOT_TTY`, `MODEL_SELECTOR_NO_INVENTORY`). The
-  // production factory enables raw mode at construction; without this
-  // finally the selector would leave the user's TTY in raw mode after a
-  // pre-flight rejection, and any subsequent interactive prompt would
-  // see escape sequences instead of normal keypresses.
-  try {
-    if (!io.isTTY) {
-      throw new PoiesisError(
-        "MODEL_SELECTOR_NOT_TTY",
-        "Interactive model selector requires a TTY; pass --non-tty or use a non-interactive workflow",
-      );
+  const currentIdentity = args.currentIdentity ?? null;
+  const rows = buildModelSelectorRows({ identities, recommended, currentIdentity });
+  const options: ClackSelectRow<ModelIdentity>[] = rows.map((row) => {
+    const hint = formatModelSelectorHint(row.hints, args.modelClass);
+    // Drop the hint entirely when the row carries no flag — Clack's
+    // option shape uses exact-optional `hint?: string`, so a literal
+    // `""` would render as a blank hint instead of "no hint at all".
+    if (hint === "") {
+      return { value: row.identity, label: row.identity };
     }
-    const identities = normalizeInventory(inventory);
-    if (identities.length === 0) {
-      throw new PoiesisError(
-        "MODEL_SELECTOR_NO_INVENTORY",
-        "OpenCode model inventory is empty; cannot offer a selection",
-      );
-    }
-    const rows = buildModelSelectorRows(identities, recommended);
-    const active = initialCursor(rows, modelClass);
-    const title = args.title ?? `Select a ${modelClass} model`;
-    const initial = renderModelSelectorFrame({ title, rows, active, inventorySize: identities.length });
-    io.write(initial);
-
-    // Cursor is a 0-based index into `rows`.
-    let cursor = active;
-    // Loop until the user confirms a selection or cancels.
-    // Each iteration re-renders the frame so the visible cursor reflects
-    // the latest keypress. We always re-render after a state change; the
-    // cost is trivial (a few dozen bytes) and avoids bespoke partial-frame
-    // bookkeeping in the production IO seam.
-    for (;;) {
-      const key = await io.readKey();
-      let moved = false;
-      switch (key.kind) {
-        case "up":
-          cursor = (cursor - 1 + rows.length) % rows.length;
-          moved = true;
-          break;
-        case "down":
-          cursor = (cursor + 1) % rows.length;
-          moved = true;
-          break;
-        case "number": {
-          const target = key.value - 1;
-          if (target >= 0 && target < rows.length) {
-            cursor = target;
-            moved = true;
-          }
-          break;
-        }
-        case "enter": {
-          const chosen = rows[cursor];
-          if (chosen === undefined) {
-            throw new PoiesisError("MODEL_SELECTOR_NO_INVENTORY", "Selector cursor is out of bounds");
-          }
-          return chosen.identity;
-        }
-        case "cancel":
-          throw new PoiesisError(
-            "MODEL_SELECTOR_CANCELLED",
-            "Model selection was cancelled by the user",
-            { modelClass },
-          );
-      }
-      if (moved) {
-        io.write(renderModelSelectorFrame({ title, rows, active: cursor, inventorySize: identities.length }));
-      }
-    }
-  } finally {
-    io.dispose?.();
-  }
+    return { value: row.identity, label: row.identity, hint };
+  });
+  const initialValue = resolveIdentityInitialValue({
+    inventory: identities,
+    currentIdentity,
+    recommended,
+    modelClass: args.modelClass,
+  });
+  const message = args.title ?? `Select a ${args.modelClass} model`;
+  return runClackSelect<ModelIdentity>({
+    message,
+    options,
+    ...(initialValue === undefined ? {} : { initialValue }),
+    cancelError:
+      args.cancelError ?? new PoiesisError("MODEL_SELECTOR_CANCELLED", "Model selection was cancelled by the user", { modelClass: args.modelClass }),
+  });
 }
-
-function initialCursor(rows: ModelSelectorRenderedRow[], modelClass: ModelClass): number {
-  // Preselect ONLY when the constant for the active modelClass is in
-  // the inventory. The cross-class recommendation is annotated but
-  // never moves the cursor (no cousin substitute).
-  for (let i = 0; i < rows.length; i++) {
-    const row = rows[i];
-    if (row === undefined) continue;
-    if (row.recommendedFor === modelClass) return i;
-  }
-  return 0;
-}
-
-/**
- * Production IO factory. Wires the selector to the supplied stream
- * pair (defaulting to `process.stdin` / `process.stderr` when omitted
- * so the typical CLI invocation stays a zero-argument call site and
- * the selector's frames stay on the human-facing channel, not on the
- * structured-JSON stdout reserved for `writeSuccess` / `writeFailure`).
- *
- * Uses Node 22 stdlib `readline.emitKeypressEvents` plus raw mode on
- * the input stream. Only the keypress events the selector needs are
- * surfaced through the `ModelSelectorKey` discriminated union, so the
- * selector never sees a raw `Key` object and tests cannot leak into
- * the production code path.
- *
- * Raw mode is enabled exactly once at construction and restored to
- * `false` whenever the IO leaves the waiting state (terminal key
- * resolution, stream end / close, or an unsupported-key error). This
- * keeps the terminal in cooked mode after the selector returns so a
- * stray Ctrl+C / EOF does not leave the user's TTY in raw mode.
- */
-export interface ProductionModelSelectorIOArgs {
-  readonly stdin?: Readable;
-  readonly stdout?: Writable;
-}
-
-export function createProductionModelSelectorIO(
-  args: ProductionModelSelectorIOArgs = {},
-): ModelSelectorIO {
-  const stdin = args.stdin ?? process.stdin;
-  const stdout = args.stdout ?? process.stderr;
-  const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
-  emitKeypressEvents(stdin);
-  const raw = stdin as Readable & { setRawMode?: (mode: boolean) => void };
-  const canRawMode = typeof raw.setRawMode === "function";
-  if (canRawMode) raw.setRawMode!(true);
-  // Track whether raw mode is currently armed so an idempotent
-  // `restoreRawMode` (and the `dispose()` seam) cannot double-toggle
-  // the TTY back to raw after a prior restore.
-  let rawModeActive = canRawMode;
-  const restoreRawMode = (): void => {
-    if (canRawMode && rawModeActive) {
-      raw.setRawMode!(false);
-      rawModeActive = false;
-    }
-  };
-  const writer = (data: string): void => {
-    stdout.write(data);
-  };
-  const readKey = (): Promise<ModelSelectorKey> =>
-    new Promise((resolve, reject) => {
-      // Node's `readline.emitKeypressEvents` listener signature is
-      // `(chunk, key)` where `chunk` is the raw byte sequence (often
-      // `undefined` for fragments that resolve into a multi-byte CSI
-      // sequence like arrow keys) and `key` is the parsed `Key`
-      // descriptor. The selector is interested in `key` — passing
-      // `chunk` is what produced the `Cannot read properties of
-      // undefined (reading 'sequence')` `UNEXPECTED` crash on the very
-      // first Down arrow reported by the Python-PTY dogfood. Per ticket
-      // #65 we forward `key` and keep waiting when it is undefined.
-      const onKey = (_chunk: string | undefined, key: Key | undefined): void => {
-        if (key === undefined) {
-          return;
-        }
-        stdin.removeListener("keypress", onKey);
-        stdin.removeListener("end", onEnd);
-        stdin.removeListener("close", onEnd);
-        let resolved: ModelSelectorKey;
-        try {
-          resolved = translateKeypress(key);
-        } catch (error) {
-          restoreRawMode();
-          reject(error instanceof Error ? error : new Error(String(error)));
-          return;
-        }
-        // `enter` and `cancel` are the two selector-terminal keys; an
-        // `up` / `down` / `number` resolution keeps the loop alive so
-        // raw mode stays on until the next keypress.
-        if (resolved.kind === "enter" || resolved.kind === "cancel") {
-          restoreRawMode();
-        }
-        resolve(resolved);
-      };
-      const onEnd = (): void => {
-        stdin.removeListener("keypress", onKey);
-        restoreRawMode();
-        reject(
-          new PoiesisError(
-            "MODEL_SELECTOR_CANCELLED",
-            "Model selection was cancelled by the user (input closed)",
-          ),
-        );
-      };
-      stdin.on("keypress", onKey);
-      stdin.once("end", onEnd);
-      stdin.once("close", onEnd);
-    });
-  return {
-    isTTY,
-    write: writer,
-    readKey,
-    // Ticket #66: `runModelSelector` invokes `dispose()` from a
-    // `finally` block so any pre-`readKey` rejection
-    // (`MODEL_SELECTOR_NOT_TTY`, `MODEL_SELECTOR_NO_INVENTORY`) still
-    // returns the TTY to cooked mode. Idempotent — safe to call after
-    // a successful keypress that already restored raw mode.
-    dispose: restoreRawMode,
-  };
-}
-
-/**
- * Translate a Node `Key` object (or an undefined / null chunk emitted
- * for incomplete CSI fragments) into the selector's typed union. The
- * undefined / null case is intentionally collapsed to `null` so the
- * caller's keypress loop keeps waiting without throwing UNEXPECTED.
- *
- * The two signatures mirror the production read loop's two call
- * shapes: production always passes a concrete `Key` (the narrowed
- * second arg of the keypress event) and gets back a non-null typed
- * key, while the regression suite (and any other defensive caller)
- * can pass undefined / null and observe the `null` sentinel without a
- * thrown `UNEXPECTED`.
- */
-function translateKeypress(chunk: Key): ModelSelectorKey;
-function translateKeypress(chunk: undefined | null): null;
-function translateKeypress(chunk: Key | undefined | null): ModelSelectorKey | null;
-function translateKeypress(chunk: Key | undefined | null): ModelSelectorKey | null {
-  if (chunk === undefined || chunk === null) return null;
-  if (chunk.sequence === "\u0003" || chunk.sequence === "\u001b" || chunk.name === "escape") {
-    return { kind: "cancel" };
-  }
-  if (chunk.name === "up" || chunk.sequence === "\u001b[A") return { kind: "up" };
-  if (chunk.name === "down" || chunk.sequence === "\u001b[B") return { kind: "down" };
-  if (chunk.name === "return" || chunk.sequence === "\r" || chunk.sequence === "\n") {
-    return { kind: "enter" };
-  }
-  if (chunk.name === "q" && !chunk.ctrl) return { kind: "cancel" };
-  const numeric = matchNumericKeypress(chunk);
-  if (numeric !== null) return { kind: "number", value: numeric };
-  throw new PoiesisError(
-    "MODEL_SELECTOR_UNSUPPORTED_KEY",
-    "Selector received an unsupported keypress",
-    { sequence: chunk.sequence, name: chunk.name },
-  );
-}
-
-function matchNumericKeypress(chunk: Key): number | null {
-  if (chunk.ctrl || chunk.meta || chunk.shift) return null;
-  if (chunk.name === undefined) return null;
-  if (!/^[0-9]$/.test(chunk.name)) return null;
-  return Number.parseInt(chunk.name, 10);
-}
-
-/**
- * Internal helpers exposed for the model-selector regression suite
- * (ticket #65). Kept behind a `__test` namespace so the package-root
- * re-exports never surface them to outside consumers.
- */
-export const __test = { translateKeypress };

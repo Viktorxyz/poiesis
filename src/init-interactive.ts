@@ -47,11 +47,12 @@ import {
 } from "./init-discovery.js";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
-  createProductionModelSelectorIO,
   runModelSelector,
   type ModelClass,
   type ModelIdentity,
+  type RecommendedModelIds,
 } from "./model-selector.js";
+import { settleOnceLinePrompt } from "./prompt-line.js";
 import { init, parseOpenCodeModelInventory } from "./maintenance.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { run as runChildProcess } from "./process.js";
@@ -61,7 +62,8 @@ export type TrackerProvider = "github" | "gitlab";
 export interface ModelSelection {
   readonly modelClass: ModelClass;
   readonly inventory: readonly string[];
-  readonly recommended: { reasoning: ModelIdentity; execution: ModelIdentity };
+  readonly recommended: RecommendedModelIds;
+  readonly currentIdentity: ModelIdentity | null;
 }
 
 export interface TrackerAuthProbeResult {
@@ -423,6 +425,10 @@ async function selectModel(io: InteractiveInitIO, modelClass: ModelClass): Promi
     modelClass,
     inventory,
     recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
+    // Init runs before any model is installed, so there is no
+    // "current" identity to mark in the hint. Pass `null` and let
+    // `runModelSelector` apply its own `initialValue` policy.
+    currentIdentity: null,
   };
   const chosen = await io.runModelSelector(selection);
   if (chosen.trim().length === 0) {
@@ -574,9 +580,11 @@ export const __test = { resolveAuthorChoices, refuseIfAlreadyInstalled };
 /**
  * Production IO factory. Wires the interactive init IO to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a zero-argument call site. Model-selector IO is delegated to
- * the existing `createProductionModelSelectorIO` so the shared
- * keypress loop is reused byte-for-byte.
+ * stays a zero-argument call site. Model selection is delegated to
+ * `runModelSelector`, which goes through the CLI-internal Clack
+ * adapter (`src/clack-select.ts`). The init / model flows share that
+ * single interactive list primitive so there is no second selector
+ * implementation to drift.
  *
  * Tests inject a fully scripted IO via the `io` parameter on
  * `runInteractiveInit`; production code goes through this factory.
@@ -591,25 +599,22 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
     async promptLine(prompt: string): Promise<string> {
-      // Lazy: production callers go through readline only when a prompt
-      // is actually issued. Tests inject their own `promptLine`.
-      const { createInterface } = await import("node:readline");
-      return await new Promise<string>((resolve, reject) => {
-        try {
-          const rl = createInterface({ input: stdin, output: stderr, terminal: isTTY });
-          stderr.write(`${prompt}: `);
-          rl.once("line", (line) => {
-            rl.close();
-            resolve(line);
-          });
-          rl.once("close", () => {
-            // close-without-line means the user closed stdin; surface as
-            // a cancellation so callers can branch on a typed error.
-            reject(new PoiesisError("INIT_PROMPT_CANCELLED", "Interactive prompt was cancelled by the user", { prompt }));
-          });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
+      // Ticket #68: the production prompt is a thin adapter over the
+      // CLI-internal settle-once readline helper. The helper owns the
+      // settle-once invariant; the factory only binds stdin / stderr and
+      // the distinct `INIT_PROMPT_CANCELLED` cancellation error (kept
+      // distinct from `MODEL_PROMPT_CANCELLED` per Spec §"Design").
+      // Callers still `.trim()` the returned raw line themselves.
+      return await settleOnceLinePrompt({
+        prompt,
+        input: stdin,
+        output: stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "INIT_PROMPT_CANCELLED",
+          "Interactive prompt was cancelled by the user",
+          { prompt },
+        ),
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
@@ -624,16 +629,19 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
       return [...parseOpenCodeModelInventory(result.stdout)];
     },
     async runModelSelector(selection: ModelSelection): Promise<string> {
-      // The shared selector owns its own IO and keypress loop. We
-      // forward stderr for its prompt frames (mirrors `runModelSelector`
-      // defaults) and let it surface MODEL_SELECTOR_NOT_TTY up the stack
-      // if the parent IO was somehow misconfigured.
-      const io = createProductionModelSelectorIO();
+      // Init runs before any model is installed, so there is no
+      // "current" identity to mark in the hint. Pass `null` and let
+      // `runModelSelector` apply its own `initialValue` policy.
       return await runModelSelector({
-        io,
         inventory: selection.inventory,
         recommended: selection.recommended,
         modelClass: selection.modelClass,
+        currentIdentity: selection.currentIdentity,
+        cancelError: new PoiesisError(
+          "INIT_MODEL_SELECTOR_CANCELLED",
+          "Interactive init model selector was cancelled by the user",
+          { modelClass: selection.modelClass },
+        ),
       });
     },
     async probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult> {
