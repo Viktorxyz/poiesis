@@ -1,9 +1,24 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Ticket #74 — wrap `run` in a vi.fn so the GitHub-provider tests can
+// intercept `gh` calls while letting real git operations continue. The
+// factory stashes the real runner on `globalThis` so re-imports after
+// the (hoisted) `vi.mock` resolves can reach the un-wrapped impl; tests
+// reset the mock implementation per `beforeEach`.
+vi.mock("../src/process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/process.js")>();
+  (globalThis as unknown as { __poiesisRealRun?: typeof actual.run }).__poiesisRealRun = actual.run;
+  return {
+    ...actual,
+    run: vi.fn(actual.run),
+  };
+});
+
 import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, workspacePrepare } from "../src/git.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
-import { run } from "../src/process.js";
+import { run, type RunResult } from "../src/process.js";
 import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
@@ -452,5 +467,256 @@ describe("deterministic Git lifecycle", () => {
     // foreign-file-only status. No default-path residue leaks.
     const afterStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
     expect(afterStatus.trim()).toBe("?? foreign.txt");
+  }, 30_000);
+});
+
+// Ticket #74 — `gh pr list --json headRepository` may omit `nameWithOwner`
+// (or omit the whole `headRepository` field) for same-repo PRs. The former
+// failed closed with CHANGE_REQUEST_OWNERSHIP_MISMATCH against actual "",
+// breaking legitimate re-publishes. These tests go through the real
+// `publish()` flow with the GitHub provider and feed the `gh` responses
+// via the `process.js` mock. Real git operations (push, ls-remote, etc.)
+// continue to use the un-wrapped runner.
+describe("GitHub provider headRepository handling", () => {
+  const repositories: TestRepository[] = [];
+  // ghResponse.queue holds the queued responses for each `gh` call. They
+  // are consumed in order: list → create/edit → list (verify).
+  let ghResponseQueue: RunResult[] = [];
+  let realRun: typeof run;
+
+  afterEach(async () => {
+    vi.mocked(run).mockReset();
+    vi.mocked(run).mockImplementation(realRun);
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  beforeEach(() => {
+    const stash = (globalThis as unknown as { __poiesisRealRun?: typeof run }).__poiesisRealRun;
+    if (stash === undefined) throw new Error("process.js mock factory did not stash the real runner");
+    realRun = stash;
+    ghResponseQueue = [];
+    vi.mocked(run).mockReset();
+    vi.mocked(run).mockImplementation(async (command, args, options) => {
+      if (command === "gh") {
+        const next = ghResponseQueue.shift();
+        if (next === undefined) {
+          throw new Error(`Unexpected gh call: gh ${args.join(" ")}`);
+        }
+        return next;
+      }
+      return await realRun(command, args, options);
+    });
+  });
+
+  function ghResult(stdout: string, exitCode = 0): RunResult {
+    return {
+      command: "gh",
+      args: [],
+      exitCode,
+      stdout,
+      stderr: "",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      timedOut: false,
+      signal: null,
+      durationMs: 0,
+    };
+  }
+
+  // gh pr list returning a single PR with the given headRefOid and an
+  // explicit headRepository payload. Pass `null` for `headRepository` to
+  // produce JSON where the field is present with value `null`; pass
+  // `undefined` to omit the field entirely.
+  function ghListEntry(candidateSha: string, headRepository: unknown): RunResult {
+    const entry: Record<string, unknown> = {
+      number: 7,
+      url: "https://github.com/owner/repo/pull/7",
+      headRefOid: candidateSha,
+    };
+    if (headRepository !== undefined) entry.headRepository = headRepository;
+    return ghResult(JSON.stringify([entry]));
+  }
+
+  function ghListEmpty(): RunResult {
+    return ghResult("[]");
+  }
+
+  function ghPrCreateResponse(): RunResult {
+    // `gh pr create` writes the new PR URL to stdout.
+    return ghResult("https://github.com/owner/repo/pull/7\n");
+  }
+
+  function ghPrEditResponse(): RunResult {
+    return ghResult("");
+  }
+
+  async function createWorkspaceWithCheckpoint(
+    repository: TestRepository,
+    specId: string,
+  ): Promise<{ workspacePath: string; ownershipId: string; sha: string; tree: string }> {
+    const workspace = await workspacePrepare({
+      cwd: repository.root,
+      remote: "origin",
+      integrationBranch: "main",
+      branch: `poiesis/${specId}`,
+      workspacePath: join(repository.parent, `${specId}-workspace`),
+      specId,
+    });
+    await writeFile(join(workspace.path, "feature.txt"), "feature\n");
+    const accepted = await checkpoint({
+      cwd: workspace.path,
+      paths: ["feature.txt"],
+      message: "ticket",
+      review: { verdict: "PASS", reviewerIdentity: "review", evidence: "pass" },
+    });
+    const tree = await candidateTree(repository, accepted.sha);
+    return {
+      workspacePath: workspace.path,
+      ownershipId: workspace.ownershipId,
+      sha: accepted.sha,
+      tree,
+    };
+  }
+
+  it("treats an empty headRepository.nameWithOwner as matching options.project on republish", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-empty-headrepo");
+
+    // First publish: gh has no PR yet → create one, then verify.
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, { nameWithOwner: "" }),
+    );
+    const first = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(first.action).toBe("created");
+
+    // Second publish: gh now reports the PR with matching headRefOid but
+    // an empty nameWithOwner. Before the fix this threw
+    // CHANGE_REQUEST_OWNERSHIP_MISMATCH with actual "".
+    ghResponseQueue.push(
+      ghListEntry(sha, { nameWithOwner: "" }),
+      ghPrEditResponse(),
+      ghListEntry(sha, { nameWithOwner: "" }),
+    );
+    const second = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec v2",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(second.action).toBe("updated");
+  }, 30_000);
+
+  it("treats a missing headRepository field as matching options.project on republish", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-missing-headrepo");
+
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, undefined),
+    );
+    await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+
+    // Second publish: headRepository field absent entirely.
+    ghResponseQueue.push(
+      ghListEntry(sha, undefined),
+      ghPrEditResponse(),
+      ghListEntry(sha, undefined),
+    );
+    const second = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec v2",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(second.action).toBe("updated");
+  }, 30_000);
+
+  it("still fails closed when headRepository.nameWithOwner differs from options.project", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-mismatch-headrepo");
+
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+    );
+    await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+
+    // Second publish: gh returns a PR that points at a fork. Still mismatch.
+    ghResponseQueue.push(ghListEntry(sha, { nameWithOwner: "fork/repo" }));
+    await expect(
+      publish({
+        cwd: workspacePath,
+        ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        candidateSha: sha,
+        candidateTree: tree,
+        provider: "github",
+        project,
+        title: "Spec v2",
+        body: "body",
+        proof: proofShell(sha, tree),
+      }),
+    ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
   }, 30_000);
 });

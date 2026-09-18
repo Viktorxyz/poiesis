@@ -936,11 +936,20 @@ async function publishGitHub(
       "Existing GitHub pull request points at a different candidate",
       { expected: candidateSha, actual: jsonString(request, "headRefOid") },
     );
-    const headRepository = isJsonRecord(request) && isJsonRecord(request.headRepository)
-      ? jsonString(request.headRepository, "nameWithOwner")
+    const headRepositoryRecord = isJsonRecord(request) && isJsonRecord(request.headRepository)
+      ? request.headRepository
       : undefined;
+    // gh pr list omits the headRepository object entirely (or returns
+    // nameWithOwner as "") for same-repo PRs. Treat both as matching
+    // options.project; only fail closed when nameWithOwner is present
+    // and differs from the configured project.
+    const headRepository = headRepositoryRecord === undefined
+      ? undefined
+      : jsonString(headRepositoryRecord, "nameWithOwner");
     invariant(
-      headRepository === options.project,
+      headRepository === undefined ||
+        headRepository === "" ||
+        headRepository === options.project,
       "CHANGE_REQUEST_OWNERSHIP_MISMATCH",
       "Existing GitHub pull request comes from a different repository",
       { expected: options.project, actual: headRepository },
