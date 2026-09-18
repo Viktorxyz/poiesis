@@ -164,6 +164,106 @@ describe("settleOnceLinePrompt (ticket #68)", () => {
     expect(settled.value).toBe("execution");
   });
 
+  it("the input stream stays flowing after settlement so the next interactive seam can run", async () => {
+    // Ticket #71 regression. Node's `readline.close()` pauses the
+    // underlying input stream. The production flow hands the same
+    // stdin to the model selector's keypress loop (`createProductionModelSelectorIO`)
+    // immediately after `settleOnceLinePrompt` resolves — that loop uses
+    // `readline.emitKeypressEvents` plus `setRawMode(true)`, which do NOT
+    // call `resume()` on a paused stream. Without an explicit resume
+    // in this helper, keypress data written to stdin is buffered and
+    // never reaches the listener (the production failure mode).
+    //
+    // This test reproduces the production seam with the same primitives:
+    // `emitKeypressEvents` + a `keypress` listener. Without the fix,
+    // the Down-arrow escape written below is silently dropped.
+    const { stdin, stderr } = setupPair();
+    const cancellation = new PoiesisError("MODEL_PROMPT_CANCELLED", "cancelled", { prompt: "Class" });
+
+    const promise = settleOnceLinePrompt({
+      prompt: "Class",
+      input: stdin,
+      output: stderr,
+      isTTY: true,
+      cancellationError: cancellation,
+    });
+    stdin.write("reasoning\n");
+    await expect(promise).resolves.toBe("reasoning");
+
+    // Simulate `createProductionModelSelectorIO`'s keypress attachment.
+    const { emitKeypressEvents } = await import("node:readline");
+    emitKeypressEvents(stdin);
+    const received: string[] = [];
+    stdin.on("keypress", (_chunk: unknown, key: { sequence?: string } | undefined) => {
+      if (key && typeof key.sequence === "string") received.push(key.sequence);
+    });
+
+    // Bound the wait so a hang fails the test fast.
+    stdin.write("\u001b[B");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(received).toContain("\u001b[B");
+  });
+
+  it("a second settleOnceLinePrompt on the same stdin receives a second line", async () => {
+    // Contract test (ticket #71). Two sequential `settleOnceLinePrompt`
+    // calls on the same PassThrough stream must both resolve with the
+    // entered lines. The helper must leave stdin in a state where the
+    // next interactive seam — whether another readline cycle or a
+    // keypress loop — can receive data without manually calling
+    // `resume()` first.
+    //
+    // Production models this with real async time between prompts
+    // (model-selector frames render, the Author reads them and types).
+    // A synchronous `stdin.write("execution\n")` right after the second
+    // helper call would race against `createInterface`'s async import
+    // and lose the chunk (a Readable stream's "flowing + no consumer"
+    // state drops pre-listener writes). The `setImmediate` here mirrors
+    // the production async gap so the test exercises the contract
+    // without depending on microtask scheduling order.
+    const { stdin, stderr } = setupPair();
+    const cancellation = new PoiesisError("MODEL_PROMPT_CANCELLED", "cancelled", { prompt: "Class" });
+
+    const p1 = settleOnceLinePrompt({
+      prompt: "Class",
+      input: stdin,
+      output: stderr,
+      isTTY: true,
+      cancellationError: cancellation,
+    });
+    stdin.write("reasoning\n");
+    await expect(p1).resolves.toBe("reasoning");
+
+    const p2 = settleOnceLinePrompt({
+      prompt: "Class",
+      input: stdin,
+      output: stderr,
+      isTTY: true,
+      cancellationError: cancellation,
+    });
+    // Production-timing gap: model selector frames, model-selector
+    // readKey loop, or simply the human Author typing — none of those
+    // arrive synchronously with the next helper call.
+    await new Promise((resolve) => setImmediate(resolve));
+    stdin.write("execution\n");
+    // Bound the wait so a hang fails the test fast instead of waiting
+    // for vitest's default test timeout.
+    const result = await Promise.race([
+      p2,
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                "second settleOnceLinePrompt hung — stdin was not resumed after readline.close()",
+              ),
+            ),
+          500,
+        ),
+      ),
+    ]);
+    expect(result).toBe("execution");
+  });
+
   it("writes the prompt label to the supplied output stream before reading the line", async () => {
     const { stdin, stderr, stderrChunks } = setupPair();
     const cancellation = new PoiesisError("MODEL_PROMPT_CANCELLED", "cancelled", { prompt: "Tracker provider (github|gitlab)" });
