@@ -59,9 +59,9 @@ No default `AGENTS.md` mutation.
 
 Before implementing OpenCode integration, verify the target installed/current OpenCode source/docs and schema.
 
-The bundle targets the **OpenCode adapter-version-1** config schema, verified against supported OpenCode tags `1.18.29` and `1.18.30` (see `COMPATIBILITY.md` and `src/opencode.ts::SUPPORTED_OPENCODE_VERSIONS`). OpenCode-specific projection syntax below is **adapter-syntax**, not harness-neutral Poiesis semantics — Poiesis method, role files, and CLI surface remain harness-neutral and do not change shape per adapter.
+The bundle targets the **OpenCode adapter-version-1** config schema, verified against supported OpenCode tags `1.18.29`, `1.18.30`, and `1.18.31` (see `COMPATIBILITY.md` and `src/opencode.ts::SUPPORTED_OPENCODE_VERSIONS`). OpenCode-specific projection syntax below is **adapter-syntax**, not harness-neutral Poiesis semantics — Poiesis method, role files, and CLI surface remain harness-neutral and do not change shape per adapter.
 
-Qualified OpenCode 1.18.29 / 1.18.30 adapter v1 schema:
+Qualified OpenCode 1.18.29 / 1.18.30 / 1.18.31 adapter v1 schema:
 - Markdown custom agents under `.opencode/agents/`;
 - Markdown body is the agent `system`;
 - `mode: primary|subagent`;
@@ -175,7 +175,7 @@ Preserve preexisting skills as user-owned.
 
 Generate the six Poiesis agent files from the `OPENCODE_AGENT_*.md` templates. `poiesis-reviewer` and `poiesis-final-reviewer` are adapter-only projections of the same canonical Reviewer role, required to route ticket review to the execution model and final reviews to the reasoning model.
 
-Generate the OpenCode config projection directly from `src/opencode.ts::desiredOpenCodePatches()` against the qualified adapter-version-1 schema (singular `agent` / `permission`, keys such as `bash`, `task`, `skill`, etc.). Do not copy or extend the legacy `OPENCODE_CONFIG_PATCH_V2.jsonc` — its plural `agents` / `permissions` shape and `shell` / `subagent` action names are not accepted by supported OpenCode `1.18.29` / `1.18.30`. Validate the projected payload with `opencode debug config` before write.
+Generate the OpenCode config projection directly from `src/opencode.ts::desiredOpenCodePatches()` against the qualified adapter-version-1 schema (singular `agent` / `permission`, keys such as `bash`, `task`, `skill`, etc.). Do not copy or extend the legacy `OPENCODE_CONFIG_PATCH_V2.jsonc` — its plural `agents` / `permissions` shape and `shell` / `subagent` action names are not accepted by supported OpenCode `1.18.29` / `1.18.30` / `1.18.31`. Validate the projected payload with `opencode debug config` before write.
 
 Do not copy the patch file verbatim. Do not overwrite unrelated OpenCode config.
 

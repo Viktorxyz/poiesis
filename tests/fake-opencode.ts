@@ -82,6 +82,10 @@ case "$1" in
     exit 0
     ;;
   models)
+    if [ "$POIESIS_TEST_OPENCODE_FAIL" = "1" ]; then
+      printf 'forced models failure\\n' >&2
+      exit 1
+    fi
     if [ "\${POIESIS_TEST_OPENCODE_MODELS+set}" = set ]; then
       printf '%s\\n' "$POIESIS_TEST_OPENCODE_MODELS"
     else

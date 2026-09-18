@@ -15,7 +15,7 @@ Poiesis combines:
 
 - a harness-neutral method (Express → Understand → Authorize → Prepare → Capability Check → Plan → Specify → Tickets → Realize → Prove → Publish → Preview → Author validation → freshness → Staging → Integrate → Production authorization → Release → Complete);
 - a small TypeScript / Node.js CLI for exact mechanics (`init`, `doctor`, `update`, `uninstall`, `inspect`, `capability`, `workspace`, `checkpoint`, `verify`, `publish`, `preview`, `promote`, `integrate`, `tracker`, `session`);
-- a first OpenCode `1.18.29` / `1.18.30` adapter (explicit adapter-version-1 supported set).
+- a first OpenCode `1.18.29` / `1.18.30` / `1.18.31` adapter (explicit adapter-version-1 supported set).
 
 Poiesis is not a workflow database, not an OpenCode plugin, and does not own your `AGENTS.md`.
 
@@ -23,7 +23,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 
 - Node.js `>=22.20.0`
 - Git
-- OpenCode `1.18.29` or `1.18.30`
+- OpenCode `1.18.29`, `1.18.30`, or `1.18.31` (see [COMPATIBILITY.md](./COMPATIBILITY.md) for the verified adapter-v1 contract)
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
 - A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))
@@ -34,15 +34,27 @@ Poiesis is published as the `poiesis-cli` npm package. The CLI binary is named `
 
 ### First-time init
 
-In a real Git repository:
+In a real Git repository, the human happy path is flagless:
+
+```bash
+pnpm dlx poiesis-cli@latest init
+```
+
+`poiesis init` with no flags runs the interactive TTY flow. It discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
+
+`init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
+
+The repository remote and integration branch are not CLI options — they are read from the Git repository directly. The config file described below is the **output** of `init`, not the input: a successful `init` writes a resolved `.poiesis/config.jsonc` plus the manifest, and that resolved file is what subsequent operations consume.
+
+#### Non-interactive init (automation only)
+
+For CI / scripted use, `init` accepts the same resolved config file via `--config`. The flag is reserved for non-TTY invocations and reproducible automation:
 
 ```bash
 pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
 ```
 
-`init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
-
-The repository remote and integration branch are not CLI options — they are read from the `repository` block of the supplied config file (or auto-discovered from the Git repository when omitted; see the minimal config example below).
+A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rather than guessing; the structured path is the supported automation contract. The repository remote and integration branch are still read from the Git repository directly — `repository.remote` and `repository.integrationBranch` keys in the config file are accepted for completeness but the Git repository is the source of truth.
 
 `doctor` runs without mutation and verifies the same set of invariants any time:
 
@@ -66,10 +78,10 @@ After that command succeeds, later `doctor`, `update`, `uninstall`, and capabili
 
 ### Updating the managed config
 
-`.poiesis/config.jsonc` is a managed surface — Poiesis generated it from the
-original `init --config` input, and ordinary editing would create a stale
-configuration that nothing would reconcile. The supported update path is the
-intentional managed-config workflow:
+`.poiesis/config.jsonc` is a managed surface — Poiesis generated it from a
+successful `init`, and ordinary editing would create a stale configuration
+that nothing would reconcile. The supported update path is the intentional
+managed-config workflow:
 
 ```bash
 pnpm dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
@@ -121,9 +133,9 @@ before any side effect.
 pnpm dlx poiesis-cli@latest uninstall
 ```
 
-## What `init` needs from a config file
+## What `init` produces
 
-`init` cannot run from nothing because every project makes a real choice that only the Author owns. The minimal config file is:
+`init` cannot run from nothing because every project makes a real choice that only the Author owns. The interactive flow discovers everything it can and asks only for the Author-owned decisions. The successful install writes a resolved `.poiesis/config.jsonc` shaped like:
 
 ```jsonc
 {
@@ -144,7 +156,7 @@ pnpm dlx poiesis-cli@latest uninstall
 }
 ```
 
-`repository.remote` and `repository.integrationBranch` are auto-discovered from the Git repository when omitted. `verification.commands` are auto-derived from the project's package manager and test scripts.
+The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init). `repository.remote` and `repository.integrationBranch` are auto-discovered from the Git repository; `verification.commands` are auto-derived from the project's package manager and test scripts.
 
 ## Preview and Staging
 
@@ -169,12 +181,14 @@ For projects with no existing preview/staging infrastructure, Poiesis uses a fix
 ## Operations
 
 ```text
-init                    install owned method and adapter files
+init                    install owned method and adapter files (flagless interactive on TTY; --config <path> only for non-interactive / CI use)
 doctor                  inspect health without mutation
 update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
 capability install      install one selected, revision-pinned skill
+model                   interactive: pick exactly one slot (reasoning or execution) from the live OpenCode inventory
+model set               deterministic single-class set (reasoning|execution <provider/model>)
 workspace prepare       create an isolated owned branch/worktree (default omits --path and lives under <root>/.poiesis/workspaces/<derived-id>)
 checkpoint              commit an accepted reviewed ticket
 verify                  run checks against an exact clean SHA
@@ -189,9 +203,40 @@ session cleanup         best-effort OpenCode child-session hygiene
 
 Every command emits structured JSON. Run `poiesis help` for command syntax.
 
+### Changing the configured model
+
+`poiesis model` (TTY) walks the live OpenCode model inventory and writes the chosen `<provider/model>` for the chosen slot through the authenticated `update --config` transaction. The change is durable: the manifest, `.poiesis/config.jsonc`, and OpenCode projection are all updated together. Restart OpenCode after success — Poiesis does not restart it.
+
+`poiesis model set reasoning|execution <provider/model>` is the deterministic single-class set (no inventory walk). Both forms target exactly one slot per invocation; pick the slot explicitly so the Author-owned decision stays in scope.
+
+A non-TTY `poiesis model` invocation fails closed with `NON_TTY_MODEL`; the deterministic `model set ...` subcommand is the supported path for scripted use.
+
 `workspace prepare` is invoked as `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`; the CLI then selects a deterministic, traversal-safe workspace under `<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is gitignored so it never appears as foreign work in the primary checkout.
 
 Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
+
+## Use with a coding agent
+
+The normal Author experience is to ask Poiesis for something in natural language and let the visible primary agent orchestrate the work. The following prompt is a reusable, internal-mechanics-free recipe for handing a fresh coding agent a project plus Poiesis without teaching it adapter internals:
+
+```text
+You are operating inside a real Git repository that is being onboarded to Poiesis (a deterministic runtime for turning human intent into working, proven software). Treat the Poiesis CLI as the only supported interface — do not hand-write Poiesis config, do not invent an OpenCode agent or skill installation, and do not reimplement a Poiesis step the CLI already provides.
+
+There are two phases. The bootstrap phase runs the published package through a package runner because Poiesis is not yet installed in this project. Once `init` succeeds, the local `poiesis` CLI is available and later commands can call it directly (or via `pnpm exec poiesis`).
+
+Bootstrap (Poiesis is not installed yet):
+  1. Run `pnpm dlx poiesis-cli@latest init` (TTY). Poiesis prints every detection and asks only the remaining Author-owned choices. After success, tell the human to restart OpenCode.
+
+After init (Poiesis is installed locally):
+  2. Inspect: `poiesis inspect` for bounded project and Git facts.
+  3. Change a model slot: `poiesis model` (TTY), or the deterministic `poiesis model set reasoning|execution <provider/model>` for scripted use.
+
+If a step needs authentication that Poiesis cannot perform on its own (e.g. signing in to `gh`, `glab`, or a delivery target), copy-paste the exact auth command Poiesis prints, run it, and re-run the Poiesis step — do not invent a different auth path.
+
+Ask the human only for decisions that materially affect their product (intent, acceptance, consequential constraints). Do not ask about adapter version numbers, capability shapes, manifest paths, or other Poiesis internals — those are Poiesis's responsibility. If a command fails closed with a structured error, surface the error verbatim; do not silently retry or substitute.
+```
+
+Paste that block into a fresh coding-agent session (Cursor, Claude Code, OpenCode chat, etc.) before asking it to do work in the project. It does not teach adapter internals, it does not ask the agent to invent Poiesis flows, and it routes every external auth step through a copy-paste command.
 
 ## Safety
 

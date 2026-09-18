@@ -5,7 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -32,6 +32,7 @@ type Values = Record<string, string | boolean | string[] | undefined>;
 const HELP = `Poiesis deterministic runtime
 
 Usage:
+  poiesis init                                          # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
@@ -39,13 +40,15 @@ Usage:
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
-  poiesis workspace prepare --branch <name> --spec <id>     # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
-  poiesis workspace prepare --branch <name> --path <absolute> --spec <id>     # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
+  poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
+  poiesis model set reasoning|execution <provider/model> # deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
+  poiesis workspace prepare --branch <name> --spec <id> # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
+  poiesis workspace prepare --branch <name> --path <absolute> --spec <id> # exceptional only: when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>
-  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>     # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>     # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
+  poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>   # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
@@ -81,6 +84,8 @@ async function main(argv: string[]): Promise<void> {
       return commandInspect(rest);
     case "capability":
       return commandCapability(rest);
+    case "model":
+      return commandModel(rest);
     case "workspace":
       return commandWorkspace(rest);
     case "checkpoint":
@@ -104,7 +109,7 @@ async function main(argv: string[]): Promise<void> {
   }
 }
 
-async function commandInit(args: string[]): Promise<void> {
+export async function commandInit(args: string[]): Promise<void> {
   const values = options(args, {
     config: { type: "string" },
     "allow-fixtures": { type: "boolean" },
@@ -112,14 +117,34 @@ async function commandInit(args: string[]): Promise<void> {
   });
   const cwd = cwdOf(values);
   const root = await resolveGitRoot(cwd);
-  const configPath = resolve(cwd, required(values, "config"));
-  const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
-  writeSuccess(
-    "init",
-    await init(root, config, {
-      allowFixtureAdapters: boolean(values, "allow-fixtures"),
-    }),
-  );
+  const configArg = values.config;
+  // --config still drives the structured-JSON install path (no flagless
+  // interactive flow; ticket #58 keeps `--config` working exactly as
+  // before for CI / non-TTY operators).
+  if (typeof configArg === "string" && configArg.trim().length > 0) {
+    const configPath = resolve(cwd, configArg);
+    const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
+    writeSuccess(
+      "init",
+      await init(root, config, {
+        allowFixtureAdapters: boolean(values, "allow-fixtures"),
+      }),
+    );
+    return;
+  }
+  // Flagless path: the interactive init TTY flow. Every TTY check,
+  // prompt, model-selector call, and auth probe is delegated to the
+  // dedicated module so this dispatcher stays a thin shell.
+  const { runInteractiveInit, createProductionInteractiveInitIO } = await import("./init-interactive.js");
+  const io = createProductionInteractiveInitIO();
+  if (!io.isTTY) {
+    throw new PoiesisError(
+      "NON_TTY_INIT",
+      "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
+      { hint: "use `poiesis init --config <path>` or run inside a TTY" },
+    );
+  }
+  writeSuccess("init", await runInteractiveInit({ root, io }));
 }
 
 async function commandDoctor(args: string[]): Promise<void> {
@@ -196,6 +221,91 @@ async function commandCapability(args: string[]): Promise<void> {
       revision: required(values, "revision"),
     }),
   );
+}
+
+/**
+ * CLI dispatch for `poiesis model ...` (ticket #56 / #59 / #66).
+ *
+ * `model set reasoning|execution <provider/model>` is the deterministic
+ * single-class set (ticket #56) and is unchanged. Bare `poiesis model`
+ * on a TTY now invokes the interactive flow (ticket #59) so the
+ * Author can change exactly one slot through the shared selector.
+ * Bare `poiesis model` on a non-TTY invocation fails closed with
+ * `NON_TTY_MODEL` and a hint pointing at the deterministic subcommand.
+ * Unknown subcommands error with `UNKNOWN_COMMAND` and explicitly list
+ * the supported set.
+ *
+ * Ticket #66: `--cwd` is parsed up-front and stripped from the
+ * remaining args BEFORE the subcommand check, so
+ * `poiesis model --cwd <path>` (with no `set` subcommand) reaches the
+ * interactive flow against the supplied repo root instead of being
+ * rejected as `UNKNOWN_COMMAND`. The interactive IO factory is given
+ * that resolved git root so `loadConfig` and the `opencode models`
+ * child process read from the same root `setModel` writes to.
+ */
+export async function commandModel(args: string[]): Promise<void> {
+  // Pull `--cwd <path>` pairs out up front. The remaining `rest`
+  // drives the subcommand decision: empty → interactive, `set …` →
+  // deterministic, anything else → UNKNOWN_COMMAND.
+  const { cwd, rest } = splitCwdArgs(args);
+  const root = await resolveGitRoot(resolve(typeof cwd === "string" ? cwd : process.cwd()));
+
+  if (rest.length === 0) {
+    const { runInteractiveModel, createProductionInteractiveModelIO } = await import(
+      "./model-interactive.js"
+    );
+    const io = createProductionInteractiveModelIO(root);
+    // The interactive flow refuses non-TTY itself with `NON_TTY_MODEL`
+    // (the canonical ticket #59 error code); the dispatch surface stays
+    // a thin shell.
+    writeSuccess("model.interactive", await runInteractiveModel({ root, io }));
+    return;
+  }
+  const sub = rest[0];
+  if (sub !== "set") {
+    throw new PoiesisError("UNKNOWN_COMMAND", `Unknown model subcommand: ${sub ?? ""}`, {
+      subcommand: sub ?? "",
+      supported: ["set"],
+    });
+  }
+  // Parse `set` arguments positionally: `<class> <id>` followed by
+  // `--cwd`. `parseArgs` rejects positionals in strict mode, so we
+  // slice them off the head and run the parser only on the flag tail.
+  const positional = rest.slice(1, 3);
+  const className = positional[0];
+  const modelId = positional[1];
+  if (typeof className !== "string" || className.length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model class", { expected: "reasoning|execution" });
+  }
+  if (typeof modelId !== "string" || modelId.length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model ID", { expected: "<provider/model>" });
+  }
+  writeSuccess(
+    "model.set",
+    await setModel(root, className as ModelClassName, modelId),
+  );
+}
+
+/**
+ * Pull every `--cwd <value>` pair out of `args` and return the value
+ * (last-wins, mirroring `parseArgs` semantics for repeated flags) plus
+ * the residual positional/flag tail. Used by `commandModel` so a bare
+ * `poiesis model --cwd <path>` reaches the interactive dispatcher
+ * instead of falling through to the `UNKNOWN_COMMAND` branch.
+ */
+function splitCwdArgs(args: string[]): { cwd: string | undefined; rest: string[] } {
+  let cwd: string | undefined;
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const current = args[i];
+    if (current === "--cwd" && i + 1 < args.length) {
+      cwd = args[i + 1];
+      i++;
+      continue;
+    }
+    if (typeof current === "string") rest.push(current);
+  }
+  return { cwd, rest };
 }
 
 async function commandWorkspace(args: string[]): Promise<void> {

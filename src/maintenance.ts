@@ -259,13 +259,17 @@ export async function autoResolveConfigDefaults(
   let discoveredTracker = false;
   let trackerProvider = config.tracker.provider;
   let trackerProject = config.tracker.project ?? "";
-  if (trackerProvider === "github" && trackerProject.trim().length === 0 && remote !== undefined) {
+  if (
+    (trackerProvider === "github" || trackerProvider === "gitlab") &&
+    trackerProject.trim().length === 0 &&
+    remote !== undefined
+  ) {
     const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
     const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
     if (url !== undefined) {
-      const parsed = parseGitHubProject(url);
-      if (parsed !== null) {
-        trackerProject = parsed;
+      const parsed = parseTrackerFromUrl(url);
+      if (parsed !== null && parsed.provider === trackerProvider) {
+        trackerProject = parsed.project;
         discoveredTracker = true;
       }
     }
@@ -323,7 +327,7 @@ async function discoverVerificationCommands(root: string): Promise<string[]> {
   return out;
 }
 
-function parseGitHubProject(url: string): string | null {
+export function parseGitHubProject(url: string): string | null {
   const trimmed = url.trim();
   const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
   if (sshMatch !== null && sshMatch[1] !== undefined && sshMatch[2] !== undefined) {
@@ -333,6 +337,50 @@ function parseGitHubProject(url: string): string | null {
   if (httpsMatch !== null && httpsMatch[1] !== undefined && httpsMatch[2] !== undefined) {
     return `${httpsMatch[1]}/${httpsMatch[2]}`;
   }
+  return null;
+}
+
+export function parseGitLabProject(url: string): string | null {
+  const trimmed = url.trim();
+  // SSH: `git@gitlab.com:<group-path>` (with optional `.git` suffix).
+  // Group path may contain nested groups separated by `/`, and must
+  // contain at least two non-empty segments (group + project).
+  const sshMatch = trimmed.match(/^git@gitlab\.com:(.+?)(?:\.git)?$/);
+  if (sshMatch !== null && sshMatch[1] !== undefined) {
+    return normalizeGitLabProjectPath(sshMatch[1]);
+  }
+  // HTTPS / HTTP: `https?://gitlab.com/<group-path>` (with optional
+  // `.git` suffix). Same nested-group / minimum-two-segment rule as
+  // the SSH form.
+  const httpsMatch = trimmed.match(/^https?:\/\/gitlab\.com\/(.+?)(?:\.git)?$/);
+  if (httpsMatch !== null && httpsMatch[1] !== undefined) {
+    return normalizeGitLabProjectPath(httpsMatch[1]);
+  }
+  return null;
+}
+
+/**
+ * Normalize the captured GitLab project path: it must contain at least two
+ * non-empty slash-separated segments (namespace + project). Nested groups
+ * like `group/subgroup/project` are allowed; bare single-segment namespaces
+ * (e.g. `group.git`) and empty segments are rejected.
+ */
+function normalizeGitLabProjectPath(raw: string): string | null {
+  if (raw.length === 0) return null;
+  const segments = raw.split("/");
+  if (segments.length < 2) return null;
+  if (segments.some((segment) => segment.length === 0)) return null;
+  return raw;
+}
+
+export function parseTrackerFromUrl(url: string): { provider: "github" | "gitlab"; project: string } | null {
+  const githubProject = parseGitHubProject(url);
+  if (githubProject !== null) return { provider: "github", project: githubProject };
+  const gitlabProject = parseGitLabProject(url);
+  if (gitlabProject !== null) return { provider: "gitlab", project: gitlabProject };
+  // Unknown / self-hosted hosts and malformed URLs deliberately do NOT
+  // invent a tracker provider; the caller surfaces the unconfigured
+  // tracker.project as an explicit validation failure.
   return null;
 }
 
@@ -415,11 +463,22 @@ export async function verifyModels(root: string, config: ResolvedPoiesisConfig):
       stderr: result.stderr,
     });
   }
-  const available = new Set(result.stdout.split("\n").map((line) => line.trim()).filter(Boolean));
+  const available = parseOpenCodeModelInventory(result.stdout);
   const missing = [config.models.reasoning, config.models.execution].filter((model) => !available.has(model));
   if (missing.length > 0) {
     throw new PoiesisError("MODEL_UNAVAILABLE", "Configured OpenCode model is unavailable", { missing });
   }
+}
+
+/**
+ * Single canonical parse of an `opencode models` newline-separated
+ * provider/model inventory. Every caller (currently
+ * `verifyModels`, but available to future inventory consumers at the
+ * same library seam) MUST reuse this function so the trim / blank /
+ * dedupe semantics stay consistent.
+ */
+export function parseOpenCodeModelInventory(stdout: string): Set<string> {
+  return new Set(stdout.split("\n").map((line) => line.trim()).filter(Boolean));
 }
 
 async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise<void> {
@@ -1645,6 +1704,122 @@ export async function updateFromConfig(
   options: UpdateConfigOptions = {},
 ): Promise<UpdateResult> {
   return runUpdateConfigTransaction(root, configPath, options, {});
+}
+
+/**
+ * Canonical user-facing model class identifiers. These are the only
+ * values `setModel` (and the matching CLI subcommand) accept; every
+ * other input is rejected fail-closed with `INVALID_MODEL_CLASS` before
+ * any side effect. Mirrors the user-facing classes documented in
+ * POIESIS_FOUNDATION_v1.1 §45 (User-facing model classes).
+ */
+export type ModelClassName = "reasoning" | "execution";
+
+/**
+ * `setModel` adds a structured `restart` notice to the standard
+ * `UpdateResult` shape. The notice tells the operator that OpenCode
+ * must be restarted for the new model configuration to take effect;
+ * Poiesis intentionally does NOT start, stop, or signal OpenCode on
+ * the operator's behalf (per ticket #56 constraint: "do not restart
+ * OpenCode"). The `started` flag is a literal `false` so the field is
+ * self-describing in the JSON payload — it is never set to `true`.
+ */
+export interface SetModelResult extends UpdateResult {
+  restart: { notice: string; started: false };
+}
+
+const MODEL_ID_FORMAT = /^[^/]+\/.+$/;
+const MODEL_INTERACTIVE_HINT =
+  "use `poiesis model` on a TTY for the interactive selector, or `poiesis model set reasoning|execution <provider/model>` for the deterministic single-class set";
+
+/**
+ * Deterministic wrapper for `poiesis model set reasoning|execution <id>`.
+ *
+ * This is the THIN wrapper around `updateFromConfig` for ticket #56.
+ * It performs exactly three steps and nothing else:
+ *
+ *   1. Validate `className` and `modelId` against the canonical format
+ *      and probe the live OpenCode model inventory via `opencode models`.
+ *      A missing class throws `INVALID_MODEL_CLASS`, a missing ID format
+ *      throws `INVALID_MODEL_ID`, and an ID that is not in the live
+ *      inventory throws `MODEL_UNAVAILABLE` — all BEFORE any byte is
+ *      written and BEFORE the candidate config file is staged. There
+ *      is no model substitution (ticket #48: "no substitute").
+ *
+ *   2. Load the installed Poiesis config, mutate ONLY the requested
+ *      class field, and serialize the proposed candidate to a private
+ *      temp file under the system temp directory.
+ *
+ *   3. Hand the candidate file to `updateFromConfig` and return its
+ *      result plus the restart notice. Every transaction invariant
+ *      (receipt auth, no-op detection, doctor gate, fail-closed
+ *      rollback) stays the single source of truth — `setModel` adds
+ *      NO second config writer.
+ *
+ * The temp file is unlinked in a `finally` so a foreign-writer race
+ * or doctor-gate failure cannot leak the proposed candidate onto the
+ * repository filesystem after the transaction settles.
+ */
+export async function setModel(
+  root: string,
+  className: ModelClassName,
+  modelId: string,
+): Promise<SetModelResult> {
+  if (className !== "reasoning" && className !== "execution") {
+    throw new PoiesisError("INVALID_MODEL_CLASS", `Unknown model class: ${className}`, { className });
+  }
+  if (typeof modelId !== "string" || !MODEL_ID_FORMAT.test(modelId)) {
+    throw new PoiesisError(
+      "INVALID_MODEL_ID",
+      "Model ID must use provider/model format",
+      { modelId },
+    );
+  }
+
+  // Inventory probe runs BEFORE any write. Reuses the same parser
+  // `verifyModels` and `update --config` already use, so the
+  // trim/blank/dedupe semantics stay consistent. The error shape
+  // mirrors `verifyModels` so downstream tooling can reuse the same
+  // matcher.
+  const inventory = await run("opencode", ["models"], { cwd: root, allowFailure: true });
+  if (inventory.exitCode !== 0) {
+    throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {
+      stderr: inventory.stderr,
+    });
+  }
+  const available = parseOpenCodeModelInventory(inventory.stdout);
+  if (!available.has(modelId)) {
+    throw new PoiesisError("MODEL_UNAVAILABLE", "Configured OpenCode model is unavailable", {
+      missing: [modelId],
+    });
+  }
+
+  // Load the installed config, mutate ONLY the requested class, and
+  // route the proposed candidate through `updateFromConfig`. The
+  // wrapper MUST NOT add a second config writer — every other
+  // transaction invariant is reused.
+  const current = await loadConfig(root);
+  const proposed: PoiesisConfig = {
+    ...current,
+    models: { ...current.models, [className]: modelId },
+  };
+
+  const tempDir = await mkdtemp(join(tmpdir(), "poiesis-model-set-"));
+  const candidatePath = join(tempDir, "candidate-config.jsonc");
+  try {
+    await atomicWrite(candidatePath, serializeConfig(proposed));
+    const result = await updateFromConfig(root, candidatePath);
+    return {
+      manifest: result.manifest,
+      doctor: result.doctor,
+      restart: {
+        notice: "Restart OpenCode to apply the new model configuration. Poiesis did not restart OpenCode.",
+        started: false,
+      },
+    };
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 }
 
 export async function uninstall(root: string): Promise<UninstallResult> {
