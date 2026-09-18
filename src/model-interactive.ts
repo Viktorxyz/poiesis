@@ -54,6 +54,7 @@ import {
   type ModelIdentity,
   type ModelSelectorIO,
 } from "./model-selector.js";
+import { settleOnceLinePrompt } from "./prompt-line.js";
 import { run as runChildProcess } from "./process.js";
 
 export type { ModelClass, ModelIdentity };
@@ -250,27 +251,22 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
     async promptLine(prompt: string): Promise<string> {
-      const { createInterface } = await import("node:readline");
-      return await new Promise<string>((resolve, reject) => {
-        try {
-          const rl = createInterface({ input: stdin, output: stderr, terminal: isTTY });
-          stderr.write(`${prompt}: `);
-          rl.once("line", (line) => {
-            rl.close();
-            resolve(line);
-          });
-          rl.once("close", () => {
-            reject(
-              new PoiesisError(
-                "MODEL_PROMPT_CANCELLED",
-                "Interactive model prompt was cancelled by the user",
-                { prompt },
-              ),
-            );
-          });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
+      // Ticket #68: the production prompt is now a thin adapter over the
+      // CLI-internal settle-once readline helper. The helper owns the
+      // settle-once invariant (resolve or reject, never both, never
+      // neither) so the factory stays a binding seam for stdin / stderr
+      // and the distinct `MODEL_PROMPT_CANCELLED` cancellation error.
+      // Callers still `.trim()` the returned raw line themselves.
+      return await settleOnceLinePrompt({
+        prompt,
+        input: stdin,
+        output: stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "MODEL_PROMPT_CANCELLED",
+          "Interactive model prompt was cancelled by the user",
+          { prompt },
+        ),
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {

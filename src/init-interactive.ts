@@ -52,6 +52,7 @@ import {
   type ModelClass,
   type ModelIdentity,
 } from "./model-selector.js";
+import { settleOnceLinePrompt } from "./prompt-line.js";
 import { init, parseOpenCodeModelInventory } from "./maintenance.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { run as runChildProcess } from "./process.js";
@@ -591,25 +592,22 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
     async promptLine(prompt: string): Promise<string> {
-      // Lazy: production callers go through readline only when a prompt
-      // is actually issued. Tests inject their own `promptLine`.
-      const { createInterface } = await import("node:readline");
-      return await new Promise<string>((resolve, reject) => {
-        try {
-          const rl = createInterface({ input: stdin, output: stderr, terminal: isTTY });
-          stderr.write(`${prompt}: `);
-          rl.once("line", (line) => {
-            rl.close();
-            resolve(line);
-          });
-          rl.once("close", () => {
-            // close-without-line means the user closed stdin; surface as
-            // a cancellation so callers can branch on a typed error.
-            reject(new PoiesisError("INIT_PROMPT_CANCELLED", "Interactive prompt was cancelled by the user", { prompt }));
-          });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
+      // Ticket #68: the production prompt is a thin adapter over the
+      // CLI-internal settle-once readline helper. The helper owns the
+      // settle-once invariant; the factory only binds stdin / stderr and
+      // the distinct `INIT_PROMPT_CANCELLED` cancellation error (kept
+      // distinct from `MODEL_PROMPT_CANCELLED` per Spec §"Design").
+      // Callers still `.trim()` the returned raw line themselves.
+      return await settleOnceLinePrompt({
+        prompt,
+        input: stdin,
+        output: stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "INIT_PROMPT_CANCELLED",
+          "Interactive prompt was cancelled by the user",
+          { prompt },
+        ),
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {

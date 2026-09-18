@@ -32,6 +32,16 @@
  *     in `dist/index.d.ts`; the public
  *     `installAuthorizedCapability(root, input)` wrapper is the only
  *     package-root re-export, and it has EXACTLY TWO parameters.
+ *   - the ticket #58 / #59 interactive IO factories
+ *     (`createProductionInteractiveInitIO`,
+ *     `createProductionInteractiveModelIO`) and every shape from
+ *     `src/init-interactive.ts` / `src/model-interactive.ts` — they
+ *     stay CLI-internal so the `InteractiveInitIO` / `InteractiveModelIO`
+ *     contracts do not freeze before the TTY flow stabilizes.
+ *   - the ticket #68 settle-once readline helper
+ *     (`settleOnceLinePrompt` + `SettleOnceLinePromptArgs`) — it is
+ *     a private CLI seam; production callers reach it through the
+ *     factories above, never through the package root.
  *
  * The test uses TypeScript's type system:
  *   - Direct `import` statements from `../src/index.js` fail to compile
@@ -119,6 +129,17 @@ const forbiddenFunctions = [
   "runModelSelector",
   "createProductionModelSelectorIO",
   "DEFAULT_RECOMMENDED_MODEL_IDS",
+  // Ticket #58 / #59: the interactive IO factories stay CLI-internal.
+  // Tests reach them through the source modules (`src/init-interactive.ts`,
+  // `src/model-interactive.ts`) directly; the package root never
+  // re-exports them so the `InteractiveInitIO` / `InteractiveModelIO`
+  // contracts do not freeze into a public API.
+  "createProductionInteractiveInitIO",
+  "createProductionInteractiveModelIO",
+  // Ticket #68: the settle-once readline helper is a private CLI seam.
+  // The factories above are the only production callers; promoting it
+  // through `src/index.ts` would freeze the prompt-stream contract.
+  "settleOnceLinePrompt",
 ] as const;
 
 const forbiddenTypes = [
@@ -167,6 +188,19 @@ const forbiddenTypes = [
   "ModelSelectorRenderedRow",
   "RunModelSelectorArgs",
   "ProductionModelSelectorIOArgs",
+  // Ticket #58 / #59: every `src/init-interactive.ts` / `src/model-interactive.ts`
+  // surface stays internal — the IO contracts, the tracker-provider
+  // alias, and the model-selection / current-models shapes.
+  "InteractiveInitIO",
+  "InteractiveInitOptions",
+  "InteractiveModelIO",
+  "InteractiveModelOptions",
+  "TrackerProvider",
+  "TrackerAuthProbeResult",
+  "CurrentModels",
+  "ModelSelection",
+  // Ticket #68: the settle-once prompt's argument bag stays internal.
+  "SettleOnceLinePromptArgs",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
