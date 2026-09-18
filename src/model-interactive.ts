@@ -1,5 +1,5 @@
 /**
- * Interactive `poiesis model` (ticket #59).
+ * Interactive `poiesis model` (ticket #59, ticket #73).
  *
  * Flagless interactive flow that lets the Author change exactly one
  * model slot at a time. Mirrors the `poiesis init` interactive
@@ -18,12 +18,19 @@
  *   4. Probe the live OpenCode model inventory via `opencode models`.
  *      Empty inventory fails closed with `MODEL_INVENTORY_UNAVAILABLE`
  *      — no silent fallback.
- *   5. Ask the Author which slot to change (`reasoning` or `execution`).
- *      Anything else fails closed with `INVALID_MODEL_CLASS` BEFORE the
- *      model selector runs. Exactly one slot changes per run.
+ *   5. Ask the Author which slot to change (`reasoning` or `execution`)
+ *      through the shared Clack-backed class selector. The current
+ *      reasoning / execution identity is shown in each option's hint so
+ *      the operator sees the values they are choosing between. Anything
+ *      else fails closed with `MODEL_CLASS_SELECTOR_CANCELLED` if the
+ *      Author pressed Esc / Ctrl+C, or `INVALID_MODEL_CLASS` if a
+ *      custom IO seam returned a non-class answer.
  *   6. Run the shared `runModelSelector` for the chosen class with the
- *      live inventory and the canonical recommended constants. The
- *      selector's policy is identical to `poiesis init`'s.
+ *      live inventory, the canonical recommended constants, and the
+ *      currently installed identity (so the hint marks "Current" /
+ *      "Recommended" / "Current, Recommended" and the cursor lands on
+ *      that row first). The selector's policy is identical to
+ *      `poiesis init`'s.
  *   7. Hand the chosen identity to the existing `setModel` (which in
  *      turn routes through `updateFromConfig`). All transactional
  *      invariants (no-op detection, doctor gate, fail-closed rollback)
@@ -41,6 +48,9 @@
  *     out-of-band class name, or a selector cancellation all fail
  *     closed through typed `PoiesisError`s.
  *   - The module never restarts OpenCode on the Author's behalf.
+ *   - The class selector and the identity selector are the SAME
+ *     primitive (`@clack/prompts` `select` via the CLI-internal
+ *     `runClackSelect` adapter). There is no second mini-TUI.
  */
 import { PoiesisError } from "./errors.js";
 import { loadConfig } from "./config.js";
@@ -48,13 +58,11 @@ import { setModel, parseOpenCodeModelInventory, type ModelClassName, type SetMod
 import { loadManifest } from "./manifest.js";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
-  createProductionModelSelectorIO,
   runModelSelector,
   type ModelClass,
   type ModelIdentity,
-  type ModelSelectorIO,
 } from "./model-selector.js";
-import { settleOnceLinePrompt } from "./prompt-line.js";
+import { runClackSelect } from "./clack-select.js";
 import { run as runChildProcess } from "./process.js";
 
 export type { ModelClass, ModelIdentity };
@@ -63,6 +71,7 @@ export interface ModelSelection {
   readonly modelClass: ModelClass;
   readonly inventory: readonly string[];
   readonly recommended: { reasoning: ModelIdentity; execution: ModelIdentity };
+  readonly currentIdentity: ModelIdentity | null;
 }
 
 export interface CurrentModels {
@@ -70,16 +79,22 @@ export interface CurrentModels {
   readonly execution: ModelIdentity;
 }
 
+/**
+ * Class-selector result type used by `InteractiveModelIO.runModelClassSelector`.
+ * The two values mirror the canonical `ModelClass` set. Returning a
+ * different string from the IO seam surfaces as `INVALID_MODEL_CLASS`,
+ * so the seam cannot smuggle an out-of-band class through the selector.
+ */
+export type ModelClassChoice = ModelClass;
+
 export interface InteractiveModelIO {
   readonly isTTY: boolean;
   writeStderr(line: string): void;
-  /**
-   * One-line prompt. The interactive flow calls this exactly once per
-   * invocation: to ask which class (reasoning|execution) the Author
-   * wants to change.
-   */
-  promptLine(prompt: string): Promise<string>;
   listOpenCodeModels(): Promise<readonly string[]>;
+  runModelClassSelector(args: {
+    readonly current: CurrentModels;
+    readonly cancelError: PoiesisError;
+  }): Promise<ModelClassChoice>;
   runModelSelector(selection: ModelSelection): Promise<string>;
   /**
    * Read the currently-installed Poiesis config and return the two
@@ -129,10 +144,6 @@ function formatCurrentModelsFrame(current: CurrentModels): string {
   ].join("\n");
 }
 
-function formatClassPrompt(): string {
-  return "Which model class would you like to change? [reasoning/execution]";
-}
-
 function formatRestartNotice(): string {
   return [
     "",
@@ -150,9 +161,10 @@ function formatRestartNotice(): string {
  * Failure modes (always `PoiesisError`):
  *   - `NON_TTY_MODEL`               -- `io.isTTY === false`
  *   - `MODEL_NOT_INSTALLED`         -- Poiesis is not installed at `root`
- *   - `INVALID_MODEL_CLASS`         -- class answer is not reasoning|execution
+ *   - `INVALID_MODEL_CLASS`         -- the IO seam returned a non-class answer (defensive)
  *   - `MODEL_INVENTORY_UNAVAILABLE` -- `opencode models` returned an empty list
- *   - `MODEL_SELECTOR_CANCELLED`    -- user cancelled the selector (Esc / q)
+ *   - `MODEL_SELECTOR_CANCELLED`    -- user cancelled the identity selector (Esc / Ctrl+C)
+ *   - `MODEL_CLASS_SELECTOR_CANCELLED` -- user cancelled the class selector (Esc / Ctrl+C)
  *   - `MODEL_SELECTOR_NOT_TTY`      -- selector IO reports non-TTY (defensive)
  *   - `MODEL_SELECTOR_NO_INVENTORY` -- normalized inventory is empty (defensive)
  */
@@ -174,7 +186,14 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
 
   const inventory = await probeInventory(args.io);
 
-  const classAnswer = (await args.io.promptLine(formatClassPrompt())).trim();
+  const classAnswer = await args.io.runModelClassSelector({
+    current,
+    cancelError: new PoiesisError(
+      "MODEL_CLASS_SELECTOR_CANCELLED",
+      "Interactive model class selector was cancelled by the user",
+      {},
+    ),
+  });
   if (!isModelClass(classAnswer)) {
     throw new PoiesisError(
       "INVALID_MODEL_CLASS",
@@ -186,6 +205,7 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
     modelClass: classAnswer,
     inventory,
     recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
+    currentIdentity: current[classAnswer],
   });
   const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
   args.io.writeStderr(formatRestartNotice());
@@ -223,9 +243,10 @@ async function refuseIfNotInstalled(root: string): Promise<void> {
 /**
  * Production IO factory. Wires the interactive model flow to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a single-argument call site. The shared model-selector IO is
- * delegated to `createProductionModelSelectorIO` so the keypress loop
- * is reused byte-for-byte with `poiesis init`.
+ * stays a single-argument call site. The class selector and the
+ * shared identity selector are both routed through the CLI-internal
+ * Clack adapter (`src/clack-select.ts`) so there is exactly one
+ * interactive list primitive in the CLI.
  *
  * The factory takes the resolved repository `root` (git toplevel of the
  * repo the Author is editing) so every filesystem-touching seam —
@@ -250,25 +271,6 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
     writeStderr(line: string): void {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
-    async promptLine(prompt: string): Promise<string> {
-      // Ticket #68: the production prompt is now a thin adapter over the
-      // CLI-internal settle-once readline helper. The helper owns the
-      // settle-once invariant (resolve or reject, never both, never
-      // neither) so the factory stays a binding seam for stdin / stderr
-      // and the distinct `MODEL_PROMPT_CANCELLED` cancellation error.
-      // Callers still `.trim()` the returned raw line themselves.
-      return await settleOnceLinePrompt({
-        prompt,
-        input: stdin,
-        output: stderr,
-        isTTY,
-        cancellationError: new PoiesisError(
-          "MODEL_PROMPT_CANCELLED",
-          "Interactive model prompt was cancelled by the user",
-          { prompt },
-        ),
-      });
-    },
     async listOpenCodeModels(): Promise<readonly string[]> {
       // Run `opencode models` from the repo root, NOT `process.cwd()`.
       // CLI dispatch lands here when the Author passes
@@ -286,13 +288,38 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
       }
       return [...parseOpenCodeModelInventory(result.stdout)];
     },
+    async runModelClassSelector(args): Promise<ModelClassChoice> {
+      // The class selector and the identity selector are the same
+      // primitive: Clack `select` via the CLI-internal adapter. The
+      // hint carries the operator's currently installed value so the
+      // choice is informed. Both classes are always installed, so the
+      // cursor defaults to `reasoning` — the row the operator most
+      // often wants — while the hint still shows both current
+      // identities.
+      return await runClackSelect<ModelClassChoice>({
+        message: "Which model class would you like to change?",
+        options: [
+          {
+            value: "reasoning",
+            label: "Reasoning",
+            hint: `Current: ${args.current.reasoning}`,
+          },
+          {
+            value: "execution",
+            label: "Execution",
+            hint: `Current: ${args.current.execution}`,
+          },
+        ],
+        initialValue: "reasoning",
+        cancelError: args.cancelError,
+      });
+    },
     async runModelSelector(selection: ModelSelection): Promise<string> {
-      const io: ModelSelectorIO = createProductionModelSelectorIO();
       return await runModelSelector({
-        io,
         inventory: selection.inventory,
         recommended: selection.recommended,
         modelClass: selection.modelClass,
+        currentIdentity: selection.currentIdentity,
       });
     },
     async loadCurrentModels(): Promise<CurrentModels> {

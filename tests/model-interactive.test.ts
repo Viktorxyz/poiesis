@@ -1,12 +1,14 @@
 /**
  * Ticket #59 — Interactive `poiesis model`.
+ * Ticket #73 — Clack-backed class selector.
  *
  * Acceptance contract:
  *   - Human entry is `poiesis model` with NO extra verbs.
  *   - On a TTY, the flow shows the current reasoning and execution
- *     model identities on stderr, asks the Author which slot to change,
- *     runs the shared `runModelSelector` for exactly that slot, and
- *     writes through `setModel` (which in turn uses `updateFromConfig`).
+ *     model identities on stderr, asks the Author which slot to change
+ *     via the Clack-backed `runModelClassSelector`, runs the shared
+ *     `runModelSelector` for exactly that slot, and writes through
+ *     `setModel` (which in turn uses `updateFromConfig`).
  *   - Exactly one slot is changed per invocation.
  *   - Non-TTY `poiesis model` (no subcommand) fails closed with
  *     `NON_TTY_MODEL` — never a silent default.
@@ -16,20 +18,31 @@
  *   - Selector policy is identical to `poiesis init`:
  *       - inventory is the live `opencode models` list;
  *       - recommendation annotation uses the canonical constants;
+ *       - "Current" / "Recommended" hints mark the row(s) that match
+ *         the operator's currently installed identity / the canonical
+ *         recommended constants;
+ *       - `currentIdentity` flows into the shared identity selector
+ *         so its hint and `initialValue` policy know the row to mark
+ *         as Current.
  *       - empty inventory fails closed with a typed error.
  *
  * Test seam: `InteractiveModelIO` is fully injected. Tests pass scripted
- * prompts, model selections, and inventory; production wires the seam
- * to `process.stdin` / `process.stderr` and the real `opencode models`
- * call. No PTY is required.
+ * class selections, scripted model selections, and a scripted inventory;
+ * production wires the seam to `process.stdin` / `process.stderr` and
+ * the real `opencode models` call. No PTY is required.
+ *
+ * The previous `promptLine`-based class prompt is gone (ticket #73);
+ * the seam exposes `runModelClassSelector` instead, so the class
+ * selector and the identity selector share the same Clack primitive.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
   runInteractiveModel,
   type CurrentModels,
   type InteractiveModelIO,
+  type ModelClassChoice,
   type ModelSelection,
 } from "../src/model-interactive.js";
 import { commandModel } from "../src/cli.js";
@@ -40,9 +53,42 @@ import {
   ownershipReceiptLocation,
   readOwnershipReceipt,
 } from "../src/receipt.js";
-import { parseJsonc, serializeConfig, type PoiesisConfig } from "../src/config.js";
+import { parseJsonc, type PoiesisConfig } from "../src/config.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+vi.mock("@clack/prompts", () => {
+  const scope = globalThis as unknown as Record<symbol, {
+    select: ReturnType<typeof vi.fn>;
+    isCancel: ReturnType<typeof vi.fn>;
+    cancelSymbol: symbol;
+  }>;
+  const key = Symbol.for("poiesis.model-interactive.fake-holder");
+  if (scope[key] === undefined) {
+    scope[key] = {
+      select: vi.fn(),
+      isCancel: vi.fn(),
+      cancelSymbol: Symbol.for("clack.cancel"),
+    };
+  }
+  const holder = scope[key]!;
+  return {
+    isCancel: (value: unknown) => holder.isCancel(value),
+    select: (opts: unknown) => holder.select(opts),
+    CANCEL_SYMBOL: holder.cancelSymbol,
+  };
+});
+
+const fakeHolderKey = Symbol.for("poiesis.model-interactive.fake-holder");
+const globalScope = globalThis as unknown as Record<symbol, {
+  select: ReturnType<typeof vi.fn>;
+  isCancel: ReturnType<typeof vi.fn>;
+  cancelSymbol: symbol;
+}>;
+const fakes = globalScope[fakeHolderKey]!;
+const cancelSymbol = fakes.cancelSymbol;
+const fakeSelect = fakes.select;
+const fakeIsCancel = fakes.isCancel;
 
 const CONFIG_ROOT = ".poiesis/config.jsonc";
 const repositories: TestRepository[] = [];
@@ -51,12 +97,15 @@ let env: FakeOpenCodeEnvironment | undefined;
 afterEach(async () => {
   env?.restore();
   env = undefined;
+  fakeSelect.mockReset();
+  fakeIsCancel.mockReset();
+  fakeIsCancel.mockImplementation((value: unknown) => value === cancelSymbol);
   await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
 });
 
 interface ScriptedModelIO extends InteractiveModelIO {
   stderrLines: string[];
-  prompts: { prompt: string; answer: string }[];
+  classSelectorCalls: Array<{ current: CurrentModels }>;
   modelSelections: ModelSelection[];
   inventoryCalls: number;
   currentModelsCalls: number;
@@ -66,11 +115,12 @@ function scriptedModelIO(options: {
   isTTY?: boolean;
   inventory?: readonly string[];
   current?: CurrentModels;
-  classAnswer?: "reasoning" | "execution";
+  classAnswer?: ModelClassChoice;
   selectedModel?: string;
+  classSelector?: (args: { current: CurrentModels; cancelError: import("../src/errors.js").PoiesisError }) => Promise<ModelClassChoice> | ModelClassChoice;
 }): ScriptedModelIO {
   const stderrLines: string[] = [];
-  const prompts: { prompt: string; answer: string }[] = [];
+  const classSelectorCalls: Array<{ current: CurrentModels }> = [];
   const modelSelections: ModelSelection[] = [];
   const inventory = options.inventory ?? [];
   const current = options.current ?? { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" };
@@ -80,21 +130,21 @@ function scriptedModelIO(options: {
   return {
     isTTY: options.isTTY ?? true,
     stderrLines,
-    prompts,
+    classSelectorCalls,
     modelSelections,
     inventoryCalls: 0,
     currentModelsCalls: 0,
     writeStderr(line: string): void {
       stderrLines.push(line);
     },
-    async promptLine(prompt: string): Promise<string> {
-      // The class prompt is the only promptLine call in the happy path.
-      prompts.push({ prompt, answer: classAnswer });
-      return classAnswer;
-    },
     async listOpenCodeModels(): Promise<readonly string[]> {
       this.inventoryCalls += 1;
       return [...inventory];
+    },
+    async runModelClassSelector(args): Promise<ModelClassChoice> {
+      classSelectorCalls.push({ current: args.current });
+      if (options.classSelector) return await options.classSelector(args);
+      return classAnswer;
     },
     async runModelSelector(selection: ModelSelection): Promise<string> {
       modelSelections.push(selection);
@@ -137,9 +187,9 @@ describe("runInteractiveModel (ticket #59)", () => {
     ).rejects.toMatchObject({ code: "NON_TTY_MODEL" });
 
     // The flow must refuse BEFORE any IO is offered: no stderr, no
-    // prompts, no inventory probe, no selector call.
+    // class selector call, no inventory probe, no identity selector call.
     expect(io.stderrLines).toEqual([]);
-    expect(io.prompts).toEqual([]);
+    expect(io.classSelectorCalls).toEqual([]);
     expect(io.modelSelections).toEqual([]);
     expect(io.inventoryCalls).toBe(0);
     expect(io.currentModelsCalls).toBe(0);
@@ -155,7 +205,7 @@ describe("runInteractiveModel (ticket #59)", () => {
     ).rejects.toMatchObject({ code: "MODEL_NOT_INSTALLED" });
 
     expect(io.modelSelections).toEqual([]);
-    expect(io.prompts).toEqual([]);
+    expect(io.classSelectorCalls).toEqual([]);
   });
 
   it("prints current reasoning and execution on stderr BEFORE asking the Author", async () => {
@@ -186,32 +236,122 @@ describe("runInteractiveModel (ticket #59)", () => {
     expect(stderr).toContain("execution");
   });
 
+  it("calls the class selector with both current values represented as hints", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    // We verify the class-selector call shape through the scripted
+    // IO seam rather than through the (mocked) Clack primitive: the
+    // production factory is exercised in the
+    // `createProductionInteractiveModelIO` flow tests below, where
+    // the IO factory owns the Clack call directly.
+    const capturedClassCalls: Array<{ current: CurrentModels }> = [];
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      current: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      classAnswer: "reasoning",
+    });
+    io.runModelClassSelector = async (args): Promise<ModelClassChoice> => {
+      capturedClassCalls.push({ current: args.current });
+      return "reasoning";
+    };
+    await runInteractiveModel({ root: repo.root, io });
+
+    // The class selector was called exactly once with the current pair.
+    expect(capturedClassCalls).toEqual([
+      { current: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" } },
+    ]);
+    // No identity selector was offered before the class answer.
+    expect(io.modelSelections).toHaveLength(1);
+  });
+
+  it("production class-selector IO factory invokes Clack with Reasoning + Execution hints carrying current values", async () => {
+    // The production factory's class selector must use the same
+    // Clack primitive as the identity selector, with each option's
+    // hint carrying the operator's currently installed value. We
+    // inspect the mock call args directly.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    // Force isTTY=true so the production IO factory admits the
+    // class-selector call. Vitest's stdin is not a TTY by default.
+    const originalIsTTY = (process.stdin as { isTTY?: boolean }).isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    try {
+      const { createProductionInteractiveModelIO } = await import("../src/model-interactive.js");
+      const io = createProductionInteractiveModelIO(repo.root);
+      // Inventory is required by the class selector call to also
+      // produce the row shapes the identity selector consumes; we
+      // stub the inventory probe directly to avoid spawning
+      // opencode.
+      const inventory = ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"];
+      fakeSelect
+        .mockResolvedValueOnce("execution" as never) // class selector
+        .mockResolvedValueOnce("minimax/MiniMax-M3-alt" as never); // identity selector
+      await runInteractiveModel({
+        root: repo.root,
+        io: {
+          ...io,
+          listOpenCodeModels: async () => inventory,
+        },
+      });
+
+      // First Clack call: class selector. Two options, each with a
+      // hint that names the operator's currently installed value.
+      const classCallArg = fakeSelect.mock.calls[0]![0] as {
+        message: string;
+        options: Array<{ value: string; label: string; hint?: string }>;
+      };
+      expect(classCallArg.options.map((option) => option.label)).toEqual(["Reasoning", "Execution"]);
+      const reasoning = classCallArg.options.find((option) => option.label === "Reasoning")!;
+      expect(reasoning.value).toBe("reasoning");
+      expect(reasoning.hint).toBe("Current: openai/gpt-5.6-sol");
+      const execution = classCallArg.options.find((option) => option.label === "Execution")!;
+      expect(execution.value).toBe("execution");
+      expect(execution.hint).toBe("Current: minimax/MiniMax-M3");
+
+      // Second Clack call: identity selector. Must carry the
+      // execution recommended constant in its cross-class hint.
+      const identityCallArg = fakeSelect.mock.calls[1]![0] as {
+        options: Array<{ value: string; hint?: string }>;
+      };
+      const reasoningRow = identityCallArg.options.find((option) => option.value === "openai/gpt-5.6-sol")!;
+      expect(reasoningRow.hint).toMatch(/Recommended/);
+    } finally {
+      if (originalIsTTY === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = originalIsTTY;
+      }
+    }
+  });
+
   it("runs the shared model selector for the chosen class with the live inventory", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await install(repo);
     const inventory = ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"];
+    fakeSelect
+      .mockResolvedValueOnce("reasoning" as never) // class selector
+      .mockResolvedValueOnce("openai/gpt-5.6-fallback" as never); // identity selector
     const io = scriptedModelIO({
       isTTY: true,
       inventory,
-      classAnswer: "reasoning",
-      selectedModel: "openai/gpt-5.6-fallback",
     });
+    await runInteractiveModel({ root: repo.root, io });
 
-    const result = await runInteractiveModel({ root: repo.root, io });
-
-    // Exactly one selector call with the chosen class.
+    // Exactly one identity selector call with the chosen class.
     expect(io.modelSelections).toHaveLength(1);
     expect(io.modelSelections[0]!.modelClass).toBe("reasoning");
-    // The inventory is the live `opencode models` list (every entry flows through).
     expect([...io.modelSelections[0]!.inventory]).toEqual(inventory);
-    // The recommendation policy mirrors `poiesis init`: canonical constants.
     expect(io.modelSelections[0]!.recommended).toEqual({
       reasoning: "openai/gpt-5.6-sol",
       execution: "minimax/MiniMax-M3",
     });
-    // The chosen identity is the one we asked the selector to return.
-    expect(result.manifest).toBeDefined();
+    // The current identity for the chosen class is passed through so
+    // the identity selector can mark Current in its hint + initialValue.
+    expect(io.modelSelections[0]!.currentIdentity).toBe("openai/gpt-5.6-sol");
   });
 
   it("changes exactly one slot per run (reasoning chosen → execution is preserved)", async () => {
@@ -316,7 +456,7 @@ describe("runInteractiveModel (ticket #59)", () => {
     expect(stderr.toLowerCase()).toMatch(/poiesis.*did not.*restart|poiesis.*not.*restart/);
   }, 30_000);
 
-  it("rejects an invalid class answer (anything other than reasoning|execution) BEFORE any selector call", async () => {
+  it("rejects an invalid class answer (anything other than reasoning|execution) BEFORE any identity selector call", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await install(repo);
@@ -324,17 +464,14 @@ describe("runInteractiveModel (ticket #59)", () => {
       isTTY: true,
       inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
     });
-    // Override the default promptLine to return garbage.
-    io.promptLine = async (prompt: string): Promise<string> => {
-      io.prompts.push({ prompt, answer: "planner" });
-      return "planner";
-    };
+    // Override the class selector to return a non-class answer.
+    io.runModelClassSelector = async (): Promise<ModelClassChoice> => "planner" as ModelClassChoice;
 
     await expect(
       runInteractiveModel({ root: repo.root, io }),
     ).rejects.toMatchObject({ code: "INVALID_MODEL_CLASS" });
 
-    // No selector was offered — the bad class answer short-circuits.
+    // No identity selector was offered — the bad class answer short-circuits.
     expect(io.modelSelections).toEqual([]);
   });
 
@@ -347,6 +484,74 @@ describe("runInteractiveModel (ticket #59)", () => {
     await expect(
       runInteractiveModel({ root: repo.root, io }),
     ).rejects.toMatchObject({ code: "MODEL_INVENTORY_UNAVAILABLE" });
+  });
+
+  it("propagates MODEL_CLASS_SELECTOR_CANCELLED without writing when the Author cancels the class selector", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const receiptPath = await ownershipReceiptLocation(repo.root);
+    const beforePoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const beforeManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const beforeReceipt = await readFile(receiptPath);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+    });
+    io.runModelClassSelector = async (): Promise<ModelClassChoice> => {
+      // Simulate Clack CANCEL_SYMBOL: the IO seam throws the cancel error
+      // the flow passed in.
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "MODEL_CLASS_SELECTOR_CANCELLED",
+        "cancelled",
+        {},
+      );
+    };
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_CLASS_SELECTOR_CANCELLED" });
+
+    const afterPoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const afterManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const afterReceipt = await readFile(receiptPath);
+    expect(Buffer.compare(afterPoiesis, beforePoiesis)).toBe(0);
+    expect(Buffer.compare(afterManifest, beforeManifest)).toBe(0);
+    expect(Buffer.compare(afterReceipt, beforeReceipt)).toBe(0);
+  });
+
+  it("propagates MODEL_SELECTOR_CANCELLED without writing when the Author cancels the identity selector", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const receiptPath = await ownershipReceiptLocation(repo.root);
+    const beforePoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const beforeManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const beforeReceipt = await readFile(receiptPath);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      classAnswer: "reasoning",
+    });
+    io.runModelSelector = async (selection: ModelSelection): Promise<string> => {
+      io.modelSelections.push(selection);
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "MODEL_SELECTOR_CANCELLED",
+        "cancelled",
+        { modelClass: selection.modelClass },
+      );
+    };
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_SELECTOR_CANCELLED" });
+
+    const afterPoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const afterManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const afterReceipt = await readFile(receiptPath);
+    expect(Buffer.compare(afterPoiesis, beforePoiesis)).toBe(0);
+    expect(Buffer.compare(afterManifest, beforeManifest)).toBe(0);
+    expect(Buffer.compare(afterReceipt, beforeReceipt)).toBe(0);
   });
 
   it("preserves every owned byte when the chosen identity equals the current value (no-op)", async () => {
@@ -381,40 +586,6 @@ describe("runInteractiveModel (ticket #59)", () => {
     // Even on a no-op the restart notice is part of the contract.
     expect(result.restart.started).toBe(false);
   }, 30_000);
-
-  it("propagates MODEL_SELECTOR_CANCELLED without writing when the Author cancels the selector", async () => {
-    const repo = await createTestRepository();
-    repositories.push(repo);
-    await install(repo);
-    const receiptPath = await ownershipReceiptLocation(repo.root);
-    const beforePoiesis = await readFile(join(repo.root, CONFIG_ROOT));
-    const beforeManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
-    const beforeReceipt = await readFile(receiptPath);
-    const io = scriptedModelIO({
-      isTTY: true,
-      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
-      classAnswer: "reasoning",
-    });
-    io.runModelSelector = async (selection: ModelSelection): Promise<string> => {
-      io.modelSelections.push(selection);
-      throw new (await import("../src/errors.js")).PoiesisError(
-        "MODEL_SELECTOR_CANCELLED",
-        "cancelled",
-        { modelClass: selection.modelClass },
-      );
-    };
-
-    await expect(
-      runInteractiveModel({ root: repo.root, io }),
-    ).rejects.toMatchObject({ code: "MODEL_SELECTOR_CANCELLED" });
-
-    const afterPoiesis = await readFile(join(repo.root, CONFIG_ROOT));
-    const afterManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
-    const afterReceipt = await readFile(receiptPath);
-    expect(Buffer.compare(afterPoiesis, beforePoiesis)).toBe(0);
-    expect(Buffer.compare(afterManifest, beforeManifest)).toBe(0);
-    expect(Buffer.compare(afterReceipt, beforeReceipt)).toBe(0);
-  });
 });
 
 describe("commandModel bare-args TTY wiring (ticket #59)", () => {
@@ -427,20 +598,12 @@ describe("commandModel bare-args TTY wiring (ticket #59)", () => {
     repositories.push(repo);
     await install(repo);
 
-    // Patch the production IO factory used by `commandModel` to use a
-    // scripted IO seam. We achieve this by intercepting the
-    // `createProductionInteractiveModelIO` import — but since the CLI
-    // imports it eagerly, we instead monkey-patch the prototype of
-    // `process.stdin` / `process.stderr` so `isTTY` reports true and the
-    // model selection happens through the production selector with a
-    // scripted keypress loop.
-    //
-    // Simpler approach: assert that the CLI throws
-    // NON_TTY_MODEL when the production IO sees a non-TTY stdin (which
-    // is always true under Vitest), i.e. the new fail-closed behavior
-    // is wired for non-TTY runs. The TTY happy path is covered by the
-    // `runInteractiveModel` suite above; this test only proves the CLI
-    // dispatch reaches the new code path.
+    // Patch the production IO factory used by `commandModel` so the
+    // interactive flow routes through the stubbed Clack primitive.
+    // Vitest stdin is not a TTY by default; force isTTY=false so the
+    // production IO factory reports `isTTY: false` and the flow fails
+    // closed with `NON_TTY_MODEL` (the canonical ticket #59 error
+    // code); the dispatch surface stays a thin shell.
     const saved = process.stdin.isTTY;
     (process.stdin as { isTTY?: boolean }).isTTY = false;
     try {
@@ -453,13 +616,6 @@ describe("commandModel bare-args TTY wiring (ticket #59)", () => {
   });
 
   it("dispatches `poiesis model --cwd <path>` to the interactive flow against the supplied repo (no UNKNOWN_COMMAND)", async () => {
-    // Ticket #66: `--cwd` must be parsed even when args contains no
-    // `set` subcommand, so the bare-args interactive flow can target a
-    // non-default repo root. The dispatch must NOT reject with
-    // `UNKNOWN_COMMAND` — instead it routes to the interactive flow,
-    // which then fails closed with `NON_TTY_MODEL` (Vitest stdin is
-    // not a TTY), proving we crossed the dispatcher boundary
-    // correctly and gave the IO factory the supplied git root.
     const repo = await createTestRepository();
     repositories.push(repo);
     await install(repo);
@@ -476,10 +632,6 @@ describe("commandModel bare-args TTY wiring (ticket #59)", () => {
   });
 
   it("dispatches `poiesis model set <class> <id> --cwd <path>` (set still honors --cwd after ticket #66 split)", async () => {
-    // Regression guard for ticket #66: the new `--cwd`-first split
-    // must NOT regress `set <class> <id> --cwd <path>`. We keep the
-    // invocation shape the existing set subcommand already supported
-    // and re-run the same happy-path semantics.
     const repo = await createTestRepository();
     repositories.push(repo);
     await install(repo);

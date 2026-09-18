@@ -128,6 +128,21 @@ const forbiddenFunctions = [
   // TTY keypress seam before CLI wiring exists.
   "runModelSelector",
   "createProductionModelSelectorIO",
+  // Ticket #73: the CLI-internal Clack adapter (`runClackSelect`) and
+  // its row shape (`ClackSelectRow` / `ClackSelectArgs`) live in
+  // `src/clack-select.ts` and are intentionally NOT re-exported by the
+  // package root. Promoting the adapter would freeze the Clack
+  // primitive into the public surface before Clack's API stabilizes
+  // for downstream consumers.
+  "runClackSelect",
+  // Ticket #73: the post-Clack selector exposes a library-free domain
+  // shape (`buildModelSelectorRows`, `formatModelSelectorHint`,
+  // `resolveIdentityInitialValue`, `ModelSelectorRow`,
+  // `ModelSelectorRowHints`). None of those names reach the package
+  // root either — the model-selector IO contracts must stay internal.
+  "buildModelSelectorRows",
+  "formatModelSelectorHint",
+  "resolveIdentityInitialValue",
   "DEFAULT_RECOMMENDED_MODEL_IDS",
   // Ticket #58 / #59: the interactive IO factories stay CLI-internal.
   // Tests reach them through the source modules (`src/init-interactive.ts`,
@@ -188,6 +203,17 @@ const forbiddenTypes = [
   "ModelSelectorRenderedRow",
   "RunModelSelectorArgs",
   "ProductionModelSelectorIOArgs",
+  // Ticket #73: the post-Clack selector exposes `ModelSelectorRow`,
+  // `ModelSelectorRowHints`, and a library-free
+  // `RunModelSelectorArgs` shape that does NOT take an IO seam. None
+  // of these names reach the package root.
+  "ModelSelectorRow",
+  "ModelSelectorRowHints",
+  // Ticket #73: the Clack adapter's input / output types also stay
+  // internal; promoting them would leak `@clack/prompts` types into
+  // the public surface.
+  "ClackSelectRow",
+  "ClackSelectArgs",
   // Ticket #58 / #59: every `src/init-interactive.ts` / `src/model-interactive.ts`
   // surface stays internal — the IO contracts, the tracker-provider
   // alias, and the model-selection / current-models shapes.
