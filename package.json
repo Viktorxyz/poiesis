@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
     "check": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --pool=forks --poolOptions.forks.maxForks=4",
     "test:watch": "vitest",
     "prepack": "pnpm build"
   },
