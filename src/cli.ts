@@ -256,7 +256,7 @@ async function commandCapability(args: string[]): Promise<void> {
 }
 
 /**
- * CLI dispatch for `poiesis model ...` (ticket #56 / #59 / #66).
+ * CLI dispatch for `poiesis model ...` (ticket #56 / #59 / #66 / #79).
  *
  * `model set reasoning|execution <provider/model>` is the deterministic
  * single-class set (ticket #56) and is unchanged. Bare `poiesis model`
@@ -274,15 +274,24 @@ async function commandCapability(args: string[]): Promise<void> {
  * rejected as `UNKNOWN_COMMAND`. The interactive IO factory is given
  * that resolved git root so `loadConfig` and the `opencode models`
  * child process read from the same root `setModel` writes to.
+ *
+ * Ticket #79: the previous `splitCwdArgs` recognized only the space
+ * form (`--cwd <path>`) and silently dropped `--cwd=<path>`, missing
+ * values, duplicates, unknown flags, and extra positionals — those
+ * forms could mutate the launcher repo or skip validation. The
+ * dispatcher now reuses the generic Node `parseArgs` parser in strict
+ * mode so the equals form, both ways of giving the cwd value, and
+ * malformed extras all fail closed BEFORE any inventory/mutation runs.
+ * The structured JSON success envelope, the typed `modelClass` / `modelId`
+ * validation in `setModel`, the `updateFromConfig` transaction with its
+ * doctor gate and rollback, and the flagless interactive behavior are
+ * preserved.
  */
 export async function commandModel(args: string[]): Promise<void> {
-  // Pull `--cwd <path>` pairs out up front. The remaining `rest`
-  // drives the subcommand decision: empty → interactive, `set …` →
-  // deterministic, anything else → UNKNOWN_COMMAND.
-  const { cwd, rest } = splitCwdArgs(args);
+  const { cwd, positionals } = parseModelArgs(args);
   const root = await resolveGitRoot(resolve(typeof cwd === "string" ? cwd : process.cwd()));
 
-  if (rest.length === 0) {
+  if (positionals.length === 0) {
     const { runInteractiveModel, createProductionInteractiveModelIO } = await import(
       "./model-interactive.js"
     );
@@ -319,24 +328,30 @@ export async function commandModel(args: string[]): Promise<void> {
     }
     return;
   }
-  const sub = rest[0];
+  // The strict parser rejected every unknown flag, missing value,
+  // duplicate `--cwd`, and empty `--cwd=` already (each surfacing as
+  // a typed `PoiesisError` via `parseModelArgs`). The remaining
+  // positionals must now describe exactly the `set <class> <id>`
+  // shape — anything else is malformed and must fail closed before
+  // `setModel` runs the inventory probe or invokes the transaction.
+  const [sub, className, modelId, ...extras] = positionals;
   if (sub !== "set") {
     throw new PoiesisError("UNKNOWN_COMMAND", `Unknown model subcommand: ${sub ?? ""}`, {
       subcommand: sub ?? "",
       supported: ["set"],
     });
   }
-  // Parse `set` arguments positionally: `<class> <id>` followed by
-  // `--cwd`. `parseArgs` rejects positionals in strict mode, so we
-  // slice them off the head and run the parser only on the flag tail.
-  const positional = rest.slice(1, 3);
-  const className = positional[0];
-  const modelId = positional[1];
   if (typeof className !== "string" || className.length === 0) {
-    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model class", { expected: "reasoning|execution" });
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model class", { expected: "reasoning|execution", key: "class" });
   }
   if (typeof modelId !== "string" || modelId.length === 0) {
-    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model ID", { expected: "<provider/model>" });
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required model ID", { expected: "<provider/model>", key: "id" });
+  }
+  if (extras.length > 0) {
+    throw new PoiesisError("UNKNOWN_ARGUMENT", `Unexpected positional argument: ${extras[0]}`, {
+      argument: extras[0],
+      expected: "exactly `set <class> <id> [--cwd <path>]`",
+    });
   }
   writeSuccess(
     "model.set",
@@ -345,25 +360,90 @@ export async function commandModel(args: string[]): Promise<void> {
 }
 
 /**
- * Pull every `--cwd <value>` pair out of `args` and return the value
- * (last-wins, mirroring `parseArgs` semantics for repeated flags) plus
- * the residual positional/flag tail. Used by `commandModel` so a bare
- * `poiesis model --cwd <path>` reaches the interactive dispatcher
- * instead of falling through to the `UNKNOWN_COMMAND` branch.
+ * Strict argument parser for `poiesis model ...`.
+ *
+ * Accepts a single optional `--cwd <path>` flag (in either the space
+ * or `--cwd=<path>` form) plus an ordered list of positionals that
+ * drive the subcommand decision in `commandModel`. Rejects every form
+ * that the previous loose parser accepted silently:
+ *
+ * - missing `--cwd` value (`--cwd` alone, `--cwd=` empty value);
+ * - duplicate `--cwd` (parseArgs in the supported Node line is
+ *   last-wins, so duplicate detection runs as a separate pre-scan);
+ * - unknown flags;
+ * - extra positionals beyond the supported subcommand shape.
+ *
+ * Every malformed form throws a typed `PoiesisError` from the
+ * `parseModelArgs` call site, so the dispatcher can translate it into
+ * the canonical fail-closed envelope before any inventory/mutation
+ * runs.
  */
-function splitCwdArgs(args: string[]): { cwd: string | undefined; rest: string[] } {
-  let cwd: string | undefined;
-  const rest: string[] = [];
-  for (let i = 0; i < args.length; i++) {
-    const current = args[i];
-    if (current === "--cwd" && i + 1 < args.length) {
-      cwd = args[i + 1];
-      i++;
-      continue;
-    }
-    if (typeof current === "string") rest.push(current);
+function parseModelArgs(args: string[]): { cwd: string | undefined; positionals: string[] } {
+  // Pre-scan for duplicate `--cwd` occurrences. Node's `parseArgs` in
+  // the supported line treats untyped repeats as last-wins, which is
+  // not what the ticket #79 contract demands — repeated `--cwd` from
+  // a launcher script (shell alias expansion, copy-pasted commands)
+  // must fail closed before `commandModel` resolves a git root.
+  let cwdOccurrences = 0;
+  for (const arg of args) {
+    if (arg === "--cwd" || arg.startsWith("--cwd=")) cwdOccurrences++;
   }
-  return { cwd, rest };
+  if (cwdOccurrences > 1) {
+    throw new PoiesisError("DUPLICATE_ARGUMENT", "Duplicate --cwd flag", { key: "cwd" });
+  }
+
+  let parsed: { values: Record<string, string | boolean | undefined>; positionals: string[] };
+  try {
+    parsed = parseArgs({
+      args,
+      options: { cwd: { type: "string" } },
+      strict: true,
+      allowPositionals: true,
+    }) as typeof parsed;
+  } catch (error) {
+    throw parseModelArgsError(error);
+  }
+
+  const cwd = parsed.values.cwd;
+  if (typeof cwd === "string" && cwd.length === 0) {
+    // `--cwd=` arrives here as an empty string rather than an error
+    // in the supported Node line — surface the same typed
+    // `MISSING_ARGUMENT` the missing-value form already emits.
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required --cwd value", { key: "cwd" });
+  }
+
+  return {
+    cwd: typeof cwd === "string" ? cwd : undefined,
+    positionals: parsed.positionals,
+  };
+}
+
+/**
+ * Translate a Node `parseArgs` failure into the canonical Poiesis
+ * surface so the dispatcher / interactive flow / tests all see the
+ * same `code` + `details` envelope the previous loose parser never
+ * produced.
+ *
+ * Falls back to rethrowing the original error when the failure type
+ * is not one the ticket contract enumerates — that preserves any
+ * future Node-added parseArgs diagnostics instead of swallowing them.
+ */
+function parseModelArgsError(error: unknown): unknown {
+  if (!(error instanceof TypeError) || !("code" in error)) return error;
+  const code = (error as NodeJS.ErrnoException).code;
+  if (code === "ERR_PARSE_ARGS_INVALID_OPTION_VALUE") {
+    // Node's message format is `Option '--<name> <value>' argument
+    // missing`. Pull the flag name so the typed error attributes the
+    // failure to the right option.
+    const match = /^Option '(--[a-zA-Z][\w-]*)/.exec(error.message);
+    const flag = match?.[1] ?? "--unknown";
+    const key = flag.replace(/^--/, "");
+    return new PoiesisError("MISSING_ARGUMENT", `${flag} requires a value`, { key });
+  }
+  if (code === "ERR_PARSE_ARGS_UNKNOWN_OPTION") {
+    return new PoiesisError("UNKNOWN_OPTION", error.message, { cause: code });
+  }
+  return error;
 }
 
 async function commandWorkspace(args: string[]): Promise<void> {
