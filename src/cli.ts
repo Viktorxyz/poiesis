@@ -152,7 +152,14 @@ export async function commandInit(args: string[]): Promise<void> {
   // cancellation path matches the operator's normal Ctrl+C semantics
   // — the process simply ends with the captured exit status.
   const { runInteractiveInit, createProductionInteractiveInitIO } = await import("./init-interactive.js");
-  const io = createProductionInteractiveInitIO();
+  // Ticket #78: bind the resolved target root into the production IO
+  // factory so the `opencode models` and tracker-auth probes run from
+  // the same root the transactional `init()` write path uses. Bare
+  // `process.cwd()` would let the interactive flow read a different
+  // repo's OpenCode / tracker configuration when the launcher is
+  // invoked from a subdirectory of a different repo. Mirrors the
+  // `commandModel` wiring for the model interactive flow.
+  const io = createProductionInteractiveInitIO(root);
   if (!io.isTTY) {
     throw new PoiesisError(
       "NON_TTY_INIT",

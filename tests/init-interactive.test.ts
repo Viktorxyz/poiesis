@@ -816,7 +816,7 @@ describe("runInteractiveInit stdin release (ticket #75)", () => {
     }) as () => void;
     try {
       const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
-      const io = createProductionInteractiveInitIO();
+      const io = createProductionInteractiveInitIO("/tmp/poiesis-release-root");
       expect(typeof io.releaseStdin).toBe("function");
       io.releaseStdin!();
       io.releaseStdin!();
@@ -1011,7 +1011,7 @@ describe("flagless `poiesis init` cancellation is human feedback (ticket #75 rev
     (process.stdin as { isTTY?: boolean }).isTTY = true;
 
     const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
-    const io = createProductionInteractiveInitIO();
+    const io = createProductionInteractiveInitIO("/tmp/poiesis-cancel-root");
     const originalRelease = io.releaseStdin;
     let releaseCalls = 0;
     const patchedRelease = (): void => {
@@ -1077,7 +1077,7 @@ describe("flagless `poiesis init` cancellation is human feedback (ticket #75 rev
     (process.stdin as { isTTY?: boolean }).isTTY = true;
 
     const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
-    const io = createProductionInteractiveInitIO();
+    const io = createProductionInteractiveInitIO("/tmp/poiesis-cancel-root");
     const originalRelease = io.releaseStdin;
     let releaseCalls = 0;
     const patchedRelease = (): void => {
@@ -1148,3 +1148,168 @@ describe("flagless `poiesis init` cancellation is human feedback (ticket #75 rev
     }
   });
 });
+
+describe("production interactive-init IO binds subprocess cwd to the --cwd target (ticket #78)", () => {
+  // Standards review found that `createProductionInteractiveInitIO`
+  // received no root: its `opencode models` and tracker auth probes
+  // (`gh auth status`, `glab auth status`) ran from `process.cwd()`
+  // rather than the target root resolved by `commandInit` from
+  // `--cwd <path>`. The model interactive flow already binds the
+  // root into its production IO factory; this describe block mirrors
+  // that discipline for the init interactive flow and proves the
+  // dispatch surface plumbs the root through.
+  //
+  // The test deliberately sets `process.cwd()` to a directory that
+  // differs from the target root so the regression fails closed if
+  // the production IO factory re-introduces the `process.cwd()`
+  // assumption.
+  beforeEach(async () => {
+    fakeOpenCode = await installFakeOpenCode();
+    fakeTrackers = await installFakeTrackers();
+  });
+
+  it("production factory's opencode models, gh auth status, glab auth status all run from the target root", async () => {
+    // Install custom fakes that record the cwd they were spawned with.
+    // Mirrors the existing installFakeOpenCode / installFakeTrackers
+    // pattern but adds a `pwd` marker so we can prove the production
+    // factory passes the target root (not the launcher cwd) to every
+    // repository-sensitive subprocess.
+    const bin = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-bin-"));
+    const markers = await mkdtemp(join(tmpdir(), "poiesis-cwd-markers-"));
+    const opencodeMarker = join(markers, "opencode.cwd");
+    const ghMarker = join(markers, "gh.cwd");
+    const glabMarker = join(markers, "glab.cwd");
+    for (const [name, marker] of [
+      ["opencode", opencodeMarker],
+      ["gh", ghMarker],
+      ["glab", glabMarker],
+    ] as const) {
+      const script = join(bin, name);
+      // The fake records its cwd BEFORE printing any stdout so the
+      // marker is on disk by the time the parent process reads it.
+      // `models` echoes a one-per-line model list; `auth status`
+      // echoes an empty success message. Both exit 0 so the
+      // production IO factory treats the probe as available.
+      const body = `#!/bin/sh
+{
+  pwd
+  printf '\\n'
+} > "${marker}"
+case "$1" in
+  models)
+    printf 'openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n'
+    exit 0
+    ;;
+  auth)
+    if [ "$2" = "status" ]; then
+      printf 'logged in (fake cwd-record binary)\\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+`;
+      await writeFile(script, body);
+      await chmod(script, 0o755);
+    }
+    const previousPath = process.env.PATH;
+    process.env.PATH = previousPath === undefined || previousPath === "" ? bin : `${bin}:${previousPath}`;
+
+    // Target root — the value `commandInit` would resolve from
+    // `--cwd <path>` via `resolveGitRoot(cwd)`. Distinct from the
+    // launcher cwd to exercise the bug.
+    const targetRoot = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-target-"));
+    // Launcher cwd — what `process.cwd()` returns when the CLI is
+    // invoked. We chdir into a directory that has NO relation to the
+    // target root so the regression catches any `process.cwd()`
+    // regression in the production factory.
+    const launcherCwd = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-launcher-"));
+    const savedCwd = process.cwd();
+    process.chdir(launcherCwd);
+
+    try {
+      const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
+      const io = createProductionInteractiveInitIO(targetRoot);
+
+      // Drive every repository-sensitive seam the production factory
+      // owns. Each method MUST run its subprocess with cwd=targetRoot,
+      // NOT cwd=launcherCwd / cwd=process.cwd().
+      await io.listOpenCodeModels();
+      await io.probeTrackerAuth("github");
+      await io.probeTrackerAuth("gitlab");
+
+      // The launcher cwd must be different from the target root;
+      // otherwise the test would pass even if the factory regressed
+      // to `process.cwd()` (because process.cwd() would equal the
+      // target root anyway).
+      expect(process.cwd()).toBe(launcherCwd);
+      expect(process.cwd()).not.toBe(targetRoot);
+
+      const opencodeCwd = (await readFile(opencodeMarker, "utf8")).trim();
+      const ghCwd = (await readFile(ghMarker, "utf8")).trim();
+      const glabCwd = (await readFile(glabMarker, "utf8")).trim();
+
+      // The three subprocess invocations must all be rooted at the
+      // target root. `realpathSync` resolves the macOS `/private/var`
+      // vs `/var` symlink (and similar) so the assertion is
+      // platform-stable.
+      expect(opencodeCwd).toBe(await resolveReal(targetRoot));
+      expect(ghCwd).toBe(await resolveReal(targetRoot));
+      expect(glabCwd).toBe(await resolveReal(targetRoot));
+    } finally {
+      process.chdir(savedCwd);
+      process.env.PATH = previousPath;
+      await rm(bin, { recursive: true, force: true });
+      await rm(markers, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+      await rm(launcherCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("commandInit passes the resolved --cwd root into the production IO factory", async () => {
+    // The dispatch surface must hand the resolved target root to the
+    // production factory so the factory's subprocess probes can run
+    // from the right place. We do NOT exercise the full interactive
+    // flow under vitest (no TTY); we only need to prove the factory
+    // receives the root.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+
+    const createProductionSpy = vi.fn((_root: string) => ({
+      isTTY: false, // force NON_TTY_INIT exit before any IO runs
+      writeStderr: vi.fn(),
+      promptLine: vi.fn(),
+      listOpenCodeModels: vi.fn(async () => []),
+      runModelSelector: vi.fn(async () => ""),
+      probeTrackerAuth: vi.fn(async () => ({ available: true })),
+      releaseStdin: vi.fn(),
+    }));
+    vi.doMock("../src/init-interactive.js", () => ({
+      runInteractiveInit: vi.fn(),
+      createProductionInteractiveInitIO: createProductionSpy,
+    }));
+
+    try {
+      vi.resetModules();
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await expect(cli.commandInit(["--cwd", repo.root])).rejects.toMatchObject({
+        code: "NON_TTY_INIT",
+      });
+    } finally {
+      vi.doUnmock("../src/init-interactive.js");
+      vi.resetModules();
+    }
+
+    // The factory MUST have received exactly the resolved target root
+    // (the git toplevel of --cwd, which equals the repo root here).
+    expect(createProductionSpy).toHaveBeenCalledTimes(1);
+    const firstArg = createProductionSpy.mock.calls[0]![0]!;
+    expect(firstArg.length).toBeGreaterThan(0);
+    expect(await resolveReal(firstArg)).toBe(await resolveReal(repo.root));
+  }, 30_000);
+});
+
+async function resolveReal(path: string): Promise<string> {
+  const { realpath } = await import("node:fs/promises");
+  return await realpath(path);
+}

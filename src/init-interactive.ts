@@ -600,16 +600,24 @@ export const __test = { resolveAuthorChoices, refuseIfAlreadyInstalled };
 /**
  * Production IO factory. Wires the interactive init IO to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a zero-argument call site. Model selection is delegated to
+ * stays a single-argument call site. Model selection is delegated to
  * `runModelSelector`, which goes through the CLI-internal Clack
  * adapter (`src/clack-select.ts`). The init / model flows share that
  * single interactive list primitive so there is no second selector
  * implementation to drift.
  *
+ * The factory takes the resolved repository `root` (git toplevel of the
+ * repo the Author is editing) so every repository-sensitive subprocess —
+ * `opencode models`, `gh auth status`, and `glab auth status` — runs
+ * from the SAME root the transactional `init()` write path uses. Bare
+ * `process.cwd()` would let the interactive flow read the wrong repo's
+ * OpenCode / tracker configuration when `poiesis init --cwd <path>`
+ * lands the CLI in a subdirectory of a different repo (ticket #78).
+ *
  * Tests inject a fully scripted IO via the `io` parameter on
  * `runInteractiveInit`; production code goes through this factory.
  */
-export function createProductionInteractiveInitIO(): InteractiveInitIO {
+export function createProductionInteractiveInitIO(root: string): InteractiveInitIO {
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
@@ -669,7 +677,13 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
-      const result = await runChildProcess("opencode", ["models"], { cwd: process.cwd(), allowFailure: true });
+      // Run `opencode models` from the repo root, NOT `process.cwd()`.
+      // CLI dispatch lands here when the Author passes
+      // `poiesis init --cwd <path>` from any subdirectory of the repo;
+      // the opencode config (`opencode.jsonc`) lives at the repo root,
+      // so a child process spawned from a sub-cwd could see a different
+      // (or no) OpenCode installation.
+      const result = await runChildProcess("opencode", ["models"], { cwd: root, allowFailure: true });
       if (result.exitCode !== 0) {
         throw new PoiesisError(
           "MODEL_INVENTORY_UNAVAILABLE",
@@ -697,7 +711,13 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
     },
     async probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult> {
       if (provider === "github") {
-        const result = await runChildProcess("gh", ["auth", "status"], { cwd: process.cwd(), allowFailure: true });
+        // Run from the repo root so the auth probe sees the same Git
+        // config (`gh` / `glab` honor the current repo's credentials
+        // configuration) as the rest of the init transaction. Bare
+        // `process.cwd()` would let the probe read the wrong repo
+        // when `poiesis init --cwd <path>` lands the CLI in a
+        // subdirectory of a different repo.
+        const result = await runChildProcess("gh", ["auth", "status"], { cwd: root, allowFailure: true });
         if (result.exitCode === 0) return { available: true };
         return {
           available: false,
@@ -705,7 +725,7 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
           hint: "Run `gh auth login` to authenticate, then re-run `poiesis init`",
         };
       }
-      const result = await runChildProcess("glab", ["auth", "status"], { cwd: process.cwd(), allowFailure: true });
+      const result = await runChildProcess("glab", ["auth", "status"], { cwd: root, allowFailure: true });
       if (result.exitCode === 0) return { available: true };
       return {
         available: false,
