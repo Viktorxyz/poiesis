@@ -719,4 +719,172 @@ describe("GitHub provider headRepository handling", () => {
       }),
     ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
   }, 30_000);
+
+  // Ticket #77 — verifyGitHubPullRequest must apply the same
+  // headRepository ownership check as the initial existing-PR lookup.
+  // The first final response (after `gh pr create`) only matching the
+  // candidate SHA but reporting a different non-empty
+  // headRepository.nameWithOwner must fail closed with
+  // CHANGE_REQUEST_OWNERSHIP_MISMATCH, the same code already produced
+  // by the initial-list lookup path.
+  it("fails closed on mismatched headRepository in final verify response after gh pr create", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-create-verify-headrepo");
+
+    // Initial list: no PR yet. gh pr create runs. The final verify
+    // `gh pr list` reports a PR whose headRefOid matches the candidate
+    // SHA but whose headRepository.nameWithOwner points at a fork.
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, { nameWithOwner: "fork/repo" }),
+    );
+    await expect(
+      publish({
+        cwd: workspacePath,
+        ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        candidateSha: sha,
+        candidateTree: tree,
+        provider: "github",
+        project,
+        title: "Spec",
+        body: "body",
+        proof: proofShell(sha, tree),
+      }),
+    ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
+  }, 30_000);
+
+  // Ticket #77 — same ownership check must run on the final verify
+  // response after `gh pr edit`. The initial existing-PR lookup
+  // accepts a same-repo PR and lets `gh pr edit` run; the final
+  // verify must still close the door on a post-edit report from a
+  // different repository.
+  it("fails closed on mismatched headRepository in final verify response after gh pr edit", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-edit-verify-headrepo");
+
+    // First publish: everything matches.
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+    );
+    await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+
+    // Second publish: initial list matches a same-repo PR, gh pr edit
+    // runs, then the final verify `gh pr list` returns a PR whose
+    // headRefOid matches the candidate SHA but whose
+    // headRepository.nameWithOwner now points at a fork.
+    ghResponseQueue.push(
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+      ghPrEditResponse(),
+      ghListEntry(sha, { nameWithOwner: "fork/repo" }),
+    );
+    await expect(
+      publish({
+        cwd: workspacePath,
+        ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        candidateSha: sha,
+        candidateTree: tree,
+        provider: "github",
+        project,
+        title: "Spec v2",
+        body: "body",
+        proof: proofShell(sha, tree),
+      }),
+    ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
+  }, 30_000);
+
+  // Ticket #77 — same/missing/empty headRepository.nameWithOwner on
+  // the final verify response must still pass after the new check is
+  // wired in. These guard against accidentally closing the door on
+  // legitimate same-repo reports on either the create or edit path.
+  it("still accepts matching/missing/empty headRepository on final verify after gh pr create and edit", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-verify-headrepo-same");
+
+    // Create path: final verify returns a same-repo PR.
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+    );
+    await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+
+    // Edit path, empty nameWithOwner on the final verify.
+    ghResponseQueue.push(
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+      ghPrEditResponse(),
+      ghListEntry(sha, { nameWithOwner: "" }),
+    );
+    const second = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec v2",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(second.action).toBe("updated");
+
+    // Edit path, missing headRepository field on the final verify.
+    ghResponseQueue.push(
+      ghListEntry(sha, { nameWithOwner: "owner/repo" }),
+      ghPrEditResponse(),
+      ghListEntry(sha, undefined),
+    );
+    const third = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec v3",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(third.action).toBe("updated");
+  }, 30_000);
 });

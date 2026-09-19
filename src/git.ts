@@ -936,24 +936,7 @@ async function publishGitHub(
       "Existing GitHub pull request points at a different candidate",
       { expected: candidateSha, actual: jsonString(request, "headRefOid") },
     );
-    const headRepositoryRecord = isJsonRecord(request) && isJsonRecord(request.headRepository)
-      ? request.headRepository
-      : undefined;
-    // gh pr list omits the headRepository object entirely (or returns
-    // nameWithOwner as "") for same-repo PRs. Treat both as matching
-    // options.project; only fail closed when nameWithOwner is present
-    // and differs from the configured project.
-    const headRepository = headRepositoryRecord === undefined
-      ? undefined
-      : jsonString(headRepositoryRecord, "nameWithOwner");
-    invariant(
-      headRepository === undefined ||
-        headRepository === "" ||
-        headRepository === options.project,
-      "CHANGE_REQUEST_OWNERSHIP_MISMATCH",
-      "Existing GitHub pull request comes from a different repository",
-      { expected: options.project, actual: headRepository },
-    );
+    assertHeadRepositoryOwnership(request, options.project);
     await run(
       "gh",
       [
@@ -1047,7 +1030,34 @@ async function verifyGitHubPullRequest(
   const matched = requests.find((entry) => jsonString(entry, "headRefOid") === candidateSha);
   if (matched === undefined) return null;
   if (!isJsonRecord(matched)) return null;
+  // Ticket #77 — apply the same headRepository ownership check the
+  // initial existing-PR lookup applies, so a final response whose
+  // headRefOid matches the candidate but whose headRepository points
+  // at a different non-empty repo fails closed instead of being
+  // accepted purely on SHA match.
+  assertHeadRepositoryOwnership(matched, options.project);
   return matched;
+}
+
+function assertHeadRepositoryOwnership(record: unknown, project: string): void {
+  const headRepositoryRecord = isJsonRecord(record) && isJsonRecord(record.headRepository)
+    ? record.headRepository
+    : undefined;
+  // gh pr list omits the headRepository object entirely (or returns
+  // nameWithOwner as "") for same-repo PRs. Treat both as matching
+  // the configured project; only fail closed when nameWithOwner is
+  // present and differs from the configured project.
+  const headRepository = headRepositoryRecord === undefined
+    ? undefined
+    : jsonString(headRepositoryRecord, "nameWithOwner");
+  invariant(
+    headRepository === undefined ||
+      headRepository === "" ||
+      headRepository === project,
+    "CHANGE_REQUEST_OWNERSHIP_MISMATCH",
+    "GitHub pull request comes from a different repository",
+    { expected: project, actual: headRepository },
+  );
 }
 
 async function publishGitLab(
