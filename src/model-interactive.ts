@@ -1,5 +1,5 @@
 /**
- * Interactive `poiesis model` (ticket #59, ticket #73).
+ * Interactive `poiesis model` (ticket #59, ticket #73, ticket #76).
  *
  * Flagless interactive flow that lets the Author change exactly one
  * model slot at a time. Mirrors the `poiesis init` interactive
@@ -13,18 +13,22 @@
  *      (`MODEL_NOT_INSTALLED`). The interactive flow must NOT install
  *      Poiesis for the Author — it only mutates an already-installed
  *      config.
- *   3. Print the current reasoning and execution model identities on
- *      stderr so the Author sees what they are about to change.
- *   4. Probe the live OpenCode model inventory via `opencode models`.
- *      Empty inventory fails closed with `MODEL_INVENTORY_UNAVAILABLE`
- *      — no silent fallback.
- *   5. Ask the Author which slot to change (`reasoning` or `execution`)
+ *   3. Read the currently-installed Poiesis config and print the
+ *      current reasoning and execution model identities on stderr so
+ *      the Author sees what they are about to change.
+ *   4. Ask the Author which slot to change (`reasoning` or `execution`)
  *      through the shared Clack-backed class selector. The current
  *      reasoning / execution identity is shown in each option's hint so
  *      the operator sees the values they are choosing between. Anything
  *      else fails closed with `MODEL_CLASS_SELECTOR_CANCELLED` if the
  *      Author pressed Esc / Ctrl+C, or `INVALID_MODEL_CLASS` if a
  *      custom IO seam returned a non-class answer.
+ *   5. Probe the live OpenCode model inventory via `opencode models`.
+ *      ticket #76 reordered this step to AFTER the class selector so a
+ *      class-selector cancellation (or an out-of-band class answer)
+ *      short-circuits BEFORE the `opencode models` subprocess runs.
+ *      Empty inventory still fails closed with
+ *      `MODEL_INVENTORY_UNAVAILABLE` — no silent fallback.
  *   6. Run the shared `runModelSelector` for the chosen class with the
  *      live inventory, the canonical recommended constants, and the
  *      currently installed identity (so the hint marks "Current" /
@@ -51,6 +55,11 @@
  *   - The class selector and the identity selector are the SAME
  *     primitive (`@clack/prompts` `select` via the CLI-internal
  *     `runClackSelect` adapter). There is no second mini-TUI.
+ *   - ticket #76: the inventory probe runs AFTER the class selector,
+ *     not before. Class-selector cancellation (or an invalid class
+ *     answer) must cause ZERO inventory probes and ZERO mutation; the
+ *     `finally` block still releases the input resource on every code
+ *     path.
  */
 import { PoiesisError } from "./errors.js";
 import { loadConfig } from "./config.js";
@@ -201,8 +210,13 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
     const current = await args.io.loadCurrentModels();
     args.io.writeStderr(formatCurrentModelsFrame(current));
 
-    const inventory = await probeInventory(args.io);
-
+    // ticket #76: the class selector runs BEFORE the inventory
+    // probe. The class selector only needs the operator's current
+    // identities (already loaded above) to render its hints, so the
+    // inventory subprocess is unnecessary until the Author has chosen
+    // a class. Cancelling or returning an invalid class short-circuits
+    // here with zero inventory probes and zero mutation; the finally
+    // block below still releases the input resource.
     const classAnswer = await args.io.runModelClassSelector({
       current,
       cancelError: new PoiesisError(
@@ -218,6 +232,11 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
         { className: classAnswer, supported: [...MODEL_CLASSES] },
       );
     }
+    // ticket #76: inventory discovery happens AFTER class selection.
+    // Empty inventory fails closed with `MODEL_INVENTORY_UNAVAILABLE`
+    // — no silent fallback — and the finally block still releases the
+    // input resource on that error path.
+    const inventory = await probeInventory(args.io);
     const chosen = await args.io.runModelSelector({
       modelClass: classAnswer,
       inventory,
@@ -237,7 +256,8 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
     // process can exit naturally after success or cancellation; without
     // this, Clack's last `select` leaves stdin resumed and the event
     // loop waits forever for keypress data. Tests that drive the flow
-    // with scripted IO leave `releaseStdin` undefined.
+    // with scripted IO leave `releaseStdin` undefined. Ticket #76
+    // preserves this on the new class-before-inventory ordering.
     args.io.releaseStdin?.();
   }
 }

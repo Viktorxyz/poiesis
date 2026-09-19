@@ -110,6 +110,13 @@ interface ScriptedModelIO extends InteractiveModelIO {
   inventoryCalls: number;
   currentModelsCalls: number;
   releaseCalls: number;
+  /**
+   * Ordered log of every IO seam entry (ticket #76). Each push carries
+   * the seam name; tests assert on the relative order of the seams
+   * they care about (e.g. `runModelClassSelector` before
+   * `listOpenCodeModels`).
+   */
+  callOrder: string[];
 }
 
 function scriptedModelIO(options: {
@@ -123,12 +130,13 @@ function scriptedModelIO(options: {
   const stderrLines: string[] = [];
   const classSelectorCalls: Array<{ current: CurrentModels }> = [];
   const modelSelections: ModelSelection[] = [];
+  const callOrder: string[] = [];
   const inventory = options.inventory ?? [];
   const current = options.current ?? { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" };
   const classAnswer = options.classAnswer ?? "reasoning";
   const selectedModel = options.selectedModel ?? inventory[0] ?? "openai/gpt-5.6-sol";
 
-  return {
+  const io: ScriptedModelIO = {
     isTTY: options.isTTY ?? true,
     stderrLines,
     classSelectorCalls,
@@ -136,6 +144,7 @@ function scriptedModelIO(options: {
     inventoryCalls: 0,
     currentModelsCalls: 0,
     releaseCalls: 0,
+    callOrder,
     writeStderr(line: string): void {
       stderrLines.push(line);
     },
@@ -143,23 +152,28 @@ function scriptedModelIO(options: {
       this.releaseCalls += 1;
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
+      callOrder.push("listOpenCodeModels");
       this.inventoryCalls += 1;
       return [...inventory];
     },
     async runModelClassSelector(args): Promise<ModelClassChoice> {
+      callOrder.push("runModelClassSelector");
       classSelectorCalls.push({ current: args.current });
       if (options.classSelector) return await options.classSelector(args);
       return classAnswer;
     },
     async runModelSelector(selection: ModelSelection): Promise<string> {
+      callOrder.push("runModelSelector");
       modelSelections.push(selection);
       return selectedModel;
     },
     async loadCurrentModels(): Promise<CurrentModels> {
+      callOrder.push("loadCurrentModels");
       this.currentModelsCalls += 1;
       return current;
     },
   };
+  return io;
 }
 
 async function install(repository: TestRepository): Promise<void> {
@@ -478,6 +492,14 @@ describe("runInteractiveModel (ticket #59)", () => {
 
     // No identity selector was offered — the bad class answer short-circuits.
     expect(io.modelSelections).toEqual([]);
+    // ticket #76: the bad class answer also short-circuits the
+    // inventory probe. A non-class answer is a defensive failure: we
+    // never trust a class we did not select, so we never spend the
+    // subprocess on inventory discovery.
+    expect(io.inventoryCalls).toBe(0);
+    expect(io.callOrder).not.toContain("listOpenCodeModels");
+    // Stdin still released exactly once from the finally block.
+    expect(io.releaseCalls).toBe(1);
   });
 
   it("fails closed when the OpenCode inventory is empty (no silent fallback)", async () => {
@@ -516,6 +538,12 @@ describe("runInteractiveModel (ticket #59)", () => {
     await expect(
       runInteractiveModel({ root: repo.root, io }),
     ).rejects.toMatchObject({ code: "MODEL_CLASS_SELECTOR_CANCELLED" });
+
+    // ticket #76: the inventory subprocess MUST NOT have run. A
+    // class-selector cancellation short-circuits BEFORE the inventory
+    // probe.
+    expect(io.inventoryCalls).toBe(0);
+    expect(io.callOrder).not.toContain("listOpenCodeModels");
 
     const afterPoiesis = await readFile(join(repo.root, CONFIG_ROOT));
     const afterManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
@@ -591,6 +619,183 @@ describe("runInteractiveModel (ticket #59)", () => {
     // Even on a no-op the restart notice is part of the contract.
     expect(result.restart.started).toBe(false);
   }, 30_000);
+});
+
+describe("runInteractiveModel class-before-inventory ordering (ticket #76)", () => {
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  /**
+   * Acceptance (ticket #76):
+   *   - Current model values are read and the class selector is
+   *     invoked BEFORE `opencode models` inventory discovery.
+   *   - Cancelling at the class selector performs no inventory probe,
+   *     no write, concise feedback, and natural terminal release.
+   *   - Existing concise interactive completion, deterministic JSON,
+   *     transaction/doctor, and Clack behavior remain unchanged.
+   */
+
+  it("invokes the class selector before the inventory probe on the happy path", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      current: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      classAnswer: "reasoning",
+      selectedModel: "openai/gpt-5.6-fallback",
+    });
+
+    await runInteractiveModel({ root: repo.root, io });
+
+    // Every call recorded by the IO seam in the order it happened.
+    // The class selector MUST precede the inventory probe; the
+    // inventory probe MUST precede the identity selector; the
+    // identity selector MUST precede any mutation (none observed
+    // here because the mutation path goes through `setModel`).
+    const classIdx = io.callOrder.indexOf("runModelClassSelector");
+    const inventoryIdx = io.callOrder.indexOf("listOpenCodeModels");
+    const identityIdx = io.callOrder.indexOf("runModelSelector");
+    const loadCurrentIdx = io.callOrder.indexOf("loadCurrentModels");
+
+    expect(classIdx).toBeGreaterThanOrEqual(0);
+    expect(inventoryIdx).toBeGreaterThanOrEqual(0);
+    expect(identityIdx).toBeGreaterThanOrEqual(0);
+    expect(loadCurrentIdx).toBeGreaterThanOrEqual(0);
+    // The class selector runs BEFORE the inventory probe (ticket #76
+    // reorder). Loading current models happens first because the
+    // class selector's hints depend on the operator's installed
+    // values.
+    expect(classIdx).toBeLessThan(inventoryIdx);
+    expect(loadCurrentIdx).toBeLessThan(classIdx);
+    expect(inventoryIdx).toBeLessThan(identityIdx);
+    // Exactly one probe per interactive run.
+    expect(io.inventoryCalls).toBe(1);
+  }, 30_000);
+
+  it("does NOT probe the inventory when the class selector is cancelled", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const receiptPath = await ownershipReceiptLocation(repo.root);
+    const beforePoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const beforeManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const beforeReceipt = await readFile(receiptPath);
+    const io = scriptedModelIO({
+      isTTY: true,
+      // Inventory is non-empty so a buggy flow that probed before the
+      // class selector would have to call listOpenCodeModels. After
+      // ticket #76's reorder, the class selector runs first and the
+      // inventory probe must be skipped entirely on cancellation.
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+    });
+    io.runModelClassSelector = async (): Promise<ModelClassChoice> => {
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "MODEL_CLASS_SELECTOR_CANCELLED",
+        "cancelled",
+        {},
+      );
+    };
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_CLASS_SELECTOR_CANCELLED" });
+
+    // No inventory probe ran — the Author cancelled at the class
+    // selector and ticket #76 keeps the opencode models subprocess
+    // off the wire entirely.
+    expect(io.inventoryCalls).toBe(0);
+    expect(io.callOrder).not.toContain("listOpenCodeModels");
+    // No identity selector was offered either.
+    expect(io.modelSelections).toEqual([]);
+    expect(io.callOrder).not.toContain("runModelSelector");
+    // Flow-scoped stdin release ran from the finally block.
+    expect(io.releaseCalls).toBe(1);
+    // No writes reached disk.
+    const afterPoiesis = await readFile(join(repo.root, CONFIG_ROOT));
+    const afterManifest = await readFile(join(repo.root, ".poiesis", "manifest.json"));
+    const afterReceipt = await readFile(receiptPath);
+    expect(Buffer.compare(afterPoiesis, beforePoiesis)).toBe(0);
+    expect(Buffer.compare(afterManifest, beforeManifest)).toBe(0);
+    expect(Buffer.compare(afterReceipt, beforeReceipt)).toBe(0);
+  });
+
+  it("does NOT probe the inventory when the class selector returns an invalid class", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+    });
+    io.runModelClassSelector = async (): Promise<ModelClassChoice> =>
+      "planner" as ModelClassChoice;
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "INVALID_MODEL_CLASS" });
+
+    // A non-class answer is a defensive error: we never trust a
+    // class we did not select, so the inventory probe must NOT have
+    // been invoked. ticket #76 enforces this with the reorder.
+    expect(io.inventoryCalls).toBe(0);
+    expect(io.callOrder).not.toContain("listOpenCodeModels");
+    expect(io.modelSelections).toEqual([]);
+    expect(io.callOrder).not.toContain("runModelSelector");
+    expect(io.releaseCalls).toBe(1);
+  });
+
+  it("preserves the success-path restart notice and stdin release after the reorder", async () => {
+    // Regression guard for ticket #75 behavior. After ticket #76 the
+    // class selector runs first, but the post-success contract is
+    // unchanged: the restart notice still names previous/current
+    // class identities; stdin is still released exactly once.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      current: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      classAnswer: "execution",
+      selectedModel: "minimax/MiniMax-M3-alt",
+    });
+
+    await runInteractiveModel({ root: repo.root, io });
+
+    const stderr = io.stderrLines.join("");
+    expect(stderr).toContain("execution");
+    expect(stderr).toContain("minimax/MiniMax-M3");
+    expect(stderr).toContain("minimax/MiniMax-M3-alt");
+    expect(stderr.toLowerCase()).toMatch(/restart/i);
+    expect(stderr.toLowerCase()).toMatch(/poiesis.*did not.*restart|poiesis.*not.*restart/);
+    expect(io.releaseCalls).toBe(1);
+  }, 30_000);
+
+  it("preserves the inventory-fail-closed error after the class selector succeeds", async () => {
+    // The class selector succeeds (returns `reasoning`) and the flow
+    // then discovers the inventory is empty. ticket #76 requires this
+    // fail-closed error to still surface as `MODEL_INVENTORY_UNAVAILABLE`
+    // because the empty-inventory defense happens AFTER class selection,
+    // not before.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({ isTTY: true, inventory: [] });
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_INVENTORY_UNAVAILABLE" });
+
+    // The class selector was called and the inventory probe ran and
+    // surfaced the empty case; the identity selector never fired.
+    expect(io.callOrder).toContain("runModelClassSelector");
+    expect(io.callOrder).toContain("listOpenCodeModels");
+    expect(io.callOrder).not.toContain("runModelSelector");
+    expect(io.releaseCalls).toBe(1);
+  });
 });
 
 describe("runInteractiveModel restart notice + stdin release (ticket #75)", () => {
