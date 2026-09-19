@@ -135,6 +135,22 @@ export async function commandInit(args: string[]): Promise<void> {
   // Flagless path: the interactive init TTY flow. Every TTY check,
   // prompt, model-selector call, and auth probe is delegated to the
   // dedicated module so this dispatcher stays a thin shell.
+  //
+  // Ticket #75: the flagless interactive flow is human feedback only.
+  // It does NOT emit the structured success envelope on stdout —
+  // success lives on stderr (the restart notice is the canonical
+  // human feedback). The `--config` path above keeps the structured
+  // JSON contract for automation; that is the deterministic surface.
+  //
+  // Ticket #75 (reviewer follow-up): user-initiated cancellations
+  // (Esc / Ctrl+C at the line prompt or at the Clack model selector)
+  // are human feedback too, not structured JSON. The interactive
+  // module's `finally` has already released stdin by the time we see
+  // the error; we emit a concise human-readable line on stderr, set
+  // `process.exitCode` to the typed cancellation error's exit code,
+  // and return naturally. We do NOT call `process.exit` so the
+  // cancellation path matches the operator's normal Ctrl+C semantics
+  // — the process simply ends with the captured exit status.
   const { runInteractiveInit, createProductionInteractiveInitIO } = await import("./init-interactive.js");
   const io = createProductionInteractiveInitIO();
   if (!io.isTTY) {
@@ -144,7 +160,16 @@ export async function commandInit(args: string[]): Promise<void> {
       { hint: "use `poiesis init --config <path>` or run inside a TTY" },
     );
   }
-  writeSuccess("init", await runInteractiveInit({ root, io }));
+  try {
+    await runInteractiveInit({ root, io });
+  } catch (error) {
+    if (error instanceof PoiesisError && isInteractiveInitCancellation(error.code)) {
+      io.writeStderr(formatInteractiveCancellation("init"));
+      process.exitCode = error.exitCode;
+      return;
+    }
+    throw error;
+  }
 }
 
 async function commandDoctor(args: string[]): Promise<void> {
@@ -258,7 +283,33 @@ export async function commandModel(args: string[]): Promise<void> {
     // The interactive flow refuses non-TTY itself with `NON_TTY_MODEL`
     // (the canonical ticket #59 error code); the dispatch surface stays
     // a thin shell.
-    writeSuccess("model.interactive", await runInteractiveModel({ root, io }));
+    //
+    // Ticket #75: the flagless interactive flow is human feedback only.
+    // It does NOT emit the structured success envelope on stdout — the
+    // model interactive flow already prints the exact previous/current
+    // + restart notice to stderr, and that is the canonical human
+    // feedback. The deterministic `poiesis model set reasoning|execution
+    // <provider/model>` path below keeps the structured JSON contract.
+    //
+    // Ticket #75 (reviewer follow-up): user-initiated cancellations
+    // (Esc / Ctrl+C at the class selector or at the identity selector)
+    // are human feedback too, not structured JSON. The interactive
+    // module's `finally` has already released stdin by the time we see
+    // the error; we emit a concise human-readable line on stderr, set
+    // `process.exitCode` to the typed cancellation error's exit code,
+    // and return naturally. We do NOT call `process.exit` so the
+    // cancellation path matches the operator's normal Ctrl+C semantics
+    // — the process simply ends with the captured exit status.
+    try {
+      await runInteractiveModel({ root, io });
+    } catch (error) {
+      if (error instanceof PoiesisError && isInteractiveModelCancellation(error.code)) {
+        io.writeStderr(formatInteractiveCancellation("model"));
+        process.exitCode = error.exitCode;
+        return;
+      }
+      throw error;
+    }
     return;
   }
   const sub = rest[0];
@@ -722,4 +773,37 @@ function optionalAbsoluteWorkspacePath(value: string | boolean | string[] | unde
   const trimmed = value.trim();
   if (trimmed.length === 0) return {};
   return { workspacePath: resolve(trimmed) };
+}
+
+/**
+ * Narrow predicate: the typed error codes the interactive `poiesis init`
+ * flagless flow throws when the operator cancels the prompt or the
+ * shared model selector. The list is exhaustive for the flagless
+ * happy-path module surface; `NON_TTY_INIT` and pre-write refusals
+ * like `INSTALL_PATH_CONFLICT` are deliberately excluded so they
+ * continue to surface through `writeFailure` and `process.exit`.
+ */
+function isInteractiveInitCancellation(code: string): boolean {
+  return code === "INIT_PROMPT_CANCELLED" || code === "INIT_MODEL_SELECTOR_CANCELLED";
+}
+
+/**
+ * Narrow predicate: the typed error codes the interactive `poiesis model`
+ * flagless flow throws when the operator cancels the class selector or
+ * the identity selector. `NON_TTY_MODEL`, `MODEL_NOT_INSTALLED`, and
+ * `MODEL_INVENTORY_UNAVAILABLE` are deliberately excluded so they
+ * continue to surface through `writeFailure` and `process.exit`.
+ */
+function isInteractiveModelCancellation(code: string): boolean {
+  return code === "MODEL_CLASS_SELECTOR_CANCELLED" || code === "MODEL_SELECTOR_CANCELLED";
+}
+
+/**
+ * Concise human-readable cancellation line for the interactive flows.
+ * Mirrors the ticket #75 "human feedback, no structured internal JSON"
+ * contract: the cancellation is a single stderr line that confirms the
+ * operator's Ctrl+C / Esc and tells them the transaction was a no-op.
+ */
+function formatInteractiveCancellation(flow: "init" | "model"): string {
+  return `Poiesis ${flow} cancelled. No changes were made.\n`;
 }

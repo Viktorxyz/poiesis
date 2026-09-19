@@ -79,6 +79,15 @@ export interface InteractiveInitIO {
   listOpenCodeModels(): Promise<readonly string[]>;
   runModelSelector(selection: ModelSelection): Promise<string>;
   probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult>;
+  /**
+   * Flow-scoped resource release (ticket #75). The interactive flow
+   * invokes this exactly once from a `finally` block on every code
+   * path (success, typed cancellation, and unexpected throw) so the
+   * underlying `process.stdin` cannot keep the event loop alive after
+   * the flow settles. Tests supply a counter; the production factory
+   * pauses and unrefs `process.stdin`.
+   */
+  releaseStdin?(): void;
 }
 
 export interface InteractiveInitOptions {
@@ -132,48 +141,59 @@ const FORBIDDEN_DELIVERY_ADAPTERS: ReadonlySet<string> = new Set([
  * produces structured stdout.
  */
 export async function runInteractiveInit(args: InteractiveInitOptions): Promise<Manifest> {
-  if (!args.io.isTTY) {
-    throw new PoiesisError(
-      "NON_TTY_INIT",
-      "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
-      { hint: "use `poiesis init --config <path>` or run inside a TTY" },
-    );
+  try {
+    if (!args.io.isTTY) {
+      throw new PoiesisError(
+        "NON_TTY_INIT",
+        "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
+        { hint: "use `poiesis init --config <path>` or run inside a TTY" },
+      );
+    }
+
+    // Step 1: refuse an already-installed repo BEFORE any model selector
+    // or prompt. This mirrors the existing `assertInitDestinationsAbsent`
+    // invariant that `init()` enforces anyway, but we check it up front so
+    // we never start asking the Author for choices in a repo that already
+    // has Poiesis installed.
+    await refuseIfAlreadyInstalled(args.root);
+
+    // Step 2: compose discovery. The composer is read-only — it inspects
+    // the repo and the user's draft, then reports either a fully resolved
+    // config or a list of unresolved paths.
+    const discovery = await composeInitDiscovery(args.root, args.draft);
+
+    // Step 3: print the detected facts to stderr so the Author can see
+    // what was inferred before any prompt is issued.
+    printDetections(args.io, discovery);
+
+    // Step 4: resolve every Author-owned field. Order matters — model
+    // selection runs before tracker auth so the Author sees the same
+    // config that the auth probe will read.
+    const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft);
+
+    // Step 5: probe tracker auth BEFORE `init()` writes any byte. Auth
+    // failures mention `gh auth login` / `glab auth login` and never
+    // wait-for-enter.
+    await probeTrackerAuthBeforeInstall(args.io, resolvedDraft);
+
+    // Step 6: the existing init() function owns every transactional
+    // invariant. This module never duplicates that surface.
+    const manifest = await init(args.root, resolvedDraft);
+
+    // Step 7: success. Print a restart notice on stderr; Poiesis does not
+    // restart OpenCode on the Author's behalf.
+    args.io.writeStderr(formatRestartNotice());
+    return manifest;
+  } finally {
+    // Ticket #75: flow-scoped resource release. The interactive flow
+    // pauses and unrefs `process.stdin` on every code path so the Node
+    // process can exit naturally after success or cancellation; without
+    // this, the readline prompt + Clack selector chain leaves stdin
+    // resumed and the event loop waits forever for keypress data.
+    // Tests that drive the flow with scripted IO leave `releaseStdin`
+    // undefined.
+    args.io.releaseStdin?.();
   }
-
-  // Step 1: refuse an already-installed repo BEFORE any model selector
-  // or prompt. This mirrors the existing `assertInitDestinationsAbsent`
-  // invariant that `init()` enforces anyway, but we check it up front so
-  // we never start asking the Author for choices in a repo that already
-  // has Poiesis installed.
-  await refuseIfAlreadyInstalled(args.root);
-
-  // Step 2: compose discovery. The composer is read-only — it inspects
-  // the repo and the user's draft, then reports either a fully resolved
-  // config or a list of unresolved paths.
-  const discovery = await composeInitDiscovery(args.root, args.draft);
-
-  // Step 3: print the detected facts to stderr so the Author can see
-  // what was inferred before any prompt is issued.
-  printDetections(args.io, discovery);
-
-  // Step 4: resolve every Author-owned field. Order matters — model
-  // selection runs before tracker auth so the Author sees the same
-  // config that the auth probe will read.
-  const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft);
-
-  // Step 5: probe tracker auth BEFORE `init()` writes any byte. Auth
-  // failures mention `gh auth login` / `glab auth login` and never
-  // wait-for-enter.
-  await probeTrackerAuthBeforeInstall(args.io, resolvedDraft);
-
-  // Step 6: the existing init() function owns every transactional
-  // invariant. This module never duplicates that surface.
-  const manifest = await init(args.root, resolvedDraft);
-
-  // Step 7: success. Print a restart notice on stderr; Poiesis does not
-  // restart OpenCode on the Author's behalf.
-  args.io.writeStderr(formatRestartNotice());
-  return manifest;
 }
 
 async function refuseIfAlreadyInstalled(root: string): Promise<void> {
@@ -593,11 +613,42 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
+  // Ticket #75: flow-scoped stdin release. Idempotent and
+  // defensive — `settleOnceLinePrompt` and the Clack adapter resume
+  // stdin after every intermediate prompt so the next interactive
+  // seam can run; at the very end of the interactive flow we want the
+  // inverse: pause the stream (so it stops pulling data) and unref it
+  // from the event loop (so a still-open stdin cannot keep the process
+  // alive). Mirrors the model interactive IO factory's release seam.
+  let released = false;
+  const releaseStdin = (): void => {
+    if (released) return;
+    released = true;
+    if (typeof stdin.pause === "function" && (stdin as { readableEnded?: boolean }).readableEnded !== true && (stdin as { destroyed?: boolean }).destroyed !== true) {
+      try {
+        stdin.pause();
+      } catch {
+        // Defensive: pause() can surface stream-state errors; the
+        // `unref()` below is the canonical "do not keep the event
+        // loop alive" call, so swallowing pause() failures does not
+        // weaken the release contract.
+      }
+    }
+    if (typeof stdin.unref === "function") {
+      try {
+        stdin.unref();
+      } catch {
+        // Defensive: unref() can throw on a non-standard stream, and
+        // we never want a release failure to propagate.
+      }
+    }
+  };
   return {
     isTTY,
     writeStderr(line: string): void {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
+    releaseStdin,
     async promptLine(prompt: string): Promise<string> {
       // Ticket #68: the production prompt is a thin adapter over the
       // CLI-internal settle-once readline helper. The helper owns the

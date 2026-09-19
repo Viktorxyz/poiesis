@@ -103,6 +103,15 @@ export interface InteractiveModelIO {
    * to the filesystem.
    */
   loadCurrentModels(): Promise<CurrentModels>;
+  /**
+   * Flow-scoped resource release (ticket #75). The interactive flow
+   * invokes this exactly once from a `finally` block on every code
+   * path (success, typed cancellation, and unexpected throw) so the
+   * underlying `process.stdin` cannot keep the event loop alive after
+   * the flow settles. Tests supply a counter; the production factory
+   * pauses and unrefs `process.stdin`.
+   */
+  releaseStdin?(): void;
 }
 
 export interface InteractiveModelOptions {
@@ -144,10 +153,17 @@ function formatCurrentModelsFrame(current: CurrentModels): string {
   ].join("\n");
 }
 
-function formatRestartNotice(): string {
+function formatRestartNotice(args: {
+  readonly modelClass: ModelClass;
+  readonly previous: ModelIdentity;
+  readonly current: ModelIdentity;
+}): string {
   return [
     "",
     "Poiesis model update succeeded.",
+    `  class:    ${args.modelClass}`,
+    `  previous: ${args.previous}`,
+    `  current:  ${args.current}`,
     "Restart OpenCode to apply the new model configuration.",
     "Poiesis did not restart OpenCode; you must do that yourself.",
     "",
@@ -169,47 +185,61 @@ function formatRestartNotice(): string {
  *   - `MODEL_SELECTOR_NO_INVENTORY` -- normalized inventory is empty (defensive)
  */
 export async function runInteractiveModel(args: InteractiveModelOptions): Promise<SetModelResult> {
-  if (!args.io.isTTY) {
-    throw new PoiesisError(
-      "NON_TTY_MODEL",
-      "poiesis model without a subcommand requires an interactive TTY; use `poiesis model set reasoning|execution <provider/model>` for non-interactive use",
-      {
-        hint: "use `poiesis model set reasoning|execution <provider/model>`",
-      },
-    );
+  try {
+    if (!args.io.isTTY) {
+      throw new PoiesisError(
+        "NON_TTY_MODEL",
+        "poiesis model without a subcommand requires an interactive TTY; use `poiesis model set reasoning|execution <provider/model>` for non-interactive use",
+        {
+          hint: "use `poiesis model set reasoning|execution <provider/model>`",
+        },
+      );
+    }
+
+    await refuseIfNotInstalled(args.root);
+
+    const current = await args.io.loadCurrentModels();
+    args.io.writeStderr(formatCurrentModelsFrame(current));
+
+    const inventory = await probeInventory(args.io);
+
+    const classAnswer = await args.io.runModelClassSelector({
+      current,
+      cancelError: new PoiesisError(
+        "MODEL_CLASS_SELECTOR_CANCELLED",
+        "Interactive model class selector was cancelled by the user",
+        {},
+      ),
+    });
+    if (!isModelClass(classAnswer)) {
+      throw new PoiesisError(
+        "INVALID_MODEL_CLASS",
+        `Unknown model class: ${classAnswer}`,
+        { className: classAnswer, supported: [...MODEL_CLASSES] },
+      );
+    }
+    const chosen = await args.io.runModelSelector({
+      modelClass: classAnswer,
+      inventory,
+      recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
+      currentIdentity: current[classAnswer],
+    });
+    const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
+    args.io.writeStderr(formatRestartNotice({
+      modelClass: classAnswer,
+      previous: current[classAnswer],
+      current: chosen,
+    }));
+    return result;
+  } finally {
+    // Ticket #75: flow-scoped resource release. The interactive flow
+    // pauses and unrefs `process.stdin` on every code path so the Node
+    // process can exit naturally after success or cancellation; without
+    // this, Clack's last `select` leaves stdin resumed and the event
+    // loop waits forever for keypress data. Tests that drive the flow
+    // with scripted IO leave `releaseStdin` undefined.
+    args.io.releaseStdin?.();
   }
-
-  await refuseIfNotInstalled(args.root);
-
-  const current = await args.io.loadCurrentModels();
-  args.io.writeStderr(formatCurrentModelsFrame(current));
-
-  const inventory = await probeInventory(args.io);
-
-  const classAnswer = await args.io.runModelClassSelector({
-    current,
-    cancelError: new PoiesisError(
-      "MODEL_CLASS_SELECTOR_CANCELLED",
-      "Interactive model class selector was cancelled by the user",
-      {},
-    ),
-  });
-  if (!isModelClass(classAnswer)) {
-    throw new PoiesisError(
-      "INVALID_MODEL_CLASS",
-      `Unknown model class: ${classAnswer}`,
-      { className: classAnswer, supported: [...MODEL_CLASSES] },
-    );
-  }
-  const chosen = await args.io.runModelSelector({
-    modelClass: classAnswer,
-    inventory,
-    recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
-    currentIdentity: current[classAnswer],
-  });
-  const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
-  args.io.writeStderr(formatRestartNotice());
-  return result;
 }
 
 /**
@@ -265,12 +295,42 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
+  // Ticket #75: flow-scoped stdin release. Idempotent and
+  // defensive — Clack's last `select()` resumes stdin in its `finally`
+  // block (tickets #71 / #73) so the next interactive seam can run; at
+  // the very end of the interactive flow we want the inverse: pause
+  // the stream (so it stops pulling data) and unref it from the event
+  // loop (so a still-open stdin cannot keep the process alive).
+  let released = false;
+  const releaseStdin = (): void => {
+    if (released) return;
+    released = true;
+    if (typeof stdin.pause === "function" && (stdin as { readableEnded?: boolean }).readableEnded !== true && (stdin as { destroyed?: boolean }).destroyed !== true) {
+      try {
+        stdin.pause();
+      } catch {
+        // Defensive: pause() can surface stream-state errors; the
+        // `unref()` below is the canonical "do not keep the event
+        // loop alive" call, so swallowing pause() failures does not
+        // weaken the release contract.
+      }
+    }
+    if (typeof stdin.unref === "function") {
+      try {
+        stdin.unref();
+      } catch {
+        // Same defensive posture: unref() can throw on a non-standard
+        // stream, and we never want a release failure to propagate.
+      }
+    }
+  };
 
   return {
     isTTY,
     writeStderr(line: string): void {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
+    releaseStdin,
     async listOpenCodeModels(): Promise<readonly string[]> {
       // Run `opencode models` from the repo root, NOT `process.cwd()`.
       // CLI dispatch lands here when the Author passes

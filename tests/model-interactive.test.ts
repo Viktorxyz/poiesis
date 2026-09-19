@@ -109,6 +109,7 @@ interface ScriptedModelIO extends InteractiveModelIO {
   modelSelections: ModelSelection[];
   inventoryCalls: number;
   currentModelsCalls: number;
+  releaseCalls: number;
 }
 
 function scriptedModelIO(options: {
@@ -134,8 +135,12 @@ function scriptedModelIO(options: {
     modelSelections,
     inventoryCalls: 0,
     currentModelsCalls: 0,
+    releaseCalls: 0,
     writeStderr(line: string): void {
       stderrLines.push(line);
+    },
+    releaseStdin(): void {
+      this.releaseCalls += 1;
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
       this.inventoryCalls += 1;
@@ -588,6 +593,144 @@ describe("runInteractiveModel (ticket #59)", () => {
   }, 30_000);
 });
 
+describe("runInteractiveModel restart notice + stdin release (ticket #75)", () => {
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  it("renders the post-success restart notice with the exact previous/current class identities", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      current: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      classAnswer: "reasoning",
+      selectedModel: "openai/gpt-5.6-fallback",
+    });
+
+    await runInteractiveModel({ root: repo.root, io });
+
+    const stderr = io.stderrLines.join("\n");
+    // Compact frame must carry the exact previous/current pair, the
+    // chosen class, and the restart notice. The exact previous value
+    // is the operator's pre-flow identity for the chosen class.
+    expect(stderr).toContain("reasoning");
+    expect(stderr).toContain("openai/gpt-5.6-sol");
+    expect(stderr).toContain("openai/gpt-5.6-fallback");
+    // The label set the ticket calls out:
+    expect(stderr.toLowerCase()).toMatch(/restart/i);
+    expect(stderr.toLowerCase()).toMatch(/opencode/);
+    expect(stderr.toLowerCase()).toMatch(/poiesis.*did not.*restart|poiesis.*not.*restart/);
+  }, 30_000);
+
+  it("invokes io.releaseStdin exactly once on the success path", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      classAnswer: "execution",
+      selectedModel: "minimax/MiniMax-M3-alt",
+    });
+
+    await runInteractiveModel({ root: repo.root, io });
+    expect(io.releaseCalls).toBe(1);
+  }, 30_000);
+
+  it("invokes io.releaseStdin exactly once even when the class selector is cancelled", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+    });
+    io.runModelClassSelector = async (): Promise<ModelClassChoice> => {
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "MODEL_CLASS_SELECTOR_CANCELLED",
+        "cancelled",
+        {},
+      );
+    };
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_CLASS_SELECTOR_CANCELLED" });
+    expect(io.releaseCalls).toBe(1);
+  });
+
+  it("invokes io.releaseStdin exactly once even when the identity selector is cancelled", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const io = scriptedModelIO({
+      isTTY: true,
+      inventory: ["openai/gpt-5.6-sol", "openai/gpt-5.6-fallback", "minimax/MiniMax-M3", "minimax/MiniMax-M3-alt"],
+      classAnswer: "reasoning",
+    });
+    io.runModelSelector = async (selection: ModelSelection): Promise<string> => {
+      io.modelSelections.push(selection);
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "MODEL_SELECTOR_CANCELLED",
+        "cancelled",
+        { modelClass: selection.modelClass },
+      );
+    };
+
+    await expect(
+      runInteractiveModel({ root: repo.root, io }),
+    ).rejects.toMatchObject({ code: "MODEL_SELECTOR_CANCELLED" });
+    expect(io.releaseCalls).toBe(1);
+  });
+
+  it("production IO factory's releaseStdin pauses and unrefs process.stdin so the flow can exit naturally", async () => {
+    // Forcing isTTY=true mirrors the production interactive seam. We
+    // observe stdin by patching pause/unref rather than asserting on
+    // the real stream's lifecycle (Node owns those internals).
+    const originalIsTTY = (process.stdin as { isTTY?: boolean }).isTTY;
+    const pauseCalls: number[] = [];
+    const unrefCalls: number[] = [];
+    const originalPause = (process.stdin as { pause?: () => void }).pause;
+    const originalUnref = (process.stdin as { unref?: () => void }).unref;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    (process.stdin as unknown as { pause: () => void }).pause = (() => {
+      pauseCalls.push(1);
+    }) as () => void;
+    (process.stdin as unknown as { unref: () => void }).unref = (() => {
+      unrefCalls.push(1);
+    }) as () => void;
+    try {
+      const { createProductionInteractiveModelIO } = await import("../src/model-interactive.js");
+      const root = "/tmp/poiesis-release-root";
+      const io = createProductionInteractiveModelIO(root);
+      expect(typeof io.releaseStdin).toBe("function");
+      io.releaseStdin!();
+      io.releaseStdin!();
+      expect(pauseCalls.length).toBeGreaterThanOrEqual(1);
+      expect(unrefCalls.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (originalIsTTY === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = originalIsTTY;
+      }
+      if (originalPause === undefined) {
+        delete (process.stdin as { pause?: () => void }).pause;
+      } else {
+        (process.stdin as unknown as { pause: () => void }).pause = originalPause;
+      }
+      if (originalUnref === undefined) {
+        delete (process.stdin as { unref?: () => void }).unref;
+      } else {
+        (process.stdin as unknown as { unref: () => void }).unref = originalUnref;
+      }
+    }
+  });
+});
+
 describe("commandModel bare-args TTY wiring (ticket #59)", () => {
   beforeEach(async () => {
     env = await installFakeOpenCode();
@@ -632,6 +775,282 @@ describe("commandModel bare-args TTY wiring (ticket #59)", () => {
   });
 
   it("dispatches `poiesis model set <class> <id> --cwd <path>` (set still honors --cwd after ticket #66 split)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+
+    const captured: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      captured.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await commandModel(["set", "reasoning", "openai/gpt-5.6-sol", "--cwd", repo.root]);
+    } finally {
+      process.stdout.write = originalWrite;
+    }
+    const payload = JSON.parse(captured.join("")) as { ok: boolean; operation: string };
+    expect(payload.ok).toBe(true);
+    expect(payload.operation).toBe("model.set");
+  }, 30_000);
+});
+
+describe("flagless `poiesis model` cancellation is human feedback (ticket #75 reviewer follow-up)", () => {
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  // Shared scaffolding for the cancellation tests below. Patches
+  // `process.exit`, `process.stdout.write`, and `process.stderr.write`,
+  // returning a single `restore` callback that the test's `finally`
+  // MUST call to undo every patch (including `process.exitCode`).
+  // Tracking `exitCalls` proves the cancellation path does NOT call
+  // `process.exit`; the flow returns naturally and Node exits with
+  // the captured `process.exitCode`.
+  function patchProcess(): {
+    exitCalls: number[];
+    stdoutChunks: string[];
+    stderrChunks: string[];
+    restore: () => void;
+  } {
+    const exitCalls: number[] = [];
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const originalExit = process.exit;
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+    const originalExitCode = process.exitCode;
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    process.exitCode = 0;
+    (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+      exitCalls.push(code ?? 0);
+      return undefined as never;
+    }) as never;
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stderr.write;
+    return {
+      exitCalls,
+      stdoutChunks,
+      stderrChunks,
+      restore: () => {
+        if (savedIsTTY === undefined) {
+          delete (process.stdin as { isTTY?: boolean }).isTTY;
+        } else {
+          (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+        }
+        (process as unknown as { exit: typeof originalExit }).exit = originalExit;
+        process.stdout.write = originalStdoutWrite;
+        process.stderr.write = originalStderrWrite;
+        process.exitCode = originalExitCode;
+      },
+    };
+  }
+
+  it("cancelled class selector: human feedback, silent stdout, no process.exit, exitCode=1, release ran", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    // Force TTY before constructing the IO — the production factory
+    // snapshots `process.stdin.isTTY` at construction time.
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    // We substitute the model-interactive module so we can verify
+    // both the CLI-level catch AND the IO-level releaseStdin run
+    // BEFORE the catch observes the typed error. The mock's
+    // `runInteractiveModel` MUST invoke the same `releaseStdin` the
+    // CLI sees (i.e. the patched function on the production IO
+    // factory instance) — calling the original releaseStdin would
+    // bypass the counter and silently break the assertion.
+    const { createProductionInteractiveModelIO } = await import("../src/model-interactive.js");
+    const io = createProductionInteractiveModelIO(repo.root);
+    const originalRelease = io.releaseStdin;
+    let releaseCalls = 0;
+    const patchedRelease = (): void => {
+      releaseCalls += 1;
+      if (originalRelease) originalRelease();
+    };
+    io.releaseStdin = patchedRelease;
+
+    vi.resetModules();
+    vi.doMock("../src/model-interactive.js", () => ({
+      runInteractiveModel: async () => {
+        // Mirror what the production flow does on cancellation: the
+        // finally block has already invoked releaseStdin BEFORE the
+        // typed error propagates out. We invoke it here so the CLI
+        // sees a released stdin and the test can assert release ran.
+        patchedRelease();
+        throw new (await import("../src/errors.js")).PoiesisError(
+          "MODEL_CLASS_SELECTOR_CANCELLED",
+          "Interactive model class selector was cancelled by the user",
+          {},
+        );
+      },
+      createProductionInteractiveModelIO: () => io,
+    }));
+
+    const { exitCalls, stdoutChunks, stderrChunks, restore } = patchProcess();
+    try {
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await cli.commandModel([]);
+    } finally {
+      vi.doUnmock("../src/model-interactive.js");
+      vi.resetModules();
+    }
+
+    // Snapshot the captured exit status BEFORE we restore the
+    // patches — `restore()` resets `process.exitCode` to its
+    // pre-test value (which may be undefined).
+    const capturedExitCode = process.exitCode;
+    restore();
+
+    expect(exitCalls, "process.exit must NOT be called on a typed cancellation").toEqual([]);
+    expect(stdoutChunks.join(""), "stdout must stay silent on a typed cancellation").toBe("");
+    const stderr = stderrChunks.join("");
+    expect(stderr.toLowerCase(), "cancellation feedback must reach stderr").toMatch(/cancel/);
+    expect(stderr, "no structured JSON envelope on cancellation").not.toMatch(/"ok"/);
+    expect(capturedExitCode, "exitCode must be the cancellation error's exit code (1)").toBe(1);
+    expect(releaseCalls, "production IO factory's releaseStdin must have run before the catch").toBe(1);
+
+    if (savedIsTTY === undefined) {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    } else {
+      (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+    }
+  }, 30_000);
+
+  it("cancelled identity selector: same human-feedback contract", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+
+    const { createProductionInteractiveModelIO } = await import("../src/model-interactive.js");
+    const io = createProductionInteractiveModelIO(repo.root);
+    const originalRelease = io.releaseStdin;
+    let releaseCalls = 0;
+    const patchedRelease = (): void => {
+      releaseCalls += 1;
+      if (originalRelease) originalRelease();
+    };
+    io.releaseStdin = patchedRelease;
+
+    vi.resetModules();
+    vi.doMock("../src/model-interactive.js", () => ({
+      runInteractiveModel: async () => {
+        patchedRelease();
+        throw new (await import("../src/errors.js")).PoiesisError(
+          "MODEL_SELECTOR_CANCELLED",
+          "Interactive model identity selector was cancelled by the user",
+          { modelClass: "reasoning" },
+        );
+      },
+      createProductionInteractiveModelIO: () => io,
+    }));
+
+    const { exitCalls, stdoutChunks, stderrChunks, restore } = patchProcess();
+    try {
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await cli.commandModel(["--cwd", repo.root]);
+    } finally {
+      vi.doUnmock("../src/model-interactive.js");
+      vi.resetModules();
+    }
+
+    const capturedExitCode = process.exitCode;
+    restore();
+
+    expect(exitCalls).toEqual([]);
+    expect(stdoutChunks.join("")).toBe("");
+    expect(stderrChunks.join("").toLowerCase()).toMatch(/cancel/);
+    expect(capturedExitCode).toBe(1);
+    expect(releaseCalls).toBe(1);
+
+    if (savedIsTTY === undefined) {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    } else {
+      (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+    }
+  }, 30_000);
+
+  it("non-cancellation errors (NON_TTY_MODEL) still propagate as rejections — only cancellation is intercepted", async () => {
+    // Force non-TTY so the production IO factory reports isTTY=false.
+    // The interactive flow throws NON_TTY_MODEL; this is NOT a
+    // cancellation code, so the CLI must NOT swallow it. The
+    // rejection preserves the canonical ticket #59 contract.
+    const saved = process.stdin.isTTY;
+    const savedExitCode = process.exitCode;
+    (process.stdin as { isTTY?: boolean }).isTTY = false;
+    process.exitCode = 0;
+    try {
+      await expect(commandModel([])).rejects.toMatchObject({
+        code: "NON_TTY_MODEL",
+      });
+      // NON_TTY_MODEL was not intercepted; process.exitCode stays 0
+      // because nothing inside `commandModel` set it (the rejection
+      // propagated unchanged; production main.catch would set it via
+      // writeFailure).
+      expect(process.exitCode).toBe(0);
+    } finally {
+      if (saved === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = saved;
+      }
+      process.exitCode = savedExitCode;
+    }
+  });
+});
+
+describe("flagless `poiesis model` does NOT emit the structured success envelope (ticket #75)", () => {
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  it("bare `poiesis model` on a TTY writes human feedback to stderr and nothing to stdout", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await install(repo);
+
+    // Drive the interactive flow through the production IO factory;
+    // mock Clack to return a deterministic class + identity.
+    fakeSelect
+      .mockResolvedValueOnce("reasoning" as never) // class selector
+      .mockResolvedValueOnce("openai/gpt-5.6-fallback" as never); // identity selector
+
+    const saved = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    const stdoutChunks: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    try {
+      await commandModel(["--cwd", repo.root]);
+    } finally {
+      process.stdout.write = originalWrite;
+      if (saved === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = saved;
+      }
+    }
+    // The flagless interactive flow MUST NOT emit the structured
+    // success envelope on stdout — only the human-readable frame goes
+    // to stderr.
+    expect(stdoutChunks.join("")).toBe("");
+  }, 30_000);
+
+  it("the deterministic `poiesis model set` still emits the structured success envelope on stdout", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await install(repo);
