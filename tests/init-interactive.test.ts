@@ -21,7 +21,7 @@
  * PTY, no real `gh`/`glab`/`opencode` is required. The CLI command path is
  * covered separately by `tests/cli-bin.test.ts` and `tests/maintenance.test.ts`.
  */
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -35,8 +35,47 @@ import {
 import { init } from "../src/maintenance.js";
 import type { PoiesisConfig } from "../src/config.js";
 import type { Manifest } from "../src/manifest.js";
+import { commandInit } from "../src/cli.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+// Ticket #75: the flagless-init CLI dispatch test drives the production
+// IO factory's Clack adapter. Under Vitest there is no TTY (no
+// `setRawMode` on stdin), so we stub `@clack/prompts` for the duration
+// of that test. The scripted-IO tests below this point do NOT need the
+// stub because they route through their own `runModelSelector` seam and
+// never touch Clack.
+vi.mock("@clack/prompts", () => {
+  const scope = globalThis as unknown as Record<symbol, {
+    select: ReturnType<typeof vi.fn>;
+    isCancel: ReturnType<typeof vi.fn>;
+    cancelSymbol: symbol;
+  }>;
+  const key = Symbol.for("poiesis.init-interactive.fake-holder");
+  if (scope[key] === undefined) {
+    scope[key] = {
+      select: vi.fn(),
+      isCancel: vi.fn(),
+      cancelSymbol: Symbol.for("clack.cancel"),
+    };
+  }
+  const holder = scope[key]!;
+  return {
+    isCancel: (value: unknown) => holder.isCancel(value),
+    select: (opts: unknown) => holder.select(opts),
+    CANCEL_SYMBOL: holder.cancelSymbol,
+  };
+});
+
+const fakeInitHolderKey = Symbol.for("poiesis.init-interactive.fake-holder");
+const initFakes = (globalThis as unknown as Record<symbol, {
+  select: ReturnType<typeof vi.fn>;
+  isCancel: ReturnType<typeof vi.fn>;
+  cancelSymbol: symbol;
+}>)[fakeInitHolderKey]!;
+const initFakeSelect = initFakes.select;
+const initFakeIsCancel = initFakes.isCancel;
+const initCancelSymbol = initFakes.cancelSymbol;
 
 const repositories: TestRepository[] = [];
 let fakeOpenCode: FakeOpenCodeEnvironment | undefined;
@@ -47,6 +86,9 @@ afterEach(async () => {
   fakeOpenCode = undefined;
   fakeTrackers?.restore();
   fakeTrackers = undefined;
+  initFakeSelect.mockReset();
+  initFakeIsCancel.mockReset();
+  initFakeIsCancel.mockImplementation((value: unknown) => value === initCancelSymbol);
   await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
 });
 
@@ -61,6 +103,7 @@ interface ScriptedInitIO extends InteractiveInitIO {
   prompts: { prompt: string; answer: string }[];
   modelSelections: ModelSelection[];
   authProbes: { provider: "github" | "gitlab"; command: string }[];
+  releaseCalls: number;
 }
 
 function scriptedInitIO(options: {
@@ -85,8 +128,12 @@ function scriptedInitIO(options: {
     prompts,
     modelSelections,
     authProbes,
+    releaseCalls: 0,
     writeStderr(line: string): void {
       stderrLines.push(line);
+    },
+    releaseStdin(): void {
+      this.releaseCalls += 1;
     },
     async promptLine(prompt: string): Promise<string> {
       // Match by full prompt string first, then by trailing keyword.
@@ -703,6 +750,98 @@ it("records the Author's tracker choice without ever restarting OpenCode from th
   }, 30_000);
 });
 
+describe("runInteractiveInit stdin release (ticket #75)", () => {
+  beforeEach(async () => {
+    fakeOpenCode = await installFakeOpenCode();
+    fakeTrackers = await installFakeTrackers();
+  });
+
+  it("invokes io.releaseStdin exactly once on the flagless happy path", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    const io = scriptedInitIO({ isTTY: true });
+
+    await runInteractiveInit({ root: repo.root, io, draft: baseDraft() });
+    expect(io.releaseCalls).toBe(1);
+  }, 30_000);
+
+  it("invokes io.releaseStdin exactly once even when auth fails closed", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    const io = scriptedInitIO({
+      isTTY: true,
+      auth: { github: { available: false } },
+    });
+
+    await expect(
+      runInteractiveInit({ root: repo.root, io, draft: baseDraft() }),
+    ).rejects.toMatchObject({ code: "TRACKER_AUTH_FAILED" });
+    expect(io.releaseCalls).toBe(1);
+  }, 30_000);
+
+  it("invokes io.releaseStdin exactly once even when prompt-line throws (early cancellation)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    // No delivery scripts → composer surfaces delivery as unresolved
+    // → init flow asks for the preview command.
+    const io = scriptedInitIO({ isTTY: true });
+    io.promptLine = async (): Promise<string> => {
+      throw new (await import("../src/errors.js")).PoiesisError(
+        "INIT_PROMPT_CANCELLED",
+        "cancelled",
+        { prompt: "preview" },
+      );
+    };
+
+    await expect(
+      runInteractiveInit({ root: repo.root, io, draft: baseDraft() }),
+    ).rejects.toMatchObject({ code: "INIT_PROMPT_CANCELLED" });
+    expect(io.releaseCalls).toBe(1);
+  }, 30_000);
+
+  it("production IO factory's releaseStdin pauses and unrefs process.stdin so the flow can exit naturally", async () => {
+    const originalIsTTY = (process.stdin as { isTTY?: boolean }).isTTY;
+    const pauseCalls: number[] = [];
+    const unrefCalls: number[] = [];
+    const originalPause = (process.stdin as { pause?: () => void }).pause;
+    const originalUnref = (process.stdin as { unref?: () => void }).unref;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    (process.stdin as unknown as { pause: () => void }).pause = (() => {
+      pauseCalls.push(1);
+    }) as () => void;
+    (process.stdin as unknown as { unref: () => void }).unref = (() => {
+      unrefCalls.push(1);
+    }) as () => void;
+    try {
+      const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
+      const io = createProductionInteractiveInitIO("/tmp/poiesis-release-root");
+      expect(typeof io.releaseStdin).toBe("function");
+      io.releaseStdin!();
+      io.releaseStdin!();
+      expect(pauseCalls.length).toBeGreaterThanOrEqual(1);
+      expect(unrefCalls.length).toBeGreaterThanOrEqual(1);
+    } finally {
+      if (originalIsTTY === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = originalIsTTY;
+      }
+      if (originalPause === undefined) {
+        delete (process.stdin as { pause?: () => void }).pause;
+      } else {
+        (process.stdin as unknown as { pause: () => void }).pause = originalPause;
+      }
+      if (originalUnref === undefined) {
+        delete (process.stdin as { unref?: () => void }).unref;
+      } else {
+        (process.stdin as unknown as { unref: () => void }).unref = originalUnref;
+      }
+    }
+  });
+});
+
 describe("poiesis init --config regression (ticket #58)", () => {
   beforeEach(async () => {
     fakeOpenCode = await installFakeOpenCode();
@@ -738,3 +877,439 @@ describe("poiesis init --config regression (ticket #58)", () => {
     expect(captured!.poiesisVersion).toMatch(/^\d+\.\d+\.\d+$/);
   }, 30_000);
 });
+
+describe("flagless `poiesis init` does NOT emit the structured success envelope (ticket #75)", () => {
+  // This describe block MUST stay isolated from the production IO
+  // factory because driving the full flagless init flow under Vitest
+  // would require feeding stdin via `settleOnceLinePrompt`, which
+  // expects a real TTY. We test the dispatch contract directly: the
+  // CLI surface must invoke `runInteractiveInit` and must NOT call
+  // `writeSuccess` on the flagless path. The end-to-end
+  // `runInteractiveInit` flow itself is covered by the scripted-IO
+  // describe block above.
+  it("flagless `poiesis init` calls runInteractiveInit and does NOT call writeSuccess", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+
+    // Track the calls without driving the full init flow. The CLI
+    // dispatcher does `await import("./init-interactive.js")`, so the
+    // symbol-level swap must happen through Vitest's mock registry
+    // (ESM module exports are read-only at runtime). We install the
+    // mock via `vi.doMock`, then `vi.resetModules()` so the CLI's
+    // dynamic `import()` re-resolves against the registry and picks up
+    // the stub. The real module is restored in `finally` so the rest
+    // of the test file sees the production init flow.
+    const runInteractiveInitSpy = vi.fn(async (): Promise<Manifest> => ({
+      schema: 1,
+      poiesisVersion: "1.1.1",
+      adapter: { harness: "opencode", adapterVersion: "1", supportedVersion: "1.18.29", supportedVersions: ["1.18.29"] },
+      files: [],
+      skills: [],
+      configPatches: [],
+    }));
+    const createProductionSpy = vi.fn(() => ({
+      isTTY: true,
+      writeStderr: vi.fn(),
+      promptLine: vi.fn(),
+      listOpenCodeModels: vi.fn(async () => []),
+      runModelSelector: vi.fn(async () => ""),
+      probeTrackerAuth: vi.fn(async () => ({ available: true })),
+      releaseStdin: vi.fn(),
+    }));
+    vi.doMock("../src/init-interactive.js", () => ({
+      runInteractiveInit: runInteractiveInitSpy,
+      createProductionInteractiveInitIO: createProductionSpy,
+    }));
+
+    const stdoutChunks: string[] = [];
+    const originalWrite = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    let cliModule: typeof import("../src/cli.js") | undefined;
+    try {
+      vi.resetModules();
+      // The CLI module is already loaded in the test file by the
+      // scripted-IO tests above; `vi.resetModules()` plus a fresh
+      // import re-evaluates `commandInit` against the mocked
+      // `./init-interactive.js` so the dispatcher's dynamic `import`
+      // resolves to our stub.
+      cliModule = await import("../src/cli.js");
+      await cliModule.commandInit(["--cwd", repo.root, "--allow-fixtures"]);
+    } finally {
+      process.stdout.write = originalWrite;
+      vi.doUnmock("../src/init-interactive.js");
+      vi.resetModules();
+      cliModule = undefined;
+    }
+
+    // The CLI MUST have routed through the interactive flow.
+    expect(createProductionSpy).toHaveBeenCalledTimes(1);
+    expect(runInteractiveInitSpy).toHaveBeenCalledTimes(1);
+    // The CLI MUST NOT have emitted the structured success envelope on
+    // stdout — the human-readable frame lives on stderr.
+    expect(stdoutChunks.join("")).toBe("");
+  }, 30_000);
+});
+
+describe("flagless `poiesis init` cancellation is human feedback (ticket #75 reviewer follow-up)", () => {
+  // Shared scaffolding: patches `process.exit`, stdout.write, and
+  // stderr.write; tracks exit calls; returns a single `restore` that
+  // undoes every patch (including `process.exitCode`).
+  function patchProcess(): {
+    exitCalls: number[];
+    stdoutChunks: string[];
+    stderrChunks: string[];
+    restore: () => void;
+  } {
+    const exitCalls: number[] = [];
+    const stdoutChunks: string[] = [];
+    const stderrChunks: string[] = [];
+    const originalExit = process.exit;
+    const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+    const originalStderrWrite = process.stderr.write.bind(process.stderr);
+    const originalExitCode = process.exitCode;
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+    process.exitCode = 0;
+    (process as unknown as { exit: (code?: number) => never }).exit = ((code?: number) => {
+      exitCalls.push(code ?? 0);
+      return undefined as never;
+    }) as never;
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      stdoutChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    process.stderr.write = ((chunk: string | Uint8Array): boolean => {
+      stderrChunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stderr.write;
+    return {
+      exitCalls,
+      stdoutChunks,
+      stderrChunks,
+      restore: () => {
+        if (savedIsTTY === undefined) {
+          delete (process.stdin as { isTTY?: boolean }).isTTY;
+        } else {
+          (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+        }
+        (process as unknown as { exit: typeof originalExit }).exit = originalExit;
+        process.stdout.write = originalStdoutWrite;
+        process.stderr.write = originalStderrWrite;
+        process.exitCode = originalExitCode;
+      },
+    };
+  }
+
+  it("cancelled init prompt: human feedback, silent stdout, no process.exit, exitCode=1, release ran", async () => {
+    // Force TTY before constructing the IO — the production factory
+    // snapshots `process.stdin.isTTY` at construction time, so a
+    // post-hoc patch would not flip the captured `io.isTTY` flag.
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+
+    const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
+    const io = createProductionInteractiveInitIO("/tmp/poiesis-cancel-root");
+    const originalRelease = io.releaseStdin;
+    let releaseCalls = 0;
+    const patchedRelease = (): void => {
+      releaseCalls += 1;
+      if (originalRelease) originalRelease();
+    };
+    io.releaseStdin = patchedRelease;
+
+    vi.resetModules();
+    vi.doMock("../src/init-interactive.js", () => ({
+      runInteractiveInit: async () => {
+        // Mirror what the production flow does on cancellation: the
+        // finally block has already invoked releaseStdin BEFORE the
+        // typed error propagates out. We invoke the SAME patched
+        // releaseStdin function the CLI sees so the counter
+        // captures the call from the flow's finally.
+        patchedRelease();
+        throw new (await import("../src/errors.js")).PoiesisError(
+          "INIT_PROMPT_CANCELLED",
+          "Interactive prompt was cancelled by the user",
+          { prompt: "Preview command" },
+        );
+      },
+      createProductionInteractiveInitIO: () => io,
+    }));
+
+    const { exitCalls, stdoutChunks, stderrChunks, restore } = patchProcess();
+    try {
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await cli.commandInit([]);
+    } finally {
+      vi.doUnmock("../src/init-interactive.js");
+      vi.resetModules();
+    }
+
+    // Snapshot the captured exit status BEFORE we restore the
+    // patches — `restore()` resets `process.exitCode` to its
+    // pre-test value (which may be undefined).
+    const capturedExitCode = process.exitCode;
+    restore();
+
+    expect(exitCalls, "process.exit must NOT be called on a typed cancellation").toEqual([]);
+    expect(stdoutChunks.join(""), "stdout must stay silent on a typed cancellation").toBe("");
+    const stderr = stderrChunks.join("");
+    expect(stderr.toLowerCase(), "cancellation feedback must reach stderr").toMatch(/cancel/);
+    expect(stderr, "no structured JSON envelope on cancellation").not.toMatch(/"ok"/);
+    expect(capturedExitCode, "exitCode must be the cancellation error's exit code (1)").toBe(1);
+    expect(releaseCalls, "production IO factory's releaseStdin must have run before the catch").toBe(1);
+
+    // Restore TTY only AFTER assertions so a failed expectation does
+    // not leave the global state corrupted for subsequent tests.
+    if (savedIsTTY === undefined) {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    } else {
+      (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+    }
+  }, 30_000);
+
+  it("cancelled init model selector: same human-feedback contract", async () => {
+    // Force TTY before constructing the IO (see prior test for the
+    // production factory's snapshot semantics).
+    const savedIsTTY = process.stdin.isTTY;
+    (process.stdin as { isTTY?: boolean }).isTTY = true;
+
+    const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
+    const io = createProductionInteractiveInitIO("/tmp/poiesis-cancel-root");
+    const originalRelease = io.releaseStdin;
+    let releaseCalls = 0;
+    const patchedRelease = (): void => {
+      releaseCalls += 1;
+      if (originalRelease) originalRelease();
+    };
+    io.releaseStdin = patchedRelease;
+
+    vi.resetModules();
+    vi.doMock("../src/init-interactive.js", () => ({
+      runInteractiveInit: async () => {
+        patchedRelease();
+        throw new (await import("../src/errors.js")).PoiesisError(
+          "INIT_MODEL_SELECTOR_CANCELLED",
+          "Interactive init model selector was cancelled by the user",
+          { modelClass: "reasoning" },
+        );
+      },
+      createProductionInteractiveInitIO: () => io,
+    }));
+
+    const { exitCalls, stdoutChunks, stderrChunks, restore } = patchProcess();
+    try {
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await cli.commandInit([]);
+    } finally {
+      vi.doUnmock("../src/init-interactive.js");
+      vi.resetModules();
+    }
+
+    const capturedExitCode = process.exitCode;
+    restore();
+
+    expect(exitCalls).toEqual([]);
+    expect(stdoutChunks.join("")).toBe("");
+    expect(stderrChunks.join("").toLowerCase()).toMatch(/cancel/);
+    expect(capturedExitCode).toBe(1);
+    expect(releaseCalls).toBe(1);
+
+    if (savedIsTTY === undefined) {
+      delete (process.stdin as { isTTY?: boolean }).isTTY;
+    } else {
+      (process.stdin as { isTTY?: boolean }).isTTY = savedIsTTY;
+    }
+  }, 30_000);
+
+  it("non-cancellation errors (NON_TTY_INIT) still propagate as rejections — only cancellation is intercepted", async () => {
+    // Force non-TTY so the production IO factory reports isTTY=false.
+    // The interactive flow throws NON_TTY_INIT; this is NOT a
+    // cancellation code, so the CLI must NOT swallow it.
+    const saved = process.stdin.isTTY;
+    const savedExitCode = process.exitCode;
+    (process.stdin as { isTTY?: boolean }).isTTY = false;
+    process.exitCode = 0;
+    try {
+      await expect(commandInit([])).rejects.toMatchObject({
+        code: "NON_TTY_INIT",
+      });
+      // NON_TTY_INIT was not intercepted; process.exitCode stays 0.
+      expect(process.exitCode).toBe(0);
+    } finally {
+      if (saved === undefined) {
+        delete (process.stdin as { isTTY?: boolean }).isTTY;
+      } else {
+        (process.stdin as { isTTY?: boolean }).isTTY = saved;
+      }
+      process.exitCode = savedExitCode;
+    }
+  });
+});
+
+describe("production interactive-init IO binds subprocess cwd to the --cwd target (ticket #78)", () => {
+  // Standards review found that `createProductionInteractiveInitIO`
+  // received no root: its `opencode models` and tracker auth probes
+  // (`gh auth status`, `glab auth status`) ran from `process.cwd()`
+  // rather than the target root resolved by `commandInit` from
+  // `--cwd <path>`. The model interactive flow already binds the
+  // root into its production IO factory; this describe block mirrors
+  // that discipline for the init interactive flow and proves the
+  // dispatch surface plumbs the root through.
+  //
+  // The test deliberately sets `process.cwd()` to a directory that
+  // differs from the target root so the regression fails closed if
+  // the production IO factory re-introduces the `process.cwd()`
+  // assumption.
+  beforeEach(async () => {
+    fakeOpenCode = await installFakeOpenCode();
+    fakeTrackers = await installFakeTrackers();
+  });
+
+  it("production factory's opencode models, gh auth status, glab auth status all run from the target root", async () => {
+    // Install custom fakes that record the cwd they were spawned with.
+    // Mirrors the existing installFakeOpenCode / installFakeTrackers
+    // pattern but adds a `pwd` marker so we can prove the production
+    // factory passes the target root (not the launcher cwd) to every
+    // repository-sensitive subprocess.
+    const bin = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-bin-"));
+    const markers = await mkdtemp(join(tmpdir(), "poiesis-cwd-markers-"));
+    const opencodeMarker = join(markers, "opencode.cwd");
+    const ghMarker = join(markers, "gh.cwd");
+    const glabMarker = join(markers, "glab.cwd");
+    for (const [name, marker] of [
+      ["opencode", opencodeMarker],
+      ["gh", ghMarker],
+      ["glab", glabMarker],
+    ] as const) {
+      const script = join(bin, name);
+      // The fake records its cwd BEFORE printing any stdout so the
+      // marker is on disk by the time the parent process reads it.
+      // `models` echoes a one-per-line model list; `auth status`
+      // echoes an empty success message. Both exit 0 so the
+      // production IO factory treats the probe as available.
+      const body = `#!/bin/sh
+{
+  pwd
+  printf '\\n'
+} > "${marker}"
+case "$1" in
+  models)
+    printf 'openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n'
+    exit 0
+    ;;
+  auth)
+    if [ "$2" = "status" ]; then
+      printf 'logged in (fake cwd-record binary)\\n'
+      exit 0
+    fi
+    ;;
+esac
+exit 0
+`;
+      await writeFile(script, body);
+      await chmod(script, 0o755);
+    }
+    const previousPath = process.env.PATH;
+    process.env.PATH = previousPath === undefined || previousPath === "" ? bin : `${bin}:${previousPath}`;
+
+    // Target root — the value `commandInit` would resolve from
+    // `--cwd <path>` via `resolveGitRoot(cwd)`. Distinct from the
+    // launcher cwd to exercise the bug.
+    const targetRoot = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-target-"));
+    // Launcher cwd — what `process.cwd()` returns when the CLI is
+    // invoked. We chdir into a directory that has NO relation to the
+    // target root so the regression catches any `process.cwd()`
+    // regression in the production factory.
+    const launcherCwd = await mkdtemp(join(tmpdir(), "poiesis-cwd-record-launcher-"));
+    const savedCwd = process.cwd();
+    process.chdir(launcherCwd);
+
+    try {
+      const { createProductionInteractiveInitIO } = await import("../src/init-interactive.js");
+      const io = createProductionInteractiveInitIO(targetRoot);
+
+      // Drive every repository-sensitive seam the production factory
+      // owns. Each method MUST run its subprocess with cwd=targetRoot,
+      // NOT cwd=launcherCwd / cwd=process.cwd().
+      await io.listOpenCodeModels();
+      await io.probeTrackerAuth("github");
+      await io.probeTrackerAuth("gitlab");
+
+      // The launcher cwd must be different from the target root;
+      // otherwise the test would pass even if the factory regressed
+      // to `process.cwd()` (because process.cwd() would equal the
+      // target root anyway).
+      expect(process.cwd()).toBe(launcherCwd);
+      expect(process.cwd()).not.toBe(targetRoot);
+
+      const opencodeCwd = (await readFile(opencodeMarker, "utf8")).trim();
+      const ghCwd = (await readFile(ghMarker, "utf8")).trim();
+      const glabCwd = (await readFile(glabMarker, "utf8")).trim();
+
+      // The three subprocess invocations must all be rooted at the
+      // target root. `realpathSync` resolves the macOS `/private/var`
+      // vs `/var` symlink (and similar) so the assertion is
+      // platform-stable.
+      expect(opencodeCwd).toBe(await resolveReal(targetRoot));
+      expect(ghCwd).toBe(await resolveReal(targetRoot));
+      expect(glabCwd).toBe(await resolveReal(targetRoot));
+    } finally {
+      process.chdir(savedCwd);
+      process.env.PATH = previousPath;
+      await rm(bin, { recursive: true, force: true });
+      await rm(markers, { recursive: true, force: true });
+      await rm(targetRoot, { recursive: true, force: true });
+      await rm(launcherCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("commandInit passes the resolved --cwd root into the production IO factory", async () => {
+    // The dispatch surface must hand the resolved target root to the
+    // production factory so the factory's subprocess probes can run
+    // from the right place. We do NOT exercise the full interactive
+    // flow under vitest (no TTY); we only need to prove the factory
+    // receives the root.
+    const repo = await createTestRepository();
+    repositories.push(repo);
+
+    const createProductionSpy = vi.fn((_root: string) => ({
+      isTTY: false, // force NON_TTY_INIT exit before any IO runs
+      writeStderr: vi.fn(),
+      promptLine: vi.fn(),
+      listOpenCodeModels: vi.fn(async () => []),
+      runModelSelector: vi.fn(async () => ""),
+      probeTrackerAuth: vi.fn(async () => ({ available: true })),
+      releaseStdin: vi.fn(),
+    }));
+    vi.doMock("../src/init-interactive.js", () => ({
+      runInteractiveInit: vi.fn(),
+      createProductionInteractiveInitIO: createProductionSpy,
+    }));
+
+    try {
+      vi.resetModules();
+      const cli = (await import("../src/cli.js")) as typeof import("../src/cli.js");
+      await expect(cli.commandInit(["--cwd", repo.root])).rejects.toMatchObject({
+        code: "NON_TTY_INIT",
+      });
+    } finally {
+      vi.doUnmock("../src/init-interactive.js");
+      vi.resetModules();
+    }
+
+    // The factory MUST have received exactly the resolved target root
+    // (the git toplevel of --cwd, which equals the repo root here).
+    expect(createProductionSpy).toHaveBeenCalledTimes(1);
+    const firstArg = createProductionSpy.mock.calls[0]![0]!;
+    expect(firstArg.length).toBeGreaterThan(0);
+    expect(await resolveReal(firstArg)).toBe(await resolveReal(repo.root));
+  }, 30_000);
+});
+
+async function resolveReal(path: string): Promise<string> {
+  const { realpath } = await import("node:fs/promises");
+  return await realpath(path);
+}

@@ -1,6 +1,6 @@
 {
   "name": "poiesis-cli",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "Poiesis — A deterministic runtime for turning human intent into working, proven software.",
   "type": "module",
   "bin": {
@@ -38,7 +38,7 @@
   "scripts": {
     "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
     "check": "tsc --noEmit",
-    "test": "vitest run",
+    "test": "vitest run --pool=forks --poolOptions.forks.maxForks=4",
     "test:watch": "vitest",
     "prepack": "pnpm build"
   },
@@ -54,6 +54,7 @@
     "software-development"
   ],
   "dependencies": {
+    "@clack/prompts": "^1.8.1",
     "jsonc-parser": "^3.3.1",
     "zod": "^4.1.5"
   },

@@ -13,6 +13,7 @@
  * semantics: "no substitute").
  */
 import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -415,4 +416,283 @@ describe("commandModel (CLI)", () => {
   it("rejects `poiesis model set` when the model ID is not provider/model", async () => {
     await expect(commandModel(["set", "reasoning", "no-slash"])).rejects.toMatchObject({ code: "INVALID_MODEL_ID" });
   });
+
+  // -----------------------------------------------------------------
+  // Ticket #79 — strict parsing for `poiesis model` forms.
+  //
+  // The previous `splitCwdArgs` recognized only `--cwd <path>` (space
+  // form) and silently dropped everything it did not match. That
+  // meant `--cwd=/target`, missing values, duplicate `--cwd`,
+  // unknown flags, and extra positionals could all be silently
+  // ignored — mutating the launcher repo or skipping validation.
+  //
+  // Ticket #79 reuses the generic `parseArgs` parser in strict mode
+  // so `--cwd <path>` and `--cwd=<path>` both work, missing values
+  // fail closed, unknown flags fail closed, duplicate `--cwd`
+  // fails closed, and extra positionals fail closed BEFORE any
+  // inventory/mutation runs. The structured-JSON surface,
+  // typed class/id validation, transactions/doctor, and the
+  // flagless interactive behavior are preserved.
+  // -----------------------------------------------------------------
+  it("accepts the equals form `--cwd=<path>` for `poiesis model set` and routes to the target repo", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeConfig = await readPoiesisConfig(repository);
+
+    await commandModel(["set", "execution", "minimax/MiniMax-M3-alt", `--cwd=${repository.root}`]);
+
+    const afterConfig = await readPoiesisConfig(repository);
+    expect(afterConfig.models.execution).toBe("minimax/MiniMax-M3-alt");
+    expect(afterConfig.models.reasoning).toBe(beforeConfig.models.reasoning);
+  }, 30_000);
+
+  it("rejects `poiesis model set --cwd` with no value before any write (ticket #79: missing value)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      commandModel(["set", "reasoning", "openai/gpt-5.6-fallback", "--cwd"]),
+    ).rejects.toMatchObject({ code: "MISSING_ARGUMENT", details: { key: "cwd" } });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes, "missing --cwd value");
+  }, 30_000);
+
+  it("rejects `poiesis model set --cwd=` (empty value) before any write (ticket #79: missing value)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      commandModel(["set", "reasoning", "openai/gpt-5.6-fallback", "--cwd="]),
+    ).rejects.toMatchObject({ code: "MISSING_ARGUMENT", details: { key: "cwd" } });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes, "empty --cwd value");
+  }, 30_000);
+
+  it("rejects duplicate `--cwd` flags before any write (ticket #79: duplicate cwd)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      commandModel([
+        "set",
+        "reasoning",
+        "openai/gpt-5.6-fallback",
+        "--cwd",
+        repository.root,
+        "--cwd",
+        repository.root,
+      ]),
+    ).rejects.toMatchObject({ code: "DUPLICATE_ARGUMENT", details: { key: "cwd" } });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes, "duplicate --cwd");
+  }, 30_000);
+
+  it("rejects unknown flags before any write (ticket #79: unknown flag)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      commandModel(["set", "reasoning", "openai/gpt-5.6-fallback", "--unknown-flag"]),
+    ).rejects.toMatchObject({ code: "UNKNOWN_OPTION" });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes, "unknown flag");
+  }, 30_000);
+
+  it("rejects extra positional after `set <class> <id>` before any write (ticket #79: extra positional)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await install(repository);
+    const beforeBytes = await snapshotOwnedBytes(repository);
+
+    await expect(
+      commandModel([
+        "set",
+        "reasoning",
+        "openai/gpt-5.6-fallback",
+        "extra-positional",
+      ]),
+    ).rejects.toMatchObject({ code: "UNKNOWN_ARGUMENT" });
+
+    const afterBytes = await snapshotOwnedBytes(repository);
+    expectOwnedBytesUnchanged(beforeBytes, afterBytes, "extra positional");
+  }, 30_000);
+});
+
+describe("commandModel launcher/target routing (ticket #79)", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  // Helper: snapshot the launcher repo's owned-byte surface (it has
+  // no Poiesis install at the start; we assert the install is never
+  // created by a stray --cwd misuse).
+  async function launcherOwnedSurface(launcher: TestRepository): Promise<{
+    poiesisConfigExists: boolean;
+    manifestExists: boolean;
+    receiptExists: boolean;
+  }> {
+    return {
+      poiesisConfigExists: existsSync(join(launcher.root, CONFIG_ROOT)),
+      manifestExists: existsSync(join(launcher.root, ".poiesis", "manifest.json")),
+      receiptExists: existsSync(await ownershipReceiptLocation(launcher.root)),
+    };
+  }
+
+  it("`poiesis model set --cwd <target>` mutates the target repo and leaves the launcher repo untouched", async () => {
+    // Launcher is a plain Git repo with no Poiesis install. Target is
+    // an installed Poiesis repo. The dispatcher runs from inside the
+    // launcher repo and MUST route the write to the target via
+    // --cwd, not to the launcher's `process.cwd()`.
+    const launcher = await createTestRepository();
+    const target = await createTestRepository();
+    repositories.push(launcher, target);
+    await install(target);
+    const targetBefore = await snapshotOwnedBytes(target);
+
+    const savedCwd = process.cwd();
+    process.chdir(launcher.root);
+    try {
+      await commandModel([
+        "set",
+        "execution",
+        "minimax/MiniMax-M3-alt",
+        "--cwd",
+        target.root,
+      ]);
+    } finally {
+      process.chdir(savedCwd);
+    }
+
+    // Target mutated.
+    const targetConfig = await readPoiesisConfig(target);
+    expect(targetConfig.models.execution).toBe("minimax/MiniMax-M3-alt");
+    const targetAfter = await snapshotOwnedBytes(target);
+    expect(Buffer.compare(targetAfter.poiesisConfig, targetBefore.poiesisConfig)).not.toBe(0);
+
+    // Launcher untouched: no `.poiesis/` tree created.
+    const launcherAfter = await launcherOwnedSurface(launcher);
+    expect(launcherAfter.poiesisConfigExists).toBe(false);
+    expect(launcherAfter.manifestExists).toBe(false);
+    expect(launcherAfter.receiptExists).toBe(false);
+  }, 30_000);
+
+  it("`poiesis model set --cwd=<target>` (equals form) mutates the target repo and leaves the launcher repo untouched", async () => {
+    const launcher = await createTestRepository();
+    const target = await createTestRepository();
+    repositories.push(launcher, target);
+    await install(target);
+
+    const savedCwd = process.cwd();
+    process.chdir(launcher.root);
+    try {
+      await commandModel([
+        "set",
+        "execution",
+        "minimax/MiniMax-M3-alt",
+        `--cwd=${target.root}`,
+      ]);
+    } finally {
+      process.chdir(savedCwd);
+    }
+
+    const targetConfig = await readPoiesisConfig(target);
+    expect(targetConfig.models.execution).toBe("minimax/MiniMax-M3-alt");
+
+    const launcherAfter = await launcherOwnedSurface(launcher);
+    expect(launcherAfter.poiesisConfigExists).toBe(false);
+    expect(launcherAfter.manifestExists).toBe(false);
+    expect(launcherAfter.receiptExists).toBe(false);
+  }, 30_000);
+
+  it("invalid `--cwd` / unknown-flag / extra-positional forms mutate neither launcher nor target (ticket #79: fail-closed)", async () => {
+    const launcher = await createTestRepository();
+    const target = await createTestRepository();
+    repositories.push(launcher, target);
+    await install(target);
+    const targetBefore = await snapshotOwnedBytes(target);
+
+    const savedCwd = process.cwd();
+    process.chdir(launcher.root);
+    try {
+      // Missing value.
+      await expect(
+        commandModel(["set", "execution", "minimax/MiniMax-M3-alt", "--cwd"]),
+      ).rejects.toMatchObject({ code: "MISSING_ARGUMENT", details: { key: "cwd" } });
+
+      // Duplicate --cwd.
+      await expect(
+        commandModel([
+          "set",
+          "execution",
+          "minimax/MiniMax-M3-alt",
+          "--cwd",
+          target.root,
+          "--cwd",
+          target.root,
+        ]),
+      ).rejects.toMatchObject({ code: "DUPLICATE_ARGUMENT", details: { key: "cwd" } });
+
+      // Unknown flag.
+      await expect(
+        commandModel(["set", "execution", "minimax/MiniMax-M3-alt", "--bogus"]),
+      ).rejects.toMatchObject({ code: "UNKNOWN_OPTION" });
+
+      // Extra positional.
+      await expect(
+        commandModel([
+          "set",
+          "execution",
+          "minimax/MiniMax-M3-alt",
+          "extra-positional",
+        ]),
+      ).rejects.toMatchObject({ code: "UNKNOWN_ARGUMENT" });
+
+      // Bare interactive dispatch with unknown flag.
+      await expect(commandModel(["--bogus"])).rejects.toMatchObject({ code: "UNKNOWN_OPTION" });
+
+      // Bare interactive dispatch with duplicate --cwd.
+      await expect(
+        commandModel(["--cwd", target.root, "--cwd", target.root]),
+      ).rejects.toMatchObject({ code: "DUPLICATE_ARGUMENT", details: { key: "cwd" } });
+
+      // Bare interactive dispatch with missing --cwd value.
+      await expect(commandModel(["--cwd"])).rejects.toMatchObject({
+        code: "MISSING_ARGUMENT",
+        details: { key: "cwd" },
+      });
+    } finally {
+      process.chdir(savedCwd);
+    }
+
+    // Target NOT mutated.
+    const targetAfter = await snapshotOwnedBytes(target);
+    expectOwnedBytesUnchanged(targetBefore, targetAfter, "invalid forms");
+
+    // Launcher NOT mutated.
+    const launcherAfter = await launcherOwnedSurface(launcher);
+    expect(launcherAfter.poiesisConfigExists).toBe(false);
+    expect(launcherAfter.manifestExists).toBe(false);
+    expect(launcherAfter.receiptExists).toBe(false);
+  }, 60_000);
 });

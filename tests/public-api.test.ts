@@ -32,6 +32,16 @@
  *     in `dist/index.d.ts`; the public
  *     `installAuthorizedCapability(root, input)` wrapper is the only
  *     package-root re-export, and it has EXACTLY TWO parameters.
+ *   - the ticket #58 / #59 interactive IO factories
+ *     (`createProductionInteractiveInitIO`,
+ *     `createProductionInteractiveModelIO`) and every shape from
+ *     `src/init-interactive.ts` / `src/model-interactive.ts` — they
+ *     stay CLI-internal so the `InteractiveInitIO` / `InteractiveModelIO`
+ *     contracts do not freeze before the TTY flow stabilizes.
+ *   - the ticket #68 settle-once readline helper
+ *     (`settleOnceLinePrompt` + `SettleOnceLinePromptArgs`) — it is
+ *     a private CLI seam; production callers reach it through the
+ *     factories above, never through the package root.
  *
  * The test uses TypeScript's type system:
  *   - Direct `import` statements from `../src/index.js` fail to compile
@@ -118,7 +128,33 @@ const forbiddenFunctions = [
   // TTY keypress seam before CLI wiring exists.
   "runModelSelector",
   "createProductionModelSelectorIO",
+  // Ticket #73: the CLI-internal Clack adapter (`runClackSelect`) and
+  // its row shape (`ClackSelectRow` / `ClackSelectArgs`) live in
+  // `src/clack-select.ts` and are intentionally NOT re-exported by the
+  // package root. Promoting the adapter would freeze the Clack
+  // primitive into the public surface before Clack's API stabilizes
+  // for downstream consumers.
+  "runClackSelect",
+  // Ticket #73: the post-Clack selector exposes a library-free domain
+  // shape (`buildModelSelectorRows`, `formatModelSelectorHint`,
+  // `resolveIdentityInitialValue`, `ModelSelectorRow`,
+  // `ModelSelectorRowHints`). None of those names reach the package
+  // root either — the model-selector IO contracts must stay internal.
+  "buildModelSelectorRows",
+  "formatModelSelectorHint",
+  "resolveIdentityInitialValue",
   "DEFAULT_RECOMMENDED_MODEL_IDS",
+  // Ticket #58 / #59: the interactive IO factories stay CLI-internal.
+  // Tests reach them through the source modules (`src/init-interactive.ts`,
+  // `src/model-interactive.ts`) directly; the package root never
+  // re-exports them so the `InteractiveInitIO` / `InteractiveModelIO`
+  // contracts do not freeze into a public API.
+  "createProductionInteractiveInitIO",
+  "createProductionInteractiveModelIO",
+  // Ticket #68: the settle-once readline helper is a private CLI seam.
+  // The factories above are the only production callers; promoting it
+  // through `src/index.ts` would freeze the prompt-stream contract.
+  "settleOnceLinePrompt",
 ] as const;
 
 const forbiddenTypes = [
@@ -167,6 +203,30 @@ const forbiddenTypes = [
   "ModelSelectorRenderedRow",
   "RunModelSelectorArgs",
   "ProductionModelSelectorIOArgs",
+  // Ticket #73: the post-Clack selector exposes `ModelSelectorRow`,
+  // `ModelSelectorRowHints`, and a library-free
+  // `RunModelSelectorArgs` shape that does NOT take an IO seam. None
+  // of these names reach the package root.
+  "ModelSelectorRow",
+  "ModelSelectorRowHints",
+  // Ticket #73: the Clack adapter's input / output types also stay
+  // internal; promoting them would leak `@clack/prompts` types into
+  // the public surface.
+  "ClackSelectRow",
+  "ClackSelectArgs",
+  // Ticket #58 / #59: every `src/init-interactive.ts` / `src/model-interactive.ts`
+  // surface stays internal — the IO contracts, the tracker-provider
+  // alias, and the model-selection / current-models shapes.
+  "InteractiveInitIO",
+  "InteractiveInitOptions",
+  "InteractiveModelIO",
+  "InteractiveModelOptions",
+  "TrackerProvider",
+  "TrackerAuthProbeResult",
+  "CurrentModels",
+  "ModelSelection",
+  // Ticket #68: the settle-once prompt's argument bag stays internal.
+  "SettleOnceLinePromptArgs",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

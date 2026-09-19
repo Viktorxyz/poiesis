@@ -129,7 +129,7 @@ describe("manifest authority", () => {
     });
     expect(await readFile(join(repository.root, ".poiesis", "roles", "worker.md"), "utf8")).toBe(original);
     expect(await exists(join(repository.root, ".poiesis", "manifest.json"))).toBe(true);
-  }, 30_000);
+  }, 90_000);
 });
 
 

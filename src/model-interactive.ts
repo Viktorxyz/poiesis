@@ -1,5 +1,5 @@
 /**
- * Interactive `poiesis model` (ticket #59).
+ * Interactive `poiesis model` (ticket #59, ticket #73, ticket #76).
  *
  * Flagless interactive flow that lets the Author change exactly one
  * model slot at a time. Mirrors the `poiesis init` interactive
@@ -13,17 +13,28 @@
  *      (`MODEL_NOT_INSTALLED`). The interactive flow must NOT install
  *      Poiesis for the Author — it only mutates an already-installed
  *      config.
- *   3. Print the current reasoning and execution model identities on
- *      stderr so the Author sees what they are about to change.
- *   4. Probe the live OpenCode model inventory via `opencode models`.
- *      Empty inventory fails closed with `MODEL_INVENTORY_UNAVAILABLE`
- *      — no silent fallback.
- *   5. Ask the Author which slot to change (`reasoning` or `execution`).
- *      Anything else fails closed with `INVALID_MODEL_CLASS` BEFORE the
- *      model selector runs. Exactly one slot changes per run.
+ *   3. Read the currently-installed Poiesis config and print the
+ *      current reasoning and execution model identities on stderr so
+ *      the Author sees what they are about to change.
+ *   4. Ask the Author which slot to change (`reasoning` or `execution`)
+ *      through the shared Clack-backed class selector. The current
+ *      reasoning / execution identity is shown in each option's hint so
+ *      the operator sees the values they are choosing between. Anything
+ *      else fails closed with `MODEL_CLASS_SELECTOR_CANCELLED` if the
+ *      Author pressed Esc / Ctrl+C, or `INVALID_MODEL_CLASS` if a
+ *      custom IO seam returned a non-class answer.
+ *   5. Probe the live OpenCode model inventory via `opencode models`.
+ *      ticket #76 reordered this step to AFTER the class selector so a
+ *      class-selector cancellation (or an out-of-band class answer)
+ *      short-circuits BEFORE the `opencode models` subprocess runs.
+ *      Empty inventory still fails closed with
+ *      `MODEL_INVENTORY_UNAVAILABLE` — no silent fallback.
  *   6. Run the shared `runModelSelector` for the chosen class with the
- *      live inventory and the canonical recommended constants. The
- *      selector's policy is identical to `poiesis init`'s.
+ *      live inventory, the canonical recommended constants, and the
+ *      currently installed identity (so the hint marks "Current" /
+ *      "Recommended" / "Current, Recommended" and the cursor lands on
+ *      that row first). The selector's policy is identical to
+ *      `poiesis init`'s.
  *   7. Hand the chosen identity to the existing `setModel` (which in
  *      turn routes through `updateFromConfig`). All transactional
  *      invariants (no-op detection, doctor gate, fail-closed rollback)
@@ -41,6 +52,14 @@
  *     out-of-band class name, or a selector cancellation all fail
  *     closed through typed `PoiesisError`s.
  *   - The module never restarts OpenCode on the Author's behalf.
+ *   - The class selector and the identity selector are the SAME
+ *     primitive (`@clack/prompts` `select` via the CLI-internal
+ *     `runClackSelect` adapter). There is no second mini-TUI.
+ *   - ticket #76: the inventory probe runs AFTER the class selector,
+ *     not before. Class-selector cancellation (or an invalid class
+ *     answer) must cause ZERO inventory probes and ZERO mutation; the
+ *     `finally` block still releases the input resource on every code
+ *     path.
  */
 import { PoiesisError } from "./errors.js";
 import { loadConfig } from "./config.js";
@@ -48,12 +67,11 @@ import { setModel, parseOpenCodeModelInventory, type ModelClassName, type SetMod
 import { loadManifest } from "./manifest.js";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
-  createProductionModelSelectorIO,
   runModelSelector,
   type ModelClass,
   type ModelIdentity,
-  type ModelSelectorIO,
 } from "./model-selector.js";
+import { runClackSelect } from "./clack-select.js";
 import { run as runChildProcess } from "./process.js";
 
 export type { ModelClass, ModelIdentity };
@@ -62,6 +80,7 @@ export interface ModelSelection {
   readonly modelClass: ModelClass;
   readonly inventory: readonly string[];
   readonly recommended: { reasoning: ModelIdentity; execution: ModelIdentity };
+  readonly currentIdentity: ModelIdentity | null;
 }
 
 export interface CurrentModels {
@@ -69,16 +88,22 @@ export interface CurrentModels {
   readonly execution: ModelIdentity;
 }
 
+/**
+ * Class-selector result type used by `InteractiveModelIO.runModelClassSelector`.
+ * The two values mirror the canonical `ModelClass` set. Returning a
+ * different string from the IO seam surfaces as `INVALID_MODEL_CLASS`,
+ * so the seam cannot smuggle an out-of-band class through the selector.
+ */
+export type ModelClassChoice = ModelClass;
+
 export interface InteractiveModelIO {
   readonly isTTY: boolean;
   writeStderr(line: string): void;
-  /**
-   * One-line prompt. The interactive flow calls this exactly once per
-   * invocation: to ask which class (reasoning|execution) the Author
-   * wants to change.
-   */
-  promptLine(prompt: string): Promise<string>;
   listOpenCodeModels(): Promise<readonly string[]>;
+  runModelClassSelector(args: {
+    readonly current: CurrentModels;
+    readonly cancelError: PoiesisError;
+  }): Promise<ModelClassChoice>;
   runModelSelector(selection: ModelSelection): Promise<string>;
   /**
    * Read the currently-installed Poiesis config and return the two
@@ -87,6 +112,15 @@ export interface InteractiveModelIO {
    * to the filesystem.
    */
   loadCurrentModels(): Promise<CurrentModels>;
+  /**
+   * Flow-scoped resource release (ticket #75). The interactive flow
+   * invokes this exactly once from a `finally` block on every code
+   * path (success, typed cancellation, and unexpected throw) so the
+   * underlying `process.stdin` cannot keep the event loop alive after
+   * the flow settles. Tests supply a counter; the production factory
+   * pauses and unrefs `process.stdin`.
+   */
+  releaseStdin?(): void;
 }
 
 export interface InteractiveModelOptions {
@@ -128,14 +162,17 @@ function formatCurrentModelsFrame(current: CurrentModels): string {
   ].join("\n");
 }
 
-function formatClassPrompt(): string {
-  return "Which model class would you like to change? [reasoning/execution]";
-}
-
-function formatRestartNotice(): string {
+function formatRestartNotice(args: {
+  readonly modelClass: ModelClass;
+  readonly previous: ModelIdentity;
+  readonly current: ModelIdentity;
+}): string {
   return [
     "",
     "Poiesis model update succeeded.",
+    `  class:    ${args.modelClass}`,
+    `  previous: ${args.previous}`,
+    `  current:  ${args.current}`,
     "Restart OpenCode to apply the new model configuration.",
     "Poiesis did not restart OpenCode; you must do that yourself.",
     "",
@@ -149,46 +186,80 @@ function formatRestartNotice(): string {
  * Failure modes (always `PoiesisError`):
  *   - `NON_TTY_MODEL`               -- `io.isTTY === false`
  *   - `MODEL_NOT_INSTALLED`         -- Poiesis is not installed at `root`
- *   - `INVALID_MODEL_CLASS`         -- class answer is not reasoning|execution
+ *   - `INVALID_MODEL_CLASS`         -- the IO seam returned a non-class answer (defensive)
  *   - `MODEL_INVENTORY_UNAVAILABLE` -- `opencode models` returned an empty list
- *   - `MODEL_SELECTOR_CANCELLED`    -- user cancelled the selector (Esc / q)
+ *   - `MODEL_SELECTOR_CANCELLED`    -- user cancelled the identity selector (Esc / Ctrl+C)
+ *   - `MODEL_CLASS_SELECTOR_CANCELLED` -- user cancelled the class selector (Esc / Ctrl+C)
  *   - `MODEL_SELECTOR_NOT_TTY`      -- selector IO reports non-TTY (defensive)
  *   - `MODEL_SELECTOR_NO_INVENTORY` -- normalized inventory is empty (defensive)
  */
 export async function runInteractiveModel(args: InteractiveModelOptions): Promise<SetModelResult> {
-  if (!args.io.isTTY) {
-    throw new PoiesisError(
-      "NON_TTY_MODEL",
-      "poiesis model without a subcommand requires an interactive TTY; use `poiesis model set reasoning|execution <provider/model>` for non-interactive use",
-      {
-        hint: "use `poiesis model set reasoning|execution <provider/model>`",
-      },
-    );
+  try {
+    if (!args.io.isTTY) {
+      throw new PoiesisError(
+        "NON_TTY_MODEL",
+        "poiesis model without a subcommand requires an interactive TTY; use `poiesis model set reasoning|execution <provider/model>` for non-interactive use",
+        {
+          hint: "use `poiesis model set reasoning|execution <provider/model>`",
+        },
+      );
+    }
+
+    await refuseIfNotInstalled(args.root);
+
+    const current = await args.io.loadCurrentModels();
+    args.io.writeStderr(formatCurrentModelsFrame(current));
+
+    // ticket #76: the class selector runs BEFORE the inventory
+    // probe. The class selector only needs the operator's current
+    // identities (already loaded above) to render its hints, so the
+    // inventory subprocess is unnecessary until the Author has chosen
+    // a class. Cancelling or returning an invalid class short-circuits
+    // here with zero inventory probes and zero mutation; the finally
+    // block below still releases the input resource.
+    const classAnswer = await args.io.runModelClassSelector({
+      current,
+      cancelError: new PoiesisError(
+        "MODEL_CLASS_SELECTOR_CANCELLED",
+        "Interactive model class selector was cancelled by the user",
+        {},
+      ),
+    });
+    if (!isModelClass(classAnswer)) {
+      throw new PoiesisError(
+        "INVALID_MODEL_CLASS",
+        `Unknown model class: ${classAnswer}`,
+        { className: classAnswer, supported: [...MODEL_CLASSES] },
+      );
+    }
+    // ticket #76: inventory discovery happens AFTER class selection.
+    // Empty inventory fails closed with `MODEL_INVENTORY_UNAVAILABLE`
+    // — no silent fallback — and the finally block still releases the
+    // input resource on that error path.
+    const inventory = await probeInventory(args.io);
+    const chosen = await args.io.runModelSelector({
+      modelClass: classAnswer,
+      inventory,
+      recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
+      currentIdentity: current[classAnswer],
+    });
+    const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
+    args.io.writeStderr(formatRestartNotice({
+      modelClass: classAnswer,
+      previous: current[classAnswer],
+      current: chosen,
+    }));
+    return result;
+  } finally {
+    // Ticket #75: flow-scoped resource release. The interactive flow
+    // pauses and unrefs `process.stdin` on every code path so the Node
+    // process can exit naturally after success or cancellation; without
+    // this, Clack's last `select` leaves stdin resumed and the event
+    // loop waits forever for keypress data. Tests that drive the flow
+    // with scripted IO leave `releaseStdin` undefined. Ticket #76
+    // preserves this on the new class-before-inventory ordering.
+    args.io.releaseStdin?.();
   }
-
-  await refuseIfNotInstalled(args.root);
-
-  const current = await args.io.loadCurrentModels();
-  args.io.writeStderr(formatCurrentModelsFrame(current));
-
-  const inventory = await probeInventory(args.io);
-
-  const classAnswer = (await args.io.promptLine(formatClassPrompt())).trim();
-  if (!isModelClass(classAnswer)) {
-    throw new PoiesisError(
-      "INVALID_MODEL_CLASS",
-      `Unknown model class: ${classAnswer}`,
-      { className: classAnswer, supported: [...MODEL_CLASSES] },
-    );
-  }
-  const chosen = await args.io.runModelSelector({
-    modelClass: classAnswer,
-    inventory,
-    recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
-  });
-  const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
-  args.io.writeStderr(formatRestartNotice());
-  return result;
 }
 
 /**
@@ -222,9 +293,10 @@ async function refuseIfNotInstalled(root: string): Promise<void> {
 /**
  * Production IO factory. Wires the interactive model flow to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a single-argument call site. The shared model-selector IO is
- * delegated to `createProductionModelSelectorIO` so the keypress loop
- * is reused byte-for-byte with `poiesis init`.
+ * stays a single-argument call site. The class selector and the
+ * shared identity selector are both routed through the CLI-internal
+ * Clack adapter (`src/clack-select.ts`) so there is exactly one
+ * interactive list primitive in the CLI.
  *
  * The factory takes the resolved repository `root` (git toplevel of the
  * repo the Author is editing) so every filesystem-touching seam —
@@ -243,36 +315,42 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
+  // Ticket #75: flow-scoped stdin release. Idempotent and
+  // defensive — Clack's last `select()` resumes stdin in its `finally`
+  // block (tickets #71 / #73) so the next interactive seam can run; at
+  // the very end of the interactive flow we want the inverse: pause
+  // the stream (so it stops pulling data) and unref it from the event
+  // loop (so a still-open stdin cannot keep the process alive).
+  let released = false;
+  const releaseStdin = (): void => {
+    if (released) return;
+    released = true;
+    if (typeof stdin.pause === "function" && (stdin as { readableEnded?: boolean }).readableEnded !== true && (stdin as { destroyed?: boolean }).destroyed !== true) {
+      try {
+        stdin.pause();
+      } catch {
+        // Defensive: pause() can surface stream-state errors; the
+        // `unref()` below is the canonical "do not keep the event
+        // loop alive" call, so swallowing pause() failures does not
+        // weaken the release contract.
+      }
+    }
+    if (typeof stdin.unref === "function") {
+      try {
+        stdin.unref();
+      } catch {
+        // Same defensive posture: unref() can throw on a non-standard
+        // stream, and we never want a release failure to propagate.
+      }
+    }
+  };
 
   return {
     isTTY,
     writeStderr(line: string): void {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
-    async promptLine(prompt: string): Promise<string> {
-      const { createInterface } = await import("node:readline");
-      return await new Promise<string>((resolve, reject) => {
-        try {
-          const rl = createInterface({ input: stdin, output: stderr, terminal: isTTY });
-          stderr.write(`${prompt}: `);
-          rl.once("line", (line) => {
-            rl.close();
-            resolve(line);
-          });
-          rl.once("close", () => {
-            reject(
-              new PoiesisError(
-                "MODEL_PROMPT_CANCELLED",
-                "Interactive model prompt was cancelled by the user",
-                { prompt },
-              ),
-            );
-          });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
-      });
-    },
+    releaseStdin,
     async listOpenCodeModels(): Promise<readonly string[]> {
       // Run `opencode models` from the repo root, NOT `process.cwd()`.
       // CLI dispatch lands here when the Author passes
@@ -290,13 +368,38 @@ export function createProductionInteractiveModelIO(root: string): InteractiveMod
       }
       return [...parseOpenCodeModelInventory(result.stdout)];
     },
+    async runModelClassSelector(args): Promise<ModelClassChoice> {
+      // The class selector and the identity selector are the same
+      // primitive: Clack `select` via the CLI-internal adapter. The
+      // hint carries the operator's currently installed value so the
+      // choice is informed. Both classes are always installed, so the
+      // cursor defaults to `reasoning` — the row the operator most
+      // often wants — while the hint still shows both current
+      // identities.
+      return await runClackSelect<ModelClassChoice>({
+        message: "Which model class would you like to change?",
+        options: [
+          {
+            value: "reasoning",
+            label: "Reasoning",
+            hint: `Current: ${args.current.reasoning}`,
+          },
+          {
+            value: "execution",
+            label: "Execution",
+            hint: `Current: ${args.current.execution}`,
+          },
+        ],
+        initialValue: "reasoning",
+        cancelError: args.cancelError,
+      });
+    },
     async runModelSelector(selection: ModelSelection): Promise<string> {
-      const io: ModelSelectorIO = createProductionModelSelectorIO();
       return await runModelSelector({
-        io,
         inventory: selection.inventory,
         recommended: selection.recommended,
         modelClass: selection.modelClass,
+        currentIdentity: selection.currentIdentity,
       });
     },
     async loadCurrentModels(): Promise<CurrentModels> {

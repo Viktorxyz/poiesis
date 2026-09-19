@@ -47,11 +47,12 @@ import {
 } from "./init-discovery.js";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
-  createProductionModelSelectorIO,
   runModelSelector,
   type ModelClass,
   type ModelIdentity,
+  type RecommendedModelIds,
 } from "./model-selector.js";
+import { settleOnceLinePrompt } from "./prompt-line.js";
 import { init, parseOpenCodeModelInventory } from "./maintenance.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { run as runChildProcess } from "./process.js";
@@ -61,7 +62,8 @@ export type TrackerProvider = "github" | "gitlab";
 export interface ModelSelection {
   readonly modelClass: ModelClass;
   readonly inventory: readonly string[];
-  readonly recommended: { reasoning: ModelIdentity; execution: ModelIdentity };
+  readonly recommended: RecommendedModelIds;
+  readonly currentIdentity: ModelIdentity | null;
 }
 
 export interface TrackerAuthProbeResult {
@@ -77,6 +79,15 @@ export interface InteractiveInitIO {
   listOpenCodeModels(): Promise<readonly string[]>;
   runModelSelector(selection: ModelSelection): Promise<string>;
   probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult>;
+  /**
+   * Flow-scoped resource release (ticket #75). The interactive flow
+   * invokes this exactly once from a `finally` block on every code
+   * path (success, typed cancellation, and unexpected throw) so the
+   * underlying `process.stdin` cannot keep the event loop alive after
+   * the flow settles. Tests supply a counter; the production factory
+   * pauses and unrefs `process.stdin`.
+   */
+  releaseStdin?(): void;
 }
 
 export interface InteractiveInitOptions {
@@ -130,48 +141,59 @@ const FORBIDDEN_DELIVERY_ADAPTERS: ReadonlySet<string> = new Set([
  * produces structured stdout.
  */
 export async function runInteractiveInit(args: InteractiveInitOptions): Promise<Manifest> {
-  if (!args.io.isTTY) {
-    throw new PoiesisError(
-      "NON_TTY_INIT",
-      "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
-      { hint: "use `poiesis init --config <path>` or run inside a TTY" },
-    );
+  try {
+    if (!args.io.isTTY) {
+      throw new PoiesisError(
+        "NON_TTY_INIT",
+        "poiesis init without --config requires a TTY; pass --config <path> for non-interactive use",
+        { hint: "use `poiesis init --config <path>` or run inside a TTY" },
+      );
+    }
+
+    // Step 1: refuse an already-installed repo BEFORE any model selector
+    // or prompt. This mirrors the existing `assertInitDestinationsAbsent`
+    // invariant that `init()` enforces anyway, but we check it up front so
+    // we never start asking the Author for choices in a repo that already
+    // has Poiesis installed.
+    await refuseIfAlreadyInstalled(args.root);
+
+    // Step 2: compose discovery. The composer is read-only — it inspects
+    // the repo and the user's draft, then reports either a fully resolved
+    // config or a list of unresolved paths.
+    const discovery = await composeInitDiscovery(args.root, args.draft);
+
+    // Step 3: print the detected facts to stderr so the Author can see
+    // what was inferred before any prompt is issued.
+    printDetections(args.io, discovery);
+
+    // Step 4: resolve every Author-owned field. Order matters — model
+    // selection runs before tracker auth so the Author sees the same
+    // config that the auth probe will read.
+    const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft);
+
+    // Step 5: probe tracker auth BEFORE `init()` writes any byte. Auth
+    // failures mention `gh auth login` / `glab auth login` and never
+    // wait-for-enter.
+    await probeTrackerAuthBeforeInstall(args.io, resolvedDraft);
+
+    // Step 6: the existing init() function owns every transactional
+    // invariant. This module never duplicates that surface.
+    const manifest = await init(args.root, resolvedDraft);
+
+    // Step 7: success. Print a restart notice on stderr; Poiesis does not
+    // restart OpenCode on the Author's behalf.
+    args.io.writeStderr(formatRestartNotice());
+    return manifest;
+  } finally {
+    // Ticket #75: flow-scoped resource release. The interactive flow
+    // pauses and unrefs `process.stdin` on every code path so the Node
+    // process can exit naturally after success or cancellation; without
+    // this, the readline prompt + Clack selector chain leaves stdin
+    // resumed and the event loop waits forever for keypress data.
+    // Tests that drive the flow with scripted IO leave `releaseStdin`
+    // undefined.
+    args.io.releaseStdin?.();
   }
-
-  // Step 1: refuse an already-installed repo BEFORE any model selector
-  // or prompt. This mirrors the existing `assertInitDestinationsAbsent`
-  // invariant that `init()` enforces anyway, but we check it up front so
-  // we never start asking the Author for choices in a repo that already
-  // has Poiesis installed.
-  await refuseIfAlreadyInstalled(args.root);
-
-  // Step 2: compose discovery. The composer is read-only — it inspects
-  // the repo and the user's draft, then reports either a fully resolved
-  // config or a list of unresolved paths.
-  const discovery = await composeInitDiscovery(args.root, args.draft);
-
-  // Step 3: print the detected facts to stderr so the Author can see
-  // what was inferred before any prompt is issued.
-  printDetections(args.io, discovery);
-
-  // Step 4: resolve every Author-owned field. Order matters — model
-  // selection runs before tracker auth so the Author sees the same
-  // config that the auth probe will read.
-  const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft);
-
-  // Step 5: probe tracker auth BEFORE `init()` writes any byte. Auth
-  // failures mention `gh auth login` / `glab auth login` and never
-  // wait-for-enter.
-  await probeTrackerAuthBeforeInstall(args.io, resolvedDraft);
-
-  // Step 6: the existing init() function owns every transactional
-  // invariant. This module never duplicates that surface.
-  const manifest = await init(args.root, resolvedDraft);
-
-  // Step 7: success. Print a restart notice on stderr; Poiesis does not
-  // restart OpenCode on the Author's behalf.
-  args.io.writeStderr(formatRestartNotice());
-  return manifest;
 }
 
 async function refuseIfAlreadyInstalled(root: string): Promise<void> {
@@ -423,6 +445,10 @@ async function selectModel(io: InteractiveInitIO, modelClass: ModelClass): Promi
     modelClass,
     inventory,
     recommended: DEFAULT_RECOMMENDED_MODEL_IDS,
+    // Init runs before any model is installed, so there is no
+    // "current" identity to mark in the hint. Pass `null` and let
+    // `runModelSelector` apply its own `initialValue` policy.
+    currentIdentity: null,
   };
   const chosen = await io.runModelSelector(selection);
   if (chosen.trim().length === 0) {
@@ -574,46 +600,90 @@ export const __test = { resolveAuthorChoices, refuseIfAlreadyInstalled };
 /**
  * Production IO factory. Wires the interactive init IO to
  * `process.stdin` / `process.stderr` so the typical CLI invocation
- * stays a zero-argument call site. Model-selector IO is delegated to
- * the existing `createProductionModelSelectorIO` so the shared
- * keypress loop is reused byte-for-byte.
+ * stays a single-argument call site. Model selection is delegated to
+ * `runModelSelector`, which goes through the CLI-internal Clack
+ * adapter (`src/clack-select.ts`). The init / model flows share that
+ * single interactive list primitive so there is no second selector
+ * implementation to drift.
+ *
+ * The factory takes the resolved repository `root` (git toplevel of the
+ * repo the Author is editing) so every repository-sensitive subprocess —
+ * `opencode models`, `gh auth status`, and `glab auth status` — runs
+ * from the SAME root the transactional `init()` write path uses. Bare
+ * `process.cwd()` would let the interactive flow read the wrong repo's
+ * OpenCode / tracker configuration when `poiesis init --cwd <path>`
+ * lands the CLI in a subdirectory of a different repo (ticket #78).
  *
  * Tests inject a fully scripted IO via the `io` parameter on
  * `runInteractiveInit`; production code goes through this factory.
  */
-export function createProductionInteractiveInitIO(): InteractiveInitIO {
+export function createProductionInteractiveInitIO(root: string): InteractiveInitIO {
   const stdin = process.stdin;
   const stderr = process.stderr;
   const isTTY = Boolean((stdin as { isTTY?: boolean }).isTTY);
+  // Ticket #75: flow-scoped stdin release. Idempotent and
+  // defensive — `settleOnceLinePrompt` and the Clack adapter resume
+  // stdin after every intermediate prompt so the next interactive
+  // seam can run; at the very end of the interactive flow we want the
+  // inverse: pause the stream (so it stops pulling data) and unref it
+  // from the event loop (so a still-open stdin cannot keep the process
+  // alive). Mirrors the model interactive IO factory's release seam.
+  let released = false;
+  const releaseStdin = (): void => {
+    if (released) return;
+    released = true;
+    if (typeof stdin.pause === "function" && (stdin as { readableEnded?: boolean }).readableEnded !== true && (stdin as { destroyed?: boolean }).destroyed !== true) {
+      try {
+        stdin.pause();
+      } catch {
+        // Defensive: pause() can surface stream-state errors; the
+        // `unref()` below is the canonical "do not keep the event
+        // loop alive" call, so swallowing pause() failures does not
+        // weaken the release contract.
+      }
+    }
+    if (typeof stdin.unref === "function") {
+      try {
+        stdin.unref();
+      } catch {
+        // Defensive: unref() can throw on a non-standard stream, and
+        // we never want a release failure to propagate.
+      }
+    }
+  };
   return {
     isTTY,
     writeStderr(line: string): void {
       stderr.write(line.endsWith("\n") ? line : `${line}\n`);
     },
+    releaseStdin,
     async promptLine(prompt: string): Promise<string> {
-      // Lazy: production callers go through readline only when a prompt
-      // is actually issued. Tests inject their own `promptLine`.
-      const { createInterface } = await import("node:readline");
-      return await new Promise<string>((resolve, reject) => {
-        try {
-          const rl = createInterface({ input: stdin, output: stderr, terminal: isTTY });
-          stderr.write(`${prompt}: `);
-          rl.once("line", (line) => {
-            rl.close();
-            resolve(line);
-          });
-          rl.once("close", () => {
-            // close-without-line means the user closed stdin; surface as
-            // a cancellation so callers can branch on a typed error.
-            reject(new PoiesisError("INIT_PROMPT_CANCELLED", "Interactive prompt was cancelled by the user", { prompt }));
-          });
-        } catch (error) {
-          reject(error instanceof Error ? error : new Error(String(error)));
-        }
+      // Ticket #68: the production prompt is a thin adapter over the
+      // CLI-internal settle-once readline helper. The helper owns the
+      // settle-once invariant; the factory only binds stdin / stderr and
+      // the distinct `INIT_PROMPT_CANCELLED` cancellation error (kept
+      // distinct from `MODEL_PROMPT_CANCELLED` per Spec §"Design").
+      // Callers still `.trim()` the returned raw line themselves.
+      return await settleOnceLinePrompt({
+        prompt,
+        input: stdin,
+        output: stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "INIT_PROMPT_CANCELLED",
+          "Interactive prompt was cancelled by the user",
+          { prompt },
+        ),
       });
     },
     async listOpenCodeModels(): Promise<readonly string[]> {
-      const result = await runChildProcess("opencode", ["models"], { cwd: process.cwd(), allowFailure: true });
+      // Run `opencode models` from the repo root, NOT `process.cwd()`.
+      // CLI dispatch lands here when the Author passes
+      // `poiesis init --cwd <path>` from any subdirectory of the repo;
+      // the opencode config (`opencode.jsonc`) lives at the repo root,
+      // so a child process spawned from a sub-cwd could see a different
+      // (or no) OpenCode installation.
+      const result = await runChildProcess("opencode", ["models"], { cwd: root, allowFailure: true });
       if (result.exitCode !== 0) {
         throw new PoiesisError(
           "MODEL_INVENTORY_UNAVAILABLE",
@@ -624,21 +694,30 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
       return [...parseOpenCodeModelInventory(result.stdout)];
     },
     async runModelSelector(selection: ModelSelection): Promise<string> {
-      // The shared selector owns its own IO and keypress loop. We
-      // forward stderr for its prompt frames (mirrors `runModelSelector`
-      // defaults) and let it surface MODEL_SELECTOR_NOT_TTY up the stack
-      // if the parent IO was somehow misconfigured.
-      const io = createProductionModelSelectorIO();
+      // Init runs before any model is installed, so there is no
+      // "current" identity to mark in the hint. Pass `null` and let
+      // `runModelSelector` apply its own `initialValue` policy.
       return await runModelSelector({
-        io,
         inventory: selection.inventory,
         recommended: selection.recommended,
         modelClass: selection.modelClass,
+        currentIdentity: selection.currentIdentity,
+        cancelError: new PoiesisError(
+          "INIT_MODEL_SELECTOR_CANCELLED",
+          "Interactive init model selector was cancelled by the user",
+          { modelClass: selection.modelClass },
+        ),
       });
     },
     async probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult> {
       if (provider === "github") {
-        const result = await runChildProcess("gh", ["auth", "status"], { cwd: process.cwd(), allowFailure: true });
+        // Run from the repo root so the auth probe sees the same Git
+        // config (`gh` / `glab` honor the current repo's credentials
+        // configuration) as the rest of the init transaction. Bare
+        // `process.cwd()` would let the probe read the wrong repo
+        // when `poiesis init --cwd <path>` lands the CLI in a
+        // subdirectory of a different repo.
+        const result = await runChildProcess("gh", ["auth", "status"], { cwd: root, allowFailure: true });
         if (result.exitCode === 0) return { available: true };
         return {
           available: false,
@@ -646,7 +725,7 @@ export function createProductionInteractiveInitIO(): InteractiveInitIO {
           hint: "Run `gh auth login` to authenticate, then re-run `poiesis init`",
         };
       }
-      const result = await runChildProcess("glab", ["auth", "status"], { cwd: process.cwd(), allowFailure: true });
+      const result = await runChildProcess("glab", ["auth", "status"], { cwd: root, allowFailure: true });
       if (result.exitCode === 0) return { available: true };
       return {
         available: false,

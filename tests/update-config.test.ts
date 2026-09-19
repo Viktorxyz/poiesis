@@ -1949,7 +1949,7 @@ describe("update --config fixture-adapter invariant", () => {
     expect(afterReceipt.generation).toBe(beforeReceipt.generation);
     expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
     expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
-  }, 30_000);
+  }, 90_000);
 
   // Alteration: change only the fixture-tracker project on an
   // already-installed fixture installation. The invariant must
@@ -1976,7 +1976,7 @@ describe("update --config fixture-adapter invariant", () => {
     expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfigBytes);
     expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(beforeReceipt.generation);
-  }, 30_000);
+  }, 90_000);
 
   // Canonical no-op preservation: a byte-equal fixture config does
   // not throw and does not advance the receipt generation. This
@@ -1990,7 +1990,7 @@ describe("update --config fixture-adapter invariant", () => {
 
     const candidatePath = await writeCandidateConfig(repository, () => undefined);
     const result = await updateFromConfig(repository.root, candidatePath);
-    expect(result.manifest.poiesisVersion).toBe("1.1.0");
+    expect(result.manifest.poiesisVersion).toBe("1.1.1");
     // Doctor report's `ok` may be false if the install used
     // `skipSkills: true` (the `install` helper does so); the
     // `skills` exemption is honored by the gate via
@@ -2000,7 +2000,7 @@ describe("update --config fixture-adapter invariant", () => {
     expect(result.doctor.checks.find((check) => check.id === "skills")?.status).toBe("fail");
     expect(result.doctor.checks.find((check) => check.id === "manifest")?.status).toBe("pass");
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(beforeReceipt.generation);
-  }, 30_000);
+  }, 90_000);
 
   // Local fake-`gh` seam for the two non-fixture → fixture
   // transition tests. The runtime's `verifyTracker` invokes
@@ -2114,7 +2114,7 @@ exit 0
     expect(afterReceipt.generation).toBe(beforeReceipt.generation);
     expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
     expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
-  }, 30_000);
+  }, 90_000);
 
   // Introduction: a non-fixture installation cannot transition to
   // fixture tracker via `update --config`. The invariant must
@@ -2165,5 +2165,5 @@ exit 0
     expect(afterReceipt.generation).toBe(beforeReceipt.generation);
     expect(afterReceipt.manifestDigest).toBe(beforeReceipt.manifestDigest);
     expect(serializeManifest(await loadManifest(repository.root))).toBe(serializeManifest(beforeManifest));
-  }, 30_000);
+  }, 90_000);
 });

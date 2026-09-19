@@ -217,7 +217,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     const result = await update(repository.root, { skipSkills: true });
 
     expect(result.manifest.poiesisVersion).not.toBe("1.0.1");
-    expect(result.manifest.poiesisVersion).toBe("1.1.0");
+    expect(result.manifest.poiesisVersion).toBe("1.1.1");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
 
@@ -273,7 +273,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
 
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.1.0");
+    expect(result.manifest.poiesisVersion).toBe("1.1.1");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
     expect(reviewerAfter.previousExists).toBe(false);
@@ -323,10 +323,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     await rebindReceipt(repository);
 
     // The manifest equals the strict current projection, so update() succeeds.
-    // The result version advances to the installed package version (1.1.0)
+    // The result version advances to the installed package version (1.1.1)
     // because update() always bumps poiesisVersion on success.
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.1.0");
+    expect(result.manifest.poiesisVersion).toBe("1.1.1");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
   }, 60_000);
