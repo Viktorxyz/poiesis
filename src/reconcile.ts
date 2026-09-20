@@ -2414,14 +2414,13 @@ async function walkWorkingTree(
         // whether the directory itself is empty. Empty
         // directories stay in the preimage so the destructive
         // step's `rmdir`-based cleanup can reclaim them (a
-        // sibling test in ticket #85 pins this behavior), but
-        // they are EXCLUDED from the fingerprint digest so a
-        // caller who plants an empty directory between the
-        // fingerprint capture and the reconcile call does not
-        // destabilize the pre-mutation revalidation. The
-        // postcondition's bounded residue walker is the surface
-        // that surfaces any empty directory the destructive
-        // step missed.
+        // sibling test in ticket #85 pins this behavior) and
+        // they DO contribute to the fingerprint digest (the
+        // "changes for empty-directory presence" test pins this
+        // — the header docblock's "directories including empty"
+        // is the canonical contract). The postcondition's
+        // bounded residue walker is the surface that surfaces
+        // any empty directory the destructive step missed.
         const childEntries: DiscardEntry[] = [];
         await walkWorkingTree(
           root,

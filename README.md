@@ -215,6 +215,33 @@ A non-TTY `poiesis model` invocation fails closed with `NON_TTY_MODEL`; the dete
 
 Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 
+### Inspect (read-only) and reconcile (destructive)
+
+Two operations sit on the same primary-checkout preimage surface. The first is a bounded read; the second is a bounded mutation that refuses unless every binding captured by the first matches a re-captured binding immediately before any destructive action.
+
+#### `poiesis inspect [--cwd <path>] [--fingerprint]`
+
+`inspect` always returns bounded project and Git facts. `--fingerprint` is an opt-in flag that adds an exact primary preimage fingerprint to the result — a versioned, domain-separated SHA-256 bound to the canonical root, the Git common dir, the configured remote (name plus sorted fetch and push URLs), the integration branch, the raw `.git/index` bytes, the declared exclusion list, and a deterministic byte-preserving inventory of the discard-scope filesystem (tracked files by bytes and mode, symlink targets bound by raw `readlink` bytes, every directory — including empty — and untracked/ignored residue, refusing unsafe states: active Git operations, sparse checkout, submodules, nested repositories, content filters, special entries, and any scan that exceeds a configured bound).
+
+Inspection is strictly read-only. It never fetches, never refreshes the index, never makes a judgment call about what to discard, and never invokes the destructive `reconcile` operation. The fingerprint is the only mechanical input the destructive step will accept.
+
+#### `poiesis reconcile [--cwd <path>] --integration-branch <name> --remote <name> --expected-head <sha> --expected-target <sha> --expected-fingerprint <hex> --discard-acknowledged`
+
+`reconcile` is the only bounded primary-checkout reconciliation primitive. It hard-resets the working tree to the fetched integration target while preserving Git administration, every registered linked worktree in place, shared markers/receipts, and the declared local Poiesis state exclusions (`.poiesis/manifest.json` and `.poiesis/workspaces/`).
+
+Required flags, every one of them:
+
+- `--integration-branch <name>`: the local branch the caller has verified is the configured integration branch. The destructive step re-asserts this immediately before mutation.
+- `--remote <name>`: the configured remote name (e.g., `origin`). The remote must have at least one fetch URL; `git fetch` runs against this remote without pruning (the fetch also serves as a reachability probe — an unreachable remote fails closed with `RECONCILE_REMOTE_DRIFT`).
+- `--expected-head <sha>`: the local HEAD SHA captured at the same instant as the fingerprint. A drift between capture and mutation is refused with `RECONCILE_HEAD_MISMATCH`.
+- `--expected-target <sha>`: the SHA the integration branch is expected to resolve to on the fetched ref. A fetched SHA that differs from this value is refused with `RECONCILE_TARGET_MISMATCH` rather than silently reset to the wrong commit.
+- `--expected-fingerprint <hex>`: the 64-hex SHA-256 digest returned by `inspect --fingerprint`. The destructive step re-fetches and re-captures the fingerprint immediately before mutation; a re-captured digest that differs from this value is refused with `RECONCILE_FINGERPRINT_MISMATCH`. A residue file that appears between capture and mutation is therefore reported as drift, never silently deleted.
+- `--discard-acknowledged`: must literally be the boolean `true`. Omitting it (or supplying any other value) refuses with `RECONCILE_AUTHORIZATION_MISSING` so a shell-script typo cannot silently destroy local residue.
+
+Runtime mechanics, in fixed order: validate every flag; canonicalize the root; assert the cwd is a primary checkout (not a linked worktree and not bare); assert the configured remote has at least one fetch URL; re-read the local branch and HEAD and refuse on mismatch; fetch the integration ref without pruning and refuse on mismatch; capture the fingerprint and refuse on digest mismatch; refuse any tracked target tree path that overlaps a declared exclusion prefix, a declared exclusion ancestor, or any registered linked worktree root or its ancestor (`RECONCILE_EXCLUSION_COLLISION`, `RECONCILE_TARGET_COLLISION`); refuse any `.gitattributes` the target introduces (escalated through `RECONCILE_FILTER_ACTIVE`); compare the registered linked worktree set against an optional `expectedWorktrees` baseline and refuse same-count move/swap drift with `RECONCILE_WORKTREE_DRIFT`; acquire the same cooperating mutation lock `update`, `uninstall`, and `update --config` take; revalidate every binding immediately before the destructive step; reset to the fetched target; verify the postcondition (HEAD, index, working tree match the target; no residue outside the declared exclusions).
+
+`reconcile` is mechanical, not model-driven. It does not infer the integration branch, the remote, the HEAD, or the target — every value is a caller-supplied binding, validated against a re-captured ground truth immediately before the first destructive action. An operation that cannot prove ownership of a binding refuses with a typed error (`RECONCILE_INTEGRATION_BRANCH_MISMATCH`, `RECONCILE_HEAD_MISMATCH`, `RECONCILE_TARGET_MISMATCH`, `RECONCILE_FINGERPRINT_MISMATCH`, `RECONCILE_AUTHORIZATION_MISSING`, `RECONCILE_REMOTE_DRIFT`, `RECONCILE_EXCLUSION_COLLISION`, `RECONCILE_TARGET_COLLISION`, `RECONCILE_WORKTREE_DRIFT`, `RECONCILE_SCAN_INCOMPLETE`, `RECONCILE_NESTED_REPOSITORY`, `RECONCILE_FILTER_ACTIVE`, …); it never falls back to a best-effort guess, never prunes branches, never deletes remotes, never cleans orphan markers, and never rewrites history.
+
 ## Use with a coding agent
 
 The normal Author experience is to ask Poiesis for something in natural language and let the visible primary agent orchestrate the work. The following prompt is a reusable, internal-mechanics-free recipe for handing a fresh coding agent a project plus Poiesis without teaching it adapter internals:

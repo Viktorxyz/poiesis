@@ -686,9 +686,21 @@ describe("ticket #84 — incremental bounds, dir/symlink counting, streaming has
       const repo = repos.pop()!;
       await rm(repo.parent, { recursive: true, force: true });
     }
-    // Restore the production defaults so a misbehaving test cannot
-    // leak bounds into the rest of the suite.
-    __setReconcileScanBoundsForTest({});
+    // Restore every mutable bound to its production default. The
+    // seam treats `null` as "restore default"; an empty object
+    // would be a no-op because every assignment is gated on
+    // `overrides.<key> !== undefined`, leaving a previously
+    // shrunk bound in place and making the cleanup order-
+    // dependent across the suite.
+    __setReconcileScanBoundsForTest({
+      maxFiles: null,
+      maxDirs: null,
+      maxSymlinks: null,
+      maxTotalBytes: null,
+      maxFileBytes: null,
+      maxIndexBytes: null,
+      maxPathBytes: null,
+    });
   });
 
   it("refuses when the discard scope contains more directories than the bound", async () => {

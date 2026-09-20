@@ -552,7 +552,21 @@ describe("ticket #86 — finding 4: attribute discovery bound + exclusions + wor
         }),
       ).rejects.toMatchObject({ code: "RECONCILE_SCAN_INCOMPLETE" });
     } finally {
-      __setReconcileScanBoundsForTest({});
+      // Restore every mutable bound to its production default. An
+      // empty object would be a no-op here — the seam only resets
+      // a field when its key is present in the overrides, so
+      // leaving the previously shrunk `maxDirs` bound in place
+      // would propagate into the next test sharing the module.
+      // Explicit `null` per field is the canonical restore.
+      __setReconcileScanBoundsForTest({
+        maxFiles: null,
+        maxDirs: null,
+        maxSymlinks: null,
+        maxTotalBytes: null,
+        maxFileBytes: null,
+        maxIndexBytes: null,
+        maxPathBytes: null,
+      });
     }
   });
 });
