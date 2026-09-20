@@ -277,12 +277,18 @@ export async function computeReconcileFingerprint(
   const canonicalRoot = await canonicalRootOfOrBare(options.cwd);
   await assertPrimaryCheckout(canonicalRoot);
   const gitCommonDir = await canonicalCommonDir(canonicalRoot);
+  // Ticket #92: refuse `git init --separate-git-dir` setups up
+  // front so callers know the support boundary before any
+  // fingerprint, fetch, or mutation runs. The gate is the
+  // user-visible boundary; the split-index and index captures
+  // use the resolved `gitCommonDir` for defense-in-depth.
+  await assertNoSeparateGitDir(canonicalRoot);
   await assertNoActiveGitOperation(canonicalRoot);
   await assertSparseCheckoutDisabled(canonicalRoot);
   await assertNoSubmoduleConfig(canonicalRoot);
   await assertNoContentFilters(canonicalRoot);
-  await assertNoSplitIndex(canonicalRoot);
-  const indexBytes = await readIndexBytes(canonicalRoot);
+  await assertNoSplitIndex(canonicalRoot, gitCommonDir);
+  const indexBytes = await readIndexBytes(canonicalRoot, gitCommonDir);
   // Ticket #88 finding #3: pre-fingerprint index stage/mode
   // validation. An index entry with mode 160000 (gitlink) that is
   // NOT paired with a `.gitmodules` file is an orphan gitlink —
@@ -404,6 +410,13 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
       actual: headSha,
     },
   );
+
+  // Ticket #92: refuse a `git init --separate-git-dir` setup
+  // before the network fetch. The gate also runs inside
+  // `computeReconcileFingerprint`, but the destructive path
+  // benefits from a typed early rejection so callers do not pay
+  // the fetch roundtrip when the worktree layout is unsupported.
+  await assertNoSeparateGitDir(canonicalRoot);
 
   // Fetch the configured integration ref WITHOUT pruning. The fetch
   // also serves as a reachability probe — an unreachable remote (URL
@@ -1494,6 +1507,60 @@ async function canonicalWorktreePath(path: string): Promise<string> {
   }
 }
 
+/**
+ * Refuse a worktree whose `<root>/.git` entry is NOT a directory.
+ *
+ * `git init --separate-git-dir=<dir>` creates a `.git` FILE with
+ * `gitdir: <path>` content; the actual git data lives at the
+ * external path. Reconcile targets the flat primary checkout
+ * shape where `<root>/.git` IS the git directory itself; the
+ * fingerprint would otherwise silently miss the shared
+ * `commondir` pointer, worktree `gitdir` entries, preserved
+ * markers, and every other per-checkout resource that lives under
+ * the git directory. The resolved `git rev-parse --git-dir` and
+ * `--git-common-dir` still point at the external location for a
+ * separate-git-dir primary (no worktree means no per-worktree
+ * split), so the `assertPrimaryCheckout` gate alone is
+ * insufficient — it cannot tell the file-vs-directory shape
+ * apart from the equality of the resolved git dirs.
+ *
+ * Refuse up front with the typed `RECONCILE_NOT_PRIMARY_CHECKOUT`
+ * error so callers do not have to read the docs to discover the
+ * support boundary. The gate runs BEFORE any fingerprint, fetch,
+ * or mutation, so a separate-git-dir setup never burns cycles on
+ * a scan that cannot succeed. Ticket #92.
+ */
+async function assertNoSeparateGitDir(canonicalRoot: string): Promise<void> {
+  const dotGitPath = join(canonicalRoot, ".git");
+  let stats: Awaited<ReturnType<typeof stat>>;
+  try {
+    // `stat` (not `lstat`) follows symlinks: a `<root>/.git`
+    // symlink that targets a real directory is functionally
+    // equivalent to having the directory directly and is
+    // therefore allowed. A symlink or hardlink to a file (the
+    // separate-git-dir shape) surfaces as `isFile() === true`
+    // and is refused.
+    stats = await stat(dotGitPath);
+  } catch (error) {
+    if (isEnoent(error)) {
+      // The primary-checkout gate above has already refused a
+      // missing `<root>/.git`; this gate stays the second line
+      // of defense. Skip silently so the upstream gate remains
+      // the single source of truth for the "missing git dir"
+      // shape.
+      return;
+    }
+    throw error;
+  }
+  if (!stats.isDirectory()) {
+    throw new PoiesisError(
+      "RECONCILE_NOT_PRIMARY_CHECKOUT",
+      "Refusing to reconcile a worktree where `.git` is not a directory (`git init --separate-git-dir` is unsupported)",
+      { root: canonicalRoot, dotGitPath, kind: stats.isFile() ? "file" : "other" },
+    );
+  }
+}
+
 async function assertNoActiveGitOperation(canonicalRoot: string): Promise<void> {
   // Ticket #86 finding #3: the resolved git-dir (per-worktree, not
   // the common dir) is the authoritative location for all
@@ -2018,7 +2085,7 @@ function refuseAnyGitattributesInTarget(targetTree: readonly TargetTreeEntry[]):
   }
 }
 
-async function assertNoSplitIndex(root: string): Promise<void> {
+async function assertNoSplitIndex(root: string, gitCommonDir: string): Promise<void> {
   // `git update-index --split-index` may have been run with the
   // config flag absent — the on-disk shared index file is the actual
   // signal. The presence of any `sharedindex.<hex>` file in the
@@ -2040,7 +2107,17 @@ async function assertNoSplitIndex(root: string): Promise<void> {
       "Refusing to reconcile a split-index repository",
     );
   }
-  const indexDirectory = join(root, ".git");
+  // Ticket #92: read `sharedindex.*` files from the resolved
+  // git-common-dir rather than `join(root, ".git")`. The
+  // `assertNoSeparateGitDir` gate already refused setups where
+  // `<root>/.git` is not a directory; using the resolved dir is
+  // defense-in-depth so a future relaxed primary-checkout
+  // contract cannot silently mis-probe a setup where the git dir
+  // is not colocated with the worktree root. For a canonical
+  // primary checkout the two paths are identical (the
+  // `assertPrimaryCheckout` gate proves `canonicalGitDir ==
+  // canonicalCommonDir` and both resolve to `<root>/.git`).
+  const indexDirectory = gitCommonDir;
   let sharedIndexes: string[];
   try {
     sharedIndexes = await readdir(indexDirectory);
@@ -2112,7 +2189,12 @@ async function assertIndexHasNoOrphanedGitlinks(root: string, indexBytes: Buffer
   // carrying mode 160000 OR a nonzero stage OR an unexpected
   // OID length fails with `RECONCILE_INDEX_MODE_INVALID`. Both
   // errors refuse the reconcile up front.
-  if (indexBytes.length === 0) return; // empty index is a valid exact binding
+  // Ticket #92: the zero-buffer early-return is now EXCLUSIVELY
+  // the "absent index" case; the "physically present zero-byte"
+  // shape is refused up front in `readIndexBytes` before this
+  // helper runs, so the empty-buffer code path here cannot
+  // silently accept a malformed physical index.
+  if (indexBytes.length === 0) return; // absent index: zero-byte exact binding
   await probeIndexStageViaGitLsFiles(root);
 }
 
@@ -2462,26 +2544,78 @@ async function assertExclusionSubtreesAreGenuinelyUntrackedAndIgnored(root: stri
   }
 }
 
-async function readIndexBytes(root: string): Promise<Buffer> {
-  const indexPath = join(root, ".git", "index");
-  if (!(await pathExists(indexPath))) {
-    // An absent index file is still a valid exact binding — we hash
-    // zero bytes. The spec calls this out explicitly.
-    return Buffer.alloc(0);
+/**
+ * Read the raw `.git/index` bytes for binding into the
+ * fingerprint digest. The capture distinguishes three shapes:
+ *
+ *   - **absent**: the index file does not exist. The fingerprint
+ *     binds zero bytes; this is the canonical "no tracked paths"
+ *     exact binding. The contract is documented in
+ *     `computeFingerprintDigest` (the length-framed digest input
+ *     is the empty buffer when `indexBytes.length === 0`).
+ *
+ *   - **present non-empty**: the index file exists and contains
+ *     one or more bytes. The bytes are returned verbatim for the
+ *     fingerprint digest; the subsequent
+ *     `assertIndexHasNoOrphanedGitlinks` probe validates the
+ *     parsed shape via `git ls-files --stage -z`.
+ *
+ *   - **present zero-byte**: the index file exists and is empty.
+ *     Git itself refuses to read a zero-byte index (a
+ *     `git ls-files --stage -z` invocation exits non-zero). The
+ *     previous implementation silently treated this as the
+ *     absent-binding, conflating two genuinely distinct
+ *     shapes. The fix refuses the zero-byte case up front with
+ *     `RECONCILE_INDEX_INVALID` so the fingerprint cannot
+ *     silently inherit a malformed physical index. Ticket #92.
+ *
+ * The capture reads from the resolved `gitCommonDir`, not from
+ * `<root>/.git`. The `assertPrimaryCheckout` gate has already
+ * proven `canonicalGitDir == canonicalCommonDir` for the
+ * primary checkout, and the `assertNoSeparateGitDir` gate has
+ * proven `<root>/.git` is a directory. The resolved-dir read is
+ * the defense-in-depth that keeps the helper correct in isolation
+ * — a future relaxed primary-checkout contract cannot silently
+ *     mis-target the file.
+ */
+async function readIndexBytes(_canonicalRoot: string, gitCommonDir: string): Promise<Buffer> {
+  const indexPath = join(gitCommonDir, "index");
+  let stats: Awaited<ReturnType<typeof lstat>>;
+  try {
+    stats = await lstat(indexPath);
+  } catch (error) {
+    if (isEnoent(error)) {
+      // Absent index: the canonical "no tracked paths" binding.
+      // The fingerprint hashes zero bytes; a follow-up capture
+      // with the file still absent produces the SAME digest.
+      return Buffer.alloc(0);
+    }
+    throw error;
   }
-  const details = await stat(indexPath);
-  if (!details.isFile()) {
+  if (!stats.isFile()) {
     throw new PoiesisError(
       "RECONCILE_INDEX_INVALID",
       "Git index is not a regular file",
       { path: indexPath },
     );
   }
-  if (details.size > DEFAULT_MAX_INDEX_BYTES()) {
+  // Distinguish absent (zero-buffer exact binding) from
+  // physically present zero-byte (malformed Git state). Git
+  // itself refuses to read a zero-byte index; reconcile must
+  // refuse it explicitly instead of silently treating it as the
+  // absent-binding. Ticket #92.
+  if (stats.size === 0) {
+    throw new PoiesisError(
+      "RECONCILE_INDEX_INVALID",
+      "Git index file is present but empty (zero-byte); reconcile refuses to operate on a malformed physical index",
+      { path: indexPath },
+    );
+  }
+  if (stats.size > DEFAULT_MAX_INDEX_BYTES()) {
     throw new PoiesisError(
       "RECONCILE_SCAN_INCOMPLETE",
       "Git index exceeds the maximum size for fingerprint capture",
-      { path: indexPath, size: details.size, max: DEFAULT_MAX_INDEX_BYTES() },
+      { path: indexPath, size: stats.size, max: DEFAULT_MAX_INDEX_BYTES() },
     );
   }
   return readFile(indexPath);
