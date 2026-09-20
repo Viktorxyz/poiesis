@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -172,6 +172,36 @@ describe("CLI bin (symlink-aware main resolution)", () => {
     const result = await run("node", [built.cliPath, "--version"], { cwd: built.repoRoot });
     expect(result.exitCode).toBe(0);
     expect(result.stdout).toMatch(/^\d+\.\d+\.\d+$/);
+  });
+
+  it("computes a fingerprint via the built package bin (native ESM smoke)", async () => {
+    if (!built) throw new Error("bin not built");
+    // Ticket #84 finding #1: the built native ESM fingerprint
+    // surface must work end-to-end. `poiesis inspect --fingerprint`
+    // exercises the entire reconcile code path through the bin and
+    // proves the package does not silently require a CJS shim.
+    const repoRoot = join(built.installDir, "fingerprint-smoke");
+    await mkdir(repoRoot, { recursive: true });
+    await run("git", ["init", "--quiet", "--initial-branch=main"], { cwd: repoRoot });
+    await run("git", ["config", "user.name", "Poiesis Smoke"], { cwd: repoRoot });
+    await run("git", ["config", "user.email", "poiesis-smoke@example.test"], { cwd: repoRoot });
+    await writeFile(join(repoRoot, "README.md"), "smoke\n");
+    await run("git", ["add", "README.md"], { cwd: repoRoot });
+    await run("git", ["commit", "--quiet", "-m", "smoke"], { cwd: repoRoot });
+    const result = await run(
+      "node",
+      [built.binPath, "inspect", "--cwd", repoRoot, "--fingerprint"],
+      { cwd: repoRoot },
+    );
+    expect(result.exitCode).toBe(0);
+    const payload = JSON.parse(result.stdout) as {
+      ok: boolean;
+      operation: string;
+      result: { fingerprint?: { digest: string } };
+    };
+    expect(payload.ok).toBe(true);
+    expect(payload.operation).toBe("inspect");
+    expect(payload.result.fingerprint?.digest).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("does not run main when src/cli.ts is imported by a test", async () => {

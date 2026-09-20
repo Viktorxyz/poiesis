@@ -19,6 +19,14 @@ export interface RunOptions {
   allowFailure?: boolean;
   timeoutMs?: number;
   maxBytes?: number;
+  /**
+   * When `true`, the captured stdout is returned verbatim — no
+   * trailing whitespace/NUL stripping is applied. Used by callers
+   * that need to compare raw bytes (e.g. `git cat-file blob` output
+   * for byte-for-byte equality with a working tree file). Default
+   * `false` preserves the existing textual run semantics.
+   */
+  binaryStdout?: boolean;
 }
 
 export interface RunResult {
@@ -44,6 +52,7 @@ interface Capture {
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
   const maxBytes = normalizeMaxBytes(options.maxBytes);
+  const binaryStdout = options.binaryStdout === true;
   const startedAt = Date.now();
 
   return await new Promise<RunResult>((resolve, reject) => {
@@ -82,7 +91,7 @@ export async function run(command: string, args: string[], options: RunOptions):
       command,
       args,
       exitCode,
-      stdout: stripTrailingWhitespace(captureText(stdout)),
+      stdout: binaryStdout ? captureText(stdout) : stripTrailingWhitespace(captureText(stdout)),
       stderr: stripTrailingWhitespace(captureText(stderr)),
       stdoutTruncated: stdout.truncated,
       stderrTruncated: stderr.truncated,
