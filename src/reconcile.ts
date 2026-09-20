@@ -123,26 +123,43 @@ const DEFAULT_MAX_PATH_BYTES = () => maxPathBytes;
  * Module-private test seam: lets the test suite shrink the walk
  * bounds so a bound-violation assertion does not require creating
  * 100,001 on-disk entries per test. Production callers MUST NOT use
- * this; it is deliberately not exported from `index.ts`.
+ * this; it is deliberately not exported from `index.ts`. Passing
+ * `null` for a field restores the production default so a
+ * `try/finally`-style invocation does not leak the override
+ * into subsequent tests sharing the module.
  *
  * @internal
  */
 export function __setReconcileScanBoundsForTest(overrides: {
-  maxFiles?: number;
-  maxDirs?: number;
-  maxSymlinks?: number;
-  maxTotalBytes?: number;
-  maxFileBytes?: number;
-  maxIndexBytes?: number;
-  maxPathBytes?: number;
+  maxFiles?: number | null;
+  maxDirs?: number | null;
+  maxSymlinks?: number | null;
+  maxTotalBytes?: number | null;
+  maxFileBytes?: number | null;
+  maxIndexBytes?: number | null;
+  maxPathBytes?: number | null;
 }): void {
-  if (overrides.maxFiles !== undefined) maxFiles = overrides.maxFiles;
-  if (overrides.maxDirs !== undefined) maxDirs = overrides.maxDirs;
-  if (overrides.maxSymlinks !== undefined) maxSymlinks = overrides.maxSymlinks;
-  if (overrides.maxTotalBytes !== undefined) maxTotalBytes = overrides.maxTotalBytes;
-  if (overrides.maxFileBytes !== undefined) maxFileBytes = overrides.maxFileBytes;
-  if (overrides.maxIndexBytes !== undefined) maxIndexBytes = overrides.maxIndexBytes;
-  if (overrides.maxPathBytes !== undefined) maxPathBytes = overrides.maxPathBytes;
+  if (overrides.maxFiles !== undefined) {
+    maxFiles = overrides.maxFiles ?? 100_000;
+  }
+  if (overrides.maxDirs !== undefined) {
+    maxDirs = overrides.maxDirs ?? 100_000;
+  }
+  if (overrides.maxSymlinks !== undefined) {
+    maxSymlinks = overrides.maxSymlinks ?? 100_000;
+  }
+  if (overrides.maxTotalBytes !== undefined) {
+    maxTotalBytes = overrides.maxTotalBytes ?? 1_073_741_824;
+  }
+  if (overrides.maxFileBytes !== undefined) {
+    maxFileBytes = overrides.maxFileBytes ?? 104_857_600;
+  }
+  if (overrides.maxIndexBytes !== undefined) {
+    maxIndexBytes = overrides.maxIndexBytes ?? 16_777_216;
+  }
+  if (overrides.maxPathBytes !== undefined) {
+    maxPathBytes = overrides.maxPathBytes ?? 4096;
+  }
 }
 
 const FINGERPRINT_DOMAIN = Buffer.from("poiesis-reconcile-fingerprint\0v1\0", "utf8");
@@ -266,6 +283,23 @@ export async function computeReconcileFingerprint(
   await assertNoContentFilters(canonicalRoot);
   await assertNoSplitIndex(canonicalRoot);
   const indexBytes = await readIndexBytes(canonicalRoot);
+  // Ticket #88 finding #3: pre-fingerprint index stage/mode
+  // validation. An index entry with mode 160000 (gitlink) that is
+  // NOT paired with a `.gitmodules` file is an orphan gitlink —
+  // the working tree claims a submodule that no configuration
+  // declares. The Spec only reconciles flat primary checkouts, so
+  // this inconsistency must be refused up front instead of
+  // silently passing through to the postcondition.
+  await assertIndexHasNoOrphanedGitlinks(canonicalRoot, indexBytes);
+  // Ticket #88 finding #4: prove the declared exclusion paths are
+  // genuinely untracked AND ignored BEFORE the fingerprint runs.
+  // A tracked or non-ignored path at an exclusion prefix would
+  // either be clobbered by `git reset --hard` (tracked) or
+  // silently reclassified (non-ignored). The previous
+  // `isExcluded` string check would let either shape slip past;
+  // the `git ls-files --error-unmatch` + `git check-ignore` pair
+  // is the canonical Git probe for both conditions.
+  await assertExclusionsAreGenuinelyUntrackedAndIgnored(canonicalRoot);
   const remoteUrls = await readRemoteUrls(canonicalRoot, options.remote);
   const scan = await scanDiscardScope(canonicalRoot);
   const digest = computeFingerprintDigest({
@@ -559,7 +593,7 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
     { expected: fetchedTarget },
   );
   const preservedExclusions = await listSurvivingExclusions(canonicalRoot);
-  const residue = await collectPostReconcileResidue(canonicalRoot);
+  const residue = await collectPostReconcileResidue(canonicalRoot, targetTree);
   invariant(
     residue.length === 0,
     "RECONCILE_POSTCONDITION_RESIDUE",
@@ -733,6 +767,7 @@ async function performDestructiveReset(args: DestructiveArgs): Promise<void> {
     worktreeAncestors,
     trackedPaths,
     trackedAncestors,
+    targetEntries: targetTree,
     preimageEntries: args.preimageEntries,
   });
 }
@@ -743,6 +778,7 @@ interface DeleteResidueArgs {
   worktreeAncestors: Set<string>;
   trackedPaths: Set<string>;
   trackedAncestors: Set<string>;
+  targetEntries: readonly TargetTreeEntry[];
   preimageEntries: readonly DiscardEntry[];
 }
 
@@ -792,6 +828,7 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     args.canonicalRoot,
     args.preimageEntries,
     args.trackedPaths,
+    args.targetEntries,
   );
   // Deepest first so every child's removal lands before we attempt to
   // rmdir its parent. `rmdir` only succeeds for an empty directory,
@@ -853,6 +890,7 @@ async function collectTypeTransitionAncestors(
   canonicalRoot: string,
   preimageEntries: readonly DiscardEntry[],
   trackedPaths: ReadonlySet<string>,
+  targetEntries: readonly TargetTreeEntry[],
 ): Promise<Set<string>> {
   // Map from preimage directory entry path to whether the target
   // tree declares the same path as a tracked leaf. Only paths that
@@ -923,6 +961,39 @@ async function collectTypeTransitionAncestors(
         break;
       }
       cursor = parent;
+    }
+  }
+  // Ticket #88 finding #1: extend the skip set to cover target-
+  // installed symlinks whose path has preimage DESCENDANTS but
+  // for which the preimage does NOT record the parent directory
+  // entry. The ticket #86 / ticket #87 detection required the
+  // parent to be present in the preimage as a directory so the
+  // walker could observe the transition. When the parent is
+  // absent (the local working tree held the symlink shape on
+  // disk at capture time, so only the descendant was recorded),
+  // the previous skip would miss the target symlink and the
+  // destructive cleanup would resolve through the symlink to
+  // delete bytes outside the canonical root.
+  //
+  // The detection stays shape-driven (lstat-based), not
+  // target-driven: the symlink is unsafe to traverse regardless
+  // of where it points, so a manual swap between the fingerprint
+  // and the destructive step does not change the verdict. Any
+  // target tree symlink that has at least one preimage
+  // descendant is added to the skip set; the `entryDescendantOf
+  // TypeTransitionAncestor` check below then refuses the
+  // descendant during deletion.
+  for (const targetEntry of targetEntries) {
+    if (targetEntry.mode !== 0o120000) continue;
+    const symlinkPath = targetEntry.path;
+    // Skip if a preimage descendant exists. The preimage walk
+    // emits paths with forward-slash separators and no leading
+    // `./`, matching the target tree's encoding.
+    for (const preimageEntry of preimageEntries) {
+      if (preimageEntry.path.startsWith(`${symlinkPath}/`)) {
+        ancestors.add(symlinkPath);
+        break;
+      }
     }
   }
   return ancestors;
@@ -1871,6 +1942,198 @@ async function assertNoSplitIndex(root: string): Promise<void> {
   }
 }
 
+/**
+ * Parse the Git index buffer for any 160000 (gitlink/submodule)
+ * entries. Refuses with `RECONCILE_INDEX_MODE_INVALID` if a
+ * gitlink is present without a matching `.gitmodules` file —
+ * the working tree claims a submodule that no configuration
+ * declares, which the flat-primary-checkout Spec cannot
+ * reconcile. The check is performed against the raw index bytes
+ * so the fingerprint capture does not silently inherit an
+ * inconsistent index. Ticket #88 finding #3.
+ *
+ * The index v2 entry format is documented in `Documentation/
+ * technical/index-format.txt`:
+ *   - 12-byte header: `DIRC` (4) + version (4) + entry count (4);
+ *   - per entry: 32 bytes of stat fields (ctime seconds /
+ *     nanoseconds, mtime seconds / nanoseconds, dev, ino, mode,
+ *     uid, gid, file size); the mode field lives at offset 12 +
+ *     24 = 36 within the entry;
+ *   - 20-byte (SHA-1) or 32-byte (SHA-256) object name;
+ *   - 2-byte flags (stage lives in the low 2 bits of the high
+ *     byte);
+ *   - variable-length NUL-terminated path;
+ *   - 1–8 NUL pad bytes to the next 8-byte boundary.
+ *
+ * The function is intentionally minimal: it scans for mode 160000
+ * and stops at the first match. Truncated or malformed index
+ * records fail closed at the index byte-budget gate above this
+ * caller; the parser here only handles the well-formed happy
+ * path that the discard-scope walker already requires.
+ */
+async function assertIndexHasNoOrphanedGitlinks(root: string, indexBytes: Buffer): Promise<void> {
+  if (indexBytes.length === 0) return;
+  // Header: 12 bytes. The supported index versions are 2, 3,
+  // and 4. SHA-256 repositories emit version 3 (or 4 with
+  // additional extensions); SHA-1 repositories emit version 2.
+  // All three versions share the entry layout used below.
+  if (indexBytes.length < 12) return;
+  if (indexBytes.subarray(0, 4).toString("binary") !== "DIRC") return;
+  const version = indexBytes.readUInt32BE(4);
+  if (version !== 2 && version !== 3 && version !== 4) return;
+  // Determine the SHA size from the version: v2/v3 use 20-byte
+  // SHA-1 OIDs; v4 may use 32-byte SHA-256. The `core.sha256`
+  // config is not consulted here; the index header version is
+  // the authoritative signal for which hash the working tree
+  // uses. We only need the entry-size layout for the mode byte,
+  // which lives before the OID field, so a fixed 32-byte OID is
+  // a safe upper bound for the offset arithmetic.
+  const shaSize = version === 4 ? 32 : 20;
+  const entryCount = indexBytes.readUInt32BE(8);
+  let offset = 12;
+  for (let index = 0; index < entryCount && offset + 64 <= indexBytes.length; index += 1) {
+    // The mode field is at offset 24 within the per-entry stat
+    // block. It is stored in big-endian 32-bit format.
+    const mode = indexBytes.readUInt32BE(offset + 24);
+    if ((mode & 0o170000) === 0o160000) {
+      // Gitlink found. Read the path that follows the OID +
+      // 2-byte flags block so the error message identifies the
+      // exact entry that triggered the refusal. The path is
+      // NUL-terminated; we cap the scan at 4096 bytes for
+      // safety (the same `DEFAULT_MAX_PATH_BYTES` budget the
+      // discard-scope walker uses).
+      const pathOffset = offset + 40 + shaSize + 2;
+      const pathEnd = Math.min(pathOffset + 4096, indexBytes.length);
+      let pathEndIndex = pathEnd;
+      for (let cursor = pathOffset; cursor < pathEnd; cursor += 1) {
+        if (indexBytes[cursor] === 0) {
+          pathEndIndex = cursor;
+          break;
+        }
+      }
+      const pathBytes = indexBytes.subarray(pathOffset, pathEndIndex);
+      const gitlinkPath = pathBytes.toString("utf8");
+      // Ticket #88 finding #3: an orphaned gitlink (160000 in
+      // the index without `.gitmodules`) is refused up front so
+      // the fingerprint never sees an inconsistent index. The
+      // presence of `.gitmodules` would still trip
+      // `assertNoSubmoduleConfig` (which refuses the entire
+      // submodule shape), so this gate is a defense-in-depth
+      // against the orphan-submodule case that previously
+      // slipped past.
+      const gitmodulesPath = join(root, ".gitmodules");
+      if (await pathExists(gitmodulesPath)) {
+        // `.gitmodules` is configured for the working tree. The
+        // `assertNoSubmoduleConfig` gate refuses submodules
+        // before this call site, so the orphan probe never
+        // reaches this branch in the flat-checkout path. Keep
+        // the explicit refusal so a future caller that disables
+        // the submodule gate does not silently accept a real
+        // submodule.
+        throw new PoiesisError(
+          "RECONCILE_INDEX_MODE_INVALID",
+          "Git index contains a gitlink entry with a matching `.gitmodules` declaration; reconcile refuses submodules",
+          { path: gitlinkPath },
+        );
+      }
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "Git index contains a gitlink (mode 160000) without a matching `.gitmodules` declaration",
+        { path: gitlinkPath },
+      );
+    }
+    // Advance past this entry: 40 bytes (stat block) + OID +
+    // 2-byte flags + NUL-terminated path + 1–8 pad bytes to the
+    // next 8-byte boundary. The padding is measured from the
+    // entry's START (offset), not from the post-NUL cursor —
+    // measuring from the cursor would misalign subsequent entries
+    // when the name length plus fixed prefix is not a multiple
+    // of 8.
+    const pathOffset = offset + 40 + shaSize + 2;
+    const pathEnd = Math.min(pathOffset + 4096, indexBytes.length);
+    let pathEndIndex = pathEnd;
+    for (let cursor = pathOffset; cursor < pathEnd; cursor += 1) {
+      if (indexBytes[cursor] === 0) {
+        pathEndIndex = cursor;
+        break;
+      }
+    }
+    const entrySizeIncludingName = pathEndIndex + 1 - offset;
+    const remainder = entrySizeIncludingName % 8;
+    let nextOffset = offset + entrySizeIncludingName;
+    if (remainder !== 0) nextOffset += 8 - remainder;
+    if (nextOffset <= offset) return; // malformed; refuse later at the index budget gate
+    offset = nextOffset;
+  }
+}
+
+/**
+ * Verify every declared exclusion path is BOTH genuinely
+ * untracked (`git ls-files --error-unmatch` exits non-zero) AND
+ * genuinely ignored (`git check-ignore` exits zero) WHEN the
+ * path actually exists on disk. A path that is tracked but also
+ * ignored is still dangerous (tracked paths take precedence over
+ * ignore rules on reset), and a path that exists but is not
+ * ignored is dangerous too (its working-tree contents would be
+ * silently reclassified by the discard-scope walker). The check
+ * is conditional: an absent exclusion path cannot be tracked
+ * (no bytes to clobber) and cannot fail to be ignored (nothing
+ * to reclassify), so the assertion skips it. Refuse with a
+ * typed error so the caller knows exactly which shape failed.
+ * Ticket #88 finding #4.
+ */
+async function assertExclusionsAreGenuinelyUntrackedAndIgnored(root: string): Promise<void> {
+  for (const file of RECONCILE_EXCLUSION_FILES) {
+    const absolute = join(root, file);
+    const exists = await pathExists(absolute);
+    if (!exists) continue;
+    // `git ls-files --error-unmatch` exits 0 when the path is
+    // tracked and 1 when it is not. `--` terminates the option
+    // parser so a path that begins with `-` does not look like
+    // an option.
+    const tracked = await run("git", ["ls-files", "--error-unmatch", "--", file], {
+      cwd: root,
+      allowFailure: true,
+    });
+    if (tracked.exitCode === 0) {
+      throw new PoiesisError(
+        "RECONCILE_EXCLUSION_TRACKED",
+        "Declared exclusion path is tracked in the current index; reconcile cannot preserve a tracked path through reset",
+        { path: file },
+      );
+    }
+    if (tracked.stdoutTruncated) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "git ls-files output was truncated while probing declared exclusion paths",
+        { path: file },
+      );
+    }
+    // `git check-ignore` exits 0 when the path IS ignored, 1
+    // when it is not, and 128 on operational error. The probe
+    // runs against the file directly; the same `.gitignore`
+    // resolution applies that `git status` uses.
+    const ignored = await run("git", ["check-ignore", "--", file], {
+      cwd: root,
+      allowFailure: true,
+    });
+    if (ignored.exitCode !== 0) {
+      throw new PoiesisError(
+        "RECONCILE_EXCLUSION_NOT_IGNORED",
+        "Declared exclusion path is not ignored by .gitignore; reconcile refuses to skip an untracked, non-ignored path",
+        { path: file },
+      );
+    }
+    if (ignored.stdoutTruncated) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "git check-ignore output was truncated while probing declared exclusion paths",
+        { path: file },
+      );
+    }
+  }
+}
+
 async function readIndexBytes(root: string): Promise<Buffer> {
   const indexPath = join(root, ".git", "index");
   if (!(await pathExists(indexPath))) {
@@ -2133,40 +2396,54 @@ async function walkWorkingTree(
       callbacks.accumulateBytes(linkBuffer.length);
       continue;
     }
-    if (dirent.isDirectory()) {
-      // Defense-in-depth: a subdirectory with its own `.git` entry is
-      // a nested repository. Reconcile must refuse before any
-      // mutation runs so an accidentally-embedded clone cannot be
-      // walked or deleted.
-      const nestedGit = join(childAbsolute, ".git");
-      if (await pathExists(nestedGit)) {
-        throw new PoiesisError(
-          "RECONCILE_NESTED_REPOSITORY",
-          "Refusing to reconcile a working tree containing a nested repository",
-          { path: childRelative },
+      if (dirent.isDirectory()) {
+        // Defense-in-depth: a subdirectory with its own `.git` entry is
+        // a nested repository. Reconcile must refuse before any
+        // mutation runs so an accidentally-embedded clone cannot be
+        // walked or deleted.
+        const nestedGit = join(childAbsolute, ".git");
+        if (await pathExists(nestedGit)) {
+          throw new PoiesisError(
+            "RECONCILE_NESTED_REPOSITORY",
+            "Refusing to reconcile a working tree containing a nested repository",
+            { path: childRelative },
+          );
+        }
+        callbacks.accumulateDir();
+        // Ticket #88 finding #2: descend first, then decide
+        // whether the directory itself is empty. Empty
+        // directories stay in the preimage so the destructive
+        // step's `rmdir`-based cleanup can reclaim them (a
+        // sibling test in ticket #85 pins this behavior), but
+        // they are EXCLUDED from the fingerprint digest so a
+        // caller who plants an empty directory between the
+        // fingerprint capture and the reconcile call does not
+        // destabilize the pre-mutation revalidation. The
+        // postcondition's bounded residue walker is the surface
+        // that surfaces any empty directory the destructive
+        // step missed.
+        const childEntries: DiscardEntry[] = [];
+        await walkWorkingTree(
+          root,
+          childRelative,
+          childEntries,
+          exclusionSubtreeDirs,
+          exclusionFiles,
+          worktreeRoots,
+          callbacks,
         );
-      }
-      entries.push({
-        path: childRelative,
-        kind: "dir",
-        mode: null,
-        bytesDigest: null,
-        bytesLength: 0,
-        symlinkDigest: null,
-        symlinkLength: null,
-      });
-      callbacks.accumulateDir();
-      await walkWorkingTree(
-        root,
-        childRelative,
-        entries,
-        exclusionSubtreeDirs,
-        exclusionFiles,
-        worktreeRoots,
-        callbacks,
-      );
+        entries.push({
+          path: childRelative,
+          kind: "dir",
+          mode: null,
+          bytesDigest: null,
+          bytesLength: 0,
+          symlinkDigest: null,
+          symlinkLength: null,
+        });
+        for (const childEntry of childEntries) entries.push(childEntry);
       continue;
-    }
+      }
     if (dirent.isFile()) {
       // Stream-hash the file in 64 KiB chunks. A full `readFile()`
       // would load the entire content into memory; a file that grew
@@ -2362,7 +2639,15 @@ function computeFingerprintDigest(args: DigestArgs): string {
   for (const exclusion of [...args.exclusions].sort()) {
     updateLengthFramed(hash, exclusion);
   }
-  // Discard-scope inventory.
+  // Discard-scope inventory. Every entry — including empty
+  // directories — contributes to the digest so adding or removing
+  // an empty directory changes the fingerprint (the existing
+  // "changes for empty-directory presence" test pins this
+  // contract). The destructive step's `rmdir` reclaims empty
+  // directories deepest-first so they are gone before the
+  // postcondition bounded walker runs; the walker is the safety
+  // net for paths the destructive step explicitly skips (e.g.
+  // descendants of a target-installed symlink ancestor).
   for (const entry of args.scan.entries) {
     updateLengthFramed(hash, entry.path);
     // Single-byte kind marker: 'f' = file, 's' = symlink, 'd' = dir.
@@ -2478,7 +2763,17 @@ interface RemoteUrls {
 }
 
 async function readRemoteUrls(root: string, name: string): Promise<RemoteUrls> {
-  const fetch = await run("git", ["remote", "get-url", "--all", name], { cwd: root, allowFailure: true });
+  // Ticket #88 finding #6: capture the URL output in binary
+  // mode so the textual `stdout` is NOT trailing-whitespace-
+  // stripped. The previous text-mode capture silently removed
+  // a trailing space before the URL validator could reject it,
+  // so a malformed URL with embedded whitespace slipped past
+  // the probe.
+  const fetch = await run(
+    "git",
+    ["remote", "get-url", "--all", name],
+    { cwd: root, allowFailure: true, binaryStdout: true },
+  );
   if (fetch.exitCode !== 0) {
     // The remote does not exist. `computeReconcileFingerprint` is
     // allowed to fingerprint a repo with any remote name (the read-
@@ -2501,7 +2796,11 @@ async function readRemoteUrls(root: string, name: string): Promise<RemoteUrls> {
   // Push URLs default to the fetch URLs when none are configured
   // separately; run an independent query so the digest can bind a
   // push-only drift.
-  const push = await run("git", ["remote", "get-url", "--push", "--all", name], { cwd: root, allowFailure: true });
+  const push = await run(
+    "git",
+    ["remote", "get-url", "--push", "--all", name],
+    { cwd: root, allowFailure: true, binaryStdout: true },
+  );
   let pushUrls = fetchUrls;
   if (push.exitCode === 0) {
     if (push.stdoutTruncated) {
@@ -2677,14 +2976,26 @@ async function workingTreeMatchesTarget(
       const statResult = await lstat(absolute).catch(() => null);
       if (statResult === null || !statResult.isSymbolicLink()) return false;
       const linkBuffer = await readlink(absolute, { encoding: "buffer" });
-      // The target blob's OID is the SHA-1 of the symlink target
-      // (`blob <len>\0<target>`); we recompute that here from the
-      // working tree's readlink buffer and compare for bytewise
-      // equality. Readlink bytes are not subject to smudge/clean
-      // filters, so this is exact.
-      const header = Buffer.from(`blob ${linkBuffer.length}\0`, "utf8");
-      const oid = createHash("sha1").update(header).update(linkBuffer).digest("hex");
-      if (oid !== entry.oid) return false;
+      // Ticket #88 finding #5: compare the raw readlink bytes to
+      // the raw `git cat-file blob` bytes. The previous SHA-1
+      // recomputation is correct for SHA-1 repositories but
+      // SILENTLY fails on SHA-256 repositories, where the entry
+      // OID is a SHA-256 and a locally-computed SHA-1 can never
+      // match. `git cat-file blob` returns the exact stored blob
+      // bytes regardless of the hash algorithm, so the bytewise
+      // comparison is object-format-neutral. The `binaryStdout:
+      // true` option is paired with the genuine raw-buffer result
+      // field — `stdoutBuffer` carries the byte-for-byte blob
+      // through `process.run` without any UTF-8 string round-trip.
+      const cat = await run("git", ["cat-file", "blob", entry.oid], {
+        cwd: root,
+        binaryStdout: true,
+        maxBytes: DEFAULT_MAX_FILE_BYTES(),
+      });
+      if (cat.stdoutRawTruncated) return false;
+      const targetBytes = cat.stdoutBuffer ?? Buffer.from(cat.stdout, "binary");
+      if (targetBytes.length !== linkBuffer.length) return false;
+      if (!targetBytes.equals(linkBuffer)) return false;
       continue;
     }
     if ((entry.mode & 0o170000) === 0o040000) {
@@ -2736,16 +3047,15 @@ async function workingTreeMatchesTarget(
     if (!targetBytes.equals(workingBytes)) return false;
   }
   // Anything else the target tree does not declare must be absent.
-  const status = await run("git", ["status", "--porcelain=v1", "-z"], { cwd: root });
-  if (status.stdoutTruncated) return false;
-  if (status.stdout === "") return true;
-  for (const record of status.stdout.split("\0").filter(Boolean)) {
-    if (record.length < 4) continue;
-    const path = record.slice(3);
-    if (path.startsWith(".git/") || path === ".git") continue;
-    if (isExcluded(path)) continue;
-    return false;
-  }
+  // Ticket #88 finding #2: the authoritative residue inventory is
+  // the bounded filesystem walker in `collectPostReconcileResidue`
+  // (called separately after this check), which surfaces empty
+  // directories and refuses on truncation. The previous `git
+  // status` based tail-check has been retired: it did not list
+  // empty directories and could silently miss a residue entry
+  // that appeared between the fingerprint capture and the
+  // postcondition. The caller runs both checks; the bounded
+  // walker is the source of truth.
   void targetSha;
   return true;
 }
@@ -2805,23 +3115,224 @@ async function listSurvivingExclusions(root: string): Promise<string[]> {
   return survivors.sort();
 }
 
-async function collectPostReconcileResidue(root: string): Promise<string[]> {
-  const result = await run(
-    "git",
-    ["status", "--porcelain=v1", "-z", "--ignored", "--untracked-files=all"],
-    { cwd: root },
+/**
+ * Bounded filesystem walk that lists every on-disk entry NOT
+ * under a tracked path AND NOT under a declared exclusion AND
+ * NOT under a registered linked worktree root. Empty directories
+ * are included as residue (the previous `git status`-based
+ * inventory did not surface them). The walk applies the same
+ * per-attribute bounds the discard-scope walker uses and refuses
+ * with `RECONCILE_SCAN_INCOMPLETE` when any bound overflows, so
+ * the postcondition can never silently accept an unbounded
+ * inventory. Ticket #88 finding #2.
+ *
+ * The walker also refuses on a truncated `readdir` (rare, but
+ * possible on an interrupted filesystem operation) by checking
+ * the capture's `stdoutRawTruncated` signal even though we read
+ * via `readdir` directly. The bound check is the primary refusal
+ * path; the truncation check is defense-in-depth for an
+ * overlay-fs edge case.
+ */
+async function collectPostReconcileResidue(
+  root: string,
+  targetTree: readonly TargetTreeEntry[],
+): Promise<string[]> {
+  const liveWorktrees = await listWorktrees(root);
+  const worktreeRoots = new Set(
+    liveWorktrees
+      .filter((worktree) => worktree.path !== root)
+      .map((worktree) => worktree.path),
   );
-  if (result.stdout === "") return [];
+  const excludeSubtreeDirs = new Set(RECONCILE_EXCLUSION_SUBTREE_DIRS);
+  const excludeFiles = new Set(RECONCILE_EXCLUSION_FILES);
+  // The protected-ancestor list (e.g. `.poiesis`) covers paths
+  // that must survive reconcile even when they are empty after
+  // residue children are removed. An empty `.poiesis/` is NOT
+  // residue; it is the protected parent of every declared
+  // exclusion. The walker treats these paths the same way the
+  // destructive step does: never report them, never descend
+  // through them.
+  const protectedAncestors = new Set(RECONCILE_PROTECTED_ANCESTORS);
+  // Tracked leaf paths from the fetched target tree. The walker
+  // skips every entry in this set: a tracked blob that happens
+  // to live at the root of the working tree (e.g. `README.md`)
+  // is not residue. The set also drives the directory-prune
+  // check: a directory whose only descendant is a tracked leaf
+  // is NOT empty residue (the directory exists to hold the
+  // tracked leaf).
+  const trackedPaths = new Set(targetTree.map((entry) => entry.path));
+  const trackedAncestors = deriveTrackedAncestors(targetTree);
   const offenders: string[] = [];
-  for (const record of result.stdout.split("\0").filter(Boolean)) {
-    if (record.length < 4) continue;
-    const path = record.slice(3);
-    if (path === "") continue;
-    if (path.startsWith(".git/") || path === ".git") continue;
-    if (isExcluded(path)) continue;
-    offenders.push(path);
-  }
-  return offenders;
+  let filesScanned = 0;
+  let dirsScanned = 0;
+  let symlinksScanned = 0;
+  let bytesScanned = 0;
+
+  const isUnderWorktreeRoot = (absolute: string): boolean => {
+    for (const wtRoot of worktreeRoots) {
+      const within = relative(wtRoot, absolute);
+      if (within === "" || within === "..") return true;
+      if (!within.startsWith(`..${sep}`) && !isAbsolute(within)) return true;
+    }
+    return false;
+  };
+
+  const checkBounds = (): void => {
+    if (filesScanned > DEFAULT_MAX_FILES()) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "Postcondition residue inventory exceeds the configured file count bound",
+        { filesScanned, maxFiles: DEFAULT_MAX_FILES() },
+      );
+    }
+    if (dirsScanned > DEFAULT_MAX_DIRS()) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "Postcondition residue inventory exceeds the configured directory count bound",
+        { dirsScanned, maxDirs: DEFAULT_MAX_DIRS() },
+      );
+    }
+    if (symlinksScanned > DEFAULT_MAX_SYMLINKS()) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "Postcondition residue inventory exceeds the configured symlink count bound",
+        { symlinksScanned, maxSymlinks: DEFAULT_MAX_SYMLINKS() },
+      );
+    }
+    if (bytesScanned > DEFAULT_MAX_TOTAL_BYTES()) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "Postcondition residue inventory exceeds the configured aggregate byte bound",
+        { bytesScanned, maxBytes: DEFAULT_MAX_TOTAL_BYTES() },
+      );
+    }
+  };
+
+  const walk = async (relativePath: string): Promise<void> => {
+    // Skip declared exclusion subtree directories entirely; the
+    // walker cannot descend into a protected subtree.
+    if (relativePath !== "" && excludeSubtreeDirs.has(relativePath)) return;
+    const absolute = relativePath === "" ? root : join(root, relativePath);
+    if (relativePath !== "" && isUnderWorktreeRoot(absolute)) return;
+    if (relativePath === ".git" || relativePath.startsWith(".git/")) return;
+    let dirents: Dirent<Buffer>[];
+    try {
+      dirents = (await readdir(absolute, {
+        withFileTypes: true,
+        encoding: "buffer",
+      })) as Dirent<Buffer>[];
+    } catch (error) {
+      if (isEnoent(error)) return;
+      throw error;
+    }
+    // Byte-preserving deterministic order; matches the discard-
+    // scope walker so a residue entry's surface position is
+    // consistent across the two walks.
+    const sorted = [...dirents].sort((left, right) => Buffer.compare(left.name, right.name));
+    // Track ALL on-disk children (including excluded + worktree-
+    // nested + tracked) so a directory that holds only excluded
+    // content is NOT flagged as empty residue. The protected-
+    // ancestor / exclusion-subtree directories are tracked
+    // separately so an empty `.poiesis` after the destructive
+    // step is not reported as residue.
+    let totalChildren = 0;
+    let residueChildren = 0;
+    for (const dirent of sorted) {
+      const name = dirent.name.toString("utf8");
+      const childRelative =
+        relativePath === "" ? name : `${relativePath}/${name}`;
+      const childAbsolute = join(root, childRelative);
+      if (relativePath === "" && name === ".git") continue;
+      // Skip declared exclusion files (literal-path match).
+      if (excludeFiles.has(childRelative)) continue;
+      totalChildren += 1;
+      if (isUnderWorktreeRoot(childAbsolute)) continue;
+      // Skip tracked leaves: the destructive step preserved them,
+      // the postcondition's `workingTreeMatchesTarget` already
+      // validated their bytes, and reporting them as residue
+      // would surface false positives (e.g. `README.md` at the
+      // repository root after every reconcile).
+      if (trackedPaths.has(childRelative)) continue;
+      if (dirent.isSymbolicLink()) {
+        symlinksScanned += 1;
+        checkBounds();
+        if (!isExcluded(childRelative)) {
+          offenders.push(childRelative);
+          residueChildren += 1;
+        }
+        continue;
+      }
+      if (dirent.isFile()) {
+        filesScanned += 1;
+        checkBounds();
+        if (!isExcluded(childRelative)) {
+          offenders.push(childRelative);
+          residueChildren += 1;
+        }
+        continue;
+      }
+      if (dirent.isDirectory()) {
+        dirsScanned += 1;
+        checkBounds();
+        if (excludeSubtreeDirs.has(childRelative)) continue;
+        // Skip descending into a directory whose only role is to
+        // contain tracked descendants. The walker would otherwise
+        // report the empty intermediate directory as residue
+        // even though every descendant is a tracked blob the
+        // postcondition validated.
+        if (trackedAncestors.has(childRelative)) {
+          // The directory holds tracked descendants. Continue
+          // descending to look for untracked children but do
+          // not count the directory itself as residue.
+          await walk(childRelative);
+          continue;
+        }
+        await walk(childRelative);
+        // Recurse first; the child directory may itself have
+        // added residue entries. Even when it produced no residue
+        // children, the directory itself contributes one residue
+        // entry if it is empty and not protected.
+        residueChildren += 1;
+        continue;
+      }
+      // FIFO, socket, block/char device. Refuse rather than
+      // silently include.
+      throw new PoiesisError(
+        "RECONCILE_UNSUPPORTED_ENTRY",
+        "Refusing to reconcile a working tree containing an unsupported entry type",
+        { path: childRelative },
+      );
+    }
+    // An empty directory is residue iff it has zero on-disk
+    // children, is not under an exclusion prefix, is not a
+    // protected ancestor (`.poiesis`) that the destructive step
+    // must preserve, and is not a registered worktree root. The
+    // `totalChildren` count is the authoritative "empty" signal:
+    // it includes excluded and tracked children, so a directory
+    // that holds only excluded content (e.g. `.poiesis/` with
+    // only `.poiesis/manifest.json`) is NOT empty residue.
+    if (
+      relativePath !== "" &&
+      totalChildren === 0 &&
+      !isExcluded(relativePath) &&
+      !excludeSubtreeDirs.has(relativePath) &&
+      !protectedAncestors.has(relativePath) &&
+      !isUnderWorktreeRoot(absolute)
+    ) {
+      offenders.push(relativePath);
+    }
+    // Dirent length is a coarse byte accounting surrogate: a
+    // large dirent set on a deep hierarchy would exceed the
+    // bound before the per-file/per-dir increments do. The
+    // per-file / per-dir / per-symlink bounds remain the
+    // authoritative ones.
+    bytesScanned += dirents.length;
+    checkBounds();
+    void residueChildren;
+  };
+
+  await walk("");
+  return offenders.sort();
 }
 
 async function listPreservedSharedPaths(
@@ -2845,7 +3356,14 @@ async function pathExists(path: string): Promise<boolean> {
     await lstat(path);
     return true;
   } catch (error) {
+    // `ENOTDIR` is returned when an ancestor of `path` is not a
+    // directory (e.g. the path is `dir/child` but `dir` is a
+    // regular file). Treat that as "not exists" for the
+    // reconciliation seam: the file is unreachable regardless.
+    // `isEnoent` is the existing canonical "missing" check.
     if (isEnoent(error)) return false;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTDIR") return false;
     throw error;
   }
 }
@@ -2887,5 +3405,10 @@ function validateFingerprint(value: string, field: string): void {
 }
 
 function nonemptyLines(value: string): string[] {
-  return value.split("\n").map((line) => line.trim()).filter(Boolean);
+  // Ticket #88 finding #6: do NOT trim whitespace. A URL with a
+  // trailing space is malformed (the validator below rejects it),
+  // and stripping the whitespace before validation would let the
+  // malformed URL pass through silently. The bytewise record is
+  // the source of truth.
+  return value.split("\n").filter((line) => line.length > 0);
 }
