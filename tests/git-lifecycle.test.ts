@@ -516,6 +516,7 @@ describe("GitHub provider headRepository handling", () => {
       stdout,
       stderr: "",
       stdoutTruncated: false,
+      stdoutRawTruncated: false,
       stderrTruncated: false,
       timedOut: false,
       signal: null,

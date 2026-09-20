@@ -15,7 +15,15 @@ const IS_WINDOWS = process.platform === "win32";
 export interface RunOptions {
   cwd: string;
   env?: NodeJS.ProcessEnv;
-  input?: string;
+  /**
+   * Stdin payload. When `undefined` the child's stdin is closed
+   * immediately (the previous behavior). When a string, Node pipes
+   * it through as UTF-8 bytes. When a `Buffer`, Node pipes it raw
+   * so the child receives the exact byte sequence — used by
+   * ticket #85 finding #6 callers that feed `git hash-object
+   * --stdin` from a literal binary blob.
+   */
+  input?: string | Buffer;
   allowFailure?: boolean;
   timeoutMs?: number;
   maxBytes?: number;
@@ -36,17 +44,67 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   stdoutTruncated: boolean;
+  /**
+   * `true` only when the raw captured stream was truncated by the
+   * byte budget. UTF-8 prefix truncation of the textual `stdout`
+   * leaves this `false`. Use this in tandem with `stdoutBuffer` for
+   * byte-for-byte comparisons that must distinguish "lost data" from
+   * "round-tripped through UTF-8 with a partial prefix".
+   */
+  stdoutRawTruncated: boolean;
   stderrTruncated: boolean;
   timedOut: boolean;
   signal: NodeJS.Signals | null;
   durationMs: number;
+  /**
+   * Raw stdout bytes captured when `binaryStdout: true` was set.
+   * Stays `undefined` for text-mode runs so callers keep the
+   * existing string-based API for default consumers. `undefined`
+   * for the text-mode path is the contract that the binary path
+   * is opt-in via the `stdoutBuffer` field.
+   */
+  stdoutBuffer?: Buffer;
 }
+
+/**
+ * Shared fatal UTF-8 decoder. Throws on invalid UTF-8 byte sequences
+ * so callers can detect ambiguous path-name encodings without falling
+ * back to the lossy `Buffer.toString("utf8")` default.
+ *
+ * Exported from this module because the discard-scope walker in
+ * `reconcile.ts` reuses it for both path validation and the aliasing
+ * check (issue #85 finding 4).
+ */
+export const TEXT_DECODER_FATAL = new TextDecoder("utf-8", { fatal: true });
 
 interface Capture {
   chunks: Buffer[];
   bytes: number;
+  /**
+   * Set when either the byte-budget truncated the raw stream OR the
+   * UTF-8 prefix truncation took a non-empty prefix down to fewer
+   * bytes. The postcondition uses the dedicated `rawTruncated`
+   * field for binary-mode checks so a UTF-8 prefix truncation does
+   * not falsely mark an intact raw blob as truncated.
+   */
   truncated: boolean;
+  /**
+   * Set only when the byte-budget truncated the raw captured
+   * stream. UTF-8 prefix truncation (which only affects the
+   * string-mode `stdout`) leaves this flag false.
+   */
+  rawTruncated: boolean;
   finalized: boolean;
+  /**
+   * Bytes captured before any finalization mutates the buffer. The
+   * binary-mode API (`binaryStdout: true` + `RunResult.stdoutBuffer`)
+   * reads from this field so callers receive the exact byte sequence
+   * the child emitted, without UTF-8 transcoding or prefix
+   * truncation. The string-mode `stdout` field still routes through
+   * `finalizeCapture` for textual runs.
+   */
+  rawBytes: Buffer[];
+  rawBytesLength: number;
 }
 
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
@@ -87,18 +145,33 @@ export async function run(command: string, args: string[], options: RunOptions):
     let graceTimer: NodeJS.Timeout | null = null;
     let ownedGroupMembers: Map<number, string> | null = null;
 
-    const buildResult = (): RunResult => ({
-      command,
-      args,
-      exitCode,
-      stdout: binaryStdout ? captureText(stdout) : stripTrailingWhitespace(captureText(stdout)),
-      stderr: stripTrailingWhitespace(captureText(stderr)),
-      stdoutTruncated: stdout.truncated,
-      stderrTruncated: stderr.truncated,
-      timedOut,
-      signal: exitSignal,
-      durationMs: Date.now() - startedAt,
-    });
+    const buildResult = (): RunResult => {
+      // Capture the raw binary buffer BEFORE any text-mode
+      // finalization mutates the capture (the `finalizeCapture` step
+      // truncates to the largest UTF-8 prefix, which would lose
+      // invalid bytes). The binary path is only set on
+      // `binaryStdout: true` runs, and is opt-in via the
+      // `stdoutBuffer` result field.
+      const rawBuffer = binaryStdout ? captureBuffer(stdout) : undefined;
+      const text = captureText(stdout);
+      const result: RunResult = {
+        command,
+        args,
+        exitCode,
+        stdout: binaryStdout ? text : stripTrailingWhitespace(text),
+        stderr: stripTrailingWhitespace(captureText(stderr)),
+        stdoutTruncated: stdout.truncated,
+        stdoutRawTruncated: stdout.rawTruncated,
+        stderrTruncated: stderr.truncated,
+        timedOut,
+        signal: exitSignal,
+        durationMs: Date.now() - startedAt,
+      };
+      if (binaryStdout && rawBuffer !== undefined) {
+        result.stdoutBuffer = rawBuffer;
+      }
+      return result;
+    };
 
     const settle = (): void => {
       if (settled) return;
@@ -286,6 +359,11 @@ export async function run(command: string, args: string[], options: RunOptions):
     }, timeoutMs);
 
     if (options.input !== undefined && child.stdin !== null) {
+      // Buffer inputs are piped raw (Node's `WritableStream.end`
+      // accepts Buffer chunks verbatim); string inputs default to
+      // the Node stdio encoding (UTF-8). Buffer support is the
+      // ticket #85 finding #6 path that preserves raw bytes through
+      // `git hash-object --stdin` for target blob staging.
       child.stdin.end(options.input);
     }
   });
@@ -299,7 +377,15 @@ export function bounded(value: string, limit = 8_000): string {
 }
 
 function createCapture(): Capture {
-  return { chunks: [], bytes: 0, truncated: false, finalized: false };
+  return {
+    chunks: [],
+    bytes: 0,
+    truncated: false,
+    rawTruncated: false,
+    finalized: false,
+    rawBytes: [],
+    rawBytesLength: 0,
+  };
 }
 
 function consume(capture: Capture, chunk: Buffer, maxBytes: number): void {
@@ -307,8 +393,17 @@ function consume(capture: Capture, chunk: Buffer, maxBytes: number): void {
   if (keep > 0) {
     capture.chunks.push(Buffer.from(chunk.subarray(0, keep)));
     capture.bytes += keep;
+    // Mirror the kept bytes into the raw-bytes buffer that the
+    // binary-mode API reads from. Only kept bytes are recorded; the
+    // byte budget is shared between text and binary paths so a
+    // budget violation shows up identically in both modes.
+    capture.rawBytes.push(Buffer.from(chunk.subarray(0, keep)));
+    capture.rawBytesLength += keep;
   }
-  if (keep < chunk.length) capture.truncated = true;
+  if (keep < chunk.length) {
+    capture.truncated = true;
+    capture.rawTruncated = true;
+  }
 }
 
 function finalizeCapture(capture: Capture): void {
@@ -317,6 +412,10 @@ function finalizeCapture(capture: Capture): void {
   const bytes = Buffer.concat(capture.chunks, capture.bytes);
   const safeLength = completeUtf8PrefixLength(bytes);
   if (safeLength < bytes.length) capture.truncated = true;
+  // `rawTruncated` is only set when the byte budget itself
+  // truncated the raw stream. UTF-8 prefix truncation only affects
+  // the string-mode `stdout` and leaves the raw bytes intact, so
+  // it does not flag the raw stream.
   capture.chunks = safeLength === 0 ? [] : [Buffer.from(bytes.subarray(0, safeLength))];
   capture.bytes = safeLength;
 }
@@ -324,6 +423,18 @@ function finalizeCapture(capture: Capture): void {
 function captureText(capture: Capture): string {
   finalizeCapture(capture);
   return Buffer.concat(capture.chunks, capture.bytes).toString("utf8");
+}
+
+/**
+ * Return the captured byte buffer exactly as it was received — no
+ * UTF-8 transcoding, no trailing-whitespace strip, no UTF-8 prefix
+ * truncation. The companion of `captureText` for the binary-mode
+ * result. Reads from `rawBytes` because `finalizeCapture` (called
+ * on stdout close) would otherwise have already truncated `chunks`
+ * to the largest UTF-8 prefix before this runs.
+ */
+function captureBuffer(capture: Capture): Buffer {
+  return Buffer.from(Buffer.concat(capture.rawBytes, capture.rawBytesLength));
 }
 
 function completeUtf8PrefixLength(buffer: Buffer): number {

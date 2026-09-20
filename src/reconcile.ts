@@ -38,6 +38,7 @@ import {
   readdir,
   readFile,
   rm,
+  rmdir,
   stat,
 } from "node:fs/promises";
 import { createReadStream, realpathSync } from "node:fs";
@@ -45,7 +46,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { realpath, readlink } from "node:fs/promises";
 import type { Dirent } from "node:fs";
 import { PoiesisError, invariant } from "./errors.js";
-import { bounded, run } from "./process.js";
+import { bounded, run, TEXT_DECODER_FATAL } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
 import { acquireWorkspaceMutationLock } from "./mutation-transaction.js";
 
@@ -54,13 +55,47 @@ export const RECONCILE_FINGERPRINT_SCHEMA = 1;
 /**
  * Canonical local Poiesis state paths that may survive a destructive
  * reconciliation when they are genuinely untracked/ignored and
- * collision-safe with the fetched target tree. The exclusions list is
- * a closed, narrowly-scoped constant — the destructive reconcile MUST
- * NOT accept caller-supplied exclusions from the public surface.
+ * collision-safe. The exclusions list is a closed, narrowly-scoped
+ * constant — the destructive reconcile MUST NOT accept caller-supplied
+ * exclusions from the public surface.
+ *
+ * The set is split into:
+ *
+ *   - `RECONCILE_EXCLUSION_SUBTREE_DIRS`: directories the discard-scope
+ *     walker must NOT descend into. `.poiesis/workspaces/` is the
+ *     closed set of Poiesis-owned worktree prefixes; its contents are
+ *     preserved in place.
+ *
+ *   - `RECONCILE_EXCLUSION_FILES`: individual file paths the walker
+ *     skips (does not include in the preimage). `.poiesis/manifest.json`
+ *     is the canonical local state file.
+ *
+ *   - `RECONCILE_PROTECTED_ANCESTORS`: directory paths that are
+ *     ancestors of an exclusion and MUST NEVER be deleted by the
+ *     destructive step, even when empty after residue children are
+ *     removed. `.poiesis` is included because deleting it would
+ *     orphan the manifest in a way the collision check could not
+ *     detect (a target blob at `.poiesis` would also be refused via
+ *     the `RECONCILE_EXCLUSION_COLLISION` check).
+ *
+ * Ticket #85 finding #2: this split separates the walker's "skip
+ * subtree" set from the deletion walker's "protected ancestor" set.
+ * The original `deriveExclusionBases` collapsed the two: every
+ * ancestor was both a walk-skip and a delete-protect, which meant
+ * `.poiesis/other/*` (a NONE-excluded prefix under the same parent)
+ * was never fingerprinted or cleaned.
+ */
+const RECONCILE_EXCLUSION_SUBTREE_DIRS: readonly string[] = [".poiesis/workspaces"];
+const RECONCILE_EXCLUSION_FILES: readonly string[] = [".poiesis/manifest.json"];
+const RECONCILE_PROTECTED_ANCESTORS: readonly string[] = [".poiesis"];
+/**
+ * The previous names — kept for the public API and the protected-paths
+ * helper that the deletion walker uses. Both `EXCLUSION_PATHS` and
+ * the new split are derived from the same canonical source.
  */
 const RECONCILE_EXCLUSION_PATHS: readonly string[] = [
-  ".poiesis/manifest.json",
-  ".poiesis/workspaces/",
+  ...RECONCILE_EXCLUSION_FILES,
+  ...RECONCILE_EXCLUSION_SUBTREE_DIRS.map((dir) => `${dir}/`),
 ];
 
 /**
@@ -384,8 +419,22 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
   // `.poiesis` file (e.g. a stray lockfile) would otherwise pass the
   // collision check because no entry in the target tree sits under
   // the exclusion path itself. Ticket #84 finding #2.
+  //
+  // Ticket #85 finding #3: the collision set is extended to include
+  // every registered linked worktree root AND its ancestors. A
+  // target blob whose path equals or descends through a registered
+  // worktree's directory would clobber the worktree's territory on
+  // `git reset --hard`; a target blob whose path IS an ancestor of
+  // a registered worktree would replace the parent directory of the
+  // worktree. Both shapes are refused with `RECONCILE_TARGET_COLLISION`.
   const targetTree = await listTargetTree(canonicalRoot, fetchedTarget);
   const exclusionBases = deriveExclusionBases(RECONCILE_EXCLUSION_PATHS);
+  const worktreesForCollision = await listWorktrees(canonicalRoot);
+  const protectedWorktreePaths = new Set(
+    worktreesForCollision
+      .filter((worktree) => worktree.path !== canonicalRoot)
+      .map((worktree) => worktree.path),
+  );
   for (const entry of targetTree) {
     invariant(
       !pathCollidesWithExclusion(entry.path, exclusionBases),
@@ -393,7 +442,20 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
       "Declared exclusion path (or its ancestor) overlaps a tracked target path",
       { path: entry.path },
     );
+    const absolute = resolve(canonicalRoot, entry.path);
+    invariant(
+      !collidesWithWorktreeAncestry(entry.path, absolute, protectedWorktreePaths, canonicalRoot),
+      "RECONCILE_TARGET_COLLISION",
+      "Target tracked path overlaps a registered linked worktree root or its ancestor",
+      { path: entry.path },
+    );
   }
+  // Ticket #85 finding #5: also refuse a fetched target tree that
+  // introduces `.gitattributes` at any path. The HEAD/index/worktree
+  // may be clean, but the target tree's `src/.gitattributes` would
+  // change the effective attributes on reset and break the
+  // postcondition's bytewise equality check.
+  refuseAnyGitattributesInTarget(targetTree);
 
   // Snapshot the registered linked worktree roots. Two consumers:
   //   - `expectedWorktrees` baseline check below: compare the live set
@@ -650,19 +712,27 @@ async function performDestructiveReset(args: DestructiveArgs): Promise<void> {
   // NOT in the target tree, NOT a declared exclusion, NOT a
   // registered linked worktree root, and NOT under `.git/`. The
   // protected ancestor (`.poiesis`) of any declared exclusion is
-  // preserved automatically by the `isExcluded` prefix test.
+  // preserved automatically by the `computeProtectedPaths` prefix
+  // test, and ticket #85 finding #1 extends the protection to
+  // tracked-target ancestors AND worktree ancestors so a recursive
+  // `rm` cannot reach into a tracked directory or a worktree's
+  // parent dir.
   const targetTree = await listTargetTree(args.canonicalRoot, args.targetSha);
   const trackedPaths = new Set(targetTree.map((entry) => entry.path));
+  const trackedAncestors = deriveTrackedAncestors(targetTree);
   const liveWorktrees = await listWorktrees(args.canonicalRoot);
   const worktreeRoots = new Set(
     liveWorktrees
       .filter((worktree) => worktree.path !== args.canonicalRoot)
       .map((worktree) => worktree.path),
   );
+  const worktreeAncestors = deriveWorktreeAncestors(args.canonicalRoot, liveWorktrees);
   await deleteResidue({
     canonicalRoot: args.canonicalRoot,
     worktreeRoots,
+    worktreeAncestors,
     trackedPaths,
+    trackedAncestors,
     preimageEntries: args.preimageEntries,
   });
 }
@@ -670,23 +740,41 @@ async function performDestructiveReset(args: DestructiveArgs): Promise<void> {
 interface DeleteResidueArgs {
   canonicalRoot: string;
   worktreeRoots: Set<string>;
+  worktreeAncestors: Set<string>;
   trackedPaths: Set<string>;
+  trackedAncestors: Set<string>;
   preimageEntries: readonly DiscardEntry[];
 }
 
 async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
-  // Compute the set of protected paths: declared exclusions + every
-  // ancestor of a declared exclusion + every preimage descendant of
-  // a declared exclusion base. A protected path is NEVER deleted by
-  // reconcile — its presence in the preimage is the residue scan's
-  // signal that the live filesystem matches the exclusion contract,
-  // not a free ticket to remove it. Skipping deletion here is what
-  // protects `.poiesis` itself even when `.poiesis/manifest.json`
-  // appears as a residue descendant.
-  const protectedPaths = computeProtectedPaths(args.preimageEntries);
-  // Delete in the order the preimage recorded: deepest first so a
-  // parent directory's children are gone before we try to remove the
-  // parent.
+  // Build the closed set of paths the destructive step must NEVER
+  // touch. The set is the union of:
+  //
+  //   - tracked paths (the target tree's leaves) — already preserved
+  //     by the `trackedPaths` skip below;
+  //   - tracked ancestors (every parent of a tracked leaf) — these are
+  //     the directories whose existence is required for the working
+  //     tree to match the target; ticket #85 finding #1;
+  //   - declared exclusion files (`.poiesis/manifest.json`) and the
+  //     directory roots of declared exclusion subtrees (`.poiesis/`);
+  //   - the protected ancestors that lead to a declared exclusion or
+  //     to a registered worktree root (e.g. the `distant/sibling/`
+  //     that contains the `distant/sibling/wt/` registered worktree);
+  //   - preimage entries recorded under a declared exclusion subtree
+  //     (covers the `:other` shape by transitively promoting a
+  //     residue descendant of an exclusion base to "protected" — the
+  //     walker will not descend into a real exclusion subtree, so
+  //     this only catches the preimage-internal-cleanup edge where a
+  //     descendant somehow lands in scope).
+  const protectedPaths = computeProtectedPaths({
+    preimageEntries: args.preimageEntries,
+    trackedAncestors: args.trackedAncestors,
+    worktreeAncestors: args.worktreeAncestors,
+  });
+  // Deepest first so every child's removal lands before we attempt to
+  // rmdir its parent. `rmdir` only succeeds for an empty directory,
+  // so a non-protected dir with a still-tracked child stays in
+  // place (no children removed → rmdir throws ENOTEMPTY → ignored).
   const sorted = [...args.preimageEntries].sort((left, right) => {
     if (left.path.length !== right.path.length) return right.path.length - left.path.length;
     return left.path.localeCompare(right.path);
@@ -697,44 +785,91 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     if (args.trackedPaths.has(entry.path)) continue;
     if (protectedPaths.has(entry.path)) continue;
     const absolute = resolve(args.canonicalRoot, entry.path);
+    // Direct entry into / under a registered worktree: leave alone.
+    // The worktree's working tree is its own territory; reconcile never
+    // touches it. (External worktree roots are checked here too.)
     if (isInsideAnyWorktreeRoot(args.worktreeRoots, absolute)) continue;
     await safeRemoveWithinRoot(args.canonicalRoot, entry.path);
   }
 }
 
+interface ProtectedPathsArgs {
+  preimageEntries: readonly DiscardEntry[];
+  trackedAncestors: Set<string>;
+  worktreeAncestors: Set<string>;
+}
+
 /**
- * Compute the closed set of paths reconcile must never delete. A
- * path is protected when it (a) is a declared exclusion, (b) is an
- * ancestor of a declared exclusion, or (c) is the preimage record
- * of a path that descends from an exclusion base. The third case
- * catches the typical residue shape where `.poiesis/manifest.json`
- * exists as an untracked file under the `.poiesis` ancestor — the
- * ancestor itself must NOT be deleted just because no other entry
- * points at it.
+ * Compute the closed set of paths reconcile must never delete.
+ * The set covers:
+ *
+ *   - declared exclusion file/script paths (e.g. `.poiesis/manifest.json`);
+ *   - the directory roots of declared exclusion subtrees (e.g. `.poiesis`);
+ *   - the recorded ancestors of declared exclusion roots and
+ *     exclusion files (`.poiesis` → `.`);
+ *   - the recorded ancestors of every registered linked worktree
+ *     root (the `distant/sibling/` parent of `distant/sibling/wt/`);
+ *   - tracked-target ancestors (the `src/` of a tracked `src/foo.txt`)
+ *     so the destructive step never wipes a directory that contains
+ *     a tracked child;
+ *   - any preimage entry recorded under a declared exclusion subtree
+ *     (catches the `.poiesis/manifest.json`-and-sibling shape, where
+ *     a transitively-related residue must not be deleted).
+ *
+ * The output is a `Set<string>` of canonical forward-slash paths
+ * relative to the repository root. The deletion walker consults the
+ * set to refuse the entry (`skip`) before any `rm` / `rmdir` runs.
  */
-function computeProtectedPaths(entries: readonly DiscardEntry[]): Set<string> {
+function computeProtectedPaths(args: ProtectedPathsArgs): Set<string> {
   const protectedPaths = new Set<string>();
-  for (const exclusion of RECONCILE_EXCLUSION_PATHS) {
-    const base = exclusion.endsWith("/") ? exclusion.slice(0, -1) : exclusion;
-    protectedPaths.add(base);
-    let cursor = base;
+  // 1. Declared exclusion ancestors + subtree roots.
+  for (const dir of RECONCILE_EXCLUSION_SUBTREE_DIRS) {
+    protectedPaths.add(dir);
+    let cursor = dir;
     while (cursor.includes("/")) {
       const parent = cursor.slice(0, cursor.lastIndexOf("/"));
-        if (parent === "") break;
-        protectedPaths.add(parent);
-        cursor = parent;
+      if (parent === "") break;
+      protectedPaths.add(parent);
+      cursor = parent;
     }
   }
-  for (const entry of entries) {
-    for (const exclusion of RECONCILE_EXCLUSION_PATHS) {
-      const base = exclusion.endsWith("/") ? exclusion.slice(0, -1) : exclusion;
-      if (
-        entry.path === base ||
-        entry.path.startsWith(`${base}/`)
-      ) {
-        // The entry itself is part of the exclusion subtree; mark
-        // the path and every ancestor as protected so the deletion
-        // walker never reaches it.
+  for (const file of RECONCILE_EXCLUSION_FILES) {
+    protectedPaths.add(file);
+    let cursor = file;
+    while (cursor.includes("/")) {
+      const parent = cursor.slice(0, cursor.lastIndexOf("/"));
+      if (parent === "") break;
+      protectedPaths.add(parent);
+      cursor = parent;
+    }
+  }
+  for (const ancestor of RECONCILE_PROTECTED_ANCESTORS) {
+    protectedPaths.add(ancestor);
+    let cursor = ancestor;
+    while (cursor.includes("/")) {
+      const parent = cursor.slice(0, cursor.lastIndexOf("/"));
+      if (parent === "") break;
+      protectedPaths.add(parent);
+      cursor = parent;
+    }
+  }
+  // 2. Tracked-target ancestors.
+  for (const ancestor of args.trackedAncestors) {
+    protectedPaths.add(ancestor);
+  }
+  // 3. Worktree ancestors.
+  for (const ancestor of args.worktreeAncestors) {
+    protectedPaths.add(ancestor);
+  }
+  // 4. Subtree roots of declared exclusions.
+  for (const subtree of RECONCILE_EXCLUSION_SUBTREE_DIRS) {
+    protectedPaths.add(subtree);
+  }
+  // 5. Any preimage entry whose path is under a declared exclusion
+  // subtree (defensive; the walker skips these by construction).
+  for (const entry of args.preimageEntries) {
+    for (const subtree of RECONCILE_EXCLUSION_SUBTREE_DIRS) {
+      if (entry.path === subtree || entry.path.startsWith(`${subtree}/`)) {
         protectedPaths.add(entry.path);
         let cursor = entry.path;
         while (cursor.includes("/")) {
@@ -759,6 +894,54 @@ function isInsideAnyWorktreeRoot(worktreeRoots: Set<string>, absolutePath: strin
   return false;
 }
 
+/**
+ * Build the set of canonical root-relative paths that are
+ * worktree-root ancestors (the directories between the canonical
+ * root and any registered linked worktree). The destructive step
+ * treats each as protected: a `distant/sibling/` ancestor dir of
+ * the worktree `distant/sibling/wt/` MUST NOT be deleted, but the
+ * residue files inside `distant/sibling/` (NOT under the worktree)
+ * remain deletable.
+ */
+function deriveWorktreeAncestors(canonicalRoot: string, worktrees: readonly WorktreeRecord[]): Set<string> {
+  const ancestors = new Set<string>();
+  for (const worktree of worktrees) {
+    if (worktree.path === canonicalRoot) continue;
+    const rel = relative(canonicalRoot, worktree.path);
+    if (rel === "" || rel === "..") continue;
+    let cursor = rel;
+    while (cursor.includes("/")) {
+      const parent = cursor.slice(0, cursor.lastIndexOf("/"));
+      if (parent === "" || parent === ".") break;
+      ancestors.add(parent);
+      cursor = parent;
+    }
+  }
+  return ancestors;
+}
+
+/**
+ * Build the set of tracked-target ancestor paths. Every directory
+ * path on the way from the repository root to any tracked target
+ * blob is included. The deletion walker skips entries in this set
+ * (so the directories survive) but still deletes residue files
+ * inside them (which are processed deepest-first and never reach
+ * the protected ancestor itself).
+ */
+function deriveTrackedAncestors(targetEntries: readonly TargetTreeEntry[]): Set<string> {
+  const ancestors = new Set<string>();
+  for (const entry of targetEntries) {
+    let cursor = entry.path;
+    while (cursor.includes("/")) {
+      const parent = cursor.slice(0, cursor.lastIndexOf("/"));
+      if (parent === "") break;
+      if (!ancestors.has(parent)) ancestors.add(parent);
+      cursor = parent;
+    }
+  }
+  return ancestors;
+}
+
 async function safeRemoveWithinRoot(root: string, repositoryPath: string): Promise<void> {
   const absolute = resolve(root, repositoryPath);
   const within = relative(root, absolute);
@@ -773,9 +956,26 @@ async function safeRemoveWithinRoot(root: string, repositoryPath: string): Promi
     throw error;
   }
   if (lstats.isDirectory()) {
-    await rm(absolute, { recursive: true, force: true });
+    // Non-recursive `rmdir` only succeeds for an empty directory. A
+    // directory with a still-tracked child or with a sibling residue
+    // entry that landed below it (out of preimage order) will throw
+    // ENOTEMPTY; we ignore that case because the directory is then
+    // non-residue and reconcile cannot reclaim it. The pre-mutation
+    // revalidation's fingerprint mismatch guard catches the
+    // out-of-preimage case before this code path runs.
+    // Node's `fs.rm` is for files and recurses on directories, so
+    // `rmdir` is the right primitive for the empty-dir-only case.
+    try {
+      await rmdir(absolute);
+    } catch (error) {
+      if (isEnoent(error)) return;
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === "ENOTEMPTY" || code === "EEXIST") return;
+      throw error;
+    }
     return;
   }
+  // Plain file / symlink / fifo: remove the validated leaf only.
   await rm(absolute, { force: true });
 }
 
@@ -807,6 +1007,52 @@ function pathCollidesWithExclusion(
 ): boolean {
   if (isExcluded(repositoryPath)) return true;
   if (exclusionBases.has(repositoryPath)) return true;
+  return false;
+}
+
+/**
+ * Tracked-target collision check for registered linked worktrees
+ * and their ancestors. A target blob whose path:
+ *
+ *   - equals a registered worktree root (would clobber the worktree
+ *     directory);
+ *   - descends into a registered worktree root (would create files
+ *     under the worktree's territory);
+ *   - is an ancestor of a registered worktree root (would replace
+ *     the parent directory of the worktree);
+ *
+ * all break the assumption that `git reset --hard` cannot
+ * interfere with a registered worktree's working tree. The check
+ * uses both the absolute-path containment check (the
+ * `isInsideAnyWorktreeRoot`-style logic) and the canonical-root-
+ * relative path comparison so the ancestor-of-worktree shape is
+ * caught even when the worktree lives outside the canonical root.
+ * Ticket #85 finding #3.
+ */
+function collidesWithWorktreeAncestry(
+  repositoryPath: string,
+  absolutePath: string,
+  worktreeRoots: Set<string>,
+  canonicalRoot: string,
+): boolean {
+  for (const root of worktreeRoots) {
+    const within = relative(root, absolutePath);
+    if (within === "" || within === "..") return true;
+    if (!within.startsWith(`..${sep}`) && !isAbsolute(within)) return true;
+  }
+  // Ancestor-of-worktree-root + within-worktree-root checks via the
+  // canonical-root-relative path. The equality case (`repositoryPath`
+  // === `rootRel`) is a collision because the target blob is exactly
+  // at the registered worktree directory.
+  for (const root of worktreeRoots) {
+    const rootRel = relative(canonicalRoot, root);
+    if (rootRel === "" || rootRel === "..") continue;
+    if (repositoryPath === rootRel) return true;
+    // Descendant of worktree root (inside the worktree's territory).
+    if (rootRel.startsWith(`${repositoryPath}/`)) return true;
+    // Ancestor of worktree root (would replace the parent dir).
+    if (repositoryPath.startsWith(`${rootRel}/`)) return true;
+  }
   return false;
 }
 
@@ -988,32 +1234,78 @@ async function assertNoSubmoduleConfig(root: string): Promise<void> {
 }
 
 async function assertNoContentFilters(root: string): Promise<void> {
+  // Conservative refuse of any content-transform mechanism. The
+  // discard-scope walker has just built the preimage and will report
+  // any `.gitattributes` file it descends into. The walker also
+  // flags `info/attributes` (a single sentinel path inside `.git/`),
+  // which never lands in the preimage but is conservative to refuse
+  // independently. Ticket #85 finding #5.
+  //
   // `.gitattributes` may declare `filter=` directives that route
   // through smudge/clean hooks or `eol=` attributes that switch the
-  // working tree between CRLF and LF on checkout. Any such
-  // transformation breaks the bytewise target-equality contract:
-  // the bytes the working tree holds after `git reset --hard` would
-  // not equal the bytes the target blob carries, so the postcondition
-  // could not verify an exact match.
-  const gitattributes = join(root, ".gitattributes");
-  if (await pathExists(gitattributes)) {
-    const bytes = await readFile(gitattributes);
-    const text = bytes.toString("binary");
-    if (/^.*\bfilter=/m.test(text)) {
-      throw new PoiesisError(
-        "RECONCILE_FILTER_ACTIVE",
-        "Refusing to reconcile a working tree with content filters",
-        { path: ".gitattributes" },
-      );
-    }
-    if (/^.*\beol=/m.test(text)) {
-      throw new PoiesisError(
-        "RECONCILE_FILTER_ACTIVE",
-        "Refusing to reconcile a working tree with EOL attributes",
-        { path: ".gitattributes" },
-      );
-    }
+  // working tree between CRLF and LF on checkout. Even a benign
+  // attribute like `* text` can normalize line endings on some
+  // platforms, defeating the postcondition's bytewise equality check.
+  // We refuse ALL `.gitattributes` (any path) AND `info/attributes`
+  // AND `core.attributesFile` AND `core.autocrlf` AND any
+  // `filter.*` config: any of them, alone, can break the
+  // working-tree equality contract.
+  await refuseAnyGitattributes(root);
+  await refuseInfoAttributes(root);
+  await refuseAttributesFileConfig(root);
+  await refuseFilterConfig(root);
+  await refuseAutocrlf(root);
+}
+
+/**
+ * Recursively refuse any `.gitattributes` file in the working tree.
+ * Splits out from `assertNoContentFilters` so target-tree scans can
+ * reuse the same predicate against a fetched tree.
+ */
+async function refuseAnyGitattributes(root: string): Promise<void> {
+  for await (const found of findAllGitattributesFiles(root)) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a working tree containing a `.gitattributes` file",
+      { path: found },
+    );
   }
+}
+
+async function refuseInfoAttributes(root: string): Promise<void> {
+  // `.git/info/attributes` is the per-repo fallback. Refuse even if
+  // it is empty.
+  const infoAttributes = join(root, ".git", "info", "attributes");
+  if (await pathExists(infoAttributes)) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a working tree with an `info/attributes` file",
+      { path: ".git/info/attributes" },
+    );
+  }
+}
+
+async function refuseAttributesFileConfig(root: string): Promise<void> {
+  const attrsFile = await run("git", ["config", "--get", "core.attributesFile"], {
+    cwd: root,
+    allowFailure: true,
+  });
+  if (attrsFile.exitCode === 0 && attrsFile.stdout.trim().length > 0) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a repository with a configured `core.attributesFile`",
+      { path: attrsFile.stdout.trim() },
+    );
+  }
+  if (attrsFile.exitCode === 0 && attrsFile.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a repository with truncated `core.attributesFile`",
+    );
+  }
+}
+
+async function refuseFilterConfig(root: string): Promise<void> {
   const filters = await run("git", ["config", "--get-regexp", "^filter\\."], {
     cwd: root,
     allowFailure: true,
@@ -1030,10 +1322,9 @@ async function assertNoContentFilters(root: string): Promise<void> {
       "Refusing to reconcile a repository with configured Git filters",
     );
   }
-  // `core.autocrlf=true|input` rewrites LF/CRLF on checkout and back
-  // on commit. This is the canonical global EOL transformation and
-  // must be refused for the same reason as a `.gitattributes eol=`
-  // directive.
+}
+
+async function refuseAutocrlf(root: string): Promise<void> {
   const autocrlf = await run("git", ["config", "--get", "--bool", "core.autocrlf"], {
     cwd: root,
     allowFailure: true,
@@ -1049,6 +1340,70 @@ async function assertNoContentFilters(root: string): Promise<void> {
       "RECONCILE_FILTER_ACTIVE",
       "Refusing to reconcile a repository with core.autocrlf enabled",
     );
+  }
+}
+
+/**
+ * Yield every `.gitattributes` file path found anywhere under
+ * `root`, rooted at the working tree (excluding `.git/`). Used by
+ * the working-tree gate (`assertNoContentFilters`) and by the
+ * target-tree pre-mutation validator to refuse nested
+ * `.gitattributes` introduced by the integration branch before reset.
+ */
+async function* findAllGitattributesFiles(root: string): AsyncGenerator<string> {
+  yield* await listGitattributesUnder(root, "");
+  const commonDir = await canonicalCommonDir(root);
+  // For the discard-scope walker the working-tree scan above is the
+  // sufficient pre-mutation check; the unused `commonDir` variable
+  // remains available for a future enhancement that scans the
+  // shared git dir separately.
+  void commonDir;
+}
+
+async function listGitattributesUnder(root: string, relativePath: string): Promise<string[]> {
+  const absolute = relativePath === "" ? root : join(root, relativePath);
+  let dirents: Dirent[];
+  try {
+    dirents = await readdir(absolute, { withFileTypes: true });
+  } catch (error) {
+    if (isEnoent(error)) return [];
+    throw error;
+  }
+  const found: string[] = [];
+  for (const dirent of dirents) {
+    if (relativePath === "" && dirent.name === ".git") continue;
+    const childRelative = relativePath === "" ? dirent.name : `${relativePath}/${dirent.name}`;
+    if (dirent.name === ".gitattributes" || dirent.isFile()) {
+      if (dirent.name === ".gitattributes") {
+        found.push(childRelative);
+        continue;
+      }
+      continue;
+    }
+    if (dirent.isDirectory()) {
+      const nested = await listGitattributesUnder(root, childRelative);
+      for (const match of nested) found.push(match);
+    }
+  }
+  return found;
+}
+
+/**
+ * Refuse a fetched target tree that contains any `.gitattributes`
+ * blob path. The pre-mutation validator reaches this after the
+ * `git ls-tree -r -z` parse, so the path list is fully in memory.
+ * A nested `src/.gitattributes` is enough to trigger refusal
+ * (ticket #85 finding #5).
+ */
+function refuseAnyGitattributesInTarget(targetTree: readonly TargetTreeEntry[]): void {
+  for (const entry of targetTree) {
+    if (entry.path === ".gitattributes" || entry.path.endsWith("/.gitattributes")) {
+      throw new PoiesisError(
+        "RECONCILE_FILTER_ACTIVE",
+        "Refusing to reconcile a target tree containing `.gitattributes`",
+        { path: entry.path },
+      );
+    }
   }
 }
 
@@ -1134,7 +1489,15 @@ async function scanDiscardScope(root: string): Promise<ScanResult> {
   // prefix (e.g. `.poiesis/workspaces/spec__nested`) MUST be
   // preserved in place — reconcile never refuses such a layout.
   // The worktree is a legitimate Git-owned peer, not residue.
-  const exclusionBases = deriveExclusionBases(RECONCILE_EXCLUSION_PATHS);
+  //
+  // Ticket #85 finding #2: the walker "skip" set is restricted to
+  // the actual exclusion subtree directories (and the literal
+  // exclusion files). The previous `deriveExclusionBases` collapsed
+  // these with ancestor paths, which made `.poiesis/other/*`
+  // (a sibling of the exclusion subtrees, NOT an exclusion) invisible
+  // to both the fingerprint scan and the destructive cleanup.
+  const skipSubtreeDirs = new Set(RECONCILE_EXCLUSION_SUBTREE_DIRS);
+  const skipFiles = new Set(RECONCILE_EXCLUSION_FILES);
   const liveWorktrees = await listWorktrees(root);
   const worktreeRoots = new Set(
     liveWorktrees
@@ -1150,7 +1513,7 @@ async function scanDiscardScope(root: string): Promise<ScanResult> {
   // entries in `.git/` are Git administration: the index is captured
   // separately, and markers/receipts live under it as preserved
   // shared state.
-  await walkWorkingTree(root, "", entries, exclusionBases, worktreeRoots, {
+  await walkWorkingTree(root, "", entries, skipSubtreeDirs, skipFiles, worktreeRoots, {
     accumulateFile: () => {
       filesScanned += 1;
       if (filesScanned > DEFAULT_MAX_FILES()) {
@@ -1230,12 +1593,13 @@ async function walkWorkingTree(
   root: string,
   relativePath: string,
   entries: DiscardEntry[],
-  exclusionBases: Set<string>,
+  exclusionSubtreeDirs: Set<string>,
+  exclusionFiles: Set<string>,
   worktreeRoots: Set<string>,
   callbacks: WalkCallbacks,
 ): Promise<void> {
-  // Refuse to descend into a declared exclusion base OR a
-  // registered linked worktree root. The exclusion list is a
+  // Refuse to descend into a declared exclusion subtree directory
+  // OR a registered linked worktree root. The exclusion list is a
   // closed set of protected roots; the walk must not enumerate
   // their contents or the resulting fingerprint would include
   // bytes reconcile must preserve. A registered linked worktree
@@ -1247,24 +1611,35 @@ async function walkWorkingTree(
   // so the scan and the destructive step agree on what is
   // protected.
   if (relativePath !== "") {
-    if (exclusionBases.has(relativePath)) return;
+    if (exclusionSubtreeDirs.has(relativePath)) return;
     if (worktreeRoots.has(resolve(root, relativePath))) return;
   }
   const absolute = relativePath === "" ? root : join(root, relativePath);
-  let dirents: Dirent[];
+  let dirents: Dirent<Buffer>[];
   try {
-    dirents = await readdir(absolute, { withFileTypes: true });
+    // `encoding: "buffer"` keeps raw bytes for path-name validation,
+    // sort, hash, and access. The walker still refuses the discard
+    // scope when two child names alias via the UTF-8 replacement
+    // character, so the fingerprint can never silently disagree with
+    // the raw bytes on disk. Ticket #85 finding #4.
+    const result = (await readdir(absolute, {
+      withFileTypes: true,
+      encoding: "buffer",
+    })) as Dirent<Buffer>[];
+    dirents = result;
+    assertRawNamesAreUnambiguous(dirents, relativePath);
   } catch (error) {
     if (isEnoent(error)) return;
     throw error;
   }
   // Byte-preserving deterministic order: compare each path's UTF-8
-  // bytes lexicographically. This matches the "byte-preserving
-  // deterministic path order" contract for both pure-ASCII and
-  // arbitrary-byte path names.
-  dirents.sort(bytewiseCompareDirents);
+  // bytes lexicographically. The buffer form makes the comparison
+  // immune to JS-string UTF-8 replacement characters.
+  dirents.sort(bufferDirentSort);
   for (const dirent of dirents) {
-    const childRelative = relativePath === "" ? dirent.name : `${relativePath}/${dirent.name}`;
+    const nameString = bufferDirentNameString(dirent);
+    const childRelative =
+      relativePath === "" ? nameString : `${relativePath}/${nameString}`;
     // Path-bytes bound: a discard-scope path whose UTF-8 byte length
     // exceeds the fingerprint path budget would silently disagree
     // with the digest (the fingerprint encodes each entry's path as
@@ -1286,7 +1661,7 @@ async function walkWorkingTree(
         },
       );
     }
-    if (relativePath === "" && dirent.name === ".git") continue;
+    if (relativePath === "" && nameString === ".git") continue;
     if (childRelative === ".gitmodules") {
       throw new PoiesisError(
         "RECONCILE_SUBMODULE",
@@ -1294,6 +1669,12 @@ async function walkWorkingTree(
         { path: ".gitmodules" },
       );
     }
+    // Declared-exclusion-files skip: the literal path
+    // `.poiesis/manifest.json` is part of the exclusion contract and
+    // never enters the discard scope. The walker still descends
+    // into `.poiesis/other/*`, whose preimage is the residue
+    // reconcile must clean. Ticket #85 finding #2.
+    if (exclusionFiles.has(childRelative)) continue;
     const childAbsolute = join(root, childRelative);
     // Defense-in-depth: skip a child whose absolute path IS a
     // registered linked worktree root. The exclusion-base skip at
@@ -1352,7 +1733,15 @@ async function walkWorkingTree(
         symlinkLength: null,
       });
       callbacks.accumulateDir();
-      await walkWorkingTree(root, childRelative, entries, exclusionBases, worktreeRoots, callbacks);
+      await walkWorkingTree(
+        root,
+        childRelative,
+        entries,
+        exclusionSubtreeDirs,
+        exclusionFiles,
+        worktreeRoots,
+        callbacks,
+      );
       continue;
     }
     if (dirent.isFile()) {
@@ -1401,6 +1790,71 @@ async function walkWorkingTree(
       { path: childRelative },
     );
   }
+}
+
+/**
+ * Refuse the discard scope when two sibling dirent names decode via
+ * UTF-8 to the same string but have distinct raw bytes (invalid-
+ * byte aliasing or replacement-character neighbors). The whole
+ * premise of the fingerprint is byte-stable path comparisons, so we
+ * fail closed rather than silently produce a digest that disagrees
+ * with the actual filesystem. Ticket #85 finding #4.
+ */
+function assertRawNamesAreUnambiguous(dirents: Dirent<Buffer>[], relativePath: string): void {
+  const seenBytes = new Map<string, string>();
+  for (const dirent of dirents) {
+    const bytes = dirent.name;
+    const decoded = decodeUtf8StrictOrReject(bytes);
+    const bytesKey = bytes.toString("binary");
+    const previousDecoded = seenBytes.get(bytesKey);
+    if (previousDecoded === undefined) {
+      seenBytes.set(bytesKey, decoded);
+      continue;
+    }
+    if (previousDecoded !== decoded) {
+      throw new PoiesisError(
+        "RECONCILE_INVALID_PATH_ENCODING",
+        "Discard scope contains ambiguous path-name bytes (invalid-UTF-8 aliasing)",
+        { path: relativePath === "" ? "<root>" : relativePath },
+      );
+    }
+  }
+  // Final cross-bytes check: distinct raw bytes that decode to the
+  // same string would produce the same fingerprint path while
+  // touching different bytes on disk — refuse.
+  const stringCounts = new Map<string, number>();
+  for (const decoded of seenBytes.values()) {
+    stringCounts.set(decoded, (stringCounts.get(decoded) ?? 0) + 1);
+  }
+  for (const [decoded, count] of stringCounts) {
+    if (count > 1 && decoded.includes("")) {
+      throw new PoiesisError(
+        "RECONCILE_INVALID_PATH_ENCODING",
+        "Discard scope contains ambiguous path-name bytes (replacement-character aliasing)",
+        { path: relativePath === "" ? "<root>" : relativePath, alias: decoded },
+      );
+    }
+  }
+}
+
+function decodeUtf8StrictOrReject(bytes: Buffer): string {
+  try {
+    return TEXT_DECODER_FATAL.decode(bytes);
+  } catch (error) {
+    throw new PoiesisError(
+      "RECONCILE_INVALID_PATH_ENCODING",
+      "Discard scope contains invalid-UTF8 path bytes",
+      { detail: error instanceof Error ? error.message : String(error) },
+    );
+  }
+}
+
+function bufferDirentNameString(dirent: Dirent<Buffer>): string {
+  return dirent.name.toString("utf8");
+}
+
+function bufferDirentSort(left: Dirent<Buffer>, right: Dirent<Buffer>): number {
+  return Buffer.compare(left.name, right.name);
 }
 
 /**
@@ -1789,15 +2243,25 @@ async function workingTreeMatchesTarget(
     // correspond to the bytes on disk. `git cat-file blob` returns
     // the exact stored blob bytes without transformation, so a
     // byte-equal working tree must equal the blob. Ticket #84
-    // finding #7. The `binaryStdout` option keeps the trailing
-    // whitespace strip in `process.ts::run` from corrupting the
-    // last byte of text-content blobs.
+    // finding #7. The `binaryStdout: true` option is paired with
+    // the genuine raw-buffer result field added in ticket #85
+    // finding #6 — `stdoutBuffer` carries the byte-for-byte blob
+    // through `process.run` without any UTF-8 string round-trip.
+    // The string `stdout` field remains populated so the textual
+    // text-mode API/behavior is preserved.
     const cat = await run("git", ["cat-file", "blob", entry.oid], {
       cwd: root,
       binaryStdout: true,
     });
-    if (cat.stdoutTruncated) return false;
-    const targetBytes = Buffer.from(cat.stdout, "binary");
+    // The binary-mode postcondition only refuses when the raw byte
+    // stream itself was truncated by the byte budget. UTF-8 prefix
+    // truncation (which only affects the textual `stdout` field)
+    // is fine because the genuine `stdoutBuffer` carries the full
+    // byte sequence. `stdoutTruncated` reflects BOTH signals; the
+    // dedicated `stdoutRawTruncated` flag is the binary-mode
+    // authority.
+    if (cat.stdoutRawTruncated) return false;
+    const targetBytes = cat.stdoutBuffer ?? Buffer.from(cat.stdout, "binary");
     const workingBytes = await readFile(absolute);
     if (targetBytes.length !== workingBytes.length) return false;
     if (!targetBytes.equals(workingBytes)) return false;
