@@ -14,6 +14,7 @@ import {
   workspaceCleanup,
   workspacePrepare,
 } from "./git.js";
+import { reconcile, type ReconcileOptions } from "./reconcile.js";
 import { inspectProject } from "./inspect.js";
 import {
   createTrackerAdapter,
@@ -38,7 +39,7 @@ Usage:
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
   poiesis uninstall
-  poiesis inspect
+  poiesis inspect [--fingerprint]   # add --fingerprint to opt in to the exact bounded primary preimage fingerprint (read-only)
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
   poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis model set reasoning|execution <provider/model> # deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
@@ -50,6 +51,7 @@ Usage:
   poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>   # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }) for the same clean candidate.
   poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest) that drove the successful Publish. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
+  poiesis reconcile [--cwd <path>] --integration-branch <name> --remote <name> --expected-head <sha> --expected-target <sha> --expected-fingerprint <hex> --discard-acknowledged   # primary-checkout reconciliation: hard-reset to the fetched target while preserving Git administration, linked worktrees, shared markers/receipts, and the declared local Poiesis state exclusions (.poiesis/manifest.json and .poiesis/workspaces/). Requires exact bindings AND --discard-acknowledged to refuse.
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
@@ -98,6 +100,8 @@ async function main(argv: string[]): Promise<void> {
       return commandPreview(rest);
     case "integrate":
       return commandIntegrate(rest);
+    case "reconcile":
+      return commandReconcile(rest);
     case "promote":
       return commandPromote(rest);
     case "tracker":
@@ -232,8 +236,17 @@ async function commandUninstall(args: string[]): Promise<void> {
 }
 
 async function commandInspect(args: string[]): Promise<void> {
-  const values = options(args, { cwd: { type: "string" } });
-  writeSuccess("inspect", await inspectProject(cwdOf(values)));
+  const values = options(args, {
+    cwd: { type: "string" },
+    fingerprint: { type: "boolean" },
+  });
+  writeSuccess(
+    "inspect",
+    await inspectProject({
+      cwd: cwdOf(values),
+      ...(boolean(values, "fingerprint") ? { fingerprint: true } : {}),
+    }),
+  );
 }
 
 async function commandCapability(args: string[]): Promise<void> {
@@ -622,6 +635,44 @@ async function commandIntegrate(args: string[]): Promise<void> {
       ...(postIntegrationCommands === undefined ? {} : { postIntegrationCommands }),
       ...optional(values, "ownership-id", "ownershipId"),
     }),
+  );
+}
+
+/**
+ * CLI dispatch for `poiesis reconcile` (ticket #81 revised).
+ *
+ * Single bounded operation. The CLI threads the Author's explicit
+ * expected bindings (integrationBranch, remote, expectedHead, expectedTarget,
+ * expectedFingerprint, discardAcknowledged) into `reconcile` so the
+ * surface stays a thin shell. Without `--discard-acknowledged` the
+ * call refuses with a typed `RECONCILE_AUTHORIZATION_MISSING` so a
+ * shell-script typo cannot silently destroy local residue.
+ *
+ * Reuses the canonical git lifecycle root resolution (`--cwd` defaults
+ * to `process.cwd()`) and the structured success envelope so automation
+ * sees the same JSON contract as every other Poiesis command.
+ */
+async function commandReconcile(args: string[]): Promise<void> {
+  const values = options(args, {
+    "integration-branch": { type: "string" },
+    remote: { type: "string" },
+    "expected-head": { type: "string" },
+    "expected-target": { type: "string" },
+    "expected-fingerprint": { type: "string" },
+    "discard-acknowledged": { type: "boolean" },
+    cwd: { type: "string" },
+  });
+  writeSuccess(
+    "reconcile",
+    await reconcile({
+      cwd: cwdOf(values),
+      remote: required(values, "remote"),
+      integrationBranch: required(values, "integration-branch"),
+      expectedHeadSha: required(values, "expected-head"),
+      expectedTargetSha: required(values, "expected-target"),
+      expectedFingerprint: required(values, "expected-fingerprint"),
+      discardAcknowledged: boolean(values, "discard-acknowledged"),
+    } satisfies ReconcileOptions),
   );
 }
 

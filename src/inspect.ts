@@ -6,6 +6,7 @@ import { loadManifest } from "./manifest.js";
 import { PoiesisError } from "./errors.js";
 import { resolveGitRoot } from "./paths.js";
 import { resolveConfigForRoot } from "./maintenance.js";
+import { computeReconcileFingerprint, type ReconcileFingerprintResult } from "./reconcile.js";
 
 export interface ProjectInspection {
   git: InspectResult;
@@ -19,9 +20,29 @@ export interface ProjectInspection {
     adapter?: string;
     configuredModels?: { reasoning: string; execution: string };
   };
+  /** Present only when the caller opts in via `inspectProject({ fingerprint: true })`. */
+  fingerprint?: ReconcileFingerprintResult;
 }
 
-export async function inspectProject(cwd: string): Promise<ProjectInspection> {
+export interface InspectProjectOptions {
+  cwd: string;
+  /**
+   * Opt-in exact bounded primary preimage fingerprint. When `true`,
+   * `inspectProject` captures the canonical SHA-256 over the primary
+   * checkout's working tree (excluding Git administration, linked
+   * worktrees, shared markers/receipts, and declared local Poiesis
+   * state exclusions) plus the raw `.git/index` bytes. Inspection
+   * remains strictly read-only: it never fetches, refreshes the
+   * index, makes a judgment call, or invokes the destructive
+   * `reconcile` operation. Default `false` preserves the existing
+   * inspect output shape exactly.
+   */
+  fingerprint?: boolean;
+}
+
+export async function inspectProject(options: InspectProjectOptions | string): Promise<ProjectInspection> {
+  const cwd = typeof options === "string" ? options : options.cwd;
+  const includeFingerprint = typeof options === "string" ? false : options.fingerprint === true;
   const root = await resolveGitRoot(cwd);
   let config: ResolvedPoiesisConfig | undefined;
   let manifest;
@@ -78,7 +99,7 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
           Object.entries(scriptsValue).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
         )
       : {};
-  return {
+  const inspection: ProjectInspection = {
     git,
     packageManager: await detectPackageManager(git.root),
     languages: await detectLanguages(git.root),
@@ -94,6 +115,15 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
             configuredModels: config.models,
           },
   };
+  if (includeFingerprint) {
+    inspection.fingerprint = await computeReconcileFingerprint({
+      cwd: git.root,
+      ...(config === undefined
+        ? { remote: "origin", integrationBranch: "main" }
+        : { remote: config.repository.remote, integrationBranch: config.repository.integrationBranch }),
+    });
+  }
+  return inspection;
 }
 
 async function detectPackageManager(root: string): Promise<ProjectInspection["packageManager"]> {
