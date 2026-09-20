@@ -260,7 +260,7 @@ export async function computeReconcileFingerprint(
   const canonicalRoot = await canonicalRootOfOrBare(options.cwd);
   await assertPrimaryCheckout(canonicalRoot);
   const gitCommonDir = await canonicalCommonDir(canonicalRoot);
-  await assertNoActiveGitOperation(gitCommonDir);
+  await assertNoActiveGitOperation(canonicalRoot);
   await assertSparseCheckoutDisabled(canonicalRoot);
   await assertNoSubmoduleConfig(canonicalRoot);
   await assertNoContentFilters(canonicalRoot);
@@ -593,7 +593,7 @@ interface RevalidateArgs {
 }
 
 async function revalidateBeforeMutation(args: RevalidateArgs): Promise<void> {
-  await assertNoActiveGitOperation(args.gitCommonDir);
+  await assertNoActiveGitOperation(args.canonicalRoot);
   const liveCommonDir = await canonicalCommonDir(args.canonicalRoot);
   invariant(
     liveCommonDir === args.gitCommonDir,
@@ -771,6 +771,17 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     trackedAncestors: args.trackedAncestors,
     worktreeAncestors: args.worktreeAncestors,
   });
+  // The set of repository-relative paths whose first on-disk
+  // ancestor (after `git reset --hard` replaced the working tree)
+  // is a symlink. Any descendant of those paths resolves through
+  // the symlink ancestor; removing it would delete bytes outside
+  // the canonical root (or inside a registered linked worktree's
+  // territory). Ticket #86 finding #1.
+  const symlinkAncestorEntries = await collectSymlinkAncestorEntries(
+    args.canonicalRoot,
+    args.preimageEntries,
+    args.trackedPaths,
+  );
   // Deepest first so every child's removal lands before we attempt to
   // rmdir its parent. `rmdir` only succeeds for an empty directory,
   // so a non-protected dir with a still-tracked child stays in
@@ -784,6 +795,12 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     if (entry.path.startsWith(".git/")) continue;
     if (args.trackedPaths.has(entry.path)) continue;
     if (protectedPaths.has(entry.path)) continue;
+    // Skip any entry whose ancestor chain crosses a symlink that
+    // the destructive step installed (a target leaf that is a
+    // symlink whose preimage contained a directory of the same
+    // name). Resolving through the symlink would land outside the
+    // canonical root. Ticket #86 finding #1.
+    if (entryDescendantOfSymlinkAncestor(entry.path, symlinkAncestorEntries)) continue;
     const absolute = resolve(args.canonicalRoot, entry.path);
     // Direct entry into / under a registered worktree: leave alone.
     // The worktree's working tree is its own territory; reconcile never
@@ -791,6 +808,106 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     if (isInsideAnyWorktreeRoot(args.worktreeRoots, absolute)) continue;
     await safeRemoveWithinRoot(args.canonicalRoot, entry.path);
   }
+}
+
+/**
+ * Identify repository-relative paths whose first on-disk ancestor
+ * is a symlink after the destructive reset. These are paths the
+ * target tree introduced as symlinks that REPLACED a directory of
+ * the same name recorded in the preimage. Removing descendants of
+ * these paths would resolve through the symlink and land outside
+ * the canonical root (or inside a registered linked worktree's
+ * territory). Ticket #86 finding #1.
+ *
+ * The detection is bounded to the preimage entries and the target
+ * tree leaves: it iterates the preimage, checks each entry's
+ * immediate parent against `lstat` (no descent into directories,
+ * no traversal of symlinks), and records only those parents that
+ * were (a) a directory in the preimage and (b) a symlink on disk
+ * after the reset. Both pieces are bounded by the preimage size
+ * so the loop stays within the existing bounds.
+ */
+async function collectSymlinkAncestorEntries(
+  canonicalRoot: string,
+  preimageEntries: readonly DiscardEntry[],
+  trackedPaths: ReadonlySet<string>,
+): Promise<Set<string>> {
+  // Map from preimage directory entry path to whether the target
+  // tree declares the same path as a tracked leaf. Only paths that
+  // exist as directories in the preimage AND as non-directory leaves
+  // in the target tree (i.e. as a regular file, executable, or
+  // symlink) qualify as leaf/type transitions.
+  const preimageDirs = new Set<string>();
+  for (const entry of preimageEntries) {
+    if (entry.kind === "dir") preimageDirs.add(entry.path);
+  }
+  const symlinkAncestors = new Set<string>();
+  for (const dir of preimageDirs) {
+    if (!trackedPaths.has(dir)) continue;
+    // The target declares `dir` as a tracked leaf. After `git
+    // reset --hard`, the on-disk entry at this path is whatever
+    // the target says (a regular file or a symlink). If it is a
+    // symlink, every preimage descendant of `dir` must be skipped
+    // — resolution would traverse the symlink.
+    const absolute = join(canonicalRoot, dir);
+    let stats: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stats = await lstat(absolute);
+    } catch (error) {
+      if (isEnoent(error)) continue;
+      throw error;
+    }
+    if (stats.isSymbolicLink()) symlinkAncestors.add(dir);
+  }
+  // Also check preimage entries that themselves describe a symlink
+  // (the walker never descended into them). Their children cannot
+  // be in the preimage, but a directory in the preimage whose on-
+  // disk post-reset shape is a symlink could still have descendants
+  // recorded under a different mechanism (e.g. a tracked file at
+  // the same path that pre-dates the symlink). The previous loop
+  // already captures the directory → symlink transition; this
+  // follow-up handles the type-transition case (directory →
+  // regular file), where the descendant's ancestor chain still
+  // appears as a directory in the preimage.
+  for (const dir of preimageDirs) {
+    if (trackedPaths.has(dir)) continue;
+    // `dir` is in the preimage as a directory and the target tree
+    // does NOT track it. The destructive step will attempt to
+    // remove it (subject to the protected-paths check). If the
+    // parent chain in the post-reset state contains a symlink
+    // ancestor that the target installed, the directory entry must
+    // be skipped — its removal would traverse the symlink.
+    let cursor = dir;
+    while (cursor.includes("/")) {
+      const parent = cursor.slice(0, cursor.lastIndexOf("/"));
+      if (parent === "") break;
+      if (trackedPaths.has(parent) && preimageDirs.has(parent)) {
+        const parentAbsolute = join(canonicalRoot, parent);
+        let stats: Awaited<ReturnType<typeof lstat>>;
+        try {
+          stats = await lstat(parentAbsolute);
+        } catch (error) {
+          if (isEnoent(error)) break;
+          throw error;
+        }
+        if (stats.isSymbolicLink()) symlinkAncestors.add(parent);
+        break;
+      }
+      cursor = parent;
+    }
+  }
+  return symlinkAncestors;
+}
+
+function entryDescendantOfSymlinkAncestor(
+  entryPath: string,
+  symlinkAncestors: ReadonlySet<string>,
+): boolean {
+  for (const ancestor of symlinkAncestors) {
+    if (entryPath === ancestor) return true;
+    if (entryPath.startsWith(`${ancestor}/`)) return true;
+  }
+  return false;
 }
 
 interface ProtectedPathsArgs {
@@ -1160,7 +1277,21 @@ async function canonicalWorktreePath(path: string): Promise<string> {
   }
 }
 
-async function assertNoActiveGitOperation(commonDir: string): Promise<void> {
+async function assertNoActiveGitOperation(canonicalRoot: string): Promise<void> {
+  // Ticket #86 finding #3: the resolved git-dir (per-worktree, not
+  // the common dir) is the authoritative location for all
+  // active-operation indicators. A primary checkout shares
+  // `git-dir == git-common-dir`, so the two resolve to the same
+  // path; we resolve the per-worktree dir explicitly so a linked
+  // worktree would still check its own state (the primary-checkout
+  // gate already refuses linked worktrees, so this is defense in
+  // depth).
+  const gitDir = await canonicalGitDir(canonicalRoot);
+  const commonDir = await canonicalCommonDir(canonicalRoot);
+  // The lockfiles live in the common dir because they are shared
+  // across all worktrees (a single `.git/index.lock` represents an
+  // in-progress index operation for any of them). The head/topic
+  // indicators live in the per-worktree git-dir.
   const locks = [
     "index.lock",
     "HEAD.lock",
@@ -1179,12 +1310,15 @@ async function assertNoActiveGitOperation(commonDir: string): Promise<void> {
       );
     }
   }
-  // `git status` itself surfaces an in-progress rebase/merge/cherry-pick
-  // by failing. We delegate that detection to git so the seam stays
-  // accurate against the actual Git state.
+  // Per-worktree HEAD/state indicators: in-progress rebase, merge,
+  // cherry-pick, revert. `git rev-parse --verify --quiet <ref>`
+  // returns 0 only when the ref exists; the canonical signals are
+  // checked here so a paused sequence (left behind after a crash
+  // or `git cherry-pick --quit` race) is refused before any
+  // destructive step.
   for (const indicator of ["REBASE_HEAD", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"]) {
     const result = await run("git", ["rev-parse", "--verify", "--quiet", indicator], {
-      cwd: commonDir,
+      cwd: gitDir,
       allowFailure: true,
     });
     if (result.exitCode === 0) {
@@ -1194,6 +1328,56 @@ async function assertNoActiveGitOperation(commonDir: string): Promise<void> {
         { indicator },
       );
     }
+  }
+  // Directory-shaped state indicators that `git rev-parse` does
+  // not surface: a `rebase-apply/` or `rebase-merge/` directory
+  // (paused/interactive rebase, paused `git am`), a `sequencer/`
+  // directory (paused cherry-pick or revert), and the per-worktree
+  // `MERGE_MSG` file (an in-progress merge with the user-visible
+  // message already drafted). The presence of any of these in the
+  // resolved git-dir refuses reconcile with the same typed error
+  // as the head-indicator path.
+  const stateDirs = ["rebase-apply", "rebase-merge", "sequencer"];
+  for (const dir of stateDirs) {
+    const path = join(gitDir, dir);
+    if (await pathExists(path)) {
+      throw new PoiesisError(
+        "RECONCILE_GIT_OPERATION_ACTIVE",
+        `Refusing to reconcile while a \`${dir}/\` state directory exists in the resolved git-dir`,
+        { path },
+      );
+    }
+  }
+  // `MERGE_MSG` and the `rebase-merge/` `msgnum`/`end` sentinels
+  // are file-shaped signals. We check them via the resolved git
+  // dir's filesystem entries so a paused rebase left without a
+  // `rebase-merge/` directory but with a `MERGE_MSG` (rare but
+  // possible across Git versions) still triggers the refusal.
+  const stateFiles = ["MERGE_MSG", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD"];
+  for (const file of stateFiles) {
+    const path = join(gitDir, file);
+    if (await pathExists(path)) {
+      throw new PoiesisError(
+        "RECONCILE_GIT_OPERATION_ACTIVE",
+        `Refusing to reconcile while a \`${file}\` state file exists in the resolved git-dir`,
+        { path },
+      );
+    }
+  }
+  // Paused-`am` sentinel: a `rebase-apply/` directory with no
+  // `head-name` is empty (a previous run aborted cleanly); a
+  // `rebase-apply/head-name` file is the on-disk signal for an
+  // in-progress `git am` (or interactive rebase paused before the
+  // first pick). The directory-presence check above covers most
+  // cases; this additional check documents the canonical paused-am
+  // shape for the final-review evidence trail.
+  const pausedAmSentinel = join(gitDir, "rebase-apply", "head-name");
+  if (await pathExists(pausedAmSentinel)) {
+    throw new PoiesisError(
+      "RECONCILE_GIT_OPERATION_ACTIVE",
+      "Refusing to reconcile while a paused `git am` (`rebase-apply/head-name`) state file exists",
+      { path: pausedAmSentinel },
+    );
   }
 }
 
@@ -1255,6 +1439,117 @@ async function assertNoContentFilters(root: string): Promise<void> {
   await refuseAttributesFileConfig(root);
   await refuseFilterConfig(root);
   await refuseAutocrlf(root);
+  // Ticket #86 finding #2: also resolve the implicit user/system
+  // attribute sources (`$XDG_CONFIG_HOME/git/attributes` and
+  // `/etc/gitattributes`) so a fingerprint does not silently rely
+  // on the host's user or system configuration. We probe the
+  // resolved `core.attributesFile` and the implicit fallback
+  // locations via `git config --show-origin --get` so the same
+  // source-of-truth Git uses is consulted. The probe stays
+  // byte-bounded (the attributesFile value is a single path).
+  await refuseImplicitAttributesSources(root);
+}
+
+/**
+ * Refuse when the resolved effective attributes sources include
+ * the implicit user (`$XDG_CONFIG_HOME/git/attributes`,
+ * `$XDG_CONFIG_HOME/git/ignore`, `$HOME/.config/git/attributes`)
+ * or system (`/etc/gitattributes`) attribute files. The detection
+ * uses `git config --show-origin --get core.attributesFile` so the
+ * same source-of-truth Git uses is consulted; if the resolved
+ * value is the user/system default (i.e. unset), we fall back to
+ * probing the canonical XDG and `/etc/gitattributes` paths
+ * directly. Ticket #86 finding #2.
+ */
+async function refuseImplicitAttributesSources(root: string): Promise<void> {
+  // First: ask git for the resolved attributesFile with its
+  // origin. If the origin is anything other than the local
+  // repository config or `.git/config`, we refuse.
+  const result = await run("git", ["config", "--show-origin", "--get", "core.attributesFile"], {
+    cwd: root,
+    allowFailure: true,
+  });
+  if (result.exitCode === 0 && result.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a repository with truncated `core.attributesFile`",
+    );
+  }
+  if (result.exitCode === 0 && result.stdout.trim().length > 0) {
+    // The output format is `file:<path>\t<value>` (or `command:...`
+    // for command-line overrides). Anything other than a local-repo
+    // config origin is an implicit user/system source.
+    const lines = result.stdout.split("\n");
+    for (const line of lines) {
+      const tabIndex = line.indexOf("\t");
+      if (tabIndex < 0) continue;
+      const origin = line.slice(0, tabIndex);
+      const value = line.slice(tabIndex + 1);
+      // `local` = `.git/config`, `worktree` = `.git/config.worktree`,
+      // `global` = `~/.gitconfig`, `system` = `/etc/gitconfig`,
+      // `command` = command-line `--core.attributesFile`. Anything
+      // not `local`/`worktree`/`command` is implicit.
+      if (origin !== "local" && origin !== "worktree" && origin !== "command") {
+        throw new PoiesisError(
+          "RECONCILE_FILTER_ACTIVE",
+          `Refusing to reconcile a repository with \`core.attributesFile\` resolved from \`${origin}\``,
+          { path: value, origin },
+        );
+      }
+    }
+  }
+  // Second: even when `core.attributesFile` is unset, git falls
+  // back to the implicit user/system defaults. Probe the canonical
+  // locations via `git rev-parse` so the path resolution matches
+  // Git's own behavior on this host.
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME;
+  const home = process.env.HOME;
+  const implicitPaths: string[] = [];
+  if (typeof xdgConfigHome === "string" && xdgConfigHome.length > 0) {
+    implicitPaths.push(join(xdgConfigHome, "git", "attributes"));
+  }
+  if (typeof home === "string" && home.length > 0) {
+    implicitPaths.push(join(home, ".config", "git", "attributes"));
+  }
+  implicitPaths.push("/etc/gitattributes");
+  for (const candidate of implicitPaths) {
+    if (await pathExists(candidate)) {
+      throw new PoiesisError(
+        "RECONCILE_FILTER_ACTIVE",
+        "Refusing to reconcile a repository whose implicit user/system attributes source is active",
+        { path: candidate },
+      );
+    }
+  }
+  // Third: ask git directly via `check-attr` whether ANY path in
+  // the working tree carries an attribute. If the implicit user/
+  // system attributes source declared one (e.g. `* filter=lfs`),
+  // git will surface it via check-attr even though no working-tree
+  // `.gitattributes` exists. We probe a sentinel file that always
+  // exists (`README.md` is created by every test fixture; in the
+  // rare case it does not, the check is a no-op). This is the
+  // canonical cross-host probe: git itself resolves all four
+  // attribute sources (repo `.gitattributes`, `.git/info/attributes`,
+  // `core.attributesFile`, XDG/system) and reports the merged
+  // result.
+  const probeResult = await run(
+    "git",
+    ["check-attr", "-a", "--", "README.md"],
+    { cwd: root, allowFailure: true },
+  );
+  if (probeResult.exitCode === 0 && probeResult.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a repository with truncated `git check-attr` output",
+    );
+  }
+  if (probeResult.exitCode === 0 && probeResult.stdout.trim().length > 0) {
+    throw new PoiesisError(
+      "RECONCILE_FILTER_ACTIVE",
+      "Refusing to reconcile a repository with effective attributes (user/system or `core.attributesFile`) active",
+      { attributes: probeResult.stdout.trim() },
+    );
+  }
 }
 
 /**
@@ -1349,43 +1644,142 @@ async function refuseAutocrlf(root: string): Promise<void> {
  * the working-tree gate (`assertNoContentFilters`) and by the
  * target-tree pre-mutation validator to refuse nested
  * `.gitattributes` introduced by the integration branch before reset.
+ *
+ * Ticket #86 finding #4: the walker applies the SAME bounded
+ * traversal, declared exclusion skip, and registered-worktree skip
+ * the discard-scope walker uses, so an attributes file nested
+ * inside `.poiesis/workspaces/spec__nested/` (a registered
+ * linked worktree) does not block reconcile, and an attributes
+ * walk that exceeds the resource bounds fails closed with
+ * `RECONCILE_SCAN_INCOMPLETE`.
  */
 async function* findAllGitattributesFiles(root: string): AsyncGenerator<string> {
-  yield* await listGitattributesUnder(root, "");
-  const commonDir = await canonicalCommonDir(root);
-  // For the discard-scope walker the working-tree scan above is the
-  // sufficient pre-mutation check; the unused `commonDir` variable
-  // remains available for a future enhancement that scans the
-  // shared git dir separately.
-  void commonDir;
+  // Apply identical incremental bounds to the attribute-discovery
+  // walk. The discard-scope walker enforces the same bounds via
+  // the per-`walkWorkingTree`-call counters; here we use a
+  // module-local counter because the attribute walk is a
+  // single-purpose pass.
+  let filesScanned = 0;
+  let dirsScanned = 0;
+  let symlinksScanned = 0;
+  let bytesScanned = 0;
+  const liveWorktrees = await listWorktrees(root);
+  const worktreeRoots = new Set(
+    liveWorktrees
+      .filter((worktree) => worktree.path !== root)
+      .map((worktree) => worktree.path),
+  );
+  const excludeSubtreeDirs = new Set(RECONCILE_EXCLUSION_SUBTREE_DIRS);
+  const excludeFiles = new Set(RECONCILE_EXCLUSION_FILES);
+  yield* listGitattributesUnder(root, "", excludeSubtreeDirs, excludeFiles, worktreeRoots, {
+    accumulateFile: () => {
+      filesScanned += 1;
+      if (filesScanned > DEFAULT_MAX_FILES()) {
+        throw new PoiesisError(
+          "RECONCILE_SCAN_INCOMPLETE",
+          "Attribute discovery exceeds the configured file count bound",
+          { filesScanned, maxFiles: DEFAULT_MAX_FILES() },
+        );
+      }
+    },
+    accumulateDir: () => {
+      dirsScanned += 1;
+      if (dirsScanned > DEFAULT_MAX_DIRS()) {
+        throw new PoiesisError(
+          "RECONCILE_SCAN_INCOMPLETE",
+          "Attribute discovery exceeds the configured directory count bound",
+          { dirsScanned, maxDirs: DEFAULT_MAX_DIRS() },
+        );
+      }
+    },
+    accumulateSymlink: () => {
+      symlinksScanned += 1;
+      if (symlinksScanned > DEFAULT_MAX_SYMLINKS()) {
+        throw new PoiesisError(
+          "RECONCILE_SCAN_INCOMPLETE",
+          "Attribute discovery exceeds the configured symlink count bound",
+          { symlinksScanned, maxSymlinks: DEFAULT_MAX_SYMLINKS() },
+        );
+      }
+    },
+    accumulateBytes: (count) => {
+      bytesScanned += count;
+      if (bytesScanned > DEFAULT_MAX_TOTAL_BYTES()) {
+        throw new PoiesisError(
+          "RECONCILE_SCAN_INCOMPLETE",
+          "Attribute discovery exceeds the configured aggregate byte bound",
+          { bytesScanned, maxBytes: DEFAULT_MAX_TOTAL_BYTES() },
+        );
+      }
+    },
+  });
 }
 
-async function listGitattributesUnder(root: string, relativePath: string): Promise<string[]> {
+interface GitattributesWalkCallbacks {
+  accumulateFile: () => void;
+  accumulateDir: () => void;
+  accumulateSymlink: () => void;
+  accumulateBytes: (count: number) => void;
+}
+
+async function* listGitattributesUnder(
+  root: string,
+  relativePath: string,
+  exclusionSubtreeDirs: Set<string>,
+  exclusionFiles: Set<string>,
+  worktreeRoots: Set<string>,
+  callbacks: GitattributesWalkCallbacks,
+): AsyncGenerator<string> {
+  // Mirror `walkWorkingTree`: refuse to descend into a declared
+  // exclusion subtree directory OR a registered linked worktree
+  // root. The exclusion list and worktree-root set are the SAME
+  // values the discard-scope walker uses, so both passes agree on
+  // what is skipped.
+  if (relativePath !== "") {
+    if (exclusionSubtreeDirs.has(relativePath)) return;
+    if (worktreeRoots.has(resolve(root, relativePath))) return;
+  }
   const absolute = relativePath === "" ? root : join(root, relativePath);
   let dirents: Dirent[];
   try {
     dirents = await readdir(absolute, { withFileTypes: true });
   } catch (error) {
-    if (isEnoent(error)) return [];
+    if (isEnoent(error)) return;
     throw error;
   }
-  const found: string[] = [];
   for (const dirent of dirents) {
-    if (relativePath === "" && dirent.name === ".git") continue;
     const childRelative = relativePath === "" ? dirent.name : `${relativePath}/${dirent.name}`;
-    if (dirent.name === ".gitattributes" || dirent.isFile()) {
+    if (relativePath === "" && dirent.name === ".git") continue;
+    if (exclusionFiles.has(childRelative)) continue;
+    if (dirent.isSymbolicLink()) {
+      callbacks.accumulateSymlink();
+      continue;
+    }
+    if (dirent.isFile()) {
+      callbacks.accumulateFile();
       if (dirent.name === ".gitattributes") {
-        found.push(childRelative);
-        continue;
+        yield childRelative;
       }
       continue;
     }
     if (dirent.isDirectory()) {
-      const nested = await listGitattributesUnder(root, childRelative);
-      for (const match of nested) found.push(match);
+      // Defense-in-depth: a subdirectory whose absolute path is a
+      // registered linked worktree root is skipped, mirroring
+      // `walkWorkingTree`.
+      const childAbsolute = join(root, childRelative);
+      if (worktreeRoots.has(childAbsolute)) continue;
+      callbacks.accumulateDir();
+      yield* listGitattributesUnder(
+        root,
+        childRelative,
+        exclusionSubtreeDirs,
+        exclusionFiles,
+        worktreeRoots,
+        callbacks,
+      );
+      continue;
     }
   }
-  return found;
 }
 
 /**
@@ -2141,6 +2535,7 @@ async function listTargetTree(root: string, target: string): Promise<TargetTreeE
       );
     }
     const modeOctal = match[1]!;
+    const kind = match[2]!;
     const oid = match[3]!;
     const path = match[4]!;
     if (path.includes("\n") || path.includes("\0")) {
@@ -2150,9 +2545,45 @@ async function listTargetTree(root: string, target: string): Promise<TargetTreeE
         { record: bounded(record, 256) },
       );
     }
-    entries.push({ path, mode: Number.parseInt(modeOctal, 8), oid });
+    const mode = Number.parseInt(modeOctal, 8);
+    // Ticket #86 finding #5: validate every target-tree mode BEFORE
+    // any destructive step. The supported leaves are blob modes
+    // (100644 regular, 100755 executable, 120000 symlink) and the
+    // synthetic tree mode (040000, used by `git ls-tree` itself for
+    // directory placeholders — never as a leaf in a `-r` listing,
+    // but validated here so the postcondition cannot drift). Any
+    // other mode — most importantly `160000` (gitlink/submodule)
+    // and any future reserved shape — refuses the target tree
+    // outright. Resetting to a target that contains a gitlink would
+    // either silently drop the gitlink or replace the submodule's
+    // directory with an empty entry; both outcomes violate the
+    // exact-target contract.
+    invariant(
+      isSupportedTargetMode(mode, kind),
+      "RECONCILE_TARGET_MODE_UNSUPPORTED",
+      "git ls-tree returned a record with an unsupported mode",
+      { path, mode: modeOctal, kind },
+    );
+    entries.push({ path, mode, oid });
   }
   return entries;
+}
+
+/**
+ * Supported target-tree modes for the exact-target contract. Ticket
+ * #86 finding #5: refuse anything outside this set before the
+ * destructive step so a target-only gitlink (160000) or other
+ * unsupported shape is never silently passed through.
+ */
+function isSupportedTargetMode(mode: number, kind: string): boolean {
+  if (kind === "tree") return mode === 0o040000;
+  if (kind === "blob") {
+    return mode === 0o100644 || mode === 0o100755 || mode === 0o120000;
+  }
+  // `commit` and `tag` kinds (submodule gitlinks come through with
+  // kind `commit` and mode `160000`; tag pointers have no place in a
+  // tree-listing reconcile) are refused.
+  return false;
 }
 
 async function listIndexOids(root: string): Promise<TargetTreeEntry[]> {
@@ -2252,6 +2683,15 @@ async function workingTreeMatchesTarget(
     const cat = await run("git", ["cat-file", "blob", entry.oid], {
       cwd: root,
       binaryStdout: true,
+      // Ticket #86 finding #6: align the cat-file byte budget with
+      // the per-file fingerprint bound (`DEFAULT_MAX_FILE_BYTES`,
+      // 100 MiB) so a valid retained blob >256 KiB does not appear
+      // truncated to the postcondition. The previous call relied on
+      // the 256 KiB `process.run` default; a >256 KiB working tree
+      // would silently truncate the captured blob and the bytewise
+      // comparison would refuse the working tree even when the bytes
+      // were byte-exact.
+      maxBytes: DEFAULT_MAX_FILE_BYTES(),
     });
     // The binary-mode postcondition only refuses when the raw byte
     // stream itself was truncated by the byte budget. UTF-8 prefix
