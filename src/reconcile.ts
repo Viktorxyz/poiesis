@@ -773,11 +773,22 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
   });
   // The set of repository-relative paths whose first on-disk
   // ancestor (after `git reset --hard` replaced the working tree)
-  // is a symlink. Any descendant of those paths resolves through
-  // the symlink ancestor; removing it would delete bytes outside
-  // the canonical root (or inside a registered linked worktree's
-  // territory). Ticket #86 finding #1.
-  const symlinkAncestorEntries = await collectSymlinkAncestorEntries(
+  // is a non-directory leaf that REPLACED a preimage directory of
+  // the same name. Any descendant of those paths is unreachable:
+  // - A symlink ancestor resolves through the target and would
+  //   land outside the canonical root (or inside a registered
+  //   linked worktree's territory). Removing bytes there would
+  //   corrupt an unrelated filesystem region. Ticket #86 finding
+  //   #1.
+  // - A regular-file (or executable-file) ancestor violates POSIX:
+  //   `lstat(<dir>/<descendant>)` fails with ENOTDIR. The
+  //   destructive cleanup would throw post-mutation, leaving the
+  //   repository in a partially-reset state. Ticket #87
+  //   generalization.
+  // Ticket #87 generalizes this set from "symlink-only" to
+  // "any target leaf/type transition" so the same skip rule
+  // applies regardless of the leaf shape the target installs.
+  const typeTransitionAncestors = await collectTypeTransitionAncestors(
     args.canonicalRoot,
     args.preimageEntries,
     args.trackedPaths,
@@ -795,12 +806,14 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
     if (entry.path.startsWith(".git/")) continue;
     if (args.trackedPaths.has(entry.path)) continue;
     if (protectedPaths.has(entry.path)) continue;
-    // Skip any entry whose ancestor chain crosses a symlink that
-    // the destructive step installed (a target leaf that is a
-    // symlink whose preimage contained a directory of the same
-    // name). Resolving through the symlink would land outside the
-    // canonical root. Ticket #86 finding #1.
-    if (entryDescendantOfSymlinkAncestor(entry.path, symlinkAncestorEntries)) continue;
+    // Skip any entry whose ancestor chain crosses a target leaf
+    // that the destructive step installed where the preimage had a
+    // directory of the same name. The leaf may be a symlink
+    // (resolution would traverse it) or a regular/executable file
+    // (`lstat(<dir>/<descendant>)` would throw ENOTDIR). Both
+    // shapes make the descendant unreachable; both must be
+    // skipped. Ticket #86 finding #1 + ticket #87 generalization.
+    if (entryDescendantOfTypeTransitionAncestor(entry.path, typeTransitionAncestors)) continue;
     const absolute = resolve(args.canonicalRoot, entry.path);
     // Direct entry into / under a registered worktree: leave alone.
     // The worktree's working tree is its own territory; reconcile never
@@ -812,22 +825,31 @@ async function deleteResidue(args: DeleteResidueArgs): Promise<void> {
 
 /**
  * Identify repository-relative paths whose first on-disk ancestor
- * is a symlink after the destructive reset. These are paths the
- * target tree introduced as symlinks that REPLACED a directory of
- * the same name recorded in the preimage. Removing descendants of
- * these paths would resolve through the symlink and land outside
- * the canonical root (or inside a registered linked worktree's
- * territory). Ticket #86 finding #1.
+ * is a non-directory target leaf that REPLACED a preimage directory
+ * of the same name. Removing descendants of these paths would
+ * either resolve through a symlink target (landing outside the
+ * canonical root or inside a registered linked worktree's
+ * territory) or fail with `ENOTDIR` for regular/executable leaves
+ * (POSIX does not allow children under a non-directory parent).
+ * Both shapes make every preimage descendant unreachable after
+ * `git reset --hard`; both must be skipped.
  *
  * The detection is bounded to the preimage entries and the target
  * tree leaves: it iterates the preimage, checks each entry's
  * immediate parent against `lstat` (no descent into directories,
  * no traversal of symlinks), and records only those parents that
- * were (a) a directory in the preimage and (b) a symlink on disk
- * after the reset. Both pieces are bounded by the preimage size
- * so the loop stays within the existing bounds.
+ * were (a) a directory in the preimage AND (b) a non-directory
+ * leaf on disk after the reset. Both pieces are bounded by the
+ * preimage size so the loop stays within the existing bounds.
+ *
+ * Ticket #87 generalization: the prior version only recognized
+ * `isSymbolicLink()` for the on-disk shape. The directory → leaf
+ * regular/executable transition leaves `lstat(<dir>/<descendant>)`
+ * throwing ENOTDIR post-reset, aborting the destructive step
+ * after `git reset --hard` has already run. The skip set now
+ * covers every leaf shape the target may install.
  */
-async function collectSymlinkAncestorEntries(
+async function collectTypeTransitionAncestors(
   canonicalRoot: string,
   preimageEntries: readonly DiscardEntry[],
   trackedPaths: ReadonlySet<string>,
@@ -841,14 +863,22 @@ async function collectSymlinkAncestorEntries(
   for (const entry of preimageEntries) {
     if (entry.kind === "dir") preimageDirs.add(entry.path);
   }
-  const symlinkAncestors = new Set<string>();
+  const ancestors = new Set<string>();
   for (const dir of preimageDirs) {
     if (!trackedPaths.has(dir)) continue;
     // The target declares `dir` as a tracked leaf. After `git
     // reset --hard`, the on-disk entry at this path is whatever
-    // the target says (a regular file or a symlink). If it is a
-    // symlink, every preimage descendant of `dir` must be skipped
-    // — resolution would traverse the symlink.
+    // the target says (a regular file, executable file, or
+    // symlink). Any non-directory shape means every preimage
+    // descendant of `dir` is unreachable:
+    //   - symlink: resolution traverses the target outside the
+    //     canonical root (or into a registered worktree).
+    //   - regular/executable file: `lstat(<dir>/<descendant>)`
+    //     throws ENOTDIR.
+    // Skip the descendants in both cases. Ticket #87
+    // generalization: the ticket #86 implementation only included
+    // `isSymbolicLink()`, so directory → regular-file transitions
+    // threw ENOTDIR post-reset.
     const absolute = join(canonicalRoot, dir);
     let stats: Awaited<ReturnType<typeof lstat>>;
     try {
@@ -857,26 +887,25 @@ async function collectSymlinkAncestorEntries(
       if (isEnoent(error)) continue;
       throw error;
     }
-    if (stats.isSymbolicLink()) symlinkAncestors.add(dir);
+    if (stats.isFile() || stats.isSymbolicLink()) ancestors.add(dir);
   }
-  // Also check preimage entries that themselves describe a symlink
-  // (the walker never descended into them). Their children cannot
-  // be in the preimage, but a directory in the preimage whose on-
-  // disk post-reset shape is a symlink could still have descendants
-  // recorded under a different mechanism (e.g. a tracked file at
-  // the same path that pre-dates the symlink). The previous loop
-  // already captures the directory → symlink transition; this
-  // follow-up handles the type-transition case (directory →
-  // regular file), where the descendant's ancestor chain still
-  // appears as a directory in the preimage.
+  // Also follow the parent chain of every preimage directory whose
+  // target path is NOT itself tracked as a leaf. The direct
+  // ancestor — if it was a preimage directory AND is now any
+  // non-directory leaf on disk after reset — is recorded here so
+  // the descendant preimage subtree (e.g. `a/b/c/` where the
+  // target installs a regular file at `a/b/`) is skipped in the
+  // same way. Ticket #87 generalization: the ticket #86 follow-up
+  // only matched on-disk symlinks; here we match any leaf shape.
   for (const dir of preimageDirs) {
     if (trackedPaths.has(dir)) continue;
     // `dir` is in the preimage as a directory and the target tree
     // does NOT track it. The destructive step will attempt to
-    // remove it (subject to the protected-paths check). If the
-    // parent chain in the post-reset state contains a symlink
-    // ancestor that the target installed, the directory entry must
-    // be skipped — its removal would traverse the symlink.
+    // remove it (subject to the protected-paths check). If its
+    // parent chain contains a preimage directory that became a
+    // non-directory target leaf after `git reset --hard`, the
+    // directory itself is unreachable post-reset and must be
+    // skipped.
     let cursor = dir;
     while (cursor.includes("/")) {
       const parent = cursor.slice(0, cursor.lastIndexOf("/"));
@@ -890,20 +919,20 @@ async function collectSymlinkAncestorEntries(
           if (isEnoent(error)) break;
           throw error;
         }
-        if (stats.isSymbolicLink()) symlinkAncestors.add(parent);
+        if (stats.isFile() || stats.isSymbolicLink()) ancestors.add(parent);
         break;
       }
       cursor = parent;
     }
   }
-  return symlinkAncestors;
+  return ancestors;
 }
 
-function entryDescendantOfSymlinkAncestor(
+function entryDescendantOfTypeTransitionAncestor(
   entryPath: string,
-  symlinkAncestors: ReadonlySet<string>,
+  ancestors: ReadonlySet<string>,
 ): boolean {
-  for (const ancestor of symlinkAncestors) {
+  for (const ancestor of ancestors) {
     if (entryPath === ancestor) return true;
     if (entryPath.startsWith(`${ancestor}/`)) return true;
   }
