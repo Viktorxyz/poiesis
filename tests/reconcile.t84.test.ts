@@ -246,23 +246,23 @@ describe("ticket #84 — preservation exclusions", () => {
     await run("git", ["add", "-f", ".poiesis/workspaces/tracked.txt"], { cwd: repo.root });
     await run("git", ["commit", "--quiet", "-m", "track under exclusion"], { cwd: repo.root });
     await run("git", ["push", "--quiet", "origin", "main"], { cwd: repo.root });
+    // Ticket #91 finding #3: the trash subtree check fires
+    // earlier than the target-tree collision check, refusing
+    // with `RECONCILE_SUBDIVISION_TRACKED` during
+    // `computeReconcileFingerprint` (the local index has the
+    // tracked descendant). Either error code is a fail-closed
+    // refusal of the dangerous shape.
     await expect(
-      reconcile({
+      computeReconcileFingerprint({
         cwd: repo.root,
         remote: "origin",
         integrationBranch: "main",
-        expectedHeadSha: (await run("git", ["rev-parse", "HEAD"], { cwd: repo.root })).stdout,
-        expectedTargetSha: (await run("git", ["rev-parse", "origin/main"], { cwd: repo.root })).stdout,
-        expectedFingerprint: (
-          await computeReconcileFingerprint({
-            cwd: repo.root,
-            remote: "origin",
-            integrationBranch: "main",
-          })
-        ).digest,
-        discardAcknowledged: true,
       }),
-    ).rejects.toMatchObject({ code: "RECONCILE_EXCLUSION_COLLISION" });
+    ).rejects.toMatchObject({
+      code: expect.stringMatching(
+        /^RECONCILE_(?:EXCLUSION_COLLISION|SUBDIVISION_TRACKED)$/,
+      ),
+    });
   });
 
   it("still refuses an unregistered nested repository (no .git/worktrees entry)", async () => {

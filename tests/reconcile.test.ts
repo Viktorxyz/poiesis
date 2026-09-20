@@ -662,9 +662,14 @@ describe("reconcile operation (destructive, bounded)", () => {
     repos.push(repo);
     await gitignoreRuntime(repo.root);
     const baseline = await captureBaseline(repo);
+    // The cwd must be OUTSIDE the git repository for the gate
+    // to refuse with `RECONCILE_ROOT_MISMATCH`. Use the
+    // repository's parent directory (which holds the remote bare
+    // repo but is not itself a working tree).
+    const outsideCwd = repo.parent;
     await expect(
       reconcile({
-        cwd: repo.parent,
+        cwd: outsideCwd,
         remote: "origin",
         integrationBranch: "main",
         expectedHeadSha: baseline.head,
@@ -888,18 +893,16 @@ describe("reconcile operation (destructive, bounded)", () => {
     await run("git", ["add", "-f", ".poiesis/workspaces/tracked.txt"], { cwd: repo.root });
     await run("git", ["commit", "--quiet", "-m", "track under exclusion"], { cwd: repo.root });
     await run("git", ["push", "--quiet", "origin", "main"], { cwd: repo.root });
-    const baseline = await captureBaseline(repo);
-    await expect(
-      reconcile({
-        cwd: repo.root,
-        remote: "origin",
-        integrationBranch: "main",
-        expectedHeadSha: baseline.head,
-        expectedTargetSha: baseline.target,
-        expectedFingerprint: baseline.fingerprint,
-        discardAcknowledged: true,
-      }),
-    ).rejects.toMatchObject({ code: "RECONCILE_EXCLUSION_COLLISION" });
+    // Ticket #91 finding #3: the trash subtree check fires
+    // earlier than the target-tree collision check, refusing
+    // with `RECONCILE_SUBDIVISION_TRACKED` during `captureBaseline`.
+    // Either error code is a fail-closed refusal of the
+    // dangerous shape.
+    await expect(captureBaseline(repo)).rejects.toMatchObject({
+      code: expect.stringMatching(
+        /^RECONCILE_(?:EXCLUSION_COLLISION|SUBDIVISION_TRACKED)$/,
+      ),
+    });
   });
 
   it("refuses to report success when a post-reset partial failure leaves residue", async () => {

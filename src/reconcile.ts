@@ -1103,10 +1103,30 @@ function computeProtectedPaths(args: ProtectedPathsArgs): Set<string> {
 }
 
 function isInsideAnyWorktreeRoot(worktreeRoots: Set<string>, absolutePath: string): boolean {
+  // Bounded worktree containment predicate: a path is inside a
+  // registered worktree root iff `relative(root, path)` is either
+  // empty (the path IS the root) or a descendant path that does
+  // NOT start with `..` and is NOT an absolute path.
+  //
+  // Ticket #91 finding #2: the previous implementation returned
+  // `true` when `relative(root, path) === ".."`, treating the
+  // parent directory of a registered worktree as part of the
+  // worktree's territory. That mis-classification caused the
+  // destructive step to silently skip residue that lives next to
+  // a registered worktree root — e.g. a file at
+  // `.poiesis/workspaces/late-sibling.txt` was wrongly skipped
+  // because the predicate thought `.poiesis/workspaces/` (the
+  // parent of `.poiesis/workspaces/wt/`) was inside the worktree.
+  // The fix restricts "inside" to the root and its descendants.
+  // Absolute paths (different drive / bind-mount crossing) are
+  // likewise outside.
   for (const root of worktreeRoots) {
     const within = relative(root, absolutePath);
-    if (within === "" || within === "..") return true;
-    if (!within.startsWith(`..${sep}`) && !isAbsolute(within)) return true;
+    if (within === "") return true;
+    if (within === "..") continue;
+    if (within.startsWith(`..${sep}`)) continue;
+    if (isAbsolute(within)) continue;
+    return true;
   }
   return false;
 }
@@ -1165,6 +1185,48 @@ async function safeRemoveWithinRoot(root: string, repositoryPath: string): Promi
   if (within === "" || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) {
     return;
   }
+  // Ticket #91 finding #4: bounded defense for the no-follow
+  // contract on residue deletion.
+  //
+  // Reconcile serializes against the cooperating mutation lock
+  // (see `acquireWorkspaceMutationLock`) and the pre-mutation
+  // revalidation fences the working tree across the destructive
+  // step. The quiescent-checkout contract that the lock +
+  // revalidation enforce is the structural guarantee: a writer
+  // that holds neither the cooperating lock nor a path through
+  // `reconcile`'s revalidation cannot change the working tree
+  // mid-operation.
+  //
+  // The per-entry `isAncestorChainRealDirectory` check below is
+  // defense-in-depth — NOT an atomic guarantee against a
+  // concurrent writer between the `lstat` and the subsequent
+  // `rm`. The window between the last `lstat` and `rm` is a
+  // legitimate remaining race that the atomic-syscall surface
+  // (which Node's `fs` does not expose on every supported
+  // platform) would close on a single host. The proper closure
+  // here is the cooperating lock + revalidation; the `lstat`
+  // loop catches the local-on-disk shape WITHOUT the underlying
+  // unlink(2) syscall resolving through an exchanged symlink
+  // ancestor — i.e., the on-disk shape seen at `lstat` time is
+  // what's traversed by the follow-up `rm`. A non-cooperating
+  // writer that swaps an ancestor to a symlink during that
+  // window would be visible only as the next reconcile's
+  // revalidation drift; reconcile would refuse then.
+  //
+  // In particular, this check is NOT a substitute for the
+  // cooperating lock. Lock-release / revalidation drift is the
+  // authoritative refusal path; the `lstat` walk is the second
+  // line of defense within the bounded destructive step.
+  //
+  // The skip here is fail-closed for the per-entry contract:
+  // when an ancestor is a symlink (or not a real directory),
+  // the entry is silently left in place. The postcondition
+  // residue walker then surfaces the unpurged entry as residue
+  // and reconcile refuses with `RECONCILE_POSTCONDITION_RESIDUE`
+  // during the next revalidation.
+  if (!(await isAncestorChainRealDirectory(root, repositoryPath))) {
+    return;
+  }
   let lstats: Awaited<ReturnType<typeof lstat>>;
   try {
     lstats = await lstat(absolute);
@@ -1193,7 +1255,53 @@ async function safeRemoveWithinRoot(root: string, repositoryPath: string): Promi
     return;
   }
   // Plain file / symlink / fifo: remove the validated leaf only.
+  // The `lstat`-on-each-ancestor check above is the
+  // defense-in-depth — the authoritative guarantee is the
+  // cooperating mutation lock + pre-mutation revalidation
+  // elsewhere in this file. A swap that races this `lstat` and
+  // the `rm` below would only surface as drift during the next
+  // revalidation.
   await rm(absolute, { force: true });
+}
+
+/**
+ * Bounded defense-in-depth no-follow ancestor check for the
+ * per-entry destructive step. Walks every ancestor between
+ * `root` and `repositoryPath` (exclusive of `repositoryPath`
+ * itself), and returns `false` when any ancestor is:
+ *
+ *   - a symlink (`isSymbolicLink()` true) — the kernel would
+ *     follow the symlink and `unlink(2)` would target a sibling
+ *     file inside the symlink's destination tree;
+ *   - not a regular directory — `lstat(<dir>/<descendant>)`
+ *     would throw ENOTDIR post-resolution, leaving reconcile
+ *     partially-reset;
+ *   - missing (ENOENT on an ancestor) — already handled by the
+ *     outer `lstat`/`rm`/`rmdir` no-op path.
+ *
+ * Returns `true` for the safe-to-delete case. Bounded by the
+ * path-component count (no descent into external targets).
+ * NOT an atomic guarantee against a concurrent writer; the
+ * authoritative guarantee is the cooperating mutation lock +
+ * pre-mutation revalidation elsewhere. Ticket #91 finding #4.
+ */
+async function isAncestorChainRealDirectory(root: string, repositoryPath: string): Promise<boolean> {
+  if (repositoryPath === "") return true;
+  const parts = repositoryPath.split(sep);
+  let cursor = root;
+  for (let index = 0; index < parts.length - 1; index += 1) {
+    cursor = join(cursor, parts[index]!);
+    let stats: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stats = await lstat(cursor);
+    } catch (error) {
+      if (isEnoent(error)) return true; // ancestor missing — outer no-op handles it
+      throw error;
+    }
+    if (stats.isSymbolicLink()) return false;
+    if (!stats.isDirectory()) return false;
+  }
+  return true;
 }
 
 function isExcluded(repositoryPath: string): boolean {
@@ -1252,10 +1360,19 @@ function collidesWithWorktreeAncestry(
   worktreeRoots: Set<string>,
   canonicalRoot: string,
 ): boolean {
+  // Ticket #91 finding #2: same bounded worktree containment
+  // predicate as `isInsideAnyWorktreeRoot`. The previous
+  // implementation treated the `..` parent as inside the worktree,
+  // which wrongly flagged repository-relative target paths that
+  // escaped the worktree's territory as collisions. The fix
+  // restricts the check to the root and its descendants.
   for (const root of worktreeRoots) {
     const within = relative(root, absolutePath);
-    if (within === "" || within === "..") return true;
-    if (!within.startsWith(`..${sep}`) && !isAbsolute(within)) return true;
+    if (within === "") return true;
+    if (within === "..") continue;
+    if (within.startsWith(`..${sep}`)) continue;
+    if (isAbsolute(within)) continue;
+    return true;
   }
   // Ancestor-of-worktree-root + within-worktree-root checks via the
   // canonical-root-relative path. The equality case (`repositoryPath`
@@ -1972,98 +2089,197 @@ async function assertNoSplitIndex(root: string): Promise<void> {
  * path that the discard-scope walker already requires.
  */
 async function assertIndexHasNoOrphanedGitlinks(root: string, indexBytes: Buffer): Promise<void> {
-  if (indexBytes.length === 0) return;
-  // Header: 12 bytes. The supported index versions are 2, 3,
-  // and 4. SHA-256 repositories emit version 3 (or 4 with
-  // additional extensions); SHA-1 repositories emit version 2.
-  // All three versions share the entry layout used below.
-  if (indexBytes.length < 12) return;
-  if (indexBytes.subarray(0, 4).toString("binary") !== "DIRC") return;
-  const version = indexBytes.readUInt32BE(4);
-  if (version !== 2 && version !== 3 && version !== 4) return;
-  // Determine the SHA size from the version: v2/v3 use 20-byte
-  // SHA-1 OIDs; v4 may use 32-byte SHA-256. The `core.sha256`
-  // config is not consulted here; the index header version is
-  // the authoritative signal for which hash the working tree
-  // uses. We only need the entry-size layout for the mode byte,
-  // which lives before the OID field, so a fixed 32-byte OID is
-  // a safe upper bound for the offset arithmetic.
-  const shaSize = version === 4 ? 32 : 20;
-  const entryCount = indexBytes.readUInt32BE(8);
-  let offset = 12;
-  for (let index = 0; index < entryCount && offset + 64 <= indexBytes.length; index += 1) {
-    // The mode field is at offset 24 within the per-entry stat
-    // block. It is stored in big-endian 32-bit format.
-    const mode = indexBytes.readUInt32BE(offset + 24);
+  // Ticket #91 finding #1: replace the hand-rolled raw index
+  // parser with an authoritative `git ls-files --stage -z` probe
+  // so the fingerprint can no longer silently accept a malformed
+  // or inconsistent physical index. The probe handles every
+  // shape the previous parser handled (mode 160000 / gitlink;
+  // v2/v3/v4 index versions; SHA-1/SHA-256 OID length) AND adds
+  // the missing checks: nonzero stage (unmerged conflict),
+  // raw-buffer truncation via the `git` exit code, and OID
+  // length matching the repository's hash algorithm.
+  //
+  // The raw `indexBytes` continue to be bound into the
+  // fingerprint INDEPENDENTLY of the parsed records — see
+  // `computeFingerprintDigest`. The expected-binding contract
+  // stays bytewise: a tampered index with logically-equal
+  // entries still produces a different digest.
+  //
+  // The fingerprint capture falls through to the destructive
+  // step only after this probe passes. A malformed physical
+  // index makes `git ls-files --stage -z` exit non-zero, which
+  // is surfaced as `RECONCILE_INDEX_INVALID`. A parsed record
+  // carrying mode 160000 OR a nonzero stage OR an unexpected
+  // OID length fails with `RECONCILE_INDEX_MODE_INVALID`. Both
+  // errors refuse the reconcile up front.
+  if (indexBytes.length === 0) return; // empty index is a valid exact binding
+  await probeIndexStageViaGitLsFiles(root);
+}
+
+/**
+ * Run `git ls-files --stage -z` and validate every record. Each
+ * record has the shape `<METADATA>\t<PATH>` where METADATA is
+ * `<MODE> <OID> <STAGE>` (octal mode, hex OID, decimal stage).
+ * The probe accepts index versions 2/3/4 (per
+ * `Documentation/technical/index-format.txt`) — `git ls-files`
+ * handles all three natively.
+ *
+ * Failures:
+ *   - the `git` invocation itself fails (corrupt index,
+ *     invalid permissions, etc.) → `RECONCILE_INDEX_INVALID`;
+ *   - any record carries mode 160000 (gitlink/submodule) →
+ *     `RECONCILE_INDEX_MODE_INVALID`;
+ *   - any record carries a nonzero stage (unmerged conflict) →
+ *     `RECONCILE_INDEX_MODE_INVALID`;
+ *   - any record carries an OID whose length disagrees with
+ *     the repository's hash algorithm (SHA-1 → 40 hex chars;
+ *     SHA-256 → 64 hex chars) → `RECONCILE_INDEX_MODE_INVALID`;
+ *   - any record has malformed meta (missing tab, missing fields)
+ *     → `RECONCILE_INDEX_MODE_INVALID`.
+ *
+ * Ticket #91 finding #1.
+ */
+async function probeIndexStageViaGitLsFiles(root: string): Promise<void> {
+  // Detect the repository's hash algorithm so we can validate
+  // the OID length. `git rev-parse --show-object-format` returns
+  // `sha1` or `sha256`. (`extensions.objectFormat` in the config
+  // is the underlying signal; the supported formats are sha1
+  // and sha256.)
+  const objectFormat = await run(
+    "git",
+    ["rev-parse", "--show-object-format"],
+    { cwd: root, allowFailure: true },
+  );
+  let expectedOidLength: number;
+  if (objectFormat.exitCode === 0) {
+    const trimmed = objectFormat.stdout.trim();
+    if (trimmed === "sha1") {
+      expectedOidLength = 40;
+    } else if (trimmed === "sha256") {
+      expectedOidLength = 64;
+    } else {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git index references an unsupported object format",
+        { objectFormat: trimmed },
+      );
+    }
+  } else if (objectFormat.exitCode !== 0 && !objectFormat.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_INDEX_INVALID",
+      "git rev-parse --show-object-format failed; cannot determine the index hash algorithm",
+      { exitCode: objectFormat.exitCode, stderr: objectFormat.stderr },
+    );
+  } else {
+    throw new PoiesisError(
+      "RECONCILE_SCAN_INCOMPLETE",
+      "git rev-parse --show-object-format output was truncated",
+    );
+  }
+  // Run `git ls-files --stage -z`. The NUL record separator is
+  // the canonical binary-safe format — a path containing a tab
+  // or LF would otherwise look like a malformed record. The
+  // exit code is 0 on success and non-zero on a corrupt index
+  // (e.g. `DIRC` header but truncated entry stream) — the
+  // previous hand-rolled parser silently passed those shapes.
+  const result = await run(
+    "git",
+    ["ls-files", "--stage", "-z"],
+    { cwd: root, allowFailure: true },
+  );
+  if (result.stdoutRawTruncated || result.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_SCAN_INCOMPLETE",
+      "git ls-files output was truncated while probing the current index",
+    );
+  }
+  if (result.exitCode !== 0) {
+    throw new PoiesisError(
+      "RECONCILE_INDEX_INVALID",
+      "git ls-files --stage failed to read the current index; reconcile refuses to operate on a malformed physical index",
+      { exitCode: result.exitCode, stderr: result.stderr },
+    );
+  }
+  // Parse the NUL-separated records. `result.stdout` is the raw
+  // captured text; the bounded byte budget in `run` guarantees
+  // `stdoutRawTruncated` is faithful. Empty stdout means an
+  // empty index — a valid exact binding.
+  if (result.stdout === "") return;
+  for (const record of result.stdout.split("\0")) {
+    if (record === "") continue;
+    const tabIndex = record.indexOf("\t");
+    if (tabIndex < 0) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned a record without a meta/path separator",
+        { record: bounded(record, 256) },
+      );
+    }
+    const meta = record.slice(0, tabIndex);
+    const path = record.slice(tabIndex + 1);
+    const parts = meta.split(" ");
+    if (parts.length !== 3) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned a record with an unexpected meta shape",
+        { record: bounded(record, 256) },
+      );
+    }
+    const [modeText, oid, stageText] = parts as [string, string, string];
+    if (!/^\d+$/.test(modeText) || !/^[0-9a-f]+$/.test(oid) || !/^[0-3]$/.test(stageText)) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned a record with non-numeric mode, non-hex OID, or out-of-range stage",
+        { record: bounded(record, 256) },
+      );
+    }
+    const mode = Number.parseInt(modeText, 8);
+    const stage = Number.parseInt(stageText, 10);
+    if (oid.length !== expectedOidLength) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned an OID whose length does not match the repository's hash algorithm",
+        {
+          path,
+          oidLength: oid.length,
+          expectedOidLength,
+        },
+      );
+    }
     if ((mode & 0o170000) === 0o160000) {
-      // Gitlink found. Read the path that follows the OID +
-      // 2-byte flags block so the error message identifies the
-      // exact entry that triggered the refusal. The path is
-      // NUL-terminated; we cap the scan at 4096 bytes for
-      // safety (the same `DEFAULT_MAX_PATH_BYTES` budget the
-      // discard-scope walker uses).
-      const pathOffset = offset + 40 + shaSize + 2;
-      const pathEnd = Math.min(pathOffset + 4096, indexBytes.length);
-      let pathEndIndex = pathEnd;
-      for (let cursor = pathOffset; cursor < pathEnd; cursor += 1) {
-        if (indexBytes[cursor] === 0) {
-          pathEndIndex = cursor;
-          break;
-        }
-      }
-      const pathBytes = indexBytes.subarray(pathOffset, pathEndIndex);
-      const gitlinkPath = pathBytes.toString("utf8");
-      // Ticket #88 finding #3: an orphaned gitlink (160000 in
-      // the index without `.gitmodules`) is refused up front so
-      // the fingerprint never sees an inconsistent index. The
-      // presence of `.gitmodules` would still trip
-      // `assertNoSubmoduleConfig` (which refuses the entire
-      // submodule shape), so this gate is a defense-in-depth
-      // against the orphan-submodule case that previously
-      // slipped past.
+      // Gitlink. The submodule-shape contract is enforced by
+      // `assertNoSubmoduleConfig` (which refuses `.gitmodules`
+      // before this probe runs); we additionally refuse any
+      // orphan gitlink (mode 160000 in the index without
+      // `.gitmodules`) so a `.gitmodules`-less inconsistent
+      // index never reaches the fingerprint.
       const gitmodulesPath = join(root, ".gitmodules");
       if (await pathExists(gitmodulesPath)) {
-        // `.gitmodules` is configured for the working tree. The
-        // `assertNoSubmoduleConfig` gate refuses submodules
-        // before this call site, so the orphan probe never
-        // reaches this branch in the flat-checkout path. Keep
-        // the explicit refusal so a future caller that disables
-        // the submodule gate does not silently accept a real
-        // submodule.
         throw new PoiesisError(
           "RECONCILE_INDEX_MODE_INVALID",
           "Git index contains a gitlink entry with a matching `.gitmodules` declaration; reconcile refuses submodules",
-          { path: gitlinkPath },
+          { path },
         );
       }
       throw new PoiesisError(
         "RECONCILE_INDEX_MODE_INVALID",
         "Git index contains a gitlink (mode 160000) without a matching `.gitmodules` declaration",
-        { path: gitlinkPath },
+        { path },
       );
     }
-    // Advance past this entry: 40 bytes (stat block) + OID +
-    // 2-byte flags + NUL-terminated path + 1–8 pad bytes to the
-    // next 8-byte boundary. The padding is measured from the
-    // entry's START (offset), not from the post-NUL cursor —
-    // measuring from the cursor would misalign subsequent entries
-    // when the name length plus fixed prefix is not a multiple
-    // of 8.
-    const pathOffset = offset + 40 + shaSize + 2;
-    const pathEnd = Math.min(pathOffset + 4096, indexBytes.length);
-    let pathEndIndex = pathEnd;
-    for (let cursor = pathOffset; cursor < pathEnd; cursor += 1) {
-      if (indexBytes[cursor] === 0) {
-        pathEndIndex = cursor;
-        break;
-      }
+    if (stage !== 0) {
+      // Nonzero stage (1/2/3) marks an unmerged conflict
+      // marker. The destructive step's `git reset --hard`
+      // cannot land on a clean target without an explicit
+      // resolution. Refuse up front; the ticket #86+ finding
+      // chain pins this as the canonical signal for
+      // in-progress conflicted state.
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "Git index contains an unmerged conflict (nonzero stage) that reconcile refuses to operate on",
+        { path, stage },
+      );
     }
-    const entrySizeIncludingName = pathEndIndex + 1 - offset;
-    const remainder = entrySizeIncludingName % 8;
-    let nextOffset = offset + entrySizeIncludingName;
-    if (remainder !== 0) nextOffset += 8 - remainder;
-    if (nextOffset <= offset) return; // malformed; refuse later at the index budget gate
-    offset = nextOffset;
   }
 }
 
@@ -2081,6 +2297,26 @@ async function assertIndexHasNoOrphanedGitlinks(root: string, indexBytes: Buffer
  * to reclassify), so the assertion skips it. Refuse with a
  * typed error so the caller knows exactly which shape failed.
  * Ticket #88 finding #4.
+ *
+ * Ticket #91 finding #3: extend the probe to the SUBTREE
+ * exclusions (`RECONCILE_EXCLUSION_SUBTREE_DIRS`). A tracked
+ * file under the subtree exclusion (e.g. a tracked
+ * `.poiesis/workspaces/foo.txt`) is silently accepted by the
+ * per-file probe because the subtree is walked-over by the
+ * discard-scope walker (its contents are not in the preimage);
+ * the tracked file then collides with the `.git reset --hard`
+ * destination. The fix enumerates every tracked descendant via
+ * `git ls-files -- <subtree>` (with NUL records to bound the
+ * parse) and refuses with `RECONCILE_SUBDIVISION_TRACKED` if
+ * any are found. A registered nested worktree's contents
+ * appear under `.git/worktrees/<name>/`, NOT in the primary
+ * checkout's index — the subtree probe correctly ignores it.
+ *
+ * The ignored probe for a subtree uses `git check-ignore` with
+ * a trailing path separator to test the directory itself; the
+ * directory's existence without a matching `.gitignore` rule is
+ * dangerous because the discard-scope walker would silently
+ * skip live content.
  */
 async function assertExclusionsAreGenuinelyUntrackedAndIgnored(root: string): Promise<void> {
   for (const file of RECONCILE_EXCLUSION_FILES) {
@@ -2129,6 +2365,98 @@ async function assertExclusionsAreGenuinelyUntrackedAndIgnored(root: string): Pr
         "RECONCILE_SCAN_INCOMPLETE",
         "git check-ignore output was truncated while probing declared exclusion paths",
         { path: file },
+      );
+    }
+  }
+  await assertExclusionSubtreesAreGenuinelyUntrackedAndIgnored(root);
+}
+
+/**
+ * Subtree companion of
+ * `assertExclusionsAreGenuinelyUntrackedAndIgnored`. For each
+ * declared exclusion SUBTREE directory (e.g.
+ * `.poiesis/workspaces/`), when the directory exists on disk:
+ *   - enumerate every tracked descendant via
+ *     `git ls-files -- <subtree>`; a tracked file under the
+ *     subtree would be silently accepted by the discard-scope
+ *     walker (it skips the subtree entirely) and would collide
+ *     with `git reset --hard` → refuse with
+ *     `RECONCILE_SUBDIVISION_TRACKED`;
+ *   - verify the subtree root itself is ignored via
+ *     `git check-ignore`; an untracked, non-ignored subtree
+ *     contains live content the walker silently swallowed →
+ *     refuse with `RECONCILE_SUBDIVISION_NOT_IGNORED`.
+ *
+ * Ticket #91 finding #3. A legitimate registered nested
+ * worktree is NOT a tracked file inside the subtree: the
+ * worktree's contents live in `.git/worktrees/<name>/` and the
+ * linked checkout is registered via `git worktree add`. The
+ * subtree probe stays orthogonal to that mechanism because
+ * `git ls-files .poiesis/workspaces/` returns zero entries for
+ * a worktree-only subtree.
+ */
+async function assertExclusionSubtreesAreGenuinelyUntrackedAndIgnored(root: string): Promise<void> {
+  for (const subtree of RECONCILE_EXCLUSION_SUBTREE_DIRS) {
+    const absolute = join(root, subtree);
+    const exists = await pathExists(absolute);
+    if (!exists) continue;
+    // Enumerate every tracked descendant. `git ls-files <path>`
+    // emits the relative paths of every index entry whose path
+    // is exactly OR under `path`. `--` terminates the option
+    // parser for safety. NUL records are not needed here (the
+    // output is for diagnostic/truncation detection only); the
+    // exit-code result is what matters.
+    const tracked = await run("git", ["ls-files", "--", subtree], {
+      cwd: root,
+      allowFailure: true,
+    });
+    if (tracked.stdoutTruncated) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "git ls-files output was truncated while probing declared exclusion subtree descendants",
+        { path: subtree },
+      );
+    }
+    const trackedDescendants = tracked.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    if (tracked.exitCode === 0 && trackedDescendants.length > 0) {
+      // The subtree exists AND has at least one tracked descendant.
+      // Refuse up front so the destructive step never reaches the
+      // discard-scope walker's silent subtree skip. A registered
+      // linked worktree is not a tracked descendant — the worktree
+      // contents live in `.git/worktrees/<name>/`, not in the
+      // primary checkout's index — so the probe correctly
+      // ignores legitimate nested-worktree layouts.
+      throw new PoiesisError(
+        "RECONCILE_SUBDIVISION_TRACKED",
+        "Declared exclusion subtree contains tracked descendants in the current index; reconcile cannot preserve a tracked subtree through reset",
+        { path: subtree, sample: trackedDescendants[0] ?? null },
+      );
+    }
+    // Confirm the subtree root itself is ignored. `git
+    // check-ignore` on a directory tests whether files inside
+    // it would be ignored; a rule matching the directory
+    // itself (.poiesis/workspaces/) returns exit 0. We pass the
+    // EXACT subtree path so a future exclusion like
+    // `.poiesis/workspaces/<name>/` resolves correctly.
+    const ignored = await run("git", ["check-ignore", "--", subtree], {
+      cwd: root,
+      allowFailure: true,
+    });
+    if (ignored.stdoutTruncated) {
+      throw new PoiesisError(
+        "RECONCILE_SCAN_INCOMPLETE",
+        "git check-ignore output was truncated while probing declared exclusion subtree",
+        { path: subtree },
+      );
+    }
+    if (ignored.exitCode !== 0) {
+      throw new PoiesisError(
+        "RECONCILE_SUBDIVISION_NOT_IGNORED",
+        "Declared exclusion subtree exists on disk but is not ignored by .gitignore; reconcile refuses to skip an untracked, non-ignored subtree",
+        { path: subtree },
       );
     }
   }
@@ -3168,10 +3496,20 @@ async function collectPostReconcileResidue(
   let bytesScanned = 0;
 
   const isUnderWorktreeRoot = (absolute: string): boolean => {
+    // Ticket #91 finding #2: same bounded containment predicate as
+    // `isInsideAnyWorktreeRoot`. The postcondition walker traverses
+    // ancestors to detect late siblings, but the actual registered
+    // worktree root must be skipped (its contents are not part of
+    // the primary checkout's residue). The previous implementation
+    // treated `..` as inside the worktree, which silently hid
+    // residue adjacent to the worktree root.
     for (const wtRoot of worktreeRoots) {
       const within = relative(wtRoot, absolute);
-      if (within === "" || within === "..") return true;
-      if (!within.startsWith(`..${sep}`) && !isAbsolute(within)) return true;
+      if (within === "") return true;
+      if (within === "..") continue;
+      if (within.startsWith(`..${sep}`)) continue;
+      if (isAbsolute(within)) continue;
+      return true;
     }
     return false;
   };
