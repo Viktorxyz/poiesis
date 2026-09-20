@@ -344,6 +344,107 @@ export async function computeReconcileFingerprint(
  * every binding immediately before any mutation; uses the existing
  * real cooperating mutation lock.
  */
+/**
+ * Module-private state for the bounded internal test hooks that expose
+ * the cooperating mutation lock lifecycle. The flag flips to `true`
+ * after `acquireWorkspaceMutationLock` succeeds and back to `false`
+ * after `lock.release()` resolves in the `finally` block. The
+ * listener array is invoked synchronously on every transition so
+ * deterministic observers can pin the contract that the lock is held
+ * through every postcondition check and through result construction.
+ * Production callers MUST NOT use either hook; both are deliberately
+ * not exported from `index.ts`. Ticket #93 finding #1.
+ */
+let mutationLockHeldForTest = false;
+type LockTransitionListener = (held: boolean) => void;
+let lockTransitionListeners: LockTransitionListener[] = [];
+
+/**
+ * Bounded internal test seam: returns `true` iff the cooperating
+ * mutation lock is currently held by an in-flight `reconcile` call.
+ * The hook is module-private to `src/reconcile.ts`; it is NOT
+ * re-exported from `src/index.ts`. Production callers must not depend
+ * on its presence.
+ *
+ * @internal
+ */
+export function __isReconcileMutationLockHeldForTest(): boolean {
+  return mutationLockHeldForTest;
+}
+
+/**
+ * Bounded internal test seam: install synchronous listeners that are
+ * invoked on every lock transition (acquire -> `true`; release ->
+ * `false`). The listeners run inside the reconcile call's
+ * microtask/macrotask schedule, so a deterministic observer can
+ * pin the contract that the lock is held through every
+ * postcondition check and through result construction without
+ * racing the event loop.
+ *
+ * Pass an empty array (or `null`) to remove all listeners. The hook
+ * is module-private to `src/reconcile.ts`; it is NOT re-exported
+ * from `src/index.ts`. Production callers must not depend on its
+ * presence.
+ *
+ * @internal
+ */
+export function __setReconcileLockTransitionListenersForTest(
+  listeners: LockTransitionListener[] | null,
+): void {
+  lockTransitionListeners = listeners ?? [];
+}
+
+/**
+ * Arguments passed to the post-destructive test hook. The hook runs
+ * INSIDE the lock (after `performDestructiveReset` and before any
+ * postcondition check), so a deterministic test can inject residue
+ * or throw to exercise the `finally` clause without racing the
+ * event loop.
+ */
+interface ReconcilePostdestructiveHookArgs {
+  canonicalRoot: string;
+  gitCommonDir: string;
+  fetchedTarget: string;
+}
+type ReconcilePostdestructiveHook = (args: ReconcilePostdestructiveHookArgs) => void | Promise<void>;
+let postdestructiveHookForTest: ReconcilePostdestructiveHook | null = null;
+
+/**
+ * Bounded internal test seam: install a callback that runs once,
+ * inside the lock, AFTER `performDestructiveReset` AND BEFORE the
+ * first postcondition check (`resolveCommit(HEAD)`). The callback
+ * can inject residue on disk, throw to simulate a postcondition
+ * failure, or assert any other in-lock invariant. The callback
+ * is reset to `null` automatically at the end of every reconcile
+ * call (in `finally`) so a failing test cannot leak state into a
+ * later test. Production callers must not depend on its presence.
+ *
+ * The hook is module-private to `src/reconcile.ts`; it is NOT
+ * re-exported from `src/index.ts`.
+ *
+ * @internal
+ */
+export function __setReconcilePostdestructiveHookForTest(
+  hook: ReconcilePostdestructiveHook | null,
+): void {
+  postdestructiveHookForTest = hook;
+}
+
+/**
+ * Bounded internal test seam: returns the post-destructive hook
+ * currently installed via `__setReconcilePostdestructiveHookForTest`.
+ * The hook is auto-reset to `null` in reconcile's `finally` block
+ * so this returns `null` after every successful OR failed
+ * reconcile call. The hook is module-private to `src/reconcile.ts`;
+ * it is NOT re-exported from `src/index.ts`. Production callers
+ * must not depend on its presence.
+ *
+ * @internal
+ */
+export function __peekReconcilePostdestructiveHookForTest(): ReconcilePostdestructiveHook | null {
+  return postdestructiveHookForTest;
+}
+
 export async function reconcile(options: ReconcileOptions): Promise<ReconcileResult> {
   invariant(
     options.discardAcknowledged === true,
@@ -537,7 +638,26 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
   // `poiesis update`, `poiesis uninstall`, and `update --config`
   // take; any peer mutation in flight makes us fail closed with
   // `POIESIS_MUTATION_LOCKED` instead of corrupting state.
+  //
+  // Ticket #93 finding #1: the lock is held through EVERY
+  // postcondition check AND through result construction. The
+  // previous implementation released the lock at the end of the
+  // destructive step, then ran the postcondition checks (HEAD,
+  // index, working tree, residue, preserved paths) AND
+  // constructed the result object AFTER the lock was released.
+  // That window let a peer mutation slip in between the
+  // destructive step and the postcondition, so the working tree
+  // could drift between reset and postcondition while the same
+  // `reconcile` call still reported `head === target` and
+  // `workingTreeMatchesTarget === true`. The fix moves every
+  // postcondition check AND the `return { ... }` statement inside
+  // the `try` block, so the lock is held until the promise
+  // resolves. A bounded internal test hook
+  // (`__isReconcileMutationLockHeldForTest`) exposes the lock
+  // state without leaking the surface through `index.ts`.
   const lock = await acquireWorkspaceMutationLock(canonicalRoot);
+  mutationLockHeldForTest = true;
+  for (const listener of lockTransitionListeners) listener(true);
   try {
     // Revalidate every identity binding IMMEDIATELY before the first
     // destructive action. Any drift between the initial capture and
@@ -569,63 +689,94 @@ export async function reconcile(options: ReconcileOptions): Promise<ReconcileRes
       targetSha: fetchedTarget,
       preimageEntries: [...fingerprint.entries],
     });
+
+    // Bounded internal test seam: the post-destructive hook runs
+    // INSIDE the lock, AFTER `performDestructiveReset` and BEFORE
+    // the first postcondition check (`resolveCommit(HEAD)`). The
+    // hook is the deterministic seam that exercises the in-lock
+    // postcondition failure path: a test can inject residue,
+    // throw to simulate a postcondition failure, or assert any
+    // other in-lock invariant. The hook is auto-reset to `null`
+    // in the `finally` block below so a failing test cannot leak
+    // state into a later reconcile call. Production callers
+    // must not depend on its presence. Ticket #93 finding #1.
+    if (postdestructiveHookForTest !== null) {
+      const hook = postdestructiveHookForTest;
+      await hook({ canonicalRoot, gitCommonDir, fetchedTarget });
+    }
+
+    // Postcondition verification: HEAD = target, index matches target
+    // tree, working tree bytes/modes/link targets match target for
+    // every tracked path, no residue except the declared exclusions,
+    // and preserved shared paths. Every check runs INSIDE the lock
+    // (ticket #93 finding #1) so a peer mutation cannot slip in
+    // between the destructive step and any postcondition.
+    const postHead = await resolveCommit(canonicalRoot, "HEAD");
+    invariant(
+      postHead === fetchedTarget,
+      "RECONCILE_POSTCONDITION_HEAD",
+      "Reconciliation left HEAD on the wrong commit",
+      { expected: fetchedTarget, actual: postHead },
+    );
+    const indexOids = await listIndexOids(canonicalRoot);
+    invariant(
+      indexOidsMatchTarget(indexOids, targetTree),
+      "RECONCILE_POSTCONDITION_INDEX",
+      "Reconciliation left the index in an unexpected state",
+      { expected: fetchedTarget },
+    );
+    const workingTreeClean = await workingTreeMatchesTarget(
+      canonicalRoot,
+      fetchedTarget,
+      targetTree,
+    );
+    invariant(
+      workingTreeClean,
+      "RECONCILE_POSTCONDITION_WORKTREE",
+      "Working tree does not match the fetched target tree",
+      { expected: fetchedTarget },
+    );
+    const preservedExclusions = await listSurvivingExclusions(canonicalRoot);
+    const residue = await collectPostReconcileResidue(canonicalRoot, targetTree);
+    invariant(
+      residue.length === 0,
+      "RECONCILE_POSTCONDITION_RESIDUE",
+      "Reconciliation left residue outside the declared exclusions",
+      { residue },
+    );
+    const preservedPaths = await listPreservedSharedPaths(canonicalRoot, gitCommonDir);
+
+    // Result construction runs INSIDE the lock so the entire
+    // call is uncooperative-mutation-free. The result object is
+    // fully built before the lock is released, so a peer
+    // mutation that observes the released lock sees a stable,
+    // postcondition-validated working tree.
+    return {
+      schema: RECONCILE_FINGERPRINT_SCHEMA,
+      root: canonicalRoot,
+      head: postHead,
+      target: fetchedTarget,
+      fingerprint: fingerprint.digest,
+      indexMatchesTarget: true,
+      workingTreeMatchesTarget: true,
+      preservedExclusions,
+      preservedPaths,
+    };
   } finally {
+    // The post-destructive test hook is auto-reset to `null` so
+    // a failing test cannot leak the hook into a later reconcile
+    // call. The reset happens BEFORE the lock release so a test
+    // that asserts the hook has been cleared can observe the
+    // post-cleanup state without racing the lock release.
+    postdestructiveHookForTest = null;
+    mutationLockHeldForTest = false;
+    for (const listener of lockTransitionListeners) listener(false);
     await lock.release().catch((error: unknown) => {
       if (error instanceof PoiesisError && error.code === "POIESIS_MUTATION_LOCK_LOST") {
         throw error;
       }
     });
   }
-
-  // Postcondition verification: HEAD = target, index matches target
-  // tree, working tree bytes/modes/link targets match target for
-  // every tracked path, no residue except the declared exclusions.
-  const postHead = await resolveCommit(canonicalRoot, "HEAD");
-  invariant(
-    postHead === fetchedTarget,
-    "RECONCILE_POSTCONDITION_HEAD",
-    "Reconciliation left HEAD on the wrong commit",
-    { expected: fetchedTarget, actual: postHead },
-  );
-  const indexOids = await listIndexOids(canonicalRoot);
-  invariant(
-    indexOidsMatchTarget(indexOids, targetTree),
-    "RECONCILE_POSTCONDITION_INDEX",
-    "Reconciliation left the index in an unexpected state",
-    { expected: fetchedTarget },
-  );
-  const workingTreeClean = await workingTreeMatchesTarget(
-    canonicalRoot,
-    fetchedTarget,
-    targetTree,
-  );
-  invariant(
-    workingTreeClean,
-    "RECONCILE_POSTCONDITION_WORKTREE",
-    "Working tree does not match the fetched target tree",
-    { expected: fetchedTarget },
-  );
-  const preservedExclusions = await listSurvivingExclusions(canonicalRoot);
-  const residue = await collectPostReconcileResidue(canonicalRoot, targetTree);
-  invariant(
-    residue.length === 0,
-    "RECONCILE_POSTCONDITION_RESIDUE",
-    "Reconciliation left residue outside the declared exclusions",
-    { residue },
-  );
-  const preservedPaths = await listPreservedSharedPaths(canonicalRoot, gitCommonDir);
-
-  return {
-    schema: RECONCILE_FINGERPRINT_SCHEMA,
-    root: canonicalRoot,
-    head: postHead,
-    target: fetchedTarget,
-    fingerprint: fingerprint.digest,
-    indexMatchesTarget: true,
-    workingTreeMatchesTarget: true,
-    preservedExclusions,
-    preservedPaths,
-  };
 }
 
 interface RevalidateArgs {
@@ -2220,6 +2371,12 @@ async function assertIndexHasNoOrphanedGitlinks(root: string, indexBytes: Buffer
  *     → `RECONCILE_INDEX_MODE_INVALID`.
  *
  * Ticket #91 finding #1.
+ *
+ * Ticket #93 finding #2: the preflight probe now shares the
+ * authoritative record-level validator with the post-reset probe
+ * (`parseAndValidateIndexRecords`). The two seams agree on what a
+ * valid record looks like: a preflight-passing index implies a
+ * post-reset-passing index, and vice versa.
  */
 async function probeIndexStageViaGitLsFiles(root: string): Promise<void> {
   // Detect the repository's hash algorithm so we can validate
@@ -2227,37 +2384,7 @@ async function probeIndexStageViaGitLsFiles(root: string): Promise<void> {
   // `sha1` or `sha256`. (`extensions.objectFormat` in the config
   // is the underlying signal; the supported formats are sha1
   // and sha256.)
-  const objectFormat = await run(
-    "git",
-    ["rev-parse", "--show-object-format"],
-    { cwd: root, allowFailure: true },
-  );
-  let expectedOidLength: number;
-  if (objectFormat.exitCode === 0) {
-    const trimmed = objectFormat.stdout.trim();
-    if (trimmed === "sha1") {
-      expectedOidLength = 40;
-    } else if (trimmed === "sha256") {
-      expectedOidLength = 64;
-    } else {
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "git index references an unsupported object format",
-        { objectFormat: trimmed },
-      );
-    }
-  } else if (objectFormat.exitCode !== 0 && !objectFormat.stdoutTruncated) {
-    throw new PoiesisError(
-      "RECONCILE_INDEX_INVALID",
-      "git rev-parse --show-object-format failed; cannot determine the index hash algorithm",
-      { exitCode: objectFormat.exitCode, stderr: objectFormat.stderr },
-    );
-  } else {
-    throw new PoiesisError(
-      "RECONCILE_SCAN_INCOMPLETE",
-      "git rev-parse --show-object-format output was truncated",
-    );
-  }
+  const expectedOidLength = await readExpectedOidLength(root);
   // Run `git ls-files --stage -z`. The NUL record separator is
   // the canonical binary-safe format — a path containing a tab
   // or LF would otherwise look like a malformed record. The
@@ -2282,86 +2409,36 @@ async function probeIndexStageViaGitLsFiles(root: string): Promise<void> {
       { exitCode: result.exitCode, stderr: result.stderr },
     );
   }
-  // Parse the NUL-separated records. `result.stdout` is the raw
-  // captured text; the bounded byte budget in `run` guarantees
-  // `stdoutRawTruncated` is faithful. Empty stdout means an
-  // empty index — a valid exact binding.
-  if (result.stdout === "") return;
-  for (const record of result.stdout.split("\0")) {
-    if (record === "") continue;
-    const tabIndex = record.indexOf("\t");
-    if (tabIndex < 0) {
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "git ls-files --stage returned a record without a meta/path separator",
-        { record: bounded(record, 256) },
-      );
-    }
-    const meta = record.slice(0, tabIndex);
-    const path = record.slice(tabIndex + 1);
-    const parts = meta.split(" ");
-    if (parts.length !== 3) {
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "git ls-files --stage returned a record with an unexpected meta shape",
-        { record: bounded(record, 256) },
-      );
-    }
-    const [modeText, oid, stageText] = parts as [string, string, string];
-    if (!/^\d+$/.test(modeText) || !/^[0-9a-f]+$/.test(oid) || !/^[0-3]$/.test(stageText)) {
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "git ls-files --stage returned a record with non-numeric mode, non-hex OID, or out-of-range stage",
-        { record: bounded(record, 256) },
-      );
-    }
-    const mode = Number.parseInt(modeText, 8);
-    const stage = Number.parseInt(stageText, 10);
-    if (oid.length !== expectedOidLength) {
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "git ls-files --stage returned an OID whose length does not match the repository's hash algorithm",
-        {
-          path,
-          oidLength: oid.length,
-          expectedOidLength,
-        },
-      );
-    }
-    if ((mode & 0o170000) === 0o160000) {
-      // Gitlink. The submodule-shape contract is enforced by
-      // `assertNoSubmoduleConfig` (which refuses `.gitmodules`
-      // before this probe runs); we additionally refuse any
-      // orphan gitlink (mode 160000 in the index without
-      // `.gitmodules`) so a `.gitmodules`-less inconsistent
-      // index never reaches the fingerprint.
-      const gitmodulesPath = join(root, ".gitmodules");
-      if (await pathExists(gitmodulesPath)) {
-        throw new PoiesisError(
-          "RECONCILE_INDEX_MODE_INVALID",
-          "Git index contains a gitlink entry with a matching `.gitmodules` declaration; reconcile refuses submodules",
-          { path },
-        );
+  // Validate every record through the shared authoritative
+  // parser/validator. The preflight probe discards the returned
+  // entries; the validation side-effects (throwing on bad
+  // records) are what we want here.
+  try {
+    parseAndValidateIndexRecords(result.stdout, expectedOidLength);
+  } catch (error) {
+    // The shared parser already throws the canonical
+    // `RECONCILE_INDEX_MODE_INVALID` for a gitlink. The
+    // preflight probe additionally distinguishes the "with
+    // matching .gitmodules" shape (which the per-file
+    // `assertNoSubmoduleConfig` would have already caught via
+    // the `.gitmodules` existence check, so this code path is
+    // unreachable in practice — but it pins the precise
+    // diagnostic for the post-reset-vs-preflight symmetry
+    // chain).
+    if (error instanceof PoiesisError && error.code === "RECONCILE_INDEX_MODE_INVALID") {
+      const details = (error.details ?? {}) as { path?: unknown };
+      if (typeof details.path === "string") {
+        const gitmodulesPath = join(root, ".gitmodules");
+        if (await pathExists(gitmodulesPath)) {
+          throw new PoiesisError(
+            "RECONCILE_INDEX_MODE_INVALID",
+            "Git index contains a gitlink entry with a matching `.gitmodules` declaration; reconcile refuses submodules",
+            { path: details.path },
+          );
+        }
       }
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "Git index contains a gitlink (mode 160000) without a matching `.gitmodules` declaration",
-        { path },
-      );
     }
-    if (stage !== 0) {
-      // Nonzero stage (1/2/3) marks an unmerged conflict
-      // marker. The destructive step's `git reset --hard`
-      // cannot land on a clean target without an explicit
-      // resolution. Refuse up front; the ticket #86+ finding
-      // chain pins this as the canonical signal for
-      // in-progress conflicted state.
-      throw new PoiesisError(
-        "RECONCILE_INDEX_MODE_INVALID",
-        "Git index contains an unmerged conflict (nonzero stage) that reconcile refuses to operate on",
-        { path, stage },
-      );
-    }
+    throw error;
   }
 }
 
@@ -3375,22 +3452,49 @@ function isSupportedTargetMode(mode: number, kind: string): boolean {
   return false;
 }
 
-async function listIndexOids(root: string): Promise<TargetTreeEntry[]> {
-  const result = await run("git", ["ls-files", "--stage", "-z"], { cwd: root });
-  if (result.stdoutTruncated) {
-    throw new PoiesisError(
-      "RECONCILE_INDEX_TRUNCATED",
-      "git ls-files output was truncated; reconcile refuses to operate on a partial index",
-    );
-  }
-  if (result.stdout === "") return [];
+/**
+ * Authoritative bounded binary-safe parser for `git ls-files --stage
+ * -z` records. Shared between the preflight index probe
+ * (`probeIndexStageViaGitLsFiles`) and the post-reset index probe
+ * (`listIndexOids`) so the two seams agree on what a valid record
+ * looks like.
+ *
+ * Each record has the shape `<METADATA>\t<PATH>` where METADATA is
+ * `<MODE> <OID> <STAGE>` (octal mode, hex OID, decimal stage). The
+ * parser rejects, with the typed `RECONCILE_INDEX_INVALID` /
+ * `RECONCILE_INDEX_MODE_INVALID` errors, every shape the preflight
+ * probe refuses:
+ *
+ *   - a record without a meta/path separator (missing `\t`);
+ *   - a record whose meta does not have exactly three
+ *     space-separated fields (mode / oid / stage);
+ *   - a record whose mode is non-numeric OR whose OID is non-hex OR
+ *     whose stage is out of range (1-3);
+ *   - a record whose OID length does not match the repository's
+ *     hash algorithm (`sha1` -> 40; `sha256` -> 64);
+ *   - a record whose mode is `160000` (gitlink / submodule);
+ *   - a record whose stage is non-zero (unmerged conflict);
+ *   - a record whose path contains LF or NUL bytes (the canonical
+ *     path-encoding refusal already enforced by `listTargetTree`).
+ *
+ * Returns the parsed `TargetTreeEntry[]` for the caller's downstream
+ * consumption (the preflight probe discards the result; the
+ * post-reset probe compares it against the fetched target tree).
+ * Ticket #93 finding #2.
+ */
+function parseAndValidateIndexRecords(
+  stdout: string,
+  expectedOidLength: number,
+): TargetTreeEntry[] {
+  if (stdout === "") return [];
   const entries: TargetTreeEntry[] = [];
-  for (const record of result.stdout.split("\0").filter(Boolean)) {
+  for (const record of stdout.split("\0")) {
+    if (record === "") continue;
     const tabIndex = record.indexOf("\t");
     if (tabIndex < 0) {
       throw new PoiesisError(
         "RECONCILE_INDEX_INVALID",
-        "git ls-files returned a record without a meta/path separator",
+        "git ls-files --stage returned a record without a meta/path separator",
         { record: bounded(record, 256) },
       );
     }
@@ -3400,16 +3504,134 @@ async function listIndexOids(root: string): Promise<TargetTreeEntry[]> {
     if (parts.length !== 3) {
       throw new PoiesisError(
         "RECONCILE_INDEX_INVALID",
-        "git ls-files returned a record with an unexpected meta shape",
+        "git ls-files --stage returned a record with an unexpected meta shape",
         { record: bounded(record, 256) },
       );
     }
-    const mode = Number.parseInt(parts[0]!, 8);
-    const oid = parts[1]!;
-    if (mode === 0o160000) continue; // skip submodules if any sneak through
+    const [modeText, oid, stageText] = parts as [string, string, string];
+    if (
+      !/^\d+$/.test(modeText) ||
+      !/^[0-9a-f]+$/.test(oid) ||
+      !/^[0-3]$/.test(stageText)
+    ) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned a record with non-numeric mode, non-hex OID, or out-of-range stage",
+        { record: bounded(record, 256) },
+      );
+    }
+    const mode = Number.parseInt(modeText, 8);
+    const stage = Number.parseInt(stageText, 10);
+    if (oid.length !== expectedOidLength) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "git ls-files --stage returned an OID whose length does not match the repository's hash algorithm",
+        {
+          path,
+          oidLength: oid.length,
+          expectedOidLength,
+        },
+      );
+    }
+    if (path.includes("\n") || path.includes("\0")) {
+      throw new PoiesisError(
+        "RECONCILE_INDEX_INVALID",
+        "git ls-files --stage returned a path containing LF or NUL bytes",
+        { record: bounded(record, 256) },
+      );
+    }
+    if ((mode & 0o170000) === 0o160000) {
+      // Gitlink / submodule. The preflight `assertNoSubmoduleConfig`
+      // and the destructivetree collision refusal both refuse the
+      // gitlink shape; we mirror that refusal here so the post-reset
+      // probe never silently passes an index whose target tree does
+      // not track the gitlink.
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "Git index contains a gitlink (mode 160000); reconcile refuses submodules",
+        { path },
+      );
+    }
+    if (stage !== 0) {
+      // Nonzero stage (1/2/3) marks an unmerged conflict marker.
+      // The destructive step's `git reset --hard` cannot land on a
+      // clean target without an explicit resolution; refuse so the
+      // postcondition surfaces the same shape as the preflight.
+      throw new PoiesisError(
+        "RECONCILE_INDEX_MODE_INVALID",
+        "Git index contains an unmerged conflict (nonzero stage) that reconcile refuses to operate on",
+        { path, stage },
+      );
+    }
     entries.push({ path, mode, oid });
   }
   return entries;
+}
+
+/**
+ * Read the repository's hash algorithm via `git rev-parse
+ * --show-object-format`. Returns the expected OID length in hex
+ * characters (`sha1` -> 40; `sha256` -> 64). Shared between the
+ * preflight probe and the post-reset probe so the two seams agree
+ * on what an in-range OID is. Ticket #93 finding #2.
+ */
+async function readExpectedOidLength(root: string): Promise<number> {
+  const objectFormat = await run(
+    "git",
+    ["rev-parse", "--show-object-format"],
+    { cwd: root, allowFailure: true },
+  );
+  if (objectFormat.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_SCAN_INCOMPLETE",
+      "git rev-parse --show-object-format output was truncated",
+    );
+  }
+  if (objectFormat.exitCode !== 0) {
+    throw new PoiesisError(
+      "RECONCILE_INDEX_INVALID",
+      "git rev-parse --show-object-format failed; cannot determine the index hash algorithm",
+      { exitCode: objectFormat.exitCode, stderr: objectFormat.stderr },
+    );
+  }
+  const trimmed = objectFormat.stdout.trim();
+  if (trimmed === "sha1") return 40;
+  if (trimmed === "sha256") return 64;
+  throw new PoiesisError(
+    "RECONCILE_INDEX_MODE_INVALID",
+    "git index references an unsupported object format",
+    { objectFormat: trimmed },
+  );
+}
+
+async function listIndexOids(root: string): Promise<TargetTreeEntry[]> {
+  // Ticket #93 finding #2: route the post-reset probe through the
+  // shared authoritative parser/validator. The previous
+  // implementation accepted any well-formed meta triple and only
+  // filtered out gitlinks with `if (mode === 0o160000) continue;` —
+  // a malformed mode, a SHA-1 OID in a SHA-256 repository, a
+  // nonzero stage, a path containing LF/NUL bytes, and any other
+  // unsupported shape all slipped past silently. The shared parser
+  // rejects every shape the preflight probe rejects.
+  const result = await run("git", ["ls-files", "--stage", "-z"], {
+    cwd: root,
+    allowFailure: true,
+  });
+  if (result.stdoutRawTruncated || result.stdoutTruncated) {
+    throw new PoiesisError(
+      "RECONCILE_SCAN_INCOMPLETE",
+      "git ls-files output was truncated; reconcile refuses to operate on a partial index",
+    );
+  }
+  if (result.exitCode !== 0) {
+    throw new PoiesisError(
+      "RECONCILE_INDEX_INVALID",
+      "git ls-files --stage failed to read the post-reset index; reconcile refuses to operate on a malformed physical index",
+      { exitCode: result.exitCode, stderr: result.stderr },
+    );
+  }
+  const expectedOidLength = await readExpectedOidLength(root);
+  return parseAndValidateIndexRecords(result.stdout, expectedOidLength);
 }
 
 function indexOidsMatchTarget(
