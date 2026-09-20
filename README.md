@@ -186,6 +186,7 @@ doctor                  inspect health without mutation
 update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
+reconcile               reconcile the reviewed primary checkout to the exact fetched target
 capability install      install one selected, revision-pinned skill
 model                   interactive: pick exactly one slot (reasoning or execution) from the live OpenCode inventory
 model set               deterministic single-class set (reasoning|execution <provider/model>)
