@@ -14,77 +14,17 @@ import {
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import {
   assertOwnershipReceipt,
-  ownershipReceiptExists,
   ownershipReceiptLocation,
   readOwnershipReceipt,
-  removeOwnershipReceipt,
-  replaceOwnershipReceipt,
 } from "../src/receipt.js";
 import { parseJsonc } from "../src/config.js";
 import { readUtf8 } from "../src/fs.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
-
-async function asPredecessorManifest(
-  repository: TestRepository,
-  predecessorVersion: "1.0.0" | "1.0.1" | "1.0.2" | "1.1.1",
-  options: { keepReceipt?: boolean } = {},
-): Promise<Manifest> {
-  const manifest = await loadManifest(repository.root);
-  const config = testConfig(repository);
-  const predecessor =
-    predecessorVersion === "1.1.1"
-      ? predecessorProjectionV111(config, predecessorVersion)
-      : predecessorProjectionV100V101V102(config, predecessorVersion);
-  // Replace each manifest patch\'s installed value with the exact predecessor variant.
-  manifest.poiesisVersion = predecessorVersion;
-  manifest.configPatches = manifest.configPatches.map((patch) => {
-    const matching = predecessor.find(
-      (p) =>
-        p.path.length === patch.path.length &&
-        p.path.every((s, i) => s === patch.path[i]),
-    );
-    if (matching === undefined) return patch;
-    return { ...patch, installed: matching.value };
-  });
-  await writeFile(
-    join(repository.root, ".poiesis", "manifest.json"),
-    serializeManifest(manifest),
-  );
-  // Also rewrite the on-disk OpenCode config so each claimed patch value
-  // matches the file content. Otherwise `assertConfigPatchesOwned` rejects
-  // with CONFIG_OWNERSHIP_LOST before the migration has a chance to run.
-  const openCodePath = join(repository.root, "opencode.jsonc");
-  const current = parseJsonc<Record<string, unknown>>(await readUtf8(openCodePath), openCodePath);
-  for (const patch of manifest.configPatches) {
-    let target: Record<string, unknown> = current;
-    for (let i = 0; i < patch.path.length - 1; i++) {
-      const segment = patch.path[i]!;
-      if (typeof target[segment] !== "object" || target[segment] === null) {
-        target[segment] = {};
-      }
-      target = target[segment] as Record<string, unknown>;
-    }
-    target[patch.path[patch.path.length - 1]!] = patch.installed;
-  }
-  await writeFile(openCodePath, JSON.stringify(current, null, 2) + "\n");
-  if (!options.keepReceipt && (await ownershipReceiptExists(repository.root))) {
-    await removeOwnershipReceipt(repository.root);
-  }
-  return manifest;
-}
-
-async function rebindReceipt(repository: TestRepository): Promise<void> {
-  const manifest = await loadManifest(repository.root);
-  const existing = await readOwnershipReceipt(repository.root);
-  await replaceOwnershipReceipt(repository.root, manifest, existing);
-}
-
-async function setupCurrentInstall(repository: TestRepository): Promise<Manifest> {
-  return init(repository.root, testConfig(repository), {
-    skipSkills: true,
-    allowFixtureAdapters: true,
-  });
-}
+import {
+  asPredecessorManifest,
+  rebindReceipt,
+  setupCurrentInstall,
+} from "./predecessor-migration-fixtures.js";
 
 describe("predecessor projection migration (ticket #24 Replan)", () => {
   const repositories: TestRepository[] = [];

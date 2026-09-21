@@ -76,15 +76,17 @@ Do not:
 
 ## Return
 
+Findings are evidence, not commands. Distinguish material correctness, security, reliability, spec, standards, design, and scope concerns from optional preferences; only material contract-relevant issues block. Group findings by root cause. Repeated reopening of one semantic area is evidence for reassessment/Replan, not one-finding/one-ticket churn.
+
 If no material findings:
 
 **Result**
-- `PASS`
+- `PASS` (bounded)
 
 If findings exist:
 
 **Result**
-- `FAIL`
+- `FAIL` (actionable bounded FAIL)
 
 **Findings**
 For each finding:
