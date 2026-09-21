@@ -197,11 +197,17 @@ async function assertManifestAuthorityImpl(
 
 /**
  * The exact v1.0.0/v1.0.1/v1.0.2 predecessor config patches for the OpenCode
- * adapter. Differs from the current projection in TWO fields:
+ * adapter. Differs from the current projection in THREE fields:
  *   - `agent.poiesis.permission.bash` retains the bare-launcher-allow
  *     surface (`poiesis *` / `pnpm exec poiesis *` / `npx poiesis *`)
  *     that v1.0.x shipped; the v1.1.2 surface denies these and allows
  *     only the exact-version `pnpm dlx poiesis-cli@<X>` route.
+ *   - `agent.poiesis-worker.permission.bash` retains the pre-#113 Worker
+ *     deny surface (`git *` / `poiesis *` / `pnpm exec poiesis *` /
+ *     `npx poiesis *`); v1.1.2 (Spec #104 / ticket #113) additionally
+ *     denies `pnpm dlx poiesis-cli *` and `pnpm dlx poiesis-cli@*` so the
+ *     Worker broad `*` allow cannot invoke the same authorized primary
+ *     canonical route through `pnpm dlx`.
  *   - `agent.poiesis-reviewer.permission.task` retains the obsolete
  *     `{ explore: "allow" }` field that ticket #24 removed from runtime
  *     installations.
@@ -219,6 +225,13 @@ export function predecessorProjectionV100V101V102(
     "pnpm exec poiesis *": "allow",
     "npx poiesis *": "allow",
   };
+  const legacyWorkerBash: Record<string, string> = {
+    "*": "allow",
+    "git *": "deny",
+    "poiesis *": "deny",
+    "pnpm exec poiesis *": "deny",
+    "npx poiesis *": "deny",
+  };
   return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
     if (patch.path.length === 2 && patch.path[0] === "agent") {
       if (patch.path[1] === "poiesis") {
@@ -226,6 +239,14 @@ export function predecessorProjectionV100V101V102(
         const permission = {
           ...(installed.permission as Record<string, unknown>),
           bash: legacyPrimaryBash,
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
+      if (patch.path[1] === "poiesis-worker") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          bash: legacyWorkerBash,
         };
         return { ...patch, value: { ...installed, permission } };
       }
@@ -244,13 +265,14 @@ export function predecessorProjectionV100V101V102(
 
 /**
  * The exact v1.0.0 predecessor projection for the OpenCode adapter.
- * Differs from the current projection in the SAME two fields as
- * `predecessorProjectionV100V101V102`; kept as a distinct helper for
- * clarity at the only call site that distinguishes 1.0.0 from the
- * wider 1.0.x family — the explicit `update --bootstrap-legacy-ownership`
- * path, which is 1.0.0-only. The default authority flow (doctor,
- * uninstall, installCapability) and ordinary receipt-authenticated
- * update do NOT consult this helper.
+ * Differs from the current projection in the SAME three fields as
+ * `predecessorProjectionV100V101V102` (primary-bash, worker-bash, and
+ * reviewer.task); kept as a distinct helper for clarity at the only
+ * call site that distinguishes 1.0.0 from the wider 1.0.x family — the
+ * explicit `update --bootstrap-legacy-ownership` path, which is
+ * 1.0.0-only. The default authority flow (doctor, uninstall,
+ * installCapability) and ordinary receipt-authenticated update do NOT
+ * consult this helper.
  *
  * Kept intentionally narrow: this is a migration-only exact predecessor
  * projection, not a general historical-normalization helper.
@@ -274,9 +296,16 @@ export function predecessorProjectionV100(
  * `assertManifestAuthorityToleratingPredecessor` and then transitioned to
  * 1.1.2 by an explicit `update`.
  *
- * Differs from the current projection ONLY in the `agent.poiesis.permission.bash`
- * field. Every other patch — including the worker's bash denies — is
- * identical. Kept intentionally narrow.
+ * Differs from the current projection in TWO fields:
+ *   - `agent.poiesis.permission.bash` retains the v1.1.1
+ *     bare-launcher-allow surface.
+ *   - `agent.poiesis-worker.permission.bash` retains the pre-#113
+ *     Worker deny surface; v1.1.2 (Spec #104 / ticket #113) additionally
+ *     denies `pnpm dlx poiesis-cli *` and `pnpm dlx poiesis-cli@*` so
+ *     the Worker broad `*` allow cannot invoke the same authorized
+ *     primary canonical route through `pnpm dlx`.
+ *
+ * Kept intentionally narrow.
  */
 export function predecessorProjectionV111(
   config: PoiesisConfig,
@@ -287,18 +316,31 @@ export function predecessorProjectionV111(
     "pnpm exec poiesis *": "allow",
     "npx poiesis *": "allow",
   };
+  const legacyWorkerBash: Record<string, string> = {
+    "*": "allow",
+    "git *": "deny",
+    "poiesis *": "deny",
+    "pnpm exec poiesis *": "deny",
+    "npx poiesis *": "deny",
+  };
   return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
-    if (
-      patch.path.length === 2 &&
-      patch.path[0] === "agent" &&
-      patch.path[1] === "poiesis"
-    ) {
-      const installed = patch.value as Record<string, unknown>;
-      const permission = {
-        ...(installed.permission as Record<string, unknown>),
-        bash: v111PrimaryBash,
-      };
-      return { ...patch, value: { ...installed, permission } };
+    if (patch.path.length === 2 && patch.path[0] === "agent") {
+      if (patch.path[1] === "poiesis") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          bash: v111PrimaryBash,
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
+      if (patch.path[1] === "poiesis-worker") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          bash: legacyWorkerBash,
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
     }
     return patch;
   });
@@ -326,9 +368,10 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
 
 /**
  * Authority check that, in addition to the strict current-only projection,
- * also accepts the exact v1.0.0/v1.0.1/v1.0.2 predecessor projection (which
- * retained `poiesis-reviewer.permission.task = { explore: "allow" }`) and,
- * when explicitly accepted, the exact v1.1.1 predecessor primary-bash
+ * also accepts the exact v1.0.0/v1.0.1/v1.0.2 predecessor projection
+ * (which retained `poiesis-reviewer.permission.task = { explore: "allow" }`
+ * and the pre-#113 Worker bash surface) and, when explicitly accepted,
+ * the exact v1.1.1 predecessor primary-bash + pre-#113 Worker bash
  * projection.
  *
  * Use this ONLY after authenticating the receipt: the receipt binds the
@@ -379,7 +422,8 @@ export async function assertManifestAuthorityToleratingPredecessor(
     await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
   }
-  // 1.1.1 predecessor projection: primary-bash differs from current.
+  // 1.1.1 predecessor projection: primary-bash AND pre-#113 worker-bash
+  // both differ from current.
   if (manifest.poiesisVersion === "1.1.1") {
     const predecessor = predecessorProjectionV111(config, manifest.poiesisVersion);
     if (isExactProjection(manifest, predecessor)) {
@@ -387,12 +431,13 @@ export async function assertManifestAuthorityToleratingPredecessor(
       return;
     }
   }
-  // v1.0.0 predecessor projection: BOTH primary-bash and reviewer.task
-  // differ from current. Only the explicit bootstrap-legacy-ownership
-  // path uses this predecessor (the accepted-predecessor set is `["1.0.0"]`
-  // in that path), so a 1.0.0 manifest that drifts from the current
-  // projection shape is admitted only here and never by the ordinary
-  // receipt-authenticated update path.
+  // v1.0.0 predecessor projection: primary-bash, worker-bash, AND
+  // reviewer.task all differ from current. Only the explicit
+  // bootstrap-legacy-ownership path uses this predecessor (the
+  // accepted-predecessor set is `["1.0.0"]` in that path), so a 1.0.0
+  // manifest that drifts from the current projection shape is admitted
+  // only here and never by the ordinary receipt-authenticated update
+  // path.
   if (manifest.poiesisVersion === "1.0.0") {
     const v100Predecessor = predecessorProjectionV100(config, manifest.poiesisVersion);
     if (isExactProjection(manifest, v100Predecessor)) {
