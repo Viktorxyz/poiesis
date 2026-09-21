@@ -1,9 +1,11 @@
 import { writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { publish, resolveTree, workspacePrepare, checkpoint } from "../src/git.js";
+import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
  * Publish fail-closed behavior.
@@ -20,14 +22,39 @@ import { createTestRepository, proofShell, type TestRepository } from "./helpers
  */
 
 const repositories: TestRepository[] = [];
-afterEach(async () =>
-  Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))),
-);
+let env: FakeOpenCodeEnvironment | undefined;
+
+/**
+ * Spec #104 / ticket #110: guarded Git lifecycle mutations cross the
+ * runtime identity boundary; the shared guard fails closed on an
+ * absent manifest. The publish-fail-closed tests exercise
+ * `workspacePrepare` + `checkpoint` + `publish`, all of which are
+ * guarded; they must install Poiesis first so the guard's
+ * manifest-match branch succeeds. The init uses `skipSkills: true`
+ * and `allowFixtureAdapters: true` to keep the lifecycle tests fast.
+ */
+async function installedTestRepository(): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
+
+beforeEach(async () => {
+  env = await installFakeOpenCode();
+});
+
+afterEach(async () => {
+  env?.restore();
+  await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+});
 
 describe("publish fail-closed invariants", () => {
   it("rejects Publish with a malformed proof missing specReview identity", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -70,8 +97,7 @@ describe("publish fail-closed invariants", () => {
   });
 
   it("rejects Publish with a proof carrying a different candidate identity than the candidate SHA", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -114,8 +140,7 @@ describe("publish fail-closed invariants", () => {
   });
 
   it("rejects Publish when the proof is not yet verified (verified:false)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -158,8 +183,7 @@ describe("publish fail-closed invariants", () => {
   });
 
   it("rejects Publish with a proof whose standardsReview verdict is not PASS", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -202,8 +226,7 @@ describe("publish fail-closed invariants", () => {
   });
 
   it("succeeds once the canonical identity-bound proof is supplied", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",

@@ -197,9 +197,14 @@ async function assertManifestAuthorityImpl(
 
 /**
  * The exact v1.0.0/v1.0.1/v1.0.2 predecessor config patches for the OpenCode
- * adapter. Differs from the current projection ONLY in the `poiesis-reviewer`
- * permission, which retains the obsolete `task: { explore: "allow" }` field
- * that ticket #24 removed from runtime installations.
+ * adapter. Differs from the current projection in TWO fields:
+ *   - `agent.poiesis.permission.bash` retains the bare-launcher-allow
+ *     surface (`poiesis *` / `pnpm exec poiesis *` / `npx poiesis *`)
+ *     that v1.0.x shipped; the v1.1.2 surface denies these and allows
+ *     only the exact-version `pnpm dlx poiesis-cli@<X>` route.
+ *   - `agent.poiesis-reviewer.permission.task` retains the obsolete
+ *     `{ explore: "allow" }` field that ticket #24 removed from runtime
+ *     installations.
  *
  * Kept intentionally narrow: this is a migration-only exact predecessor
  * projection, not a general historical-normalization helper. New patches
@@ -207,17 +212,91 @@ async function assertManifestAuthorityImpl(
  */
 export function predecessorProjectionV100V101V102(
   config: PoiesisConfig,
+  poiesisVersion: string,
 ): Array<{ path: string[]; value: unknown }> {
-  return desiredOpenCodePatches(config).map((patch) => {
+  const legacyPrimaryBash: Record<string, string> = {
+    "poiesis *": "allow",
+    "pnpm exec poiesis *": "allow",
+    "npx poiesis *": "allow",
+  };
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
+    if (patch.path.length === 2 && patch.path[0] === "agent") {
+      if (patch.path[1] === "poiesis") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          bash: legacyPrimaryBash,
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
+      if (patch.path[1] === "poiesis-reviewer") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          task: { explore: "allow" },
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
+    }
+    return patch;
+  });
+}
+
+/**
+ * The exact v1.0.0 predecessor projection for the OpenCode adapter.
+ * Differs from the current projection in the SAME two fields as
+ * `predecessorProjectionV100V101V102`; kept as a distinct helper for
+ * clarity at the only call site that distinguishes 1.0.0 from the
+ * wider 1.0.x family — the explicit `update --bootstrap-legacy-ownership`
+ * path, which is 1.0.0-only. The default authority flow (doctor,
+ * uninstall, installCapability) and ordinary receipt-authenticated
+ * update do NOT consult this helper.
+ *
+ * Kept intentionally narrow: this is a migration-only exact predecessor
+ * projection, not a general historical-normalization helper.
+ */
+export function predecessorProjectionV100(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  return predecessorProjectionV100V101V102(config, poiesisVersion);
+}
+
+/**
+ * The exact v1.1.1 predecessor primary bash projection. v1.1.1 was the last
+ * release that exposed the bare `poiesis`, `pnpm exec poiesis`, and
+ * `npx poiesis` launchers as the canonical Poiesis routes under the
+ * primary agent's `permission.bash`. v1.1.2 (spec #104 / ticket #105)
+ * replaces that surface with a broad ordinary shell plus ordered ambiguous
+ * launcher denies plus an exact-version `pnpm dlx poiesis-cli@X` allow
+ * last. This helper returns the 1.1.1 projection so an existing 1.1.1
+ * manifest (verified by a trusted ownership receipt) can be accepted by
+ * `assertManifestAuthorityToleratingPredecessor` and then transitioned to
+ * 1.1.2 by an explicit `update`.
+ *
+ * Differs from the current projection ONLY in the `agent.poiesis.permission.bash`
+ * field. Every other patch — including the worker's bash denies — is
+ * identical. Kept intentionally narrow.
+ */
+export function predecessorProjectionV111(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  const v111PrimaryBash: Record<string, string> = {
+    "poiesis *": "allow",
+    "pnpm exec poiesis *": "allow",
+    "npx poiesis *": "allow",
+  };
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
     if (
       patch.path.length === 2 &&
       patch.path[0] === "agent" &&
-      patch.path[1] === "poiesis-reviewer"
+      patch.path[1] === "poiesis"
     ) {
       const installed = patch.value as Record<string, unknown>;
       const permission = {
         ...(installed.permission as Record<string, unknown>),
-        task: { explore: "allow" },
+        bash: v111PrimaryBash,
       };
       return { ...patch, value: { ...installed, permission } };
     }
@@ -248,16 +327,22 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
 /**
  * Authority check that, in addition to the strict current-only projection,
  * also accepts the exact v1.0.0/v1.0.1/v1.0.2 predecessor projection (which
- * retained `poiesis-reviewer.permission.task = { explore: "allow" }`).
+ * retained `poiesis-reviewer.permission.task = { explore: "allow" }`) and,
+ * when explicitly accepted, the exact v1.1.1 predecessor primary-bash
+ * projection.
  *
  * Use this ONLY after authenticating the receipt: the receipt binds the
  * trusted manifest digest, this function then proves the manifest's projection
- * matches either the current exact or the predecessor exact projection.
+ * matches either the current exact or one of the accepted predecessor exact
+ * projections.
  *
  * Callers MUST pass the explicit predecessor version set they accept. The
- * default accepts all three v1.0.0/1.0.1/1.0.2 versions, but bootstrap and
+ * default accepts the three v1.0.0/1.0.1/1.0.2 versions, but bootstrap and
  * update paths use different subsets per ticket #24 Replan:
- *   - receipt-authenticated update: `["1.0.1", "1.0.2"]`
+ *   - receipt-authenticated update: `["1.0.1", "1.0.2", "1.1.1"]`
+ *     (1.1.1 is accepted only here, on explicit `update`, because the
+ *     primary-bash surface changed in 1.1.2 and any pre-existing 1.1.1
+ *     install must be transitioned through the receipt-gated update path)
  *   - bootstrap legacy ownership: `["1.0.0"]` (the version is already pinned
  *     by `validateLegacyInstallation`, so this is defense-in-depth)
  *
@@ -268,10 +353,21 @@ export async function assertManifestAuthorityToleratingPredecessor(
   root: string,
   manifest: Manifest,
   config: PoiesisConfig,
-  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2"> = ["1.0.0", "1.0.1", "1.0.2"],
+  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1"> = [
+    "1.0.0",
+    "1.0.1",
+    "1.0.2",
+  ],
 ): Promise<void> {
+  // Spec #104 / ticket #105: the exact-version canonical route
+  // `pnpm dlx poiesis-cli@<X>` derives from the manifest's recorded
+  // `poiesisVersion`, so the strict current projection is keyed off the
+  // manifest's own version rather than the runtime's package version.
+  // This keeps doctor / uninstall / installCapability authority stable
+  // across patch bumps of the runtime image.
+  const currentPatches = desiredOpenCodePatches(config, manifest.poiesisVersion);
   try {
-    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
   } catch (strictError) {
     if (!(strictError instanceof PoiesisError) || strictError.code !== "MANIFEST_AUTHORITY_INVALID") {
@@ -280,25 +376,51 @@ export async function assertManifestAuthorityToleratingPredecessor(
   }
   const isPredecessorVersion = (acceptedPredecessorVersions as ReadonlyArray<string>).includes(manifest.poiesisVersion);
   if (!isPredecessorVersion) {
-    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
   }
-  const predecessor = predecessorProjectionV100V101V102(config);
-  if (!isExactProjection(manifest, predecessor)) {
-    await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+  // 1.1.1 predecessor projection: primary-bash differs from current.
+  if (manifest.poiesisVersion === "1.1.1") {
+    const predecessor = predecessorProjectionV111(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, predecessor);
+      return;
+    }
+  }
+  // v1.0.0 predecessor projection: BOTH primary-bash and reviewer.task
+  // differ from current. Only the explicit bootstrap-legacy-ownership
+  // path uses this predecessor (the accepted-predecessor set is `["1.0.0"]`
+  // in that path), so a 1.0.0 manifest that drifts from the current
+  // projection shape is admitted only here and never by the ordinary
+  // receipt-authenticated update path.
+  if (manifest.poiesisVersion === "1.0.0") {
+    const v100Predecessor = predecessorProjectionV100(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, v100Predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, v100Predecessor);
+      return;
+    }
+  }
+  // v1.0.0 / v1.0.1 / v1.0.2 predecessor projection: poiesis-reviewer.permission.task differs.
+  const legacyPredecessor = predecessorProjectionV100V101V102(config, manifest.poiesisVersion);
+  if (!isExactProjection(manifest, legacyPredecessor)) {
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
   }
-  await assertManifestAuthorityImpl(root, manifest, predecessor);
+  await assertManifestAuthorityImpl(root, manifest, legacyPredecessor);
 }
 
 /**
  * Strict current-only authority check. This function is the single source of
  * truth for non-migration flows (init, installCapability, uninstall, doctor).
  * Migration flows (update with receipt, bootstrap-legacy) delegate to
- * `assertManifestAuthorityToleratingPredecessor` instead.
+ * `assertManifestAuthorityToleratingPredecessor` instead. The current
+ * projection is keyed off the manifest's own `poiesisVersion` so a strict
+ * authority check recognizes the exact-version canonical route
+ * `pnpm dlx poiesis-cli@<X>` that THIS manifest records, independent of
+ * the runtime image.
  */
 export async function assertManifestAuthority(root: string, manifest: Manifest, config: PoiesisConfig): Promise<void> {
-  await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config));
+  await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config, manifest.poiesisVersion));
 }
 
 export function nextAdapterFiles(manifest: Manifest, materialized: Array<{ path: string; kind: ManagedFile["kind"]; hash: string; durable?: boolean }>): ManagedFile[] {

@@ -102,3 +102,30 @@ The Author should normally hear:
 Natural clear acceptance of the presented realization authorizes integration. Do not require the phrase “merge it”.
 
 Production always requires a separate explicit Author decision.
+
+## Authority and exceptional administration
+
+Deterministic Poiesis operations (`init`, `doctor`, `update`,
+`uninstall`, `capability`, `workspace`, `checkpoint`, `verify`,
+`publish`, `preview`, `promote`, `integrate`, `tracker`) are the only
+authority the runtime recognizes for mutations to the owned surface.
+Invoking one of those operations through the exact generated
+`pnpm dlx poiesis-cli@<manifest.poiesisVersion>` route — the canonical
+exact-version route the installed lifecycle projects into the primary
+agent's `permission.bash` — is the normal authoritative lifecycle
+execution path. Ordinary shell is for bounded diagnosis
+(`inspect`, `doctor`) and for the explicitly Author-authorized
+exceptional administration below; it is not an alternative
+authoritative path.
+
+Exceptional administration — direct edits to managed files, out-of-band
+Git operations on the Poiesis-owned branch, manual `pnpm` runs against
+the configured Poiesis CLI, or any other action outside the
+deterministic surface — is NOT authoritative. Such actions are
+permitted only when the Author has explicitly authorized them in the
+current session, and Poiesis claims NO evidence of correctness for
+them. Raw or manual mutation outside a deterministic operation creates
+no lifecycle evidence and does not transfer lifecycle authority.
+Do not represent exceptional administration as carrying Poiesis
+authority; it carries no proof and the deterministic surface decides
+on its own terms whether to accept or reject the result.

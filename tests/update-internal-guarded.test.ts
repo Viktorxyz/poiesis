@@ -104,13 +104,63 @@ async function seedDefaultSkillDirectoriesAsPreexisting(repository: TestReposito
 }
 
 async function asLegacy1000(root: string): Promise<void> {
+  const fs = await import("node:fs/promises");
+  const { predecessorProjectionV100 } = await import("../src/authority.js");
   const manifest = await loadManifest(root);
-  // Legacy 1.0.0 manifests had the OpenCode config patch-only (not
-  // whole-file owned): drop the generated `opencode.jsonc` entry from
-  // `files` so the bootstrap's per-file hash validation does not gate
-  // the patch-ownership check we want to exercise.
+  // Spec #104 / ticket #105: rewrite the manifest AND on-disk OpenCode
+  // config into the exact v1.0.0 predecessor projection so
+  // `assertManifestAuthorityToleratingPredecessor`'s 1.0.0 predecessor
+  // admits it. Legacy 1.0.0 manifests had the OpenCode config
+  // patch-only (not whole-file owned): drop the generated
+  // `opencode.jsonc` entry from `files` so the bootstrap's per-file
+  // hash validation does not gate the patch-ownership check we want
+  // to exercise.
   manifest.files = manifest.files.filter((file) => file.path !== "opencode.jsonc");
+  const openCodePath = join(root, "opencode.jsonc");
+  const openCodeBytes = await fs.readFile(openCodePath, "utf8");
+  const openCodeConfig = JSON.parse(openCodeBytes) as {
+    agent?: Record<string, Record<string, unknown>>;
+  };
+  const reasoningModel = openCodeConfig.agent?.poiesis?.model as string;
+  const executionModel = openCodeConfig.agent?.["poiesis-worker"]?.model as string;
+  const fixtureConfig = {
+    schema: 1 as const,
+    models: { reasoning: reasoningModel, execution: executionModel },
+    repository: { remote: "origin", integrationBranch: "main" },
+    tracker: { provider: "github" as const, project: "owner/repo" },
+    delivery: {
+      preview: { adapter: "command", command: ["scripts/poiesis-preview.sh", "{sha}"] },
+      staging: { adapter: "command", command: ["scripts/poiesis-staging.sh", "{sha}"] },
+      production: { adapter: "command", command: ["scripts/poiesis-production.sh", "{sha}"] },
+    },
+    verification: { commands: ["test -f README.md"] },
+  };
+  const predecessor = predecessorProjectionV100(fixtureConfig, "1.0.0");
   manifest.poiesisVersion = "1.0.0";
+  manifest.configPatches = manifest.configPatches.map((patch) => {
+    const matching = predecessor.find(
+      (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
+    );
+    if (matching === undefined) return patch;
+    return { ...patch, installed: matching.value };
+  });
+  // Rewrite the on-disk OpenCode config so the manifest's recorded
+  // configPatches match the live file (otherwise the snapshot-config-
+  // patch ownership check inside the bootstrap transaction rejects
+  // with `CONFIG_OWNERSHIP_LOST`).
+  const current = JSON.parse(openCodeBytes) as Record<string, unknown>;
+  for (const patch of manifest.configPatches) {
+    let target: Record<string, unknown> = current;
+    for (let i = 0; i < patch.path.length - 1; i++) {
+      const segment = patch.path[i]!;
+      if (typeof target[segment] !== "object" || target[segment] === null) {
+        target[segment] = {};
+      }
+      target = target[segment] as Record<string, unknown>;
+    }
+    target[patch.path[patch.path.length - 1]!] = patch.installed;
+  }
+  await fs.writeFile(openCodePath, JSON.stringify(current, null, 2) + "\n");
   await writeFile(join(root, ".poiesis", "manifest.json"), serializeManifest(manifest));
   await removeOwnershipReceipt(root);
 }
@@ -541,11 +591,13 @@ describe("ticket #44 — bootstrap guarded transaction acceptance criteria", () 
     repositories.push(repository);
     await install(repository);
 
-    // Strip the receipt so the bootstrap path is reachable.
+    // Strip the receipt so the bootstrap path is reachable. Use the
+    // shared `asLegacy1000` helper so the manifest AND on-disk OpenCode
+    // config are both rewritten into the exact v1.0.0 predecessor
+    // projection before this test tampers with the bytes (spec #104 /
+    // ticket #105).
+    await asLegacy1000(repository.root);
     const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
-    await removeOwnershipReceipt(repository.root);
     const beforePoiesisConfig = await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8");
 
     const openCodePath = join(repository.root, "opencode.jsonc");

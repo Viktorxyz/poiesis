@@ -40,6 +40,14 @@ In a real Git repository, the human happy path is flagless:
 pnpm dlx poiesis-cli@latest init
 ```
 
+The `@latest` tag is reserved for the human/operator intentional first
+install. The runtime-generated normal installed lifecycle route is
+exactly `pnpm dlx poiesis-cli@<X>` where `X` is the sole durable
+`manifest.poiesisVersion`; the OpenCode config projected into the
+consumer repository reflects this exactly. After `init`, every later
+Poiesis-driven shell command goes through the exact-version route so
+the runtime identity boundary is never ambiguous.
+
 `poiesis init` with no flags runs the interactive TTY flow. It discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
 
 `init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
@@ -59,13 +67,13 @@ A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rat
 `doctor` runs without mutation and verifies the same set of invariants any time:
 
 ```bash
-pnpm dlx poiesis-cli@latest doctor
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
 ```
 
 `update` re-reads the installed canonical files and re-applies the OpenCode adapter projection only against proven-owned state:
 
 ```bash
-pnpm dlx poiesis-cli@latest update
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
 Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
@@ -130,7 +138,7 @@ before any side effect.
 `uninstall` removes only Poiesis-proven-owned state and preserves Git, tracker, PR/MR, and release history:
 
 ```bash
-pnpm dlx poiesis-cli@latest uninstall
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
 ```
 
 ## What `init` produces
@@ -222,7 +230,7 @@ The normal Author experience is to ask Poiesis for something in natural language
 ```text
 You are operating inside a real Git repository that is being onboarded to Poiesis (a deterministic runtime for turning human intent into working, proven software). Treat the Poiesis CLI as the only supported interface — do not hand-write Poiesis config, do not invent an OpenCode agent or skill installation, and do not reimplement a Poiesis step the CLI already provides.
 
-There are two phases. The bootstrap phase runs the published package through a package runner because Poiesis is not yet installed in this project. Once `init` succeeds, the local `poiesis` CLI is available and later commands can call it directly (or via `pnpm exec poiesis`).
+There are two phases. The bootstrap phase runs the published package through a package runner because Poiesis is not yet installed in this project. Once `init` succeeds, the local Poiesis CLI is available and the runtime-generated exact-version route `pnpm dlx poiesis-cli@<X>` is the only Poiesis-launcher route the projected OpenCode config admits. The bare `poiesis`, `pnpm exec poiesis`, `npx poiesis`, and unversioned `pnpm dlx poiesis-cli` forms are explicitly denied.
 
 Bootstrap (Poiesis is not installed yet):
   1. Run `pnpm dlx poiesis-cli@latest init` (TTY). Poiesis prints every detection and asks only the remaining Author-owned choices. After success, tell the human to restart OpenCode.

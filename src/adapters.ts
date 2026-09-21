@@ -1236,6 +1236,13 @@ export async function previewDelivery(
   input: PreviewDeliveryInput,
   root = process.cwd(),
 ): Promise<PreviewDeliveryResult> {
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Preview is not an upgrade channel; the running package must equal
+  // the durable `manifest.poiesisVersion` before the adapter creates
+  // a Preview identity. Dynamic import keeps the top-level module
+  // graph acyclic (adapters.ts and maintenance.ts must not import each
+  // other at module-load time).
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
   return createDeliveryAdapter(config, root).preview(input);
 }
 
@@ -1254,6 +1261,11 @@ export async function promoteDelivery(
   input: PromoteDeliveryInput,
   root = process.cwd(),
 ): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Promote is the extension of preview into staging / production; the
+  // guard mirrors `previewDelivery` so the surfaced error code is
+  // uniform across delivery mutations.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
   const adapter = createDeliveryAdapter(config, root);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

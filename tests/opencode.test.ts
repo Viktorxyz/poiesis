@@ -21,13 +21,18 @@ describe("OpenCode adapter", () => {
     repositories.push(repository);
     const path = join(repository.root, "opencode.jsonc");
     await writeFile(path, '{\n  "$schema": "https://opencode.ai/config.json",\n  "share": "disabled"\n}\n');
-    const patches = await applyOpenCodeConfig(repository.root, testConfig(repository));
+    const patches = await applyOpenCodeConfig(repository.root, testConfig(repository), undefined, "1.1.2");
     const installed = parseJsonc<Record<string, unknown>>(await readFile(path, "utf8"), path);
 
     expect(installed.share).toBe("disabled");
     expect(installed.default_agent).toBe("poiesis");
     expect(installed.subagent_depth).toBe(2);
-    expect(installed).toHaveProperty("agent.poiesis.permission.bash.poiesis *", "allow");
+    // Ticket #105: the runtime identity boundary uses an exact-version
+    // canonical route (last-match-wins allow) plus ordered ambiguous
+    // launcher denies; the bare `poiesis` form is no longer a canonical
+    // route and is denied.
+    expect(installed).toHaveProperty("agent.poiesis.permission.bash.*", "allow");
+    expect(installed).toHaveProperty("agent.poiesis.permission.bash.poiesis *", "deny");
     expect(installed).toHaveProperty("agent.poiesis-worker.permission.bash.git *", "deny");
     expect(installed).not.toHaveProperty("agents");
     expect(installed).not.toHaveProperty("permissions");
@@ -37,10 +42,83 @@ describe("OpenCode adapter", () => {
     expect(restored).toEqual({ $schema: "https://opencode.ai/config.json", share: "disabled" });
   });
 
+  it("primary bash denies ambiguous launchers and allows only the exact-version canonical route", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config = testConfig(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(config, "1.1.2").map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
+    );
+    const primaryBash = (patches["agent.poiesis"] as { permission: { bash: Record<string, string> } }).permission.bash;
+    // Broad ordinary shell allow first; ordered ambiguous launcher denies
+    // follow; the exact-version canonical route is the LAST entry so that
+    // OpenCode's last-match-wins resolver prefers it for any command
+    // matching `pnpm dlx poiesis-cli@<manifest.poiesisVersion> *`.
+    expect(primaryBash["*"]).toBe("allow");
+    expect(primaryBash["poiesis *"]).toBe("deny");
+    expect(primaryBash["pnpm exec poiesis *"]).toBe("deny");
+    expect(primaryBash["npx poiesis *"]).toBe("deny");
+    expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
+    // Spec #104 / ticket #110: deny version-qualified alternate routes
+    // (e.g. `pnpm dlx poiesis-cli@latest`, `pnpm dlx poiesis-cli@1.0.0`)
+    // BEFORE the exact manifest route allow last. The broad `*` allow at
+    // the head would otherwise let every off-version dlx invocation slip
+    // through; the ordered deny collapses the version-qualified surface
+    // so only `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` survives.
+    expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
+    expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
+    // The exact-version canonical route must be the LAST key in the
+    // serialized bash object so last-match-wins resolves it last.
+    const lastKey = Object.keys(primaryBash).at(-1);
+    expect(lastKey).toBe("pnpm dlx poiesis-cli@1.1.2 *");
+    // The version-qualified deny MUST sit BEFORE the exact allow so
+    // last-match-wins cannot resolve a deny for an exact-version key.
+    const keys = Object.keys(primaryBash);
+    const versionQualifiedDenyIdx = keys.indexOf("pnpm dlx poiesis-cli@*");
+    const exactAllowIdx = keys.indexOf("pnpm dlx poiesis-cli@1.1.2 *");
+    expect(versionQualifiedDenyIdx).toBeGreaterThanOrEqual(0);
+    expect(exactAllowIdx).toBeGreaterThan(versionQualifiedDenyIdx);
+  });
+
+  it("worker and specialist authority is unchanged: no broad shell and no exact-version allow", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config = testConfig(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(config, "1.1.2").map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
+    );
+    const workerBash = (patches["agent.poiesis-worker"] as { permission: { bash: Record<string, string> } }).permission.bash;
+    expect(workerBash).toEqual({
+      "*": "allow",
+      "git *": "deny",
+      "poiesis *": "deny",
+      "pnpm exec poiesis *": "deny",
+      "npx poiesis *": "deny",
+    });
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli *");
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 *");
+  });
+
+  it("exact-version canonical route is sourced from the installed package version", async () => {
+    // Spec #104 / ticket #105: the sole durable source of the exact
+    // version X in `pnpm dlx poiesis-cli@X` is the installed package
+    // version. The desiredOpenCodePatches call derives this from
+    // package.json so the route always matches the package shipped to
+    // consumers.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config = testConfig(repository);
+    const patches = Object.fromEntries(
+      desiredOpenCodePatches(config, "1.1.2").map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
+    );
+    const primaryBash = (patches["agent.poiesis"] as { permission: { bash: Record<string, string> } }).permission.bash;
+    expect(primaryBash).toHaveProperty("pnpm dlx poiesis-cli@1.1.2 *", "allow");
+  });
+
   it("projects all six roles and native Explore routing", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    const patches = desiredOpenCodePatches(testConfig(repository));
+    const patches = desiredOpenCodePatches(testConfig(repository), "1.1.2");
     expect(patches.map((entry) => entry.path.join("."))).toEqual([
       "default_agent",
       "subagent_depth",
@@ -59,7 +137,7 @@ describe("OpenCode adapter", () => {
     repositories.push(repository);
     const path = join(repository.root, "opencode.jsonc");
     await writeFile(path, "{}\n");
-    const patches = await applyOpenCodeConfig(repository.root, testConfig(repository));
+    const patches = await applyOpenCodeConfig(repository.root, testConfig(repository), undefined, "1.1.2");
     const installed = parseJsonc<Record<string, unknown>>(await readFile(path, "utf8"), path);
     expect(installed.agent).toMatchObject({
       poiesis: { mode: "primary" },
@@ -76,7 +154,7 @@ describe("OpenCode adapter", () => {
     repositories.push(repository);
     const config = testConfig(repository);
     const patches = Object.fromEntries(
-      desiredOpenCodePatches(config).map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
+      desiredOpenCodePatches(config, "1.1.2").map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
     );
     expect(patches["agent.poiesis"]).toMatchObject({ mode: "primary", model: config.models.reasoning });
     expect(patches["agent.poiesis-planner"]).toMatchObject({ mode: "subagent", model: config.models.reasoning });
@@ -102,7 +180,7 @@ describe("OpenCode adapter", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const patches = Object.fromEntries(
-      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+      desiredOpenCodePatches(testConfig(repository), "1.1.2").map((patch) => [
         patch.path.join("."),
         patch.value as Record<string, unknown>,
       ]),
@@ -116,7 +194,7 @@ describe("OpenCode adapter", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const patches = Object.fromEntries(
-      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+      desiredOpenCodePatches(testConfig(repository), "1.1.2").map((patch) => [
         patch.path.join("."),
         patch.value as Record<string, unknown>,
       ]),
@@ -136,7 +214,7 @@ describe("OpenCode adapter", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const patches = Object.fromEntries(
-      desiredOpenCodePatches(testConfig(repository)).map((patch) => [
+      desiredOpenCodePatches(testConfig(repository), "1.1.2").map((patch) => [
         patch.path.join("."),
         patch.value as Record<string, unknown>,
       ]),
@@ -216,7 +294,7 @@ describe("OpenCode adapter", () => {
     const path = join(repository.root, "opencode.jsonc");
     await writeFile(path, `${JSON.stringify(content)}\n`);
 
-    await expect(assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository))).rejects.toMatchObject({
+    await expect(assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository), "1.1.2")).rejects.toMatchObject({
       code: "INSTALL_PATH_CONFLICT",
     });
   });
@@ -238,7 +316,7 @@ describe("OpenCode adapter", () => {
     await symlink("missing.jsonc", path);
 
     await expect(
-      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository)),
+      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository), "1.1.2"),
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
   });
 
@@ -249,12 +327,12 @@ describe("OpenCode adapter", () => {
     await writeFile(path, '{ "agent": "foreign" }\n');
 
     await expect(
-      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository)),
+      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository), "1.1.2"),
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
 
     await writeFile(path, '{ "agent": { "poiesis": {} }, "agent": {} }\n');
     await expect(
-      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository)),
+      assertOpenCodeConfigAvailable(repository.root, path, testConfig(repository), "1.1.2"),
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
   });
 
@@ -266,7 +344,7 @@ describe("OpenCode adapter", () => {
     await writeFile(path, original);
 
     await expect(
-      applyOpenCodeConfig(repository.root, testConfig(repository), path, { requireAvailable: true }),
+      applyOpenCodeConfig(repository.root, testConfig(repository), path, "1.1.2", { requireAvailable: true }),
     ).rejects.toMatchObject({ code: "INSTALL_PATH_CONFLICT" });
     expect(await readFile(path, "utf8")).toBe(original);
   });
@@ -278,7 +356,7 @@ describe("OpenCode adapter", () => {
     await writeFile(path, '{ "share": "disabled" }');
     let written: string | undefined;
 
-    await applyOpenCodeConfig(repository.root, testConfig(repository), path, {
+    await applyOpenCodeConfig(repository.root, testConfig(repository), path, "1.1.2", {
       onWritten: (content) => {
         written = content;
       },
@@ -297,7 +375,7 @@ describe("OpenCode adapter", () => {
     await writeFile(path, '{ "share": "changed" }\n');
 
     await expect(
-      applyOpenCodeConfig(repository.root, testConfig(repository), path, {
+      applyOpenCodeConfig(repository.root, testConfig(repository), path, "1.1.2", {
         requireAvailable: true,
         expectedContent: expected,
       }),
@@ -309,7 +387,7 @@ describe("OpenCode adapter", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const config = testConfig(repository);
-    const patches = desiredOpenCodePatches(config);
+    const patches = desiredOpenCodePatches(config, "1.1.2");
     for (const patch of patches) {
       const value = patch.value as Record<string, unknown> | string | number | boolean | undefined;
       expect(patch.path).not.toContain("external_directory");
@@ -322,7 +400,7 @@ describe("OpenCode adapter", () => {
     // has been written.
     const path = join(repository.root, "opencode.jsonc");
     await writeFile(path, "{}\n");
-    await applyOpenCodeConfig(repository.root, config, path);
+    await applyOpenCodeConfig(repository.root, config, path, "1.1.2");
     const installed = parseJsonc<Record<string, unknown>>(await readFile(path, "utf8"), path);
     const agents = (installed.agent ?? {}) as Record<string, unknown>;
     for (const agent of Object.values(agents)) {

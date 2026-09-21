@@ -1,15 +1,35 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   createFixtureDeliveryAdapter,
   previewDelivery,
 } from "../src/adapters.js";
 import { validatePreviewPublishEvidence, type PublishEvidence } from "../src/evidence.js";
+import { init } from "../src/maintenance.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+/**
+ * Spec #104 / ticket #110: `previewDelivery` is guarded; the shared
+ * runtime identity guard fires before the adapter makes a remote
+ * call. The publish-evidence-before-preview tests must install Poiesis
+ * first so the guard's manifest-match branch succeeds. The init uses
+ * `skipSkills: true` and `allowFixtureAdapters: true` to keep the
+ * preview tests fast.
+ */
+async function installedTestRepository(): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
 
 /**
  * Ticket #49 — Require Publish evidence before Preview.
@@ -53,8 +73,14 @@ import { createTestRepository, proofShell, publishEvidence, type TestRepository 
 
 const repositories: TestRepository[] = [];
 const scratchDirs: string[] = [];
+let env: FakeOpenCodeEnvironment | undefined;
+
+beforeEach(async () => {
+  env = await installFakeOpenCode();
+});
 
 afterEach(async () => {
+  env?.restore();
   await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   await Promise.all(scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -73,8 +99,7 @@ async function writeDeliveryScript(fixturesDir: string, body: string): Promise<s
 
 describe("ticket #49 — Publish evidence is required before Preview", () => {
   it("happy path: returns a concrete Preview identity when Proof and matching Publish evidence are both valid", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const branch = "poiesis/t49-happy";
     await publishBaseSha(repository, branch);
     const sha = repository.baseSha;
@@ -102,8 +127,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence is omitted (no proof-only bypass)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
@@ -119,8 +143,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence belongs to a different candidate (cross-identity)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-cross-identity";
@@ -139,8 +162,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence carries a different tree (cross-identity)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-cross-tree";
@@ -159,8 +181,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence is not verified (failed/published=false substitute)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-unverified";
@@ -178,8 +199,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence uses a non-success action (failed/closed)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-action-closed";
@@ -197,8 +217,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence names an unsupported provider", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-fake-provider";
@@ -216,8 +235,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when Publish evidence changeRequest block is missing (fabricated)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-no-change-request";
@@ -327,8 +345,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when the configured remote change-branch head has moved off the published head (stale)", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-stale-remote-head";
@@ -355,8 +372,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when the configured remote does not exist", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-remote-missing";
@@ -374,8 +390,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when the configured remote uses an unsafe Git remote name", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/t49-unsafe-remote";
@@ -393,8 +408,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("rejects Preview when the Publish evidence change-branch name is invalid", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
@@ -410,8 +424,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
   });
 
   it("preserves the exact happy-path identities through the Preview adapter", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const branch = "poiesis/t49-identity-preserve";
     await publishBaseSha(repository, branch);
     const sha = repository.baseSha;

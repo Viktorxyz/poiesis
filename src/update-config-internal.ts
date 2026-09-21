@@ -481,8 +481,13 @@ async function runLockedUpdateConfigTransaction(
   //    attempt to atomicWrite. No filesystem work happens here — this is a
   //    pure function call. Specifically: NO `opencode debug config`
   //    invocation at this step (the pure projection does not need a debug
-  //    probe). The schema validation is moved to step 8 below.
-  const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults);
+  //    probe). The schema validation is moved to step 8 below. The
+  //    exact-version canonical route `pnpm dlx poiesis-cli@X` is sourced
+  //    from `await packageVersion()` (the new package version this
+  //    transaction is installing) so the projected OpenCode config always
+  //    matches the package on disk after a successful apply.
+  const nextPoiesisVersion = await packageVersion();
+  const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion);
   const { serialized: preflightSerialized, configPatches: projectedOpenCodePatches } = projectOpenCodePayload({
     root: resolvedRoot,
     configPath: openCodeConfigPath,
@@ -603,10 +608,12 @@ async function runLockedUpdateConfigTransaction(
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
 
     // 13. Build the next manifest. The hash for the .poiesis/config.jsonc file is recomputed; the OpenCode
-    //     config hash is taken from the on-disk write; every other file keeps its prior hash.
+    //     config hash is taken from the on-disk write; every other file keeps its prior hash. Use the
+    //     same `nextPoiesisVersion` captured at step 6 so the manifest's recorded version exactly
+    //     matches the version baked into the OpenCode config bash projection.
     const nextManifest: Manifest = {
       schema: 1,
-      poiesisVersion: await packageVersion(),
+      poiesisVersion: nextPoiesisVersion,
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,

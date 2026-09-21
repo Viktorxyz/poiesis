@@ -302,6 +302,12 @@ export async function inspect(options: InspectOptions): Promise<InspectResult> {
 export async function workspacePrepare(options: WorkspacePrepareOptions): Promise<WorkspaceIdentity> {
   validateText(options.specId, "specId");
   const root = await canonicalGitRoot(options.cwd);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard. The
+  // shared seam in `maintenance.ts` is reached via a delayed dynamic
+  // import to avoid a top-level circular import between this module and
+  // `maintenance.ts`. The guard fails closed with `RUNTIME_VERSION_MISMATCH`
+  // before any ownership marker / branch / worktree side effect runs.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
   await validateRemote(root, options.remote);
   await validateBranchName(root, options.integrationBranch);
   await validateBranchName(root, options.branch);
@@ -454,6 +460,11 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
   validateAcceptedReview(options.review);
   validateText(options.message, "message");
   const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // The receipt-authenticated manifest lives under the primary
+  // checkout that owns this workspace (`owned.marker.repositoryRoot`).
+  // The dynamic import keeps the top-level module graph acyclic.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
   const branch = await assertOwnedBranch(owned);
   const paths = normalizeExplicitPaths(owned.root, options.paths);
   const statusBefore = await gitStatus(owned.root);
@@ -601,6 +612,12 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateText(options.body, "body");
   validateSha(options.candidateSha, "candidateSha");
   const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Validates the running package equals the durable
+  // `manifest.poiesisVersion` before any push / change-request side
+  // effect. The receipt-authenticated manifest lives under the primary
+  // checkout that owns this workspace.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
   const branch = await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Publish remote does not match workspace ownership", {
     expected: owned.marker.remote,
@@ -712,6 +729,11 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateText(options.message, "message");
   validateText(options.authorAcceptance, "authorAcceptance");
   const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Validates the running package equals the durable
+  // `manifest.poiesisVersion` before any
+  // commit-tree / fetch-base / push integration side effect.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
   await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Integration remote does not match workspace ownership");
   invariant(
@@ -823,6 +845,11 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
 
 export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promise<WorkspaceCleanupResult> {
   const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // `workspace cleanup` is the owned-cleanup surface; the running
+  // package must equal the durable `manifest.poiesisVersion` before
+  // any branch / marker / worktree teardown runs.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
   invariant(
     owned.marker.branch !== owned.marker.integrationBranch,
     "INTEGRATION_WORKSPACE_CLEANUP_FORBIDDEN",

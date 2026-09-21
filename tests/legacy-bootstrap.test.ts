@@ -7,12 +7,10 @@ import { ownershipReceiptExists, readOwnershipReceipt, removeOwnershipReceipt } 
 import { run } from "../src/process.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode } from "./fake-opencode.js";
+import { asLegacyProjection } from "./legacy-bootstrap-fixture.js";
 
 async function asLegacy1000(root: string): Promise<void> {
-  const manifest = await loadManifest(root);
-  manifest.poiesisVersion = "1.0.0";
-  await writeFile(join(root, ".poiesis", "manifest.json"), serializeManifest(manifest));
-  if (await ownershipReceiptExists(root)) await removeOwnershipReceipt(root);
+  await asLegacyProjection(root, "1.0.0");
 }
 
 describe("legacy 1.0.0 ownership bootstrap", () => {
