@@ -669,7 +669,13 @@ async function commandPromote(args: string[]): Promise<void> {
   }, repoRoot));
 }
 
-async function commandTracker(args: string[]): Promise<void> {
+/**
+ * Spec #104 / ticket #110: tracker dispatcher. Exported as a library
+ * seam (matching the `commandInit` / `commandUpdate` / `commandModel`
+ * pattern) so the runtime-identity-boundary behavior can be tested
+ * directly. It is intentionally NOT re-exported by `src/index.ts`.
+ */
+export async function commandTracker(args: string[]): Promise<void> {
   const kind = args[0];
   const action = args[1];
   if ((kind !== "spec" && kind !== "ticket") || action === undefined) {
@@ -689,12 +695,17 @@ async function commandTracker(args: string[]): Promise<void> {
   const repoRoot = await resolveGitRoot(cwd);
   const configRoot = await resolveConfigRoot(repoRoot);
   const config = await resolveConfigForRoot(configRoot);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Tracker mutations (spec/ticket create | update | comment | close |
-  // supersede) are not an upgrade channel; the running package must
-  // equal the durable `manifest.poiesisVersion` before the adapter
-  // makes a remote call.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(configRoot);
+  // Spec #104 / ticket #110: pre-mutation runtime identity guard. The
+  // shared guard runs ONLY for tracker mutation actions (create |
+  // update | comment | close | supersede); the read-only `get` action
+  // stays usable across a runtime/manifest mismatch so an operator can
+  // diagnose the mismatch itself. Each mutation branch runs the guard
+  // immediately before the adapter mutation so the guard fails closed
+  // before any remote call.
+  const isMutation = action === "create" || action === "update" || action === "comment" || action === "close" || action === "supersede";
+  if (isMutation) {
+    await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(configRoot);
+  }
   const adapter = createTrackerAdapter(config.tracker, repoRoot);
   const id = () => required(values, "id");
   let result: unknown;

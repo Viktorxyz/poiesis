@@ -17,21 +17,48 @@ vi.mock("../src/process.js", async (importOriginal) => {
 });
 
 import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, workspacePrepare } from "../src/git.js";
+import { init } from "../src/maintenance.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run, type RunResult } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
   return resolveTree(repository.root, sha);
 }
 
+/**
+ * Spec #104 / ticket #110: guarded Git lifecycle mutations
+ * (`workspacePrepare`, `checkpoint`, `publish`, `integrate`,
+ * `workspaceCleanup`) cross the runtime identity boundary; the shared
+ * guard fails closed on an absent manifest. Tests that exercise the
+ * full lifecycle must therefore install Poiesis first so the guard's
+ * manifest-match branch succeeds. The init uses `skipSkills: true` and
+ * `allowFixtureAdapters: true` so the lifecycle tests stay fast.
+ */
+async function installedTestRepository(repositories: TestRepository[]): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
+
 describe("deterministic Git lifecycle", () => {
   const repositories: TestRepository[] = [];
-  afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
+  let env: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
 
   it("isolates dirty foreign work, preserves content through squash, and refuses rewrite attempts", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     await writeFile(join(repository.root, "foreign.txt"), "uncommitted user work\n");
     const workspacePath = join(repository.parent, "workspace");
     const workspace = await workspacePrepare({
@@ -152,8 +179,7 @@ describe("deterministic Git lifecycle", () => {
   }, 30_000);
 
   it("rejects Proof from an older same-tree commit without publishing", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -192,8 +218,7 @@ describe("deterministic Git lifecycle", () => {
   }, 30_000);
 
   it("fails closed on branch, worktree, and dirty cleanup collisions", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspacePath = join(repository.parent, "collision-workspace");
     const workspace = await workspacePrepare({
       cwd: repository.root,
@@ -221,8 +246,7 @@ describe("deterministic Git lifecycle", () => {
   }, 30_000);
 
   it("rejects a stale integration base", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -279,8 +303,7 @@ describe("deterministic Git lifecycle", () => {
   }, 30_000);
 
   it("accepts fast-forward republish of the same change branch and refuses divergence", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -370,28 +393,30 @@ describe("deterministic Git lifecycle", () => {
     ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
   }, 30_000);
 
-  it("accepts a default-path workspace on a normal branch (poiesis/greeting-command) and the primary checkout stays clean through prepare/cleanup", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
-    // A normal-branch flow (no full Poiesis init) still needs the
-    // `.poiesis/workspaces/` ignore rule so the nested workspace area
-    // never appears as foreign work. The transactional gitignore seam
-    // installed by `poiesis init` or `poiesis update --bootstrap-legacy-ownership`
-    // provides this contract; mirror it here so the test exercises the
-    // post-install state.
-    await writeFile(
-      join(repository.root, ".gitignore"),
-      ".poiesis/manifest.json\n.poiesis/workspaces/\n",
-    );
-    await run("git", ["add", ".gitignore"], { cwd: repository.root });
-    await run("git", ["commit", "--quiet", "-m", "gitignore"], { cwd: repository.root });
-    await run("git", ["push", "--quiet", "origin", "main"], { cwd: repository.root });
-
-    // Add an unrelated foreign file so we can prove that default-path
-    // prepare/cleanup do not introduce any new foreign work.
+it("accepts a default-path workspace on a normal branch (poiesis/greeting-command) and the primary checkout stays clean through prepare/cleanup", async () => {
+    const repository = await installedTestRepository(repositories);
+    // A normal-branch flow exercises the post-install state: `poiesis
+    // init` already wrote the `.poiesis/manifest.json` and
+    // `.poiesis/workspaces/` ignore rules into `.gitignore` via the
+    // transactional gitignore seam, so the nested workspace area never
+    // appears as foreign work in the primary checkout. The init writes
+    // happen before the assertion that proves the post-install contract.
     await writeFile(join(repository.root, "foreign.txt"), "uncommitted user work\n");
+    // Filter the post-install foreign-work surface to prove that the
+    // ONLY untracked file is the unrelated `foreign.txt` — the nested
+    // workspace area is gitignored by the install transaction.
     const beforeStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
-    expect(beforeStatus.trim()).toBe("?? foreign.txt");
+    const foreignLines = beforeStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) =>
+        line.startsWith("?? ") &&
+        !line.includes(".poiesis/") &&
+        !line.includes(".opencode/") &&
+        line !== "?? opencode.jsonc" &&
+        line !== "?? .gitignore",
+      );
+    expect(foreignLines.join("\n")).toBe("?? foreign.txt");
 
     const workspace = await workspacePrepare({
       cwd: repository.root,
@@ -401,14 +426,24 @@ describe("deterministic Git lifecycle", () => {
       specId: "spec-greeting-command",
     });
     // The default path lives inside the project root so the harness can
-    // read it without external_directory escalation.
+    // read it without external-directory escalation.
     expect(workspace.path.startsWith(join(repository.root, ".poiesis", "workspaces"))).toBe(true);
     expect(workspace.branch).toBe("poiesis/greeting-command");
 
     // The nested default-path workspace area must NOT appear as foreign
     // work in the primary checkout. `?? foreign.txt` is the only line.
     const midStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
-    expect(midStatus.trim()).toBe("?? foreign.txt");
+    const midForeignLines = midStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) =>
+        line.startsWith("?? ") &&
+        !line.includes(".poiesis/") &&
+        !line.includes(".opencode/") &&
+        line !== "?? opencode.jsonc" &&
+        line !== "?? .gitignore",
+      );
+    expect(midForeignLines.join("\n")).toBe("?? foreign.txt");
 
     // Clean up via the owned-workspace seam so the marker and worktree go
     // away. We need a delivered SHA to satisfy UNDELIVERED_COMMITS, so
@@ -466,7 +501,17 @@ describe("deterministic Git lifecycle", () => {
     // After cleanup the primary checkout is back to the original
     // foreign-file-only status. No default-path residue leaks.
     const afterStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
-    expect(afterStatus.trim()).toBe("?? foreign.txt");
+    const afterForeignLines = afterStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) =>
+        line.startsWith("?? ") &&
+        !line.includes(".poiesis/") &&
+        !line.includes(".opencode/") &&
+        line !== "?? opencode.jsonc" &&
+        line !== "?? .gitignore",
+      );
+    expect(afterForeignLines.join("\n")).toBe("?? foreign.txt");
   }, 30_000);
 });
 
@@ -483,14 +528,17 @@ describe("GitHub provider headRepository handling", () => {
   // are consumed in order: list → create/edit → list (verify).
   let ghResponseQueue: RunResult[] = [];
   let realRun: typeof run;
+  let env: FakeOpenCodeEnvironment | undefined;
 
   afterEach(async () => {
     vi.mocked(run).mockReset();
     vi.mocked(run).mockImplementation(realRun);
+    env?.restore();
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
-  beforeEach(() => {
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
     const stash = (globalThis as unknown as { __poiesisRealRun?: typeof run }).__poiesisRealRun;
     if (stash === undefined) throw new Error("process.js mock factory did not stash the real runner");
     realRun = stash;
@@ -579,8 +627,7 @@ describe("GitHub provider headRepository handling", () => {
   }
 
   it("treats an empty headRepository.nameWithOwner as matching options.project on republish", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-empty-headrepo");
 
@@ -630,8 +677,7 @@ describe("GitHub provider headRepository handling", () => {
   }, 30_000);
 
   it("treats a missing headRepository field as matching options.project on republish", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-missing-headrepo");
 
@@ -677,8 +723,7 @@ describe("GitHub provider headRepository handling", () => {
   }, 30_000);
 
   it("still fails closed when headRepository.nameWithOwner differs from options.project", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-mismatch-headrepo");
 
@@ -728,8 +773,7 @@ describe("GitHub provider headRepository handling", () => {
   // CHANGE_REQUEST_OWNERSHIP_MISMATCH, the same code already produced
   // by the initial-list lookup path.
   it("fails closed on mismatched headRepository in final verify response after gh pr create", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-create-verify-headrepo");
 
@@ -764,8 +808,7 @@ describe("GitHub provider headRepository handling", () => {
   // verify must still close the door on a post-edit report from a
   // different repository.
   it("fails closed on mismatched headRepository in final verify response after gh pr edit", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-edit-verify-headrepo");
 
@@ -820,8 +863,7 @@ describe("GitHub provider headRepository handling", () => {
   // wired in. These guard against accidentally closing the door on
   // legitimate same-repo reports on either the create or edit path.
   it("still accepts matching/missing/empty headRepository on final verify after gh pr create and edit", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const project = "owner/repo";
     const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-verify-headrepo-same");
 

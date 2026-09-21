@@ -30,19 +30,23 @@ export function isSupportedOpenCodeVersion(version: string): boolean {
 type JsonObject = Record<string, unknown>;
 
 /**
- * Spec #104 / ticket #105: the runtime identity boundary for the primary
- * (Poiesis) agent. The generated normal installed lifecycle route is exactly
- * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`. The bare `poiesis`,
- * `pnpm exec poiesis`, and `npx poiesis` canonical routes are removed and
- * explicitly denied, and the unversioned `pnpm dlx poiesis-cli *` launcher is
- * also denied so only the exact-version route survives. The keys are emitted
- * in the documented order so OpenCode's last-match-wins resolver picks the
- * exact-version allow entry last for any matching command.
+ * Spec #104 / tickets #105 / #110: the runtime identity boundary for the
+ * primary (Poiesis) agent. The generated normal installed lifecycle
+ * route is exactly `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`. The
+ * bare `poiesis`, `pnpm exec poiesis`, and `npx poiesis` canonical routes
+ * are removed and explicitly denied, and the unversioned
+ * `pnpm dlx poiesis-cli *` launcher is also denied so only the
+ * exact-version route survives. The keys are emitted in the documented
+ * order so OpenCode's last-match-wins resolver picks the exact-version
+ * allow entry last for any matching command.
  *
  * The `*` allow first provides broad ordinary shell; the ordered denies
- * cover every known ambiguous launcher; the exact-version allow last is the
- * sole canonical CLI route. `@latest` remains reserved for human/operator
- * intentional init/update outside this projection.
+ * cover every known ambiguous launcher including version-qualified
+ * alternate routes (`pnpm dlx poiesis-cli@latest`,
+ * `pnpm dlx poiesis-cli@1.0.0`, etc.) so the broad `*` allow does not
+ * let off-version dlx invocations slip through; the exact-version allow
+ * last is the sole canonical CLI route. `@latest` remains reserved for
+ * human/operator intentional init/update outside this projection.
  */
 function primaryBashPermissions(poiesisVersion: string): Record<string, string> {
   return {
@@ -51,6 +55,7 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
     "pnpm exec poiesis *": "deny",
     "npx poiesis *": "deny",
     "pnpm dlx poiesis-cli *": "deny",
+    "pnpm dlx poiesis-cli@*": "deny",
     [`pnpm dlx poiesis-cli@${poiesisVersion} *`]: "allow",
   };
 }

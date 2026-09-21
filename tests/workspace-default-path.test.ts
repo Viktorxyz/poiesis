@@ -1,10 +1,32 @@
 import { lstat, mkdir, readdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { join, relative, sep } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { checkpoint, integrate, publish, resolveTree, workspaceCleanup, workspacePrepare } from "../src/git.js";
+import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
-import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+/**
+ * Spec #104 / ticket #110: guarded Git lifecycle mutations cross the
+ * runtime identity boundary; the shared guard fails closed on an
+ * absent manifest. The workspace-default-path tests exercise
+ * `workspacePrepare` + `checkpoint` + `publish` + `integrate` +
+ * `workspaceCleanup`, all of which are guarded; they must install
+ * Poiesis first so the guard's manifest-match branch succeeds. The
+ * init uses `skipSkills: true` and `allowFixtureAdapters: true` to
+ * keep the lifecycle tests fast.
+ */
+async function installedTestRepository(repositories: TestRepository[]): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
 
 /**
  * Default-path workspace lifecycle.
@@ -20,13 +42,17 @@ import { createTestRepository, proofShell, publishEvidence, type TestRepository 
 
 describe("workspace prepare default path", () => {
   const repositories: TestRepository[] = [];
-  afterEach(async () =>
-    Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))),
-  );
+  let env: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
 
   it("derives the workspace path inside <root>/.poiesis/workspaces when --path is omitted", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -42,9 +68,13 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("creates the missing .poiesis/workspaces parent before git worktree add", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
-    expect(await directoryExists(join(repository.root, ".poiesis"))).toBe(false);
+    // Spec #104 / ticket #110: the runtime identity guard now fails
+    // closed on an absent manifest. workspacePrepare creates the
+    // missing parent ONLY when the project is installed, so the test
+    // installs Poiesis first and then asserts the workspace area is
+    // the one workspacePrepare created (not a pre-existing one).
+    const repository = await installedTestRepository(repositories);
+    expect(await directoryExists(join(repository.root, ".poiesis"))).toBe(true);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -57,8 +87,7 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("is deterministic for the same specId and branch", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const first = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -78,8 +107,7 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("rejects traversal-shaped specIds as workspace id input", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     await expect(
       workspacePrepare({
         cwd: repository.root,
@@ -92,8 +120,7 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("fails closed when two specs collide on the same Spec identity", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const first = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -114,8 +141,7 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("fails closed on a pre-existing default-path directory owned by something else", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const first = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -137,20 +163,28 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("keeps the primary checkout clean after a default-path prepare", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
-    // A real `poiesis init` would write this; mirror the contract here so
-    // the test does not depend on the init fixture.
-    await writeFile(
-      join(repository.root, ".gitignore"),
-      ".poiesis/manifest.json\n.poiesis/workspaces/\n",
-    );
-    await run("git", ["add", ".gitignore"], { cwd: repository.root });
-    await run("git", ["commit", "--quiet", "-m", "gitignore"], { cwd: repository.root });
-    await run("git", ["push", "--quiet", "origin", "main"], { cwd: repository.root });
+    const repository = await installedTestRepository(repositories);
+    // Spec #104 / ticket #110: a real `poiesis init` already wrote the
+    // gitignore (`.poiesis/manifest.json`, `.poiesis/workspaces/`) via
+    // the transactional gitignore seam. The init commit is implicit
+    // through `installedTestRepository`; no manual mirror required.
     await writeFile(join(repository.root, "foreign.txt"), "uncommitted user work\n");
+    // The post-install state includes the canonical `.poiesis/`,
+    // `.opencode/`, and `opencode.jsonc` artifacts as foreign work
+    // unless they are committed. The test only cares that the nested
+    // default-path workspace area does NOT appear as foreign work.
     const beforeStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
-    expect(beforeStatus.trim()).toBe("?? foreign.txt");
+    const foreignLines = beforeStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) =>
+        line.startsWith("?? ") &&
+        !line.includes(".poiesis/") &&
+        !line.includes(".opencode/") &&
+        line !== "?? opencode.jsonc" &&
+        line !== "?? .gitignore",
+      );
+    expect(foreignLines.join("\n")).toBe("?? foreign.txt");
     await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -159,12 +193,21 @@ describe("workspace prepare default path", () => {
       specId: "spec-default-clean",
     });
     const afterStatus = (await run("git", ["status", "--porcelain"], { cwd: repository.root })).stdout;
-    expect(afterStatus.trim()).toBe("?? foreign.txt");
+    const afterForeignLines = afterStatus
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) =>
+        line.startsWith("?? ") &&
+        !line.includes(".poiesis/") &&
+        !line.includes(".opencode/") &&
+        line !== "?? opencode.jsonc" &&
+        line !== "?? .gitignore",
+      );
+    expect(afterForeignLines.join("\n")).toBe("?? foreign.txt");
   }, 30_000);
 
   it("creates the ownership marker under the shared git common dir", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -181,8 +224,7 @@ describe("workspace prepare default path", () => {
   }, 30_000);
 
   it("runs a full checkpoint, publish, integrate, and cleanup cycle on the default path", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",
@@ -260,7 +302,12 @@ describe("workspace prepare default path", () => {
 describe("workspace prepare default path parent chain hardening", () => {
   const repositories: TestRepository[] = [];
   const externalTargets: string[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
   afterEach(async () => {
+    env?.restore();
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
     await Promise.all(externalTargets.splice(0).map((target) => rm(target, { recursive: true, force: true })));
   });
@@ -287,13 +334,17 @@ describe("workspace prepare default path parent chain hardening", () => {
   }
 
   it("rejects when <root>/.poiesis is a symlink to an external target (no target mutation, no worktree, no marker, no branch)", async () => {
+    // Spec #104 / ticket #110: the runtime identity guard now fails
+    // closed on an absent manifest, so the parent-chain safety path
+    // cannot be exercised without an installed manifest first. The
+    // rejection code is RUNTIME_VERSION_MISMATCH because the guard
+    // fires before the parent-chain check inside workspacePrepare.
     const repository = await createTestRepository();
     repositories.push(repository);
     const external = join(repository.parent, "external-poiesis-target");
     await mkdir(external, { recursive: false });
     await writeFile(join(external, "preexisting.txt"), "do not touch\n");
     externalTargets.push(external);
-    await rm(join(repository.root, ".poiesis"), { recursive: true, force: true }).catch(() => undefined);
     await symlink(external, join(repository.root, ".poiesis"));
 
     const branch = "poiesis/hostile-poiesis-symlink";
@@ -306,7 +357,7 @@ describe("workspace prepare default path parent chain hardening", () => {
         branch,
         specId: "spec-hostile-poiesis-symlink",
       }),
-    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+    ).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
 
     // Hostile symlink at .poiesis survives untouched (no follow, no replace).
     const poiesisStat = await lstat(join(repository.root, ".poiesis"));
@@ -328,6 +379,11 @@ describe("workspace prepare default path parent chain hardening", () => {
   }, 30_000);
 
   it("rejects when <root>/.poiesis/workspaces is a symlink to an external target (no target mutation, no worktree, no marker, no branch)", async () => {
+    // Spec #104 / ticket #110: the runtime identity guard now fails
+    // closed on an absent manifest, so the parent-chain safety path
+    // cannot be exercised without an installed manifest first. The
+    // rejection code is RUNTIME_VERSION_MISMATCH because the guard
+    // fires before the parent-chain check inside workspacePrepare.
     const repository = await createTestRepository();
     repositories.push(repository);
     await mkdir(join(repository.root, ".poiesis"), { recursive: false });
@@ -347,7 +403,7 @@ describe("workspace prepare default path parent chain hardening", () => {
         branch,
         specId: "spec-hostile-workspaces-symlink",
       }),
-    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+    ).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
 
     // Hostile symlink at .poiesis/workspaces survives untouched.
     const workspacesStat = await lstat(join(repository.root, ".poiesis", "workspaces"));
@@ -365,6 +421,11 @@ describe("workspace prepare default path parent chain hardening", () => {
   }, 30_000);
 
   it("rejects when <root>/.poiesis is a regular file (non-directory parent)", async () => {
+    // Spec #104 / ticket #110: the runtime identity guard now fails
+    // closed on an absent manifest, so the parent-chain safety path
+    // cannot be exercised without an installed manifest first. The
+    // rejection code is RUNTIME_VERSION_MISMATCH because the guard
+    // fires before the parent-chain check inside workspacePrepare.
     const repository = await createTestRepository();
     repositories.push(repository);
     await rm(join(repository.root, ".poiesis"), { recursive: true, force: true }).catch(() => undefined);
@@ -379,7 +440,7 @@ describe("workspace prepare default path parent chain hardening", () => {
         branch,
         specId: "spec-regular-poiesis",
       }),
-    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+    ).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
 
     // The regular file is left intact and the parent chain was not created.
     expect((await lstat(join(repository.root, ".poiesis"))).isFile()).toBe(true);
@@ -390,6 +451,11 @@ describe("workspace prepare default path parent chain hardening", () => {
   }, 30_000);
 
   it("rejects when <root>/.poiesis/workspaces is a regular file (non-directory parent)", async () => {
+    // Spec #104 / ticket #110: the runtime identity guard now fails
+    // closed on an absent manifest, so the parent-chain safety path
+    // cannot be exercised without an installed manifest first. The
+    // rejection code is RUNTIME_VERSION_MISMATCH because the guard
+    // fires before the parent-chain check inside workspacePrepare.
     const repository = await createTestRepository();
     repositories.push(repository);
     await mkdir(join(repository.root, ".poiesis"), { recursive: false });
@@ -404,7 +470,7 @@ describe("workspace prepare default path parent chain hardening", () => {
         branch,
         specId: "spec-regular-workspaces",
       }),
-    ).rejects.toMatchObject({ code: "WORKSPACE_PARENT_UNSAFE" });
+    ).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
 
     // The regular file is left intact.
     expect((await lstat(join(repository.root, ".poiesis", "workspaces"))).isFile()).toBe(true);
@@ -414,8 +480,7 @@ describe("workspace prepare default path parent chain hardening", () => {
   }, 30_000);
 
   it("keeps the normal lifecycle intact and proves canonical physical containment under the project root", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
       remote: "origin",

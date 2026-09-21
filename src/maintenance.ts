@@ -214,7 +214,7 @@ export async function packageVersion(): Promise<string> {
 }
 
 /**
- * Spec #104 / ticket #106 — runtime identity boundary guard.
+ * Spec #104 / ticket #106 / ticket #110 — runtime identity boundary guard.
  *
  * The executing Poiesis runtime identity is uniquely identified by the
  * package version baked into the exact-version canonical route
@@ -236,18 +236,40 @@ export async function packageVersion(): Promise<string> {
  * the rule is uniform — the spec explicitly forbids a per-command
  * version matrix. The exempt surfaces are:
  *
- *   - `init` (no manifest yet; this helper no-ops on the absent path),
+ *   - `init` (no manifest yet; this helper is NEVER called from init —
+ *     init writes the manifest as its own first durable artifact),
  *   - `doctor` and `inspect` (read-only; needed for mismatch diagnosis),
  *   - `update` and `updateFromConfig` (the explicit, receipt-gated
  *     version-crossing boundary),
- *   - `verify` and `session cleanup` (no project-bound mutation).
+ *   - `verify` and `session cleanup` (no project-bound mutation),
+ *   - `tracker <kind> get` (read-only dispatch; guarded mutations only).
+ *
+ * The manifest-less branch fails CLOSED with `RUNTIME_VERSION_MISMATCH`
+ * and details `{ project: null, runtime }` so a guarded mutation cannot
+ * run in an uninstalled project. The init path stays coherent because
+ * it does not call this helper — init is the only operation that may
+ * legitimately run on a manifest-less project. The update path stays
+ * coherent because it does not call this helper — update is the
+ * explicit, receipt-gated version-crossing boundary.
  */
 export async function assertRuntimeVersionMatchesProject(root: string): Promise<void> {
   const manifestPath = poiesisPath(root, "manifest.json");
-  // Manifest-less path = init scenario. The guard has nothing to
-  // compare against and must stay silent; the spec notes "Init has no
-  // manifest" as the canonical exemption.
-  if (!(await exists(manifestPath))) return;
+  // Manifest-less path = uninstalled project. The guard fails CLOSED
+  // because every caller is a project-bound installed lifecycle
+  // mutation that must NOT run on an uninstalled project. Init does
+  // not call this helper, so the init flow is exempt by construction;
+  // update does not call this helper, so the version-crossing boundary
+  // stays explicit and receipt-gated. A typo / malformed manifest is a
+  // manifest-authority error, not a runtime-mismatch error; let
+  // `loadManifest` surface its own typed error so existing failure
+  // modes stay bounded.
+  if (!(await exists(manifestPath))) {
+    throw new PoiesisError(
+      "RUNTIME_VERSION_MISMATCH",
+      "Poiesis runtime identity boundary cannot be verified: project is not installed (no manifest)",
+      { project: null, runtime: await packageVersion() },
+    );
+  }
   // Read the manifest and the running package version directly. A
   // typo / malformed manifest is a manifest-authority error, not a
   // runtime-mismatch error; let `loadManifest` surface its own typed

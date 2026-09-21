@@ -415,13 +415,41 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
     });
   }, 30_000);
 
-  it("manifest-less path is exempt: no manifest on disk => guard no-ops (init scenario)", async () => {
+  it("absent manifest fails closed: no manifest on disk => guard rejects as RUNTIME_VERSION_MISMATCH (uninstalled project cannot run a guarded mutation)", async () => {
     const repository = await createTestRepository();
     helperRepositories.push(repository);
-    // No init; no manifest. Override active but the guard short-circuits.
+    // No init; no manifest. The guard must fail closed — guarded
+    // mutations (workspace prepare, preview/promote delivery, checkpoint,
+    // publish, integrate, tracker mutations, installAuthorizedCapability,
+    // setModel, uninstall) must not run in an uninstalled project. The
+    // exempt surfaces (`init` because it does not call the guard;
+    // `update` / `updateFromConfig` by design as the explicit
+    // version-crossing boundary; `doctor` / `inspect` / `verify` /
+    // `session cleanup` because they are read-only or non-project-bound)
+    // remain coherent without the guard.
     setRuntimePackageVersionOverrideForTest("anything");
-    await expect(assertRuntimeVersionMatchesProject(repository.root)).resolves.toBeUndefined();
+    await expect(assertRuntimeVersionMatchesProject(repository.root)).rejects.toMatchObject({
+      code: "RUNTIME_VERSION_MISMATCH",
+      details: { project: null, runtime: "anything" },
+    });
   }, 10_000);
+
+  it("init is coherent without calling the guard: no manifest, no guard call => init succeeds and stamps the runtime version", async () => {
+    // Init does NOT call the shared guard. The exempt path stays
+    // implicit: `init` writes the manifest as its own first durable
+    // artifact, so the "absent manifest" branch of the guard never fires
+    // from inside init. The test exercises the explicit invariant: init
+    // against a fresh, manifest-less project stamps the running package
+    // version onto the freshly-authored manifest.
+    setRuntimePackageVersionOverrideForTest(null);
+    const repository = await createTestRepository();
+    helperRepositories.push(repository);
+    const manifest = await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    expect(manifest.poiesisVersion).toBe("1.1.2");
+  }, 30_000);
 
   it("packageVersion() reads through the seam when the override is set", async () => {
     setRuntimePackageVersionOverrideForTest("2.0.0-from-seam");
@@ -435,4 +463,213 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
     // the only override; clearing it returns the filesystem truth.
     expect(await packageVersion()).toBe("1.1.2");
   }, 5_000);
+});
+
+describe("runtime identity boundary — tracker dispatcher (ticket #110)", () => {
+  // Spec #104 / ticket #110: tracker `get` is read-only and must
+  // remain usable across a runtime/manifest mismatch (so an operator
+  // can diagnose the mismatch by reading the remote). Tracker mutations
+  // (`create`, `update`, `comment`, `close`, `supersede`) cross the
+  // runtime identity boundary; the shared guard runs immediately
+  // BEFORE the adapter mutation so the guard fails closed before any
+  // remote call.
+  //
+  // `commandTracker` is exported from `src/cli.ts` as a library seam
+  // (same pattern as `commandInit`, `commandUpdate`, `commandModel`)
+  // for the test-only purpose of exercising the dispatcher behavior
+  // directly. It is intentionally NOT re-exported by `src/index.ts`.
+  const trackerRepositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    setRuntimePackageVersionOverrideForTest(null);
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    setRuntimePackageVersionOverrideForTest(null);
+    env?.restore();
+    await Promise.all(
+      trackerRepositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })),
+    );
+  });
+
+  function captureStdout(): { chunks: string[]; restore: () => void } {
+    const chunks: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      chunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    return { chunks, restore: () => { process.stdout.write = original; } };
+  }
+
+  it("tracker spec get stays usable across a runtime/manifest mismatch (read-only)", async () => {
+    // Setup: init creates a manifest stamped with the running package
+    // version (1.1.2). The seam then makes the runtime present as
+    // "1.0.3" while the manifest still claims "1.1.2" (Lucca-class).
+    // The fixture adapter seeds a Spec at init time, so `spec get` is
+    // a pure read.
+    const repository = await createTestRepository();
+    trackerRepositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    // First, create a Spec via the dispatcher while runtime matches so
+    // the fixture tracker has an item to return.
+    setRuntimePackageVersionOverrideForTest("1.1.2");
+    const { commandTracker } = await import("../src/cli.js");
+    const createCapture = captureStdout();
+    try {
+      await commandTracker(["spec", "create", "--title", "Mismatch diag", "--body", "Body", "--cwd", repository.root]);
+    } finally {
+      createCapture.restore();
+    }
+    const created = JSON.parse(createCapture.chunks.join("")) as {
+      ok: boolean;
+      operation: string;
+      result: { id: string };
+    };
+    expect(created.ok).toBe(true);
+    const specId = created.result.id;
+
+    // Now flip the runtime to a mismatching version. `spec get` must
+    // still work — read-only dispatchers do not cross the runtime
+    // identity boundary.
+    setRuntimePackageVersionOverrideForTest("9.9.9-different");
+    const getCapture = captureStdout();
+    try {
+      await expect(
+        commandTracker(["spec", "get", "--id", specId, "--cwd", repository.root]),
+      ).resolves.toBeUndefined();
+    } finally {
+      getCapture.restore();
+    }
+    const got = JSON.parse(getCapture.chunks.join("")) as {
+      ok: boolean;
+      operation: string;
+      result: { id: string };
+    };
+    expect(got.ok).toBe(true);
+    expect(got.result.id).toBe(specId);
+  }, 60_000);
+
+  it("tracker ticket get stays usable across a runtime/manifest mismatch (read-only)", async () => {
+    const repository = await createTestRepository();
+    trackerRepositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    setRuntimePackageVersionOverrideForTest("1.1.2");
+    const { commandTracker } = await import("../src/cli.js");
+    const createSpecCapture = captureStdout();
+    try {
+      await commandTracker(["spec", "create", "--title", "Ticket get diag", "--body", "Body", "--cwd", repository.root]);
+    } finally {
+      createSpecCapture.restore();
+    }
+    const specId = (JSON.parse(createSpecCapture.chunks.join("")) as { result: { id: string } }).result.id;
+
+    const createTicketCapture = captureStdout();
+    try {
+      await commandTracker([
+        "ticket", "create",
+        "--title", "Ticket",
+        "--body", "Body",
+        "--parent", specId,
+        "--dependencies", "none",
+        "--cwd", repository.root,
+      ]);
+    } finally {
+      createTicketCapture.restore();
+    }
+    const ticketId = (JSON.parse(createTicketCapture.chunks.join("")) as { result: { id: string } }).result.id;
+
+    setRuntimePackageVersionOverrideForTest("9.9.9-different");
+    const getCapture = captureStdout();
+    try {
+      await expect(
+        commandTracker(["ticket", "get", "--id", ticketId, "--cwd", repository.root]),
+      ).resolves.toBeUndefined();
+    } finally {
+      getCapture.restore();
+    }
+    const got = JSON.parse(getCapture.chunks.join("")) as {
+      ok: boolean;
+      operation: string;
+      result: { id: string };
+    };
+    expect(got.ok).toBe(true);
+    expect(got.result.id).toBe(ticketId);
+  }, 60_000);
+
+  it("tracker spec create rejects a runtime/manifest mismatch BEFORE the adapter mutation", async () => {
+    const repository = await createTestRepository();
+    trackerRepositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    // Lucca-class mismatch.
+    setRuntimePackageVersionOverrideForTest("9.9.9-different");
+    const manifest = await loadManifest(repository.root);
+    const { commandTracker } = await import("../src/cli.js");
+    const capture = captureStdout();
+    try {
+      await expect(
+        commandTracker(["spec", "create", "--title", "Mismatch blocked", "--body", "Body", "--cwd", repository.root]),
+      ).rejects.toMatchObject({
+        code: "RUNTIME_VERSION_MISMATCH",
+        details: { project: manifest.poiesisVersion, runtime: "9.9.9-different" },
+      });
+    } finally {
+      capture.restore();
+    }
+  }, 60_000);
+
+  it("tracker ticket update rejects a runtime/manifest mismatch BEFORE the adapter mutation", async () => {
+    const repository = await createTestRepository();
+    trackerRepositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    setRuntimePackageVersionOverrideForTest("1.1.2");
+    const { commandTracker } = await import("../src/cli.js");
+    const createSpecCapture = captureStdout();
+    try {
+      await commandTracker(["spec", "create", "--title", "S", "--body", "B", "--cwd", repository.root]);
+    } finally {
+      createSpecCapture.restore();
+    }
+    const specId = (JSON.parse(createSpecCapture.chunks.join("")) as { result: { id: string } }).result.id;
+    const createTicketCapture = captureStdout();
+    try {
+      await commandTracker([
+        "ticket", "create",
+        "--title", "T",
+        "--body", "B",
+        "--parent", specId,
+        "--dependencies", "none",
+        "--cwd", repository.root,
+      ]);
+    } finally {
+      createTicketCapture.restore();
+    }
+    const ticketId = (JSON.parse(createTicketCapture.chunks.join("")) as { result: { id: string } }).result.id;
+
+    setRuntimePackageVersionOverrideForTest("9.9.9-different");
+    const capture = captureStdout();
+    try {
+      await expect(
+        commandTracker(["ticket", "update", "--id", ticketId, "--title", "renamed", "--cwd", repository.root]),
+      ).rejects.toMatchObject({
+        code: "RUNTIME_VERSION_MISMATCH",
+      });
+    } finally {
+      capture.restore();
+    }
+  }, 60_000);
 });

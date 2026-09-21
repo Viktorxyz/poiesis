@@ -152,6 +152,8 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "poiesis *": "deny",
       "pnpm exec poiesis *": "deny",
       "npx poiesis *": "deny",
+      "pnpm dlx poiesis-cli *": "deny",
+      "pnpm dlx poiesis-cli@*": "deny",
       "pnpm dlx poiesis-cli@1.1.2 *": "allow",
     });
     // Every other patch must be identical (including worker bash, model
@@ -380,6 +382,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(primaryBash["pnpm exec poiesis *"]).toBe("deny");
     expect(primaryBash["npx poiesis *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
+    expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
     // Worker bash denies are unchanged.
     const workerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-worker")!;
@@ -667,6 +670,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(primaryBash["pnpm exec poiesis *"]).toBe("deny");
     expect(primaryBash["npx poiesis *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
+    expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
 
     // Unrelated OpenCode config is preserved byte-for-byte except for

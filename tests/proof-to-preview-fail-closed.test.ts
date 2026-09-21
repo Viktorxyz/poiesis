@@ -1,11 +1,31 @@
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { previewDelivery } from "../src/adapters.js";
+import { init } from "../src/maintenance.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+/**
+ * Spec #104 / ticket #110: `previewDelivery` is guarded; the shared
+ * runtime identity guard fires before the adapter makes a remote
+ * call. The proof-to-preview tests must install Poiesis first so the
+ * guard's manifest-match branch succeeds. The init uses
+ * `skipSkills: true` and `allowFixtureAdapters: true` to keep the
+ * preview tests fast.
+ */
+async function installedTestRepository(): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
 
 /**
  * Fail-closed Preview behavior.
@@ -27,7 +47,14 @@ import { createTestRepository, proofShell, publishEvidence, type TestRepository 
 
 const repositories: TestRepository[] = [];
 const scratchDirs: string[] = [];
+let env: FakeOpenCodeEnvironment | undefined;
+
+beforeEach(async () => {
+  env = await installFakeOpenCode();
+});
+
 afterEach(async () => {
+  env?.restore();
   await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   await Promise.all(scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -46,8 +73,7 @@ async function publishBaseSha(repository: TestRepository, branch: string): Promi
 
 describe("preview fail-closed invariants", () => {
   it("rejects a delivery command that returns verified:false", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const fixtures = await mkdtemp(join(tmpdir(), "poiesis-failclosed-1-"));
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
@@ -71,8 +97,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("rejects a delivery command that does not return a concrete artifactIdentity", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const fixtures = await mkdtemp(join(tmpdir(), "poiesis-failclosed-2-"));
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
@@ -96,8 +121,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("fails closed (no Preview identity returned) when the delivery command exits non-zero", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const fixtures = await mkdtemp(join(tmpdir(), "poiesis-failclosed-3-"));
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;
@@ -121,8 +145,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("fails closed when the candidate SHA is not in the repository", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const tree = await resolveTree(repository.root, repository.baseSha);
     const fakeSha = "f".repeat(40);
     await expect(
@@ -138,8 +161,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("fails closed when the supplied proof is missing the specReview identity", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/failclosed-no-spec-identity";
@@ -164,8 +186,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("fails closed when the supplied proof lacks a passed Standards Review verdict", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/failclosed-standards-fail";
@@ -190,8 +211,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("fails closed when the supplied proof carries a different candidate identity than the candidate SHA", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/failclosed-proof-mismatch";
@@ -216,8 +236,7 @@ describe("preview fail-closed invariants", () => {
   });
 
   it("returns a concrete Preview identity only when every required field is verified and present", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const fixtures = await mkdtemp(join(tmpdir(), "poiesis-failclosed-ok-"));
     scratchDirs.push(fixtures);
     const sha = repository.baseSha;

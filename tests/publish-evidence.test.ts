@@ -1,14 +1,16 @@
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { publish, resolveTree, workspacePrepare, checkpoint, type PublishResult } from "../src/git.js";
 import { run } from "../src/process.js";
 import {
   validatePublishEvidence,
   type PublishEvidence,
 } from "../src/evidence.js";
-import { createTestRepository, proofShell, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, testConfig, type TestRepository } from "./helpers.js";
+import { init } from "../src/maintenance.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
  * Ticket #48 — Emit candidate-bound Publish evidence.
@@ -48,8 +50,33 @@ import { createTestRepository, proofShell, type TestRepository } from "./helpers
 
 const repositories: TestRepository[] = [];
 const scratchDirs: string[] = [];
+let env: FakeOpenCodeEnvironment | undefined;
+
+/**
+ * Spec #104 / ticket #110: guarded Git lifecycle mutations cross the
+ * runtime identity boundary; the shared guard fails closed on an
+ * absent manifest. The publish-evidence tests exercise
+ * `workspacePrepare` + `checkpoint` + `publish`, all of which are
+ * guarded; they must install Poiesis first so the guard's
+ * manifest-match branch succeeds. The init uses `skipSkills: true`
+ * and `allowFixtureAdapters: true` to keep the lifecycle tests fast.
+ */
+async function installedTestRepository(): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
+  return repository;
+}
+
+beforeEach(async () => {
+  env = await installFakeOpenCode();
+});
 
 afterEach(async () => {
+  env?.restore();
   await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   await Promise.all(scratchDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
@@ -111,8 +138,7 @@ function assertCommonEvidenceContract(
 
 describe("ticket #48 — fixture publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence with verified:true for the first publish", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "fixture-first",
@@ -138,8 +164,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
   });
 
   it("emits identity-bound evidence with action:updated on a fast-forward republish", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const branch = "poiesis/fixture-ff";
     const { workspacePath, sha, tree } = await freshWorkspace(repository, "fixture-ff", branch);
     const first = await publish({
@@ -184,8 +209,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
 
 describe("ticket #48 — command publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence when the command provider reports verified:true", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "command-ok",
@@ -229,8 +253,7 @@ printf '{"id":"42","url":"https://example.test/pr/42","verified":true,"action":"
   });
 
   it("rejects before evidence is returned when the command provider omits verified:true", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "command-unverified",
@@ -266,8 +289,7 @@ printf '{"id":"x","url":"https://example.test/pr/x"}\n'
   });
 
   it("rejects before evidence is returned when the command provider reports a different candidate", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "command-wrong-sha",
@@ -303,8 +325,7 @@ printf '{"id":"x","url":"https://example.test/pr/x","verified":true,"candidateSh
   });
 
   it("rejects with INVALID_PUBLISH_COMMAND when the command provider has no argv", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "command-missing",
@@ -330,8 +351,7 @@ printf '{"id":"x","url":"https://example.test/pr/x","verified":true,"candidateSh
 
 describe("ticket #48 — publish evidence fails closed", () => {
   it("rejects Publish with no success evidence when the candidate tree does not match", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "tree-mismatch",
@@ -355,8 +375,7 @@ describe("ticket #48 — publish evidence fails closed", () => {
   });
 
   it("rejects Publish with no success evidence when the proof candidate SHA does not match", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
       repository,
       "proof-mismatch",
@@ -380,8 +399,7 @@ describe("ticket #48 — publish evidence fails closed", () => {
   });
 
   it("rejects Publish with no success evidence when the remote branch diverges", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository();
     const branch = "poiesis/diverged-evidence";
     const { workspacePath, sha, tree } = await freshWorkspace(repository, "diverged-evidence", branch);
 

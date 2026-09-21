@@ -59,11 +59,25 @@ describe("OpenCode adapter", () => {
     expect(primaryBash["pnpm exec poiesis *"]).toBe("deny");
     expect(primaryBash["npx poiesis *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
+    // Spec #104 / ticket #110: deny version-qualified alternate routes
+    // (e.g. `pnpm dlx poiesis-cli@latest`, `pnpm dlx poiesis-cli@1.0.0`)
+    // BEFORE the exact manifest route allow last. The broad `*` allow at
+    // the head would otherwise let every off-version dlx invocation slip
+    // through; the ordered deny collapses the version-qualified surface
+    // so only `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` survives.
+    expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
     // The exact-version canonical route must be the LAST key in the
     // serialized bash object so last-match-wins resolves it last.
     const lastKey = Object.keys(primaryBash).at(-1);
     expect(lastKey).toBe("pnpm dlx poiesis-cli@1.1.2 *");
+    // The version-qualified deny MUST sit BEFORE the exact allow so
+    // last-match-wins cannot resolve a deny for an exact-version key.
+    const keys = Object.keys(primaryBash);
+    const versionQualifiedDenyIdx = keys.indexOf("pnpm dlx poiesis-cli@*");
+    const exactAllowIdx = keys.indexOf("pnpm dlx poiesis-cli@1.1.2 *");
+    expect(versionQualifiedDenyIdx).toBeGreaterThanOrEqual(0);
+    expect(exactAllowIdx).toBeGreaterThan(versionQualifiedDenyIdx);
   });
 
   it("worker and specialist authority is unchanged: no broad shell and no exact-version allow", async () => {

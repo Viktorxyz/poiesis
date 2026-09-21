@@ -67,13 +67,13 @@ A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rat
 `doctor` runs without mutation and verifies the same set of invariants any time:
 
 ```bash
-pnpm dlx poiesis-cli@latest doctor
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
 ```
 
 `update` re-reads the installed canonical files and re-applies the OpenCode adapter projection only against proven-owned state:
 
 ```bash
-pnpm dlx poiesis-cli@latest update
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
 Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
@@ -138,7 +138,7 @@ before any side effect.
 `uninstall` removes only Poiesis-proven-owned state and preserves Git, tracker, PR/MR, and release history:
 
 ```bash
-pnpm dlx poiesis-cli@latest uninstall
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
 ```
 
 ## What `init` produces
