@@ -55,6 +55,8 @@ Return compactly:
 **Result**
 - `ready_for_review`, `blocked`, or `contradiction`.
 
+`ready_for_review` only when implementation exists, focused checks pass, and no known ticket-blocking defect remains.
+
 **Changed**
 - paths/symbols changed, not a pasted diff.
 
@@ -64,4 +66,4 @@ Return compactly:
 **Concerns**
 - remaining risk, contradiction, or missing evidence.
 
-No narrative transcript.
+Unrelated failures absent causal evidence are bounded Concerns, not new debugging missions. Do not rerun the same failing command absent relevant mutation or a concrete new hypothesis. No narrative transcript.

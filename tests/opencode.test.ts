@@ -80,7 +80,7 @@ describe("OpenCode adapter", () => {
     expect(exactAllowIdx).toBeGreaterThan(versionQualifiedDenyIdx);
   });
 
-  it("worker and specialist authority is unchanged: no broad shell and no exact-version allow", async () => {
+  it("worker and specialist authority is unchanged: only primary retains exact-version allow", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const config = testConfig(repository);
@@ -88,15 +88,28 @@ describe("OpenCode adapter", () => {
       desiredOpenCodePatches(config, "1.1.2").map((patch) => [patch.path.join("."), patch.value as Record<string, unknown>]),
     );
     const workerBash = (patches["agent.poiesis-worker"] as { permission: { bash: Record<string, string> } }).permission.bash;
+    // Spec #104 / ticket #113: the Worker must deny every known
+    // package-runner lifecycle launcher in addition to the existing
+    // bare/exec/npx denies. Worker has no primary-style exact-version
+    // allow, so the broad `*` allow first is kept narrow by the two
+    // ordered `pnpm dlx` denies below; the exact manifest-version allow
+    // is reserved for the primary alone.
     expect(workerBash).toEqual({
       "*": "allow",
       "git *": "deny",
       "poiesis *": "deny",
       "pnpm exec poiesis *": "deny",
       "npx poiesis *": "deny",
+      "pnpm dlx poiesis-cli *": "deny",
+      "pnpm dlx poiesis-cli@*": "deny",
     });
-    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli *");
+    expect(workerBash["pnpm dlx poiesis-cli *"]).toBe("deny");
+    expect(workerBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
+    // Worker must NOT retain a primary-style exact-version allow.
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 *");
+    // Primary alone retains the exact-version canonical route.
+    const primaryBash = (patches["agent.poiesis"] as { permission: { bash: Record<string, string> } }).permission.bash;
+    expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
   });
 
   it("exact-version canonical route is sourced from the installed package version", async () => {

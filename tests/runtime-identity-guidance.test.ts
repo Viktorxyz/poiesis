@@ -21,14 +21,18 @@ async function readRepoFile(relativePath: string): Promise<string> {
 }
 
 describe("Spec #104 / ticket #107 role guidance", () => {
-  it("POIESIS_METHOD.md does not carry the scope-expansion return-to-Authorize policy (Replan-time #108-only)", async () => {
+  it("POIESIS_METHOD.md owns the Realize-time scope-expansion returns-to-Authorize content (Spec #108 contract, not Replan-only)", async () => {
+    // Spec #108 contract: Method's Realize section owns the material
+    // product / architecture expansion → returns-to-Authorize gate.
+    // The earlier #104-only negative assertion (Method must NOT carry
+    // this) is stale and contradicted the accepted Spec #108 wording
+    // currently in POIESIS_METHOD.md.
     const method = await readRepoFile("POIESIS_METHOD.md");
-    expect(method, "POIESIS_METHOD.md must not own the Replan-time scope-expansion gate").not.toContain(
-      "Scope expansion return-to-Authorize",
-    );
-    expect(method, "POIESIS_METHOD.md must not own the Replan-time scope-expansion gate").not.toContain(
-      "return-to-Authorize",
-    );
+    expect(
+      method,
+      "POIESIS_METHOD.md must own the Realize-time material scope-expansion returns-to-Authorize gate (Spec #108)",
+    ).toMatch(/material[^.]*returns to Authorize|expansion[^.]*returns to Authorize|scope[^.]*returns to Authorize/i);
+    expect(method).toContain("returns to Authorize");
   });
 
   it("POIESIS_ROLE_POIESIS.md frames the exact-version route as the normal authoritative lifecycle execution path", async () => {

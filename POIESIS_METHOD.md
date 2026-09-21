@@ -137,6 +137,16 @@ If the ticket and Spec conflict, stop and escalate instead of guessing.
 
 Execute tickets in dependency order on one Poiesis-owned change branch.
 
+Realize continues only for a concrete unsatisfied authorized obligation or for new evidence the current realization cannot satisfy. Poiesis does not continue work merely because more work can be done.
+
+Worker runs relevant focused ticket checks and returns `ready_for_review` only when implementation exists, focused checks pass, and no known ticket-blocking defect remains. Unrelated failures absent causal evidence are bounded Concerns in the return, not new debugging missions. Do not rerun the same failing command absent relevant mutation or a concrete new hypothesis.
+
+Reviewer findings are evidence, not commands. Distinguish material correctness, security, reliability, spec, standards, and design issues from optional preferences; only material contract-relevant issues block. Return bounded PASS, or actionable bounded FAIL grouped by root cause. Repeated reopening of one semantic area triggers reassessment/Replan, not one-finding/one-ticket churn. Tickets are the smallest coherent engineering outcomes. Child context/returns stay bounded and do not duplicate irrelevant discovery.
+
+Material product or architecture expansion discovered during Realize returns to Authorize before implementation; Poiesis owns acceptance, localized correction, reassessment, diagnosis, Replan, and Authorize, and identifies the concrete unsatisfied authorized obligation before dispatching another implementation Worker.
+
+Realize owns no new machinery: no new mode, no new stage, no new counter, no new budget, no new cache, no new telemetry, no new durable state, no new database, no new agent. Discipline lives on the existing Realize path.
+
 For each ticket:
 
 1. Dispatch a fresh Worker.

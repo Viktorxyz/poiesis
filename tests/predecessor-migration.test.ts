@@ -14,83 +14,23 @@ import {
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import {
   assertOwnershipReceipt,
-  ownershipReceiptExists,
   ownershipReceiptLocation,
   readOwnershipReceipt,
-  removeOwnershipReceipt,
-  replaceOwnershipReceipt,
 } from "../src/receipt.js";
 import { parseJsonc } from "../src/config.js";
 import { readUtf8 } from "../src/fs.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
-
-async function asPredecessorManifest(
-  repository: TestRepository,
-  predecessorVersion: "1.0.0" | "1.0.1" | "1.0.2" | "1.1.1",
-  options: { keepReceipt?: boolean } = {},
-): Promise<Manifest> {
-  const manifest = await loadManifest(repository.root);
-  const config = testConfig(repository);
-  const predecessor =
-    predecessorVersion === "1.1.1"
-      ? predecessorProjectionV111(config, predecessorVersion)
-      : predecessorProjectionV100V101V102(config, predecessorVersion);
-  // Replace each manifest patch\'s installed value with the exact predecessor variant.
-  manifest.poiesisVersion = predecessorVersion;
-  manifest.configPatches = manifest.configPatches.map((patch) => {
-    const matching = predecessor.find(
-      (p) =>
-        p.path.length === patch.path.length &&
-        p.path.every((s, i) => s === patch.path[i]),
-    );
-    if (matching === undefined) return patch;
-    return { ...patch, installed: matching.value };
-  });
-  await writeFile(
-    join(repository.root, ".poiesis", "manifest.json"),
-    serializeManifest(manifest),
-  );
-  // Also rewrite the on-disk OpenCode config so each claimed patch value
-  // matches the file content. Otherwise `assertConfigPatchesOwned` rejects
-  // with CONFIG_OWNERSHIP_LOST before the migration has a chance to run.
-  const openCodePath = join(repository.root, "opencode.jsonc");
-  const current = parseJsonc<Record<string, unknown>>(await readUtf8(openCodePath), openCodePath);
-  for (const patch of manifest.configPatches) {
-    let target: Record<string, unknown> = current;
-    for (let i = 0; i < patch.path.length - 1; i++) {
-      const segment = patch.path[i]!;
-      if (typeof target[segment] !== "object" || target[segment] === null) {
-        target[segment] = {};
-      }
-      target = target[segment] as Record<string, unknown>;
-    }
-    target[patch.path[patch.path.length - 1]!] = patch.installed;
-  }
-  await writeFile(openCodePath, JSON.stringify(current, null, 2) + "\n");
-  if (!options.keepReceipt && (await ownershipReceiptExists(repository.root))) {
-    await removeOwnershipReceipt(repository.root);
-  }
-  return manifest;
-}
-
-async function rebindReceipt(repository: TestRepository): Promise<void> {
-  const manifest = await loadManifest(repository.root);
-  const existing = await readOwnershipReceipt(repository.root);
-  await replaceOwnershipReceipt(repository.root, manifest, existing);
-}
-
-async function setupCurrentInstall(repository: TestRepository): Promise<Manifest> {
-  return init(repository.root, testConfig(repository), {
-    skipSkills: true,
-    allowFixtureAdapters: true,
-  });
-}
+import {
+  asPredecessorManifest,
+  rebindReceipt,
+  setupCurrentInstall,
+} from "./predecessor-migration-fixtures.js";
 
 describe("predecessor projection migration (ticket #24 Replan)", () => {
   const repositories: TestRepository[] = [];
   afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
 
-  it("predecessorProjectionV100V101V102 differs from current only in poiesis-reviewer.permission.task", async () => {
+  it("predecessorProjectionV100V101V102 differs from current in poiesis-reviewer.permission.task and pre-#113 worker bash", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const config = testConfig(repository);
@@ -110,7 +50,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     const predecessorPermission = (predecessorReviewer.value as { permission: Record<string, unknown> }).permission;
     expect(predecessorPermission.task).toEqual({ explore: "allow" });
     expect(currentPermission).not.toHaveProperty("task");
-    // Every other agent patch must be identical.
+    // Every other agent patch's path must be identical (paths only;
+    // value-equality is intentionally not asserted so the legacy override
+    // cases in `predecessorProjectionV100V101V102` are free to differ in
+    // the Worker bash — Spec #104 / ticket #114).
     const currentOtherKeys = currentManifest.configPatches
       .filter((p) => !(p.path.length === 2 && p.path[1] === "poiesis-reviewer"))
       .map((p) => p.path.join("\0"));
@@ -120,11 +63,16 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(predecessorOtherKeys).toEqual(currentOtherKeys);
   }, 60_000);
 
-  it("predecessorProjectionV111 differs from current only in agent.poiesis.permission.bash", async () => {
+  it("predecessorProjectionV111 differs from current in agent.poiesis.permission.bash and pre-#113 worker bash", async () => {
     // Spec #104 / ticket #105: the v1.1.1 primary-bash surface
     // (`poiesis *` / `pnpm exec poiesis *` / `npx poiesis *` allows) is the
-    // sole predecessor-only difference from the v1.1.2 projection. Every
-    // other patch — including the worker's bash denies — must be identical.
+    // primary-bash predecessor-only difference from the v1.1.2 projection.
+    // Spec #104 / ticket #114 also re-overrides the Worker bash to the
+    // pre-#113 deny surface so the 1.1.1 manifest admits through the
+    // legacy projection match. Every other patch's path must be identical
+    // (paths only; value-equality is intentionally not asserted so the
+    // legacy override cases in `predecessorProjectionV111` are free to
+    // differ in the Worker bash).
     const repository = await createTestRepository();
     repositories.push(repository);
     const config = testConfig(repository);
@@ -156,8 +104,11 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "pnpm dlx poiesis-cli@*": "deny",
       "pnpm dlx poiesis-cli@1.1.2 *": "allow",
     });
-    // Every other patch must be identical (including worker bash, model
-    // wiring, task delegation, etc.).
+    // Every other patch's path must be identical (paths only;
+    // value-equality is intentionally not asserted so the legacy override
+    // cases in `predecessorProjectionV111` are free to differ in the
+    // Worker bash — Spec #104 / ticket #114). Model wiring, task
+    // delegation, etc. remain unchanged.
     const currentOtherKeys = currentManifest.configPatches
       .filter((p) => !(p.path.length === 2 && p.path[1] === "poiesis"))
       .map((p) => p.path.join("\0"));
@@ -384,7 +335,12 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
-    // Worker bash denies are unchanged.
+    // Worker bash advances to the current (post-#113) deny surface:
+    // the trusted migration projects `pnpm dlx poiesis-cli *` and
+    // `pnpm dlx poiesis-cli@*` denies so the Worker broad `*` allow
+    // cannot invoke the primary's exact-version canonical route through
+    // `pnpm dlx`. The exact-version allow remains reserved for the
+    // primary alone.
     const workerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-worker")!;
     expect((workerAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash).toEqual({
       "*": "allow",
@@ -392,6 +348,11 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "poiesis *": "deny",
       "pnpm exec poiesis *": "deny",
       "npx poiesis *": "deny",
+      "pnpm dlx poiesis-cli *": "deny",
+      "pnpm dlx poiesis-cli@*": "deny",
+    });
+    expect(workerAfter.installed as { permission: { bash: Record<string, string> } }).not.toMatchObject({
+      permission: { bash: expect.objectContaining({ "pnpm dlx poiesis-cli@1.1.2 *": "allow" }) },
     });
     // Receipt advances by exactly ONE.
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(3);
