@@ -128,6 +128,13 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           "poiesis *": "deny",
           "pnpm exec poiesis *": "deny",
           "npx poiesis *": "deny",
+          // Spec #104 / ticket #113: deny package-runner lifecycle
+          // launchers as well so the broad `*` allow cannot be used to
+          // invoke the same authorized primary canonical route through
+          // `pnpm dlx`. Worker retains no exact-version allow; only the
+          // primary does.
+          "pnpm dlx poiesis-cli *": "deny",
+          "pnpm dlx poiesis-cli@*": "deny",
         },
       },
     },
