@@ -67,6 +67,7 @@ import {
   hashDirectoryTree,
 } from "../src/mutation-transaction.js";
 import { installDefaultSkills, loadDefaultSkills, type DefaultSkill } from "../src/skills.js";
+import { asLegacyProjection } from "./legacy-bootstrap-fixture.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
@@ -114,15 +115,11 @@ async function asPredecessorManifest(
   predecessorVersion: "1.0.0" | "1.0.1" | "1.0.2",
   options: { keepReceipt?: boolean } = {},
 ): Promise<void> {
-  const manifest = await loadManifest(repository.root);
-  manifest.poiesisVersion = predecessorVersion;
-  await writeFile(
-    join(repository.root, ".poiesis", "manifest.json"),
-    serializeManifest(manifest),
-  );
-  if (!options.keepReceipt && (await ownershipReceiptLocation(repository.root).then(() => true).catch(() => false))) {
-    await removeOwnershipReceipt(repository.root);
-  }
+  // Spec #104 / ticket #105: rewrite the manifest AND on-disk OpenCode
+  // config into the exact legacy predecessor projection so
+  // `assertManifestAuthorityToleratingPredecessor` admits the manifest
+  // through the predecessor path.
+  await asLegacyProjection(repository.root, predecessorVersion, options);
 }
 
 async function rebindReceipt(repository: TestRepository): Promise<void> {
@@ -689,8 +686,12 @@ describe("ticket #46 — full update/bootstrap transaction integration", () => {
     for (const name of DEFAULT_SKILL_NAMES) {
       await seedPreexistingSkill(repository, name, `# ${name}\nseeded bootstrap preimage\n`);
     }
+    // Spec #104 / ticket #105: rewrite the manifest AND on-disk OpenCode
+    // config into the exact v1.0.0 predecessor projection so the
+    // bootstrap path can admit it through
+    // `assertManifestAuthorityToleratingPredecessor`'s 1.0.0 predecessor.
+    await asLegacyProjection(repository.root, "1.0.0");
     const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
     for (const skill of manifest.skills) {
       if (skill.preexisting || skill.name === undefined) continue;
       skill.preexisting = false;
@@ -737,9 +738,14 @@ describe("ticket #46 — full update/bootstrap transaction integration", () => {
 // `src/update-config-internal.ts::assertUpdateConfigDoctorGate`.
 describe("skipSkills must not bypass non-skill doctor failures", () => {
   const repositories: TestRepository[] = [];
-  afterEach(async () =>
-    Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))),
-  );
+  let openCodeEnv: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    openCodeEnv = await installFakeOpenCode();
+  });
+  afterEach(async () => {
+    openCodeEnv?.restore();
+    Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
 
   it("ordinary update with skipSkills:true still fails closed on a non-skill doctor failure", async () => {
     const repository = await createTestRepository();
@@ -777,13 +783,11 @@ describe("skipSkills must not bypass non-skill doctor failures", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     // init() then immediately strip the receipt and rewrite the
-    // manifest version to a 1.0.0 predecessor so the bootstrap path
-    // is the canonical 1.0.0 explicit bootstrap.
+    // manifest version AND on-disk OpenCode config into the 1.0.0
+    // predecessor projection so the bootstrap path is the canonical
+    // 1.0.0 explicit bootstrap (spec #104 / ticket #105).
     await installPoiesis(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
-    await removeOwnershipReceipt(repository.root);
+    await asLegacyProjection(repository.root, "1.0.0");
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
 
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;

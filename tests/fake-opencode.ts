@@ -1,4 +1,4 @@
-import { chmod, mkdir, mkdtemp, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -23,6 +23,7 @@ export const TEST_OPENCODE_MODEL_LIST = [
 
 export interface FakeOpenCodeEnvironment {
   bin: string;
+  parent: string;
   restore: () => void;
 }
 
@@ -39,11 +40,54 @@ export interface InstallFakeOpenCodeOptions {
   failAfterDebugCalls?: { file: string; threshold: number };
   /**
    * When set, the fake reports this list for `models` instead of
-   * `TEST_OPENCODE_MODEL_LIST`. Pass an empty list to simulate an
+   * TEST_OPENCODE_MODEL_LIST. Pass an empty list to simulate an
    * OpenCode installation that has not downloaded any models so every
    * configured model is reported as unavailable.
    */
   modelList?: readonly string[];
+}
+
+// Module-level registry of installed fake-opencode bin directories. Used
+// for two purposes:
+//
+//  1. Stale-PATH cleanup at process exit. If a test crashes between
+//     `installFakeOpenCode` and `env.restore()`, the on-disk bin dir is
+//     removed on `beforeExit` so the temp filesystem does not accumulate
+//     thousands of stale `poiesis-fake-opencode-*` directories across
+//     full-suite runs.
+//
+//  2. Stale-PATH defense for tests that install the fake twice without
+//     calling restore() between installs. The second install captures
+//     the first install's PATH as its `previousPath`; if the first
+//     install is never restored, restoring the second install leaves
+//     the first install's bin prefix in `process.env.PATH`. Tracking
+//     every active install lets the second install's restore also
+//     strip the first install's bin prefix.
+const installedBins = new Set<string>();
+let processCleanupRegistered = false;
+function registerProcessCleanup(): void {
+  if (processCleanupRegistered) return;
+  processCleanupRegistered = true;
+  const cleanup = () => {
+    for (const parent of installedBins) {
+      rm(parent, { recursive: true, force: true }).catch(() => {
+        // Best-effort cleanup; never throw from a process-exit hook.
+      });
+    }
+    installedBins.clear();
+  };
+  process.once("beforeExit", cleanup);
+  process.once("exit", cleanup);
+}
+
+/**
+ * Strips a known bin directory prefix from a `:`-delimited PATH string.
+ * Idempotent: if the prefix is not present, the path is returned unchanged.
+ */
+function stripBinPrefix(pathValue: string | undefined, bin: string): string | undefined {
+  if (pathValue === undefined) return pathValue;
+  const parts = pathValue.split(":").filter((part) => part !== bin);
+  return parts.length === 0 ? undefined : parts.join(":");
 }
 
 /**
@@ -60,6 +104,7 @@ export interface InstallFakeOpenCodeOptions {
 export async function installFakeOpenCode(
   versionOrOptions: string | InstallFakeOpenCodeOptions = TEST_OPENCODE_VERSION,
 ): Promise<FakeOpenCodeEnvironment> {
+  registerProcessCleanup();
   const version = typeof versionOrOptions === "string" ? versionOrOptions : (versionOrOptions.version ?? TEST_OPENCODE_VERSION);
   const failAfter = typeof versionOrOptions === "string" ? undefined : versionOrOptions.failAfterDebugCalls;
   const modelList = typeof versionOrOptions === "string"
@@ -67,6 +112,7 @@ export async function installFakeOpenCode(
     : (versionOrOptions.modelList ?? TEST_OPENCODE_MODEL_LIST);
   const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-opencode-"));
   const bin = join(parent, "bin");
+  installedBins.add(parent);
   await mkdir(bin);
   const script = join(bin, "opencode");
   const debugCountFile = failAfter === undefined ? "" : failAfter.file;
@@ -120,10 +166,33 @@ exit 0
     ? bin
     : `${bin}:${previousPath}`;
   process.env.PATH = nextPath;
+  let restored = false;
   return {
     bin,
+    parent,
     restore: () => {
-      process.env.PATH = previousPath;
+      if (restored) return;
+      restored = true;
+      installedBins.delete(parent);
+      // Restore PATH: strip this install's bin prefix AND any other
+      // tracked install's bin prefix that may have leaked through a
+      // missed restore on a prior install. The captured previousPath
+      // remains the authoritative baseline.
+      let restored_path = stripBinPrefix(previousPath, bin);
+      for (const otherParent of installedBins) {
+        const otherBin = join(otherParent, "bin");
+        restored_path = stripBinPrefix(restored_path, otherBin);
+      }
+      process.env.PATH = restored_path;
+      // Synchronously schedule bin-dir cleanup. We deliberately do NOT
+      // await it inside restore() — restore() is intentionally
+      // synchronous so callers can call it from `finally` blocks
+      // without changing their error-handling shape — but we fire the
+      // rm eagerly so the directory is normally gone before any
+      // subsequent filesystem check. Failures here do not affect
+      // correctness — the process-exit hook above catches anything we
+      // miss.
+      void rm(parent, { recursive: true, force: true }).catch(() => undefined);
     },
   };
 }

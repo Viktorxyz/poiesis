@@ -190,7 +190,7 @@ describe("update --config", () => {
     expect(recorded?.hash).toBe(hashContent(afterConfigBytes));
 
     const openCodeJson = await readOpenCodeJson(repository);
-    const desired = desiredOpenCodePatches(afterConfig);
+    const desired = desiredOpenCodePatches(afterConfig, "1.1.2");
     for (const patch of desired) {
       const top = openCodeJson[patch.path[0]!];
       if (patch.path.length === 1) expect(top).toEqual(patch.value);
@@ -696,7 +696,7 @@ describe("update --config", () => {
     const { writeFile, readFile } = await import("node:fs/promises");
     const { parseJsonc } = await import("../src/config.js");
     const manifest: Manifest = await loadManifest(repository.root);
-    const predecessor = predecessorProjectionV100V101V102(testConfig(repository));
+    const predecessor = predecessorProjectionV100V101V102(testConfig(repository), predecessorVersion);
     manifest.poiesisVersion = predecessorVersion;
     manifest.configPatches = manifest.configPatches.map((patch) => {
       const matching = predecessor.find(
@@ -1990,7 +1990,7 @@ describe("update --config fixture-adapter invariant", () => {
 
     const candidatePath = await writeCandidateConfig(repository, () => undefined);
     const result = await updateFromConfig(repository.root, candidatePath);
-    expect(result.manifest.poiesisVersion).toBe("1.1.1");
+    expect(result.manifest.poiesisVersion).toBe("1.1.2");
     // Doctor report's `ok` may be false if the install used
     // `skipSkills: true` (the `install` helper does so); the
     // `skills` exemption is honored by the gate via

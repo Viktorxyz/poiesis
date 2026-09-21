@@ -29,7 +29,33 @@ export function isSupportedOpenCodeVersion(version: string): boolean {
 
 type JsonObject = Record<string, unknown>;
 
-function permissions(config: PoiesisConfig): Record<string, JsonObject> {
+/**
+ * Spec #104 / ticket #105: the runtime identity boundary for the primary
+ * (Poiesis) agent. The generated normal installed lifecycle route is exactly
+ * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`. The bare `poiesis`,
+ * `pnpm exec poiesis`, and `npx poiesis` canonical routes are removed and
+ * explicitly denied, and the unversioned `pnpm dlx poiesis-cli *` launcher is
+ * also denied so only the exact-version route survives. The keys are emitted
+ * in the documented order so OpenCode's last-match-wins resolver picks the
+ * exact-version allow entry last for any matching command.
+ *
+ * The `*` allow first provides broad ordinary shell; the ordered denies
+ * cover every known ambiguous launcher; the exact-version allow last is the
+ * sole canonical CLI route. `@latest` remains reserved for human/operator
+ * intentional init/update outside this projection.
+ */
+function primaryBashPermissions(poiesisVersion: string): Record<string, string> {
+  return {
+    "*": "allow",
+    "poiesis *": "deny",
+    "pnpm exec poiesis *": "deny",
+    "npx poiesis *": "deny",
+    "pnpm dlx poiesis-cli *": "deny",
+    [`pnpm dlx poiesis-cli@${poiesisVersion} *`]: "allow",
+  };
+}
+
+function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {
   const reasoning = config.models.reasoning;
   const execution = config.models.execution;
   return {
@@ -61,11 +87,7 @@ function permissions(config: PoiesisConfig): Record<string, JsonObject> {
           "poiesis-reviewer": "allow",
           "poiesis-final-reviewer": "allow",
         },
-        bash: {
-          "poiesis *": "allow",
-          "pnpm exec poiesis *": "allow",
-          "npx poiesis *": "allow",
-        },
+        bash: primaryBashPermissions(poiesisVersion),
       },
     },
     "poiesis-planner": {
@@ -146,8 +168,11 @@ function permissions(config: PoiesisConfig): Record<string, JsonObject> {
   };
 }
 
-export function desiredOpenCodePatches(config: PoiesisConfig): Array<{ path: string[]; value: unknown }> {
-  const agents = permissions(config);
+export function desiredOpenCodePatches(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  const agents = permissions(config, poiesisVersion);
   return [
     { path: ["default_agent"], value: "poiesis" },
     { path: ["subagent_depth"], value: 2 },
@@ -213,11 +238,11 @@ function assertNoDuplicateProperties(content: string, configPath: string): void 
   assertNoDuplicatePropertiesShared(content, configPath);
 }
 
-function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig): void {
+function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig, poiesisVersion: string): void {
   if (typeof original !== "object" || original === null || Array.isArray(original)) {
     throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config root must be an object");
   }
-  for (const desired of desiredOpenCodePatches(config)) {
+  for (const desired of desiredOpenCodePatches(config, poiesisVersion)) {
     let current: unknown = original;
     for (const [index, part] of desired.path.entries()) {
       if (typeof current !== "object" || current === null || Array.isArray(current)) {
@@ -236,9 +261,9 @@ function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisC
   }
 }
 
-function assertOpenCodeContentAvailable(content: string, configPath: string, config: PoiesisConfig): void {
+function assertOpenCodeContentAvailable(content: string, configPath: string, config: PoiesisConfig, poiesisVersion: string): void {
   assertNoDuplicateProperties(content, configPath);
-  assertDesiredOpenCodePathsAvailable(parseJsonc<unknown>(content, configPath), config);
+  assertDesiredOpenCodePathsAvailable(parseJsonc<unknown>(content, configPath), config, poiesisVersion);
 }
 
 async function readOpenCodeContent(configPath: string): Promise<string> {
@@ -256,6 +281,7 @@ export async function assertOpenCodeConfigAvailable(
   root: string,
   configPath: string,
   config: PoiesisConfig,
+  poiesisVersion: string,
 ): Promise<boolean> {
   if (await pathEntryExists(configPath)) {
     const details = await lstat(configPath);
@@ -264,7 +290,7 @@ export async function assertOpenCodeConfigAvailable(
         path: relative(root, configPath),
       });
     }
-    assertOpenCodeContentAvailable(await readOpenCodeContent(configPath), configPath, config);
+    assertOpenCodeContentAvailable(await readOpenCodeContent(configPath), configPath, config, poiesisVersion);
     return true;
   }
   return false;
@@ -273,7 +299,8 @@ export async function assertOpenCodeConfigAvailable(
 export async function applyOpenCodeConfig(
   root: string,
   config: PoiesisConfig,
-  managedConfigPath?: string,
+  managedConfigPath: string | undefined,
+  poiesisVersion: string,
   options: {
     requireAvailable?: boolean;
     expectedContent?: Buffer | null;
@@ -301,7 +328,7 @@ export async function applyOpenCodeConfig(
       path: relative(root, configPath),
     });
   }
-  if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config);
+  if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config, poiesisVersion);
   // The pure projection loop (parse original → for each desired patch compute
   // provenance + apply jsonc edits → emit serialized payload) is delegated to
   // `projectOpenCodePayload` so the transaction-time preflight in
@@ -312,7 +339,7 @@ export async function applyOpenCodeConfig(
     root,
     configPath,
     currentContent: content,
-    patches: desiredOpenCodePatches(config),
+    patches: desiredOpenCodePatches(config, poiesisVersion),
   });
   // Strengthened apply: re-read the on-disk bytes immediately before the
   // atomicWrite and compare against `options.expectedContent`. This is a TOCTOU

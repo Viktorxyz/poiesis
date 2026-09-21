@@ -175,7 +175,30 @@ export async function isRegularManagedFile(root: string, path: string): Promise<
   return isRegularFile(path);
 }
 
+/**
+ * Internal test-only seam for `packageVersion()`.
+ *
+ * Production callers (CLI / runtime) MUST NOT touch this variable; the
+ * exact-version canonical route `pnpm dlx poiesis-cli@<X>` is the sole
+ * durable source of the executing runtime identity. Tests use the seam
+ * to project a synthetic runtime version WITHOUT mutating the
+ * workspace `package.json`, because rewriting the workspace manifest on
+ * disk is non-atomic (a process crash between snapshot and restore
+ * leaves the workspace in a corrupted state and bleeds across the
+ * parallel test pool).
+ *
+ * The seam is module-scoped, lives in this module only, and is NOT
+ * re-exported through `src/index.ts`. The setter is intentionally
+ * suffixed `ForTest` so accidental production use is grep-able.
+ */
+let runtimePackageVersionOverride: string | null = null;
+
+export function setRuntimePackageVersionOverrideForTest(version: string | null): void {
+  runtimePackageVersionOverride = version;
+}
+
 export async function packageVersion(): Promise<string> {
+  if (runtimePackageVersionOverride !== null) return runtimePackageVersionOverride;
   const path = join(packageRoot, "package.json");
   const value = parseJsonc<unknown>(await readUtf8(path), path);
   if (
@@ -188,6 +211,55 @@ export async function packageVersion(): Promise<string> {
     throw new PoiesisError("INVALID_PACKAGE_METADATA", "Poiesis package version is unavailable", { path });
   }
   return value.version;
+}
+
+/**
+ * Spec #104 / ticket #106 — runtime identity boundary guard.
+ *
+ * The executing Poiesis runtime identity is uniquely identified by the
+ * package version baked into the exact-version canonical route
+ * `pnpm dlx poiesis-cli@<X>` projected into the OpenCode config. The
+ * durable half of that pair is `manifest.poiesisVersion`, recorded in
+ * `.poiesis/manifest.json` at install time and re-asserted by the
+ * receipt-gated `update` boundary. Every project-bound installed
+ * lifecycle mutation MUST cross-check that the running package version
+ * equals the durable recorded version BEFORE any consequential
+ * mutation; a mismatch fails closed with `RUNTIME_VERSION_MISMATCH`
+ * and details `{ project, runtime }` so an Operator can diagnose which
+ * exact-version `dlx poiesis-cli@X` route is required.
+ *
+ * This helper is the SINGLE shared seam that enforces the rule. Every
+ * guarded entry point (`uninstall`, `installAuthorizedCapability`,
+ * `setModel`, `workspacePrepare`, `workspaceCleanup`, `checkpoint`,
+ * `publish`, `integrate`, `previewDelivery`, `promoteDelivery`, the
+ * tracker mutation dispatcher) calls this helper as its first action so
+ * the rule is uniform — the spec explicitly forbids a per-command
+ * version matrix. The exempt surfaces are:
+ *
+ *   - `init` (no manifest yet; this helper no-ops on the absent path),
+ *   - `doctor` and `inspect` (read-only; needed for mismatch diagnosis),
+ *   - `update` and `updateFromConfig` (the explicit, receipt-gated
+ *     version-crossing boundary),
+ *   - `verify` and `session cleanup` (no project-bound mutation).
+ */
+export async function assertRuntimeVersionMatchesProject(root: string): Promise<void> {
+  const manifestPath = poiesisPath(root, "manifest.json");
+  // Manifest-less path = init scenario. The guard has nothing to
+  // compare against and must stay silent; the spec notes "Init has no
+  // manifest" as the canonical exemption.
+  if (!(await exists(manifestPath))) return;
+  // Read the manifest and the running package version directly. A
+  // typo / malformed manifest is a manifest-authority error, not a
+  // runtime-mismatch error; let `loadManifest` surface its own typed
+  // error so existing failure modes stay bounded.
+  const manifest = await loadManifest(root);
+  const runtime = await packageVersion();
+  if (manifest.poiesisVersion === runtime) return;
+  throw new PoiesisError(
+    "RUNTIME_VERSION_MISMATCH",
+    "Executing Poiesis runtime version does not match the project's installed manifest version",
+    { project: manifest.poiesisVersion, runtime },
+  );
 }
 
 export async function autoResolveConfigDefaults(
@@ -751,10 +823,16 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
 
   const openCodeConfigPath = await detectOpenCodeConfigForInit(resolvedRoot);
   await assertSafeParents(resolvedRoot, openCodeConfigPath);
+  // The Poiesis version is the sole durable source of the exact-version
+  // canonical route (`pnpm dlx poiesis-cli@<X>`) projected into the
+  // generated OpenCode config. Capture it once at init entry so every
+  // downstream ownership assertion and apply step uses the same X.
+  const installingPoiesisVersion = await packageVersion();
   const openCodeConfigPresent = await assertOpenCodeConfigAvailable(
     resolvedRoot,
     openCodeConfigPath,
     resolvedConfig,
+    installingPoiesisVersion,
   );
   const initialOpenCodeConfigSnapshot = await snapshotFile(openCodeConfigPath);
   await assertGitignoreAvailable(resolvedRoot);
@@ -845,6 +923,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       resolvedRoot,
       openCodeConfigPath,
       resolvedConfigWithDefaults,
+      installingPoiesisVersion,
     );
     if (currentlyPresent !== openCodeConfigPresent) {
       throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config presence changed during initialization", {
@@ -860,14 +939,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         path: relative(resolvedRoot, openCodeConfigPath),
       });
     }
-    configPatches = await applyOpenCodeConfig(resolvedRoot, resolvedConfigWithDefaults, openCodeConfigPath, {
-      requireAvailable: true,
-      expectedContent: initialOpenCodeConfigSnapshot,
-      onWritten: (content) => {
-        writtenOpenCodeConfigContent = content;
-        writtenOpenCodeConfigHash = hashContent(content);
+    configPatches = await applyOpenCodeConfig(
+      resolvedRoot,
+      resolvedConfigWithDefaults,
+      openCodeConfigPath,
+      installingPoiesisVersion,
+      {
+        requireAvailable: true,
+        expectedContent: initialOpenCodeConfigSnapshot,
+        onWritten: (content) => {
+          writtenOpenCodeConfigContent = content;
+          writtenOpenCodeConfigHash = hashContent(content);
+        },
       },
-    });
+    );
     if (writtenOpenCodeConfigContent === undefined || writtenOpenCodeConfigHash === undefined) {
       throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config write did not produce an ownership receipt", {
         path: relative(resolvedRoot, openCodeConfigPath),
@@ -1285,7 +1370,11 @@ export async function doctor(root: string): Promise<DoctorReport> {
   if (config !== undefined && manifest !== undefined) {
     try {
       await assertConfigPatchesOwned(resolvedRoot, manifest.configPatches);
-      const desired = desiredOpenCodePatches(config);
+      // Doctor projects the desired OpenCode config against the manifest's
+      // recorded `poiesisVersion` so the strict authority check recognizes
+      // every owned patch as installed by THIS package, even when the
+      // current runtime image is newer than the recorded install.
+      const desired = desiredOpenCodePatches(config, manifest.poiesisVersion);
       const recorded = new Map(manifest.configPatches.map((patch) => [patch.path.join("\0"), patch]));
       const mismatches = desired.filter((patch) => {
         const installed = recorded.get(patch.path.join("\0"));
@@ -1536,6 +1625,11 @@ export async function runCapabilityInstallTransaction(
   hooks?: CapabilityInstallTransactionHooks,
 ): Promise<ManagedSkill> {
   const resolvedRoot = resolve(root);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // `capability install` is not an upgrade channel, so a version
+  // mismatch fails closed before any transaction capture / write /
+  // receipt advance runs.
+  await assertRuntimeVersionMatchesProject(resolvedRoot);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);
@@ -1776,6 +1870,12 @@ export async function setModel(
     );
   }
 
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // `model set` is not an upgrade channel; the guard fails closed with
+  // `RUNTIME_VERSION_MISMATCH` before the OpenCode inventory probe
+  // (which itself can be expensive / slow / unavailable).
+  await assertRuntimeVersionMatchesProject(resolve(root));
+
   // Inventory probe runs BEFORE any write. Reuses the same parser
   // `verifyModels` and `update --config` already use, so the
   // trim/blank/dedupe semantics stay consistent. The error shape
@@ -1824,6 +1924,10 @@ export async function setModel(
 
 export async function uninstall(root: string): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Fails closed with `RUNTIME_VERSION_MISMATCH` before any other
+  // authority / receipt / config / marker check runs.
+  await assertRuntimeVersionMatchesProject(resolvedRoot);
   const manifest = await loadManifest(resolvedRoot);
   const config = await resolveConfigForRoot(resolvedRoot);
   await assertManifestAuthority(resolvedRoot, manifest, config);

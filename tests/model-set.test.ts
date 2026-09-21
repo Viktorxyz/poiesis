@@ -156,7 +156,7 @@ describe("setModel (ticket #56)", () => {
     // The OpenCode projection reflects the new reasoning model.
     const openCode = await readOpenCodeJson(repository);
     expect((openCode.agent as Record<string, Record<string, unknown>>)?.poiesis?.model).toBe("openai/gpt-5.6-fallback");
-    const desired = desiredOpenCodePatches(afterConfig);
+    const desired = desiredOpenCodePatches(afterConfig, "1.1.2");
     for (const patch of desired) {
       const top = openCode[patch.path[0]!];
       if (patch.path.length === 1) expect(top).toEqual(patch.value);

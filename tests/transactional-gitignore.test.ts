@@ -6,6 +6,7 @@ import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.
 import { ownershipReceiptExists, readOwnershipReceipt, removeOwnershipReceipt } from "../src/receipt.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+import { hashContent } from "../src/hash.js";
 
 /**
  * Deterministic transactional `.gitignore` rollback tests.
@@ -99,8 +100,60 @@ async function asPredecessorManifest(
   predecessorVersion: "1.0.0" | "1.0.1" | "1.0.2",
   options: { keepReceipt?: boolean } = {},
 ): Promise<Manifest> {
+  const fs = await import("node:fs/promises");
   const manifest = await loadManifest(repository.root);
+  // Spec #104 / ticket #105: rewrite the manifest AND on-disk
+  // OpenCode config into the exact v1.0.x predecessor projection so
+  // `assertManifestAuthorityToleratingPredecessor` admits it on the
+  // receipt-authenticated update path. v1.0.x carried the
+  // bare-launcher primary bash + obsolete reviewer.task fields; the
+  // v1.1.2 contract removes both.
+  const { predecessorProjectionV100V101V102 } = await import("../src/authority.js");
+  const openCodePath = join(repository.root, "opencode.jsonc");
+  const openCodeBytes = await fs.readFile(openCodePath, "utf8");
+  const openCodeConfig = JSON.parse(openCodeBytes) as {
+    agent?: Record<string, Record<string, unknown>>;
+  };
+  const reasoningModel = openCodeConfig.agent?.poiesis?.model as string;
+  const executionModel = openCodeConfig.agent?.["poiesis-worker"]?.model as string;
+  const fixtureConfig = {
+    schema: 1 as const,
+    models: { reasoning: reasoningModel, execution: executionModel },
+    repository: { remote: "origin", integrationBranch: "main" },
+    tracker: { provider: "github" as const, project: "owner/repo" },
+    delivery: {
+      preview: { adapter: "command", command: ["scripts/poiesis-preview.sh", "{sha}"] },
+      staging: { adapter: "command", command: ["scripts/poiesis-staging.sh", "{sha}"] },
+      production: { adapter: "command", command: ["scripts/poiesis-production.sh", "{sha}"] },
+    },
+    verification: { commands: ["test -f README.md"] },
+  };
+  const predecessor = predecessorProjectionV100V101V102(fixtureConfig, predecessorVersion);
   manifest.poiesisVersion = predecessorVersion;
+  manifest.configPatches = manifest.configPatches.map((patch) => {
+    const matching = predecessor.find(
+      (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
+    );
+    if (matching === undefined) return patch;
+    return { ...patch, installed: matching.value };
+  });
+  const current = JSON.parse(openCodeBytes) as Record<string, unknown>;
+  for (const patch of manifest.configPatches) {
+    let target: Record<string, unknown> = current;
+    for (let i = 0; i < patch.path.length - 1; i++) {
+      const segment = patch.path[i]!;
+      if (typeof target[segment] !== "object" || target[segment] === null) {
+        target[segment] = {};
+      }
+      target = target[segment] as Record<string, unknown>;
+    }
+    target[patch.path[patch.path.length - 1]!] = patch.installed;
+  }
+  const rewrittenOpenCodeBytes = JSON.stringify(current, null, 2) + "\n";
+  await fs.writeFile(openCodePath, rewrittenOpenCodeBytes);
+  manifest.files = manifest.files.map((file) =>
+    file.path === "opencode.jsonc" ? { ...file, hash: hashContent(rewrittenOpenCodeBytes) } : file,
+  );
   await writeFile(
     join(repository.root, ".poiesis", "manifest.json"),
     serializeManifest(manifest),
@@ -262,8 +315,57 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
     await setupCurrentInstall(repository);
     // Demote the install to the 1.0.0 predecessor so explicit
     // --bootstrap-legacy-ownership is the path exercised by the test.
+    // Spec #104 / ticket #105: rewrite the manifest AND on-disk
+    // OpenCode config into the exact v100 predecessor projection so
+    // `assertManifestAuthorityToleratingPredecessor` admits it.
+    const { predecessorProjectionV100 } = await import("../src/authority.js");
+    const fs = await import("node:fs/promises");
     const manifest = await loadManifest(repository.root);
+    const openCodePath = join(repository.root, "opencode.jsonc");
+    const openCodeBytes = await fs.readFile(openCodePath, "utf8");
+    const openCodeConfig = JSON.parse(openCodeBytes) as {
+      agent?: Record<string, Record<string, unknown>>;
+    };
+    const reasoningModel = openCodeConfig.agent?.poiesis?.model as string;
+    const executionModel = openCodeConfig.agent?.["poiesis-worker"]?.model as string;
+    const fixtureConfig = {
+      schema: 1 as const,
+      models: { reasoning: reasoningModel, execution: executionModel },
+      repository: { remote: "origin", integrationBranch: "main" },
+      tracker: { provider: "github" as const, project: "owner/repo" },
+      delivery: {
+        preview: { adapter: "command", command: ["scripts/poiesis-preview.sh", "{sha}"] },
+        staging: { adapter: "command", command: ["scripts/poiesis-staging.sh", "{sha}"] },
+        production: { adapter: "command", command: ["scripts/poiesis-production.sh", "{sha}"] },
+      },
+      verification: { commands: ["test -f README.md"] },
+    };
+    const predecessor = predecessorProjectionV100(fixtureConfig, "1.0.0");
     manifest.poiesisVersion = "1.0.0";
+    manifest.configPatches = manifest.configPatches.map((patch) => {
+      const matching = predecessor.find(
+        (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
+      );
+      if (matching === undefined) return patch;
+      return { ...patch, installed: matching.value };
+    });
+    const current = JSON.parse(openCodeBytes) as Record<string, unknown>;
+    for (const patch of manifest.configPatches) {
+      let target: Record<string, unknown> = current;
+      for (let i = 0; i < patch.path.length - 1; i++) {
+        const segment = patch.path[i]!;
+        if (typeof target[segment] !== "object" || target[segment] === null) {
+          target[segment] = {};
+        }
+        target = target[segment] as Record<string, unknown>;
+      }
+      target[patch.path[patch.path.length - 1]!] = patch.installed;
+    }
+    const rewrittenOpenCodeBytes = JSON.stringify(current, null, 2) + "\n";
+    await fs.writeFile(openCodePath, rewrittenOpenCodeBytes);
+    manifest.files = manifest.files.map((file) =>
+      file.path === "opencode.jsonc" ? { ...file, hash: hashContent(rewrittenOpenCodeBytes) } : file,
+    );
     await writeFile(
       join(repository.root, ".poiesis", "manifest.json"),
       serializeManifest(manifest),

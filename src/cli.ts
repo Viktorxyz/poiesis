@@ -689,6 +689,12 @@ async function commandTracker(args: string[]): Promise<void> {
   const repoRoot = await resolveGitRoot(cwd);
   const configRoot = await resolveConfigRoot(repoRoot);
   const config = await resolveConfigForRoot(configRoot);
+  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Tracker mutations (spec/ticket create | update | comment | close |
+  // supersede) are not an upgrade channel; the running package must
+  // equal the durable `manifest.poiesisVersion` before the adapter
+  // makes a remote call.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(configRoot);
   const adapter = createTrackerAdapter(config.tracker, repoRoot);
   const id = () => required(values, "id");
   let result: unknown;

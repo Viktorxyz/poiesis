@@ -369,9 +369,11 @@ async function runLockedUpdateTransaction(
   // predecessor provenance. A 1.0.0 manifest WITHOUT a receipt must use the
   // explicit --bootstrap-legacy-ownership path, not normal update.
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
-  // Tolerant authority check: accepts the strict current projection OR the
-  // exact v1.0.1/1.0.2 predecessor projection.
-  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2"]);
+  // Tolerant authority check: accepts the strict current projection OR
+  // the exact v1.0.1/v1.0.2 legacy predecessor projection OR the exact
+  // v1.1.1 predecessor primary-bash projection (only here, on explicit
+  // receipt-authenticated `update`).
+  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1"]);
   await verifyGitRepository(resolvedRoot, config);
   await verifyOpenCodeVersion(resolvedRoot);
 
@@ -492,13 +494,17 @@ async function runLockedUpdateTransaction(
     //    binds `transactionWrittenIdentity` to the bytes we just wrote,
     //    so `journal.rollback` hash-gates against the transaction's own
     //    bytes (preserves any foreign replacement that races between
-    //    the apply and the rollback).
+    //    the apply and the rollback). Spec #104 / ticket #105: the
+    //    exact-version canonical route `pnpm dlx poiesis-cli@X` is
+    //    sourced from `await packageVersion()` (the new version being
+    //    installed by this update transaction), not the prior manifest.
     const openCodeEntry = journal.entries.find((candidate) => candidate.path === openCodeConfigPath);
     if (openCodeEntry === undefined) {
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
+    const updatingPoiesisVersion = await packageVersion();
     await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       expectedContent: openCodeConfigCurrentBytes,
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
@@ -807,8 +813,9 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     if (openCodeEntry === undefined) {
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
+    const updatingPoiesisVersion = await packageVersion();
     await hooks?.preOpenCodeApply?.();
-    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, {
+    const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       ...(openCodeConfigCurrentBytes !== null ? { expectedContent: openCodeConfigCurrentBytes } : {}),
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };

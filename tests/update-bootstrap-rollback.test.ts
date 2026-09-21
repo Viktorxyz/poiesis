@@ -188,7 +188,7 @@ async function asPredecessorManifest(
   const { ownershipReceiptExists, removeOwnershipReceipt } = await import("../src/receipt.js");
   const manifest = await loadManifest(repository.root);
   const config = testConfig(repository);
-  const predecessor = predecessorProjectionV100V101V102(config);
+  const predecessor = predecessorProjectionV100V101V102(config, predecessorVersion);
   manifest.poiesisVersion = predecessorVersion;
   manifest.configPatches = manifest.configPatches.map((patch) => {
     const matching = predecessor.find(
@@ -225,6 +225,89 @@ async function rebindReceipt(repository: TestRepository): Promise<void> {
   const manifest = await loadManifest(repository.root);
   const existing = await readOwnershipReceipt(repository.root);
   await replaceOwnershipReceipt(repository.root, manifest, existing);
+}
+
+/**
+ * Spec #104 / ticket #105: rewrite a manifest into the exact v1.0.0
+ * predecessor shape (legacy bare-launcher primary bash + obsolete
+ * reviewer.task) so the explicit `bootstrap-legacy-ownership` path
+ * can admit it via `assertManifestAuthorityToleratingPredecessor`'s
+ * 1.0.0 predecessor projection. The legacy primary-bash surface and
+ * the reviewer.task field were both part of the v1.0.x contract; the
+ * v1.1.2 contract removes both, so a real 1.0.0 install must match
+ * the v100 predecessor projection exactly to be admitted.
+ */
+async function asLegacy1000Projection(
+  repository: TestRepository,
+  options: { openCodeRelativePath?: string } = {},
+): Promise<void> {
+  const openCodeRelativePath = options.openCodeRelativePath ?? "opencode.jsonc";
+  const { predecessorProjectionV100 } = await import("../src/authority.js");
+  const fs = await import("node:fs/promises");
+  const manifest = await loadManifest(repository.root);
+  // Read the live OpenCode config off disk so the predecessor
+  // projection is keyed off the same reasoning/execution models the
+  // manifest already records (testConfig() models differ slightly per
+  // repo when overridden).
+  const openCodePath = join(repository.root, openCodeRelativePath);
+  const openCodeBytes = await fs.readFile(openCodePath, "utf8");
+  const openCodeConfig = JSON.parse(openCodeBytes) as {
+    agent?: Record<string, Record<string, unknown>>;
+  };
+  const reasoningModel = openCodeConfig.agent?.poiesis?.model as string | undefined;
+  const executionModel = openCodeConfig.agent?.poiesis?.permission
+    ? ((openCodeConfig.agent["poiesis-worker"]?.model as string | undefined) ?? reasoningModel)
+    : undefined;
+  if (reasoningModel === undefined || executionModel === undefined) {
+    throw new Error("asLegacy1000Projection fixture requires a live OpenCode config with primary + worker model wiring");
+  }
+  const fixtureConfig = {
+    schema: 1 as const,
+    models: { reasoning: reasoningModel, execution: executionModel },
+    repository: { remote: "origin", integrationBranch: "main" },
+    tracker: { provider: "github" as const, project: "owner/repo" },
+    delivery: {
+      preview: { adapter: "command", command: ["scripts/poiesis-preview.sh", "{sha}"] },
+      staging: { adapter: "command", command: ["scripts/poiesis-staging.sh", "{sha}"] },
+      production: { adapter: "command", command: ["scripts/poiesis-production.sh", "{sha}"] },
+    },
+    verification: { commands: ["test -f README.md"] },
+  };
+  const predecessor = predecessorProjectionV100(fixtureConfig, "1.0.0");
+  manifest.poiesisVersion = "1.0.0";
+  manifest.configPatches = manifest.configPatches.map((patch) => {
+    const matching = predecessor.find(
+      (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
+    );
+    if (matching === undefined) return patch;
+    return { ...patch, installed: matching.value };
+  });
+  // Rewrite the on-disk OpenCode config so the manifest's recorded
+  // configPatches match the live file (otherwise the snapshot-config-
+  // patch ownership check inside the bootstrap transaction rejects with
+  // `CONFIG_OWNERSHIP_LOST`). Also recompute the manifest.files[] hash
+  // for that file so the file-hash verification inside the bootstrap
+  // transaction passes.
+  const current = JSON.parse(openCodeBytes) as Record<string, unknown>;
+  for (const patch of manifest.configPatches) {
+    let target: Record<string, unknown> = current;
+    for (let i = 0; i < patch.path.length - 1; i++) {
+      const segment = patch.path[i]!;
+      if (typeof target[segment] !== "object" || target[segment] === null) {
+        target[segment] = {};
+      }
+      target = target[segment] as Record<string, unknown>;
+    }
+    target[patch.path[patch.path.length - 1]!] = patch.installed;
+  }
+  const rewrittenOpenCodeBytes = JSON.stringify(current, null, 2) + "\n";
+  await writeFile(openCodePath, rewrittenOpenCodeBytes);
+  manifest.files = manifest.files.map((file) =>
+    file.path === openCodeRelativePath ? { ...file, hash: hashContent(rewrittenOpenCodeBytes) } : file,
+  );
+  await writeFile(join(repository.root, ".poiesis", "manifest.json"), serializeManifest(manifest));
+  const { removeOwnershipReceipt } = await import("../src/receipt.js");
+  await removeOwnershipReceipt(repository.root);
 }
 
 async function stripNewGitignoreRule(repository: TestRepository): Promise<Buffer> {
@@ -680,14 +763,7 @@ describe("explicit 1.0.0 bootstrap rollback hardening (ticket #30)", () => {
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const beforeBytes = await snapshotOwnedBytes(repository, MATERIALIZED_PATHS);
@@ -718,14 +794,7 @@ describe("explicit 1.0.0 bootstrap rollback hardening (ticket #30)", () => {
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const foreignReviewerBytes = Buffer.from("# foreign bootstrap reviewer\\n");
@@ -759,14 +828,7 @@ describe("explicit 1.0.0 bootstrap rollback hardening (ticket #30)", () => {
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const manifestPath = join(repository.root, ".poiesis", "manifest.json");
@@ -804,14 +866,7 @@ describe("explicit 1.0.0 bootstrap rollback hardening (ticket #30)", () => {
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const result = await runBootstrapLegacyOwnershipTransaction(repository.root, {}, {});
@@ -941,14 +996,7 @@ describe("ticket #32 -- next-manifest OpenCode hash bound to applyOpenCodeConfig
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const manifestPath = join(repository.root, ".poiesis", "manifest.json");
@@ -987,14 +1035,7 @@ describe("ticket #32 -- next-manifest OpenCode hash bound to applyOpenCodeConfig
     repositories.push(repository);
     await install(repository);
     await seedDefaultSkillDirectoriesAsPreexisting(repository);
-    const manifest = await loadManifest(repository.root);
-    manifest.poiesisVersion = "1.0.0";
-    await writeFile(
-      join(repository.root, ".poiesis", "manifest.json"),
-      serializeManifest(manifest),
-    );
-    const { removeOwnershipReceipt } = await import("../src/receipt.js");
-    await removeOwnershipReceipt(repository.root);
+    await asLegacy1000Projection(repository);
     await stripNewGitignoreRule(repository);
 
     const openCodePath = join(repository.root, "opencode.jsonc");
