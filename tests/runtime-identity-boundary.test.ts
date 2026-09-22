@@ -382,7 +382,17 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
   // above; this unit-level proof covers the helper's three core
   // behaviours (mismatch, equal, manifest-less) at the source.
   const helperRepositories: TestRepository[] = [];
+  let helperEnv: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    // The "helper seam" describe is a top-level peer of the main
+    // describe, so it does NOT inherit the parent's `beforeEach`. Install
+    // the fake here too so the `init()` calls below resolve the
+    // certified `1.18.29` binary regardless of the real-world
+    // installation (`opencode --version`).
+    helperEnv = await installFakeOpenCode();
+  });
   afterEach(async () => {
+    helperEnv?.restore();
     setRuntimePackageVersionOverrideForTest(null);
     await Promise.all(
       helperRepositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })),

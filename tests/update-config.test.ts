@@ -1325,10 +1325,15 @@ describe("update --config", () => {
     expectOwnedBytesUnchanged(beforeBytes, afterBytes);
   }, 30_000);
 
-  it("rejects with OPENCODE_VERSION_UNSUPPORTED before any write when the installed OpenCode version is not in the supported set", async () => {
-    // Override the fake `opencode --version` output to a version outside the
-    // supported set. The OpenCode-version probe MUST run before the first
-    // write and MUST reject every owned byte.
+  it("rejects with OPENCODE_ADAPTER_INCOMPATIBLE before any write when the installed OpenCode rejects the V1 schema projection", async () => {
+    // The strict certified-set gate is no longer what `update --config`
+    // checks against; the runtime now probes the installed binary's
+    // capability to accept the projected V1 schema. A version that is
+    // NOT in `CERTIFIED_OPENCODE_VERSIONS` and whose fake binary rejects
+    // the V1 schema must fail closed at the capability probe, BEFORE
+    // any owned byte is mutated, with a typed
+    // `OPENCODE_ADAPTER_INCOMPATIBLE` that names the missing capability
+    // so an operator can diagnose WHAT the installed binary lacks.
     const repository = await createTestRepository();
     repositories.push(repository);
     await install(repository);
@@ -1338,10 +1343,15 @@ describe("update --config", () => {
     const beforeBytes = await snapshotOwnedBytes(repository);
 
     env?.restore();
-    env = await installFakeOpenCode("1.19.0"); // not in SUPPORTED_OPENCODE_VERSIONS
+    // Install the fake with `rejectV1SchemaForUnknownVersions: true` so
+    // `1.19.0` (NOT in the certified set) fails the V1 schema probe,
+    // simulating a real-world installation whose adapter contract has
+    // drifted away from the V1 projection.
+    env = await installFakeOpenCode({ version: "1.19.0", rejectV1SchemaForUnknownVersions: true });
     try {
       await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({
-        code: "OPENCODE_VERSION_UNSUPPORTED",
+        code: "OPENCODE_ADAPTER_INCOMPATIBLE",
+        details: { installed: "1.19.0", capability: "debug config schema" },
       });
     } finally {
       env.restore();

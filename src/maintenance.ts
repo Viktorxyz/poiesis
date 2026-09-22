@@ -50,10 +50,10 @@ import {
   detectOpenCodeConfig,
   detectOpenCodeConfigForInit,
   OPENCODE_ADAPTER_VERSION,
-  SUPPORTED_OPENCODE_VERSION,
-  SUPPORTED_OPENCODE_VERSIONS,
+  probeOpenCodeAdapterContract,
+  CERTIFIED_OPENCODE_VERSION,
+  CERTIFIED_OPENCODE_VERSIONS,
   validateOpenCodeConfig,
-  verifyOpenCodeVersion,
 } from "./opencode.js";
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
 import { run } from "./process.js";
@@ -578,7 +578,18 @@ export function parseOpenCodeModelInventory(stdout: string): Set<string> {
 async function verifyOpenCodeEnvironment(config: ResolvedPoiesisConfig): Promise<void> {
   const directory = await mkdtemp(join(tmpdir(), "poiesis-opencode-check-"));
   try {
-    await verifyOpenCodeVersion(directory);
+    // Production invariant for init's environment verification: the
+    // installed OpenCode must be able to serve the model inventory the
+    // configured reasoning/execution models must live in. The
+    // capability probe itself is non-fatal here — a newer
+    // not-yet-certified patch version whose `models` probe succeeds
+    // is allowed to install (the certified-set flag is informational
+    // metadata; the V1 schema is validated separately by
+    // `validateOpenCodeConfigPayload` against the actual init
+    // projection). Init does NOT probe `--version`: the binary's
+    // functional presence is already proven by the `models` probe
+    // itself, and a separate `--version` call would be a redundant
+    // subprocess for no additional capability evidence.
     await verifyModels(directory, config);
   } finally {
     await rm(directory, { recursive: true, force: true });
@@ -1040,8 +1051,8 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
+        supportedVersion: CERTIFIED_OPENCODE_VERSION,
+        supportedVersions: [...CERTIFIED_OPENCODE_VERSIONS],
       },
       files: managedFiles,
       skills: managedSkills,
@@ -1372,10 +1383,42 @@ export async function doctor(root: string): Promise<DoctorReport> {
   }
 
   try {
-    const installed = await verifyOpenCodeVersion(resolvedRoot);
-    checks.push({ id: "opencode-version", status: "pass", message: "OpenCode version is supported", details: { installed } });
+    // Capability-based contract probe: distinguishes the four states the
+    // Poiesis doc demands (`certified/supported`, `newer and not yet
+    // certified`, `known incompatible/unsupported`, `required capability
+    // unavailable`) without inventing new persistent concepts. The
+    // V1 schema probe (via `debug config`) is owned by the
+    // `opencode-schema` check below; this check only probes the
+    // installed binary's reachability and version/certified flag.
+    const contract = await probeOpenCodeAdapterContract(resolvedRoot);
+    if (contract.certified) {
+      checks.push({
+        id: "opencode-version",
+        status: "pass",
+        message: "OpenCode version is certified",
+        details: { installed: contract.installed, certified: contract.latestCertified },
+      });
+    } else {
+      // Capability probe passed but the version is not on the
+      // certified set: this is the "newer and not yet certified"
+      // state. `warn` keeps the report green overall (doctor.ok is the
+      // NOT-gate over `status === "fail"`) while still surfacing the
+      // operator-visible notice in the structured report.
+      checks.push({
+        id: "opencode-version",
+        status: "warn",
+        message: `OpenCode version is newer than the latest certified compatibility; Poiesis proceeded under capability parity`,
+        details: { installed: contract.installed, latestCertified: contract.latestCertified },
+      });
+    }
   } catch (error) {
-    checks.push({ id: "opencode-version", status: "fail", message: "OpenCode version is unsupported or unavailable", details: errorDetails(error) });
+    // `OPENCODE_UNAVAILABLE` (binary missing) and the capability probe
+    // failures are not distinguished here on purpose: the
+    // `opencode-schema` and `models` checks below surface their own
+    // targeted diagnostics; this check is only the version reachability
+    // gate, and `fail` is the conservative posture when the binary is
+    // unreachable.
+    checks.push({ id: "opencode-version", status: "fail", message: "OpenCode version is unavailable", details: errorDetails(error) });
   }
 
   if (config !== undefined) {
@@ -1902,7 +1945,11 @@ export async function setModel(
   // `verifyModels` and `update --config` already use, so the
   // trim/blank/dedupe semantics stay consistent. The error shape
   // mirrors `verifyModels` so downstream tooling can reuse the same
-  // matcher.
+  // matcher. `setModel` does NOT probe `--version` itself: the
+  // version is informational metadata only (a newer not-yet-certified
+  // patch version whose inventory probe passes is allowed to
+  // proceed). The interactive flow does its own `--version` probe for
+  // its "newer than latest certified compatibility" notice.
   const inventory = await run("opencode", ["models"], { cwd: root, allowFailure: true });
   if (inventory.exitCode !== 0) {
     throw new PoiesisError("MODEL_INVENTORY_UNAVAILABLE", "OpenCode model inventory is unavailable", {

@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
-import { lstat, readFile } from "node:fs/promises";
+import { lstat, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
@@ -10,7 +11,6 @@ import { assertNoDuplicateProperties as assertNoDuplicatePropertiesShared } from
 import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { run } from "./process.js";
 
-export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
 /**
  * The explicit, ordered set of OpenCode versions the V1 adapter contract
  * applies to. `1.18.29`, `1.18.30`, and `1.18.31` lower the same
@@ -19,16 +19,203 @@ export const SUPPORTED_OPENCODE_VERSION = "1.18.29";
  * provider/model-only. Newer releases MUST NOT be added here without
  * explicit contract verification (probe parity for `--version`,
  * `models`, and `debug config` against the projected V1 schema).
+ *
+ * `CERTIFIED_OPENCODE_VERSIONS` is the SINGLE source of truth for every
+ * certified-version derived value. `CERTIFIED_OPENCODE_VERSION` (the
+ * legacy single-pin shape carried in pre-1.0.3 manifests' `supportedVersion`
+ * field) and `LATEST_CERTIFIED_OPENCODE_VERSION` (the informational
+ * "latest certified compatibility" pin) are both derived from it so the
+ * three cannot drift independently. Edit only this array when adding a
+ * newly-verified tag.
  */
-export const SUPPORTED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30", "1.18.31"];
+export const CERTIFIED_OPENCODE_VERSIONS: readonly string[] = ["1.18.29", "1.18.30", "1.18.31"];
+/**
+ * The legacy single-version pin recorded in
+ * `manifest.adapter.supportedVersion` for backward compatibility with
+ * pre-1.0.3 manifests that only carry `supportedVersion`. Derived from
+ * `CERTIFIED_OPENCODE_VERSIONS[0]` so the literal `"1.18.29"` lives in
+ * exactly one place. Newer releases do NOT need an update here — the
+ * authoritative ordered list is `CERTIFIED_OPENCODE_VERSIONS`.
+ */
+export const CERTIFIED_OPENCODE_VERSION: string = CERTIFIED_OPENCODE_VERSIONS[0]!;
+/**
+ * The latest version the V1 adapter contract has been explicitly
+ * certified against. Derived from `CERTIFIED_OPENCODE_VERSIONS` so the
+ * two cannot drift; surfaced only as informational metadata in
+ * human-readable "newer than latest certified compatibility" notices.
+ * Not part of the public API — callers who need this value compute
+ * it from `CERTIFIED_OPENCODE_VERSIONS` directly.
+ */
+const LATEST_CERTIFIED_OPENCODE_VERSION: string = CERTIFIED_OPENCODE_VERSIONS[CERTIFIED_OPENCODE_VERSIONS.length - 1]!;
 export const OPENCODE_ADAPTER_VERSION = "1";
 
-export function isSupportedOpenCodeVersion(version: string): boolean {
-  return SUPPORTED_OPENCODE_VERSIONS.includes(version);
+export function isCertifiedOpenCodeVersion(version: string): boolean {
+  return CERTIFIED_OPENCODE_VERSIONS.includes(version);
 }
 
 type JsonObject = Record<string, unknown>;
 
+/**
+ * Result of the V1 adapter contract capability probe. Reports what the
+ * installed OpenCode binary actually does (or refuses to do) for the
+ * surfaces Poiesis depends on. The version being on the certified
+ * `CERTIFIED_OPENCODE_VERSIONS` set is informational metadata; the real
+ * safety boundary is the capability probe results.
+ *
+ * - `installed`              the trimmed `opencode --version` stdout
+ * - `certified`              `installed` is in `CERTIFIED_OPENCODE_VERSIONS`
+ * - `latestCertified`        latest entry of `CERTIFIED_OPENCODE_VERSIONS`,
+ *                            surfaced as informational metadata
+ * - `modelsInventory`        result of `opencode models`; `null` if not
+ *                            probed or the call failed
+ * - `acceptsV1Schema`        result of writing the projected payload
+ *                            and running `opencode debug config`;
+ *                            `null` if not probed, `true`/`false` if
+ *                            probed
+ */
+export interface OpenCodeAdapterContract {
+  installed: string;
+  certified: boolean;
+  latestCertified: string;
+  modelsInventory: readonly string[] | null;
+  acceptsV1Schema: boolean | null;
+}
+
+/**
+ * Options accepted by `probeOpenCodeAdapterContract` /
+ * `assertOpenCodeAdapterContract`. Each capability is opt-in so callers
+ * can request only the surfaces they actually need; probes that are not
+ * requested remain `null` in the returned contract.
+ */
+export interface ProbeAdapterContractOptions {
+  /**
+   * Probe the OpenCode model inventory via `opencode models`.
+   * When set, `assertOpenCodeAdapterContract` hard-fails with
+   * `OPENCODE_ADAPTER_INCOMPATIBLE` if the inventory call fails or
+   * returns an empty list.
+   */
+  probeModels?: boolean;
+  /**
+   * Probe the V1 adapter projection by writing `payload` to a temp
+   * file and running `opencode debug config` from `cwd`. When set,
+   * `assertOpenCodeAdapterContract` hard-fails with
+   * `OPENCODE_ADAPTER_INCOMPATIBLE` if the call rejects the projection.
+   */
+  probeSchema?: { payload: string; cwd: string };
+}
+
+/**
+ * Probe the installed OpenCode for the V1 adapter contract surface
+ * Poiesis depends on. The probe is non-fatal: every capability probe
+ * that fails records `null` / `false` in the report. The only
+ * non-capability failure this function raises is `OPENCODE_UNAVAILABLE`
+ * when `opencode --version` itself cannot run; without the version
+ * string nothing else can be reported.
+ *
+ * The capability-based check is what `update --config`, `setModel`,
+ * the interactive `poiesis model` flow, and `doctor` rely on. A newer
+ * or otherwise unrecognized OpenCode version that satisfies the
+ * probed capabilities is reported as `certified: false` with the
+ * capability results preserved — callers decide whether to warn the
+ * operator or fail closed, never blindly reject by version string.
+ */
+export async function probeOpenCodeAdapterContract(
+  root: string,
+  options?: ProbeAdapterContractOptions,
+): Promise<OpenCodeAdapterContract> {
+  // Always probe `--version`. A missing binary / non-zero exit is the
+  // only thing that can fail this probe; every other capability probe
+  // is best-effort and reports its own result. We also catch the
+  // synchronous spawn failure (e.g. binary not on PATH) so the same
+  // OPENCODE_UNAVAILABLE code surfaces from both exit-code and
+  // I/O-error branches.
+  let versionResult: Awaited<ReturnType<typeof run>>;
+  try {
+    versionResult = await run("opencode", ["--version"], { cwd: root, allowFailure: true });
+  } catch (error) {
+    throw new PoiesisError("OPENCODE_UNAVAILABLE", "OpenCode is not available", {
+      cause: error instanceof Error ? error.message : String(error),
+    });
+  }
+  if (versionResult.exitCode !== 0) {
+    throw new PoiesisError("OPENCODE_UNAVAILABLE", "OpenCode is not available", {
+      stderr: versionResult.stderr,
+    });
+  }
+  const installed = versionResult.stdout;
+  const certified = isCertifiedOpenCodeVersion(installed);
+
+  let modelsInventory: readonly string[] | null = null;
+  if (options?.probeModels === true) {
+    const modelsResult = await run("opencode", ["models"], { cwd: root, allowFailure: true });
+    if (modelsResult.exitCode === 0) {
+      modelsInventory = [...new Set(modelsResult.stdout.split("\n").map((line) => line.trim()).filter(Boolean))];
+    }
+  }
+
+  let acceptsV1Schema: boolean | null = null;
+  if (options?.probeSchema !== undefined) {
+    const tempDir = await mkdtemp(join(tmpdir(), "poiesis-opencode-contract-probe-"));
+    try {
+      const payloadPath = join(tempDir, "opencode.jsonc");
+      await atomicCreate(payloadPath, options.probeSchema.payload);
+      const probeResult = await run("opencode", ["debug", "config"], {
+        cwd: options.probeSchema.cwd,
+        allowFailure: true,
+      });
+      acceptsV1Schema = probeResult.exitCode === 0;
+    } finally {
+      await rm(tempDir, { recursive: true, force: true });
+    }
+  }
+
+  return {
+    installed,
+    certified,
+    latestCertified: LATEST_CERTIFIED_OPENCODE_VERSION,
+    modelsInventory,
+    acceptsV1Schema,
+  };
+}
+
+/**
+ * Probe and assert that the installed OpenCode satisfies the V1 adapter
+ * contract capabilities the caller depends on. Capability probe
+ * failures hard-fail with `OPENCODE_ADAPTER_INCOMPATIBLE` and a
+ * `capability` field naming the missing surface so an operator can
+ * diagnose WHAT the installed binary lacks.
+ *
+ * The version being on `CERTIFIED_OPENCODE_VERSIONS` is NOT a hard
+ * gate — the contract is. A newer or otherwise unrecognized patch
+ * version whose capability probe passes is reported as
+ * `certified: false` with the capability results preserved; the caller
+ * decides whether to emit a "newer than latest certified compatibility"
+ * warning to the operator.
+ *
+ * The only hard failure unrelated to capability is `OPENCODE_UNAVAILABLE`
+ * when `opencode --version` cannot run.
+ */
+export async function assertOpenCodeAdapterContract(
+  root: string,
+  options?: ProbeAdapterContractOptions,
+): Promise<OpenCodeAdapterContract> {
+  const contract = await probeOpenCodeAdapterContract(root, options);
+  if (options?.probeModels === true && (contract.modelsInventory === null || contract.modelsInventory.length === 0)) {
+    throw new PoiesisError(
+      "OPENCODE_ADAPTER_INCOMPATIBLE",
+      "OpenCode did not return a non-empty models inventory; the installed binary lacks the capability Poiesis requires",
+      { installed: contract.installed, capability: "models" },
+    );
+  }
+  if (options?.probeSchema !== undefined && contract.acceptsV1Schema === false) {
+    throw new PoiesisError(
+      "OPENCODE_ADAPTER_INCOMPATIBLE",
+      "OpenCode rejected the V1 adapter projection; the installed binary is incompatible with the configuration Poiesis generates",
+      { installed: contract.installed, capability: "debug config schema" },
+    );
+  }
+  return contract;
+}
 /**
  * Spec #104 / tickets #105 / #110: the runtime identity boundary for the
  * primary (Poiesis) agent. The generated normal installed lifecycle
@@ -422,24 +609,33 @@ export async function reverseOpenCodeConfig(root: string, patches: ConfigPatch[]
   }
   return changed;
 }
-
-export async function verifyOpenCodeVersion(root: string): Promise<string> {
-  const result = await run("opencode", ["--version"], { cwd: root, allowFailure: true });
-  if (result.exitCode !== 0) {
-    throw new PoiesisError("OPENCODE_UNAVAILABLE", "OpenCode is not available", { stderr: result.stderr });
-  }
-  if (!isSupportedOpenCodeVersion(result.stdout)) {
-    throw new PoiesisError("OPENCODE_VERSION_UNSUPPORTED", "Installed OpenCode version is not supported", {
-      installed: result.stdout,
-      supported: [...SUPPORTED_OPENCODE_VERSIONS],
-    });
-  }
-  return result.stdout;
-}
-
 export async function validateOpenCodeConfig(root: string): Promise<void> {
   const configPath = await detectOpenCodeConfig(root);
-  await run("opencode", ["debug", "config"], {
+  // The schema probe is best-effort with a typed-failure wrapper: a
+  // non-zero `debug config` exit means the installed OpenCode rejected
+  // the projected V1 payload. Surface that as
+  // `OPENCODE_ADAPTER_INCOMPATIBLE` so the caller's fail-closed path
+  // and the doctor `opencode-schema` check both report WHAT capability
+  // the installed binary is missing instead of a generic
+  // `COMMAND_FAILED`. The probe uses `allowFailure: true` so the
+  // exit code is preserved for the wrap rather than thrown as a
+  // generic command error.
+  const probe = await run("opencode", ["debug", "config"], {
     cwd: dirname(configPath) === join(root, ".opencode") ? root : dirname(configPath),
+    allowFailure: true,
   });
+  if (probe.exitCode !== 0) {
+    let installed = "<unknown>";
+    try {
+      installed = (await run("opencode", ["--version"], { cwd: root, allowFailure: true })).stdout.trim();
+    } catch {
+      // The version probe is informational only; we already have the
+      // capability failure we wanted to surface.
+    }
+    throw new PoiesisError(
+      "OPENCODE_ADAPTER_INCOMPATIBLE",
+      "OpenCode rejected the V1 adapter projection; the installed binary is incompatible with the configuration Poiesis generates",
+      { installed, capability: "debug config schema", stderr: probe.stderr },
+    );
+  }
 }

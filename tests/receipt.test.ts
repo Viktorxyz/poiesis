@@ -1,15 +1,26 @@
 import { readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { doctor, init, uninstall, update } from "../src/maintenance.js";
 import { loadManifest, serializeManifest } from "../src/manifest.js";
 import { ownershipReceiptLocation, readOwnershipReceipt } from "../src/receipt.js";
 import { exists } from "../src/fs.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 describe("ownership receipts", () => {
   const repositories: TestRepository[] = [];
-  afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
+  let env: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    // Install the fake opencode binary so the strict-version gate
+    // inside `init` resolves to a certified `1.18.29` regardless of
+    // the real-world `opencode --version` on the test machine.
+    env = await installFakeOpenCode();
+  });
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
 
   async function install(repository: TestRepository) {
     return init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });

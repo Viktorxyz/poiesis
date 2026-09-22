@@ -244,6 +244,21 @@ export async function runInteractiveModel(args: InteractiveModelOptions): Promis
       currentIdentity: current[classAnswer],
     });
     const result = await setModel(args.root, classAnswer as ModelClassName, chosen);
+    // Probe the OpenCode adapter contract to emit the "newer than
+    // latest certified compatibility" notice when the operator is on
+    // an unrecognized patch version. The capability probe here is
+    // independent of the safety probes `setModel` already ran
+    // because the warning is a UI concern, not a safety boundary —
+    // the underlying mutation has already succeeded by this point.
+    const { probeOpenCodeAdapterContract, CERTIFIED_OPENCODE_VERSIONS } = await import("./opencode.js");
+    const contract = await probeOpenCodeAdapterContract(args.root);
+    if (!contract.certified) {
+      args.io.writeStderr(
+        `Warning: OpenCode ${contract.installed} has not yet been certified by this Poiesis release.\n` +
+        `Latest certified compatibility: ${CERTIFIED_OPENCODE_VERSIONS[CERTIFIED_OPENCODE_VERSIONS.length - 1]}.\n` +
+        `Poiesis proceeded because the capability probe passed; restart OpenCode to load the change.`,
+      );
+    }
     args.io.writeStderr(formatRestartNotice({
       modelClass: classAnswer,
       previous: current[classAnswer],

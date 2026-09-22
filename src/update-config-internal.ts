@@ -34,9 +34,8 @@ import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from
 import {
   desiredOpenCodePatches,
   OPENCODE_ADAPTER_VERSION,
-  SUPPORTED_OPENCODE_VERSION,
-  SUPPORTED_OPENCODE_VERSIONS,
-  verifyOpenCodeVersion,
+  CERTIFIED_OPENCODE_VERSION,
+  CERTIFIED_OPENCODE_VERSIONS,
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
@@ -386,7 +385,12 @@ async function runLockedUpdateConfigTransaction(
   await assertManifestAuthority(resolvedRoot, manifest, currentConfig);
   const { content: currentConfigBytes } = await assertPoiesisConfigOwnership(resolvedRoot, manifest);
   await verifyGitRepository(resolvedRoot);
-  await verifyOpenCodeVersion(resolvedRoot);
+  // The transaction's actual capability probes (`models` via
+  // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run
+  // below. A blanket `--version` probe here was redundant and is
+  // removed; the certified-set flag is informational metadata, not
+  // a safety boundary, and no operation in this transaction depends
+  // on it.
   const { relativePath: openCodeRelativePath, configPatches: openCodeConfigPatches } = await identifyManagedOpenCodeConfig(manifest);
   const openCodeConfigPath = join(resolvedRoot, openCodeRelativePath);
   if (!(await exists(openCodeConfigPath)) || !(await isRegularFileNoFollow(openCodeConfigPath))) {
@@ -617,8 +621,8 @@ async function runLockedUpdateConfigTransaction(
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
+        supportedVersion: CERTIFIED_OPENCODE_VERSION,
+        supportedVersions: [...CERTIFIED_OPENCODE_VERSIONS],
       },
       files: manifest.files.map((file) => {
         if (file.path === POIESIS_CONFIG_RELATIVE_PATH) {

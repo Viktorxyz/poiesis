@@ -51,7 +51,13 @@ import { join, resolve } from "node:path";
 import { PoiesisError } from "./errors.js";
 import { hashContent } from "./hash.js";
 import { loadManifest, serializeManifest, type Manifest } from "./manifest.js";
-import { applyOpenCodeConfig, OPENCODE_ADAPTER_VERSION, SUPPORTED_OPENCODE_VERSION, SUPPORTED_OPENCODE_VERSIONS, verifyOpenCodeVersion } from "./opencode.js";
+import {
+  applyOpenCodeConfig,
+  assertOpenCodeAdapterContract,
+  OPENCODE_ADAPTER_VERSION,
+  CERTIFIED_OPENCODE_VERSION,
+  CERTIFIED_OPENCODE_VERSIONS,
+} from "./opencode.js";
 import { assertOpenCodeOwnershipAgainstSnapshot } from "./opencode-preflight.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { ownedPath, poiesisPath } from "./paths.js";
@@ -375,7 +381,12 @@ async function runLockedUpdateTransaction(
   // receipt-authenticated `update`).
   await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1"]);
   await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
+  // The transaction's actual capability probes (`models` via
+  // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run
+  // below. A blanket `--version` probe here was redundant and is
+  // removed; the certified-set flag is informational metadata, not
+  // a safety boundary, and no operation in this transaction depends
+  // on it.
 
   // Compute the materialized file list. We need this both to validate
   // ownership of each destination and to enumerate the files we will
@@ -561,8 +572,8 @@ async function runLockedUpdateTransaction(
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
+        supportedVersion: CERTIFIED_OPENCODE_VERSION,
+        supportedVersions: [...CERTIFIED_OPENCODE_VERSIONS],
       },
       files: nextFiles,
       skills,
@@ -683,7 +694,12 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     }
   }
   await verifyGitRepository(resolvedRoot, config);
-  await verifyOpenCodeVersion(resolvedRoot);
+  // The transaction's actual capability probes (`models` via
+  // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run
+  // below. A blanket `--version` probe here was redundant and is
+  // removed; the legacy manifest's `supportedVersion` field
+  // continues to gate `assertManifestAuthorityToleratingPredecessor`,
+  // which is the receipt-bound strict check the bootstrap path needs.
 
   const { readTemplate } = await import("./templates.js");
   const { serializeConfig } = await import("./config.js");
@@ -859,8 +875,8 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
+        supportedVersion: CERTIFIED_OPENCODE_VERSION,
+        supportedVersions: [...CERTIFIED_OPENCODE_VERSIONS],
       },
       files: nextFiles,
       skills,

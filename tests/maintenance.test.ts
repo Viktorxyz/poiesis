@@ -111,7 +111,7 @@ describe("maintenance ownership", () => {
     await mkdir(bin);
     await writeFile(
       opencode,
-      '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  mkdir -p "$(dirname "$POIESIS_TEST_TARGET")"\n  printf "{\\\"share\\\":\\\"disabled\\\"}\\n" > "$POIESIS_TEST_TARGET"\n  printf "1.18.29\\n"\n  exit 0\nfi\nif [ "$1" = "models" ]; then\n  printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"\n  exit 0\nfi\nexit 0\n',
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then\n  mkdir -p "$(dirname "$POIESIS_TEST_TARGET")"\n  printf "{\\"share\\":\\"disabled\\"}\\n" > "$POIESIS_TEST_TARGET"\n  printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"\n  exit 0\nfi\nexit 0\n',
     );
     await chmod(opencode, 0o755);
     const priorPath = process.env.PATH;
@@ -143,7 +143,7 @@ describe("maintenance ownership", () => {
     await mkdir(bin);
     await writeFile(
       opencode,
-      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "{ \\"share\\": \\"changed\\" }\\n" > "$POIESIS_TEST_CONFIG"; printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"; exit 0; fi\nexit 0\n',
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then printf "{ \\"share\\": \\"changed\\" }\\n" > "$POIESIS_TEST_CONFIG"; printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"; exit 0; fi\nexit 0\n',
     );
     await chmod(opencode, 0o755);
     const priorPath = process.env.PATH;
@@ -207,7 +207,7 @@ describe("maintenance ownership", () => {
     await mkdir(bin);
     await writeFile(
       opencode,
-      '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  mkdir -p "$POIESIS_TEST_SKILL"\n  printf "foreign\\n" > "$POIESIS_TEST_SKILL/SKILL.md"\n  printf "1.18.29\\n"\n  exit 0\nfi\nif [ "$1" = "models" ]; then\n  printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"\n  exit 0\nfi\nexit 0\n',
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then\n  mkdir -p "$POIESIS_TEST_SKILL"\n  printf "foreign\\n" > "$POIESIS_TEST_SKILL/SKILL.md"\n  printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"\n  exit 0\nfi\nexit 0\n',
     );
     await chmod(opencode, 0o755);
     const priorPath = process.env.PATH;
@@ -242,7 +242,7 @@ describe("maintenance ownership", () => {
     await mkdir(bin);
     await writeFile(
       opencode,
-      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "changed\\n" > "$POIESIS_TEST_SKILL_FILE"; printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"; exit 0; fi\nexit 0\n',
+      '#!/bin/sh\nif [ "$1" = "--version" ]; then printf "1.18.29\\n"; exit 0; fi\nif [ "$1" = "models" ]; then printf "changed\\n" > "$POIESIS_TEST_SKILL_FILE"; printf "openai/gpt-5.6-sol\\nminimax/MiniMax-M3\\n"; exit 0; fi\nexit 0\n',
     );
     await chmod(opencode, 0o755);
     const priorPath = process.env.PATH;

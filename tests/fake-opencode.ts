@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 /**
  * The default OpenCode version this test environment advertises. Keep in
  * sync with the adapter-version-1 supported set in `src/opencode.ts`
- * (`SUPPORTED_OPENCODE_VERSIONS`).
+ * (`CERTIFIED_OPENCODE_VERSIONS`).
  */
 export const TEST_OPENCODE_VERSION = "1.18.29";
 
@@ -45,6 +45,17 @@ export interface InstallFakeOpenCodeOptions {
    * configured model is reported as unavailable.
    */
   modelList?: readonly string[];
+  /**
+   * Capability-based test seam. When `true`, the fake's `debug config`
+   * invocation fails (exit 1) for any version that is NOT in the
+   * adapter-v1 certified set (`CERTIFIED_OPENCODE_VERSIONS`). Used by
+   * the capability-based compatibility tests to simulate a real-world
+   * scenario where an unrecognized or older OpenCode binary rejects the
+   * V1 schema projection. When omitted (default), the fake's
+   * `debug config` is permissive so it does not gate capability-based
+   * tests against unrelated changes.
+   */
+  rejectV1SchemaForUnknownVersions?: boolean;
 }
 
 // Module-level registry of installed fake-opencode bin directories. Used
@@ -110,6 +121,9 @@ export async function installFakeOpenCode(
   const modelList = typeof versionOrOptions === "string"
     ? TEST_OPENCODE_MODEL_LIST
     : (versionOrOptions.modelList ?? TEST_OPENCODE_MODEL_LIST);
+  const rejectV1SchemaForUnknownVersions = typeof versionOrOptions === "string"
+    ? false
+    : (versionOrOptions.rejectV1SchemaForUnknownVersions ?? false);
   const parent = await mkdtemp(join(tmpdir(), "poiesis-fake-opencode-"));
   const bin = join(parent, "bin");
   installedBins.add(parent);
@@ -118,6 +132,7 @@ export async function installFakeOpenCode(
   const debugCountFile = failAfter === undefined ? "" : failAfter.file;
   const debugThreshold = failAfter === undefined ? "0" : String(failAfter.threshold);
   const body = `#!/bin/sh
+rejectV1SchemaForUnknownVersions=${rejectV1SchemaForUnknownVersions ? "1" : "0"}
 case "$1" in
   --version)
     if [ "\${POIESIS_TEST_OPENCODE_VERSION+set}" = set ]; then
@@ -153,6 +168,26 @@ case "$1" in
         printf 'stateful fake-opencode: debug call #\${count} exceeds threshold ${debugThreshold}\\n' >&2
         exit 1
       fi
+    fi
+    if [ "$rejectV1SchemaForUnknownVersions" = "1" ]; then
+      # Resolve the version we are currently reporting as --version.
+      # When POIESIS_TEST_OPENCODE_VERSION is unset, fall back to the
+      # baked-in \${version} baked into the script (the default
+      # 1.18.29 certified tag). The fall-through case '*' rejects
+      # anything else, simulating a real-world OpenCode whose V1
+      # adapter contract has drifted away from the certified set.
+      effective_version="$POIESIS_TEST_OPENCODE_VERSION"
+      if [ -z "$effective_version" ]; then
+        effective_version="${version}"
+      fi
+      case "$effective_version" in
+        1.18.29|1.18.30|1.18.31)
+          ;;
+        *)
+          printf 'fake-opencode: rejecting V1 schema for unknown version $effective_version\\n' >&2
+          exit 1
+          ;;
+      esac
     fi
     exit 0
     ;;

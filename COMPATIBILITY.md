@@ -2,9 +2,25 @@
 
 ## OpenCode
 
-The first adapter is built against the adapter-version-1 contract. That contract is verified against OpenCode `1.18.29`, `1.18.30`, and `1.18.31`: all three tags lower the same V1 config schema, expose the same action keys, permission shape, and session endpoints, and accept the projected harness-native payload. The `1.18.30` and `1.18.31` release changes are provider/model-only — they do not alter `--version` (still a bare version string), the `models` inventory shape (still newline-delimited `provider/model`), or the `debug config` parser (still accepts the projected V1 schema). The runtime validates the installed version against this explicit set (`SUPPORTED_OPENCODE_VERSIONS = ["1.18.29", "1.18.30", "1.18.31"]`) with `opencode --version` before applying changes. Any other installed version is rejected fail-closed.
+The first adapter is built against the adapter-version-1 contract. That contract is verified against OpenCode `1.18.29`, `1.18.30`, and `1.18.31`: all three tags lower the same V1 config schema, expose the same action keys, permission shape, and session endpoints, and accept the projected harness-native payload. The `1.18.30` and `1.18.31` release changes are provider/model-only — they do not alter `--version` (still a bare version string), the `models` inventory shape (still newline-delimited `provider/model`), or the `debug config` parser (still accepts the projected V1 schema).
 
-Inclusion in the supported set is gated on probe parity, not on being a newer release: `1.18.31` is supported because `--version`, `models`, and `debug config` behave identically to the already-verified `1.18.29` / `1.18.30` probes against the V1 projection. The supported set is the smallest explicit list of tags with verified V1 probe parity, not a broad semver range. Newer OpenCode releases MUST NOT be added to `SUPPORTED_OPENCODE_VERSIONS` without explicit V1 contract verification.
+### Capability-based contract check
+
+The runtime probes the **capability** the installed OpenCode binary actually exposes, not the version string alone. The V1 adapter contract is checked by running the same probes (`opencode --version`, `opencode models`, and `opencode debug config` against the projected schema) that the certified set was originally verified against. The version being on the certified allowlist is treated as informational metadata, not a hard safety boundary — the capability probe results are the real safety boundary.
+
+The capability check has two layers:
+
+1. **`probeOpenCodeAdapterContract(root, options?)`** — non-fatal probe that returns the installed version, the `certified` flag, the latest certified tag, the model inventory (when `probeModels: true`), and the V1 schema acceptance (when `probeSchema: { payload, cwd }` is supplied). Every probe failure is recorded in the report as `null` / `false`; the only non-capability failure is `OPENCODE_UNAVAILABLE` when `opencode --version` itself cannot run.
+2. **`assertOpenCodeAdapterContract(root, options?)`** — the hard-fail version. Capability probe failures surface as `OPENCODE_ADAPTER_INCOMPATIBLE` with a `capability` field naming the missing surface (`"models"` or `"debug config schema"`) and the installed version in details, so an operator can diagnose WHAT the installed binary lacks. The version being on `CERTIFIED_OPENCODE_VERSIONS` is **NOT** a hard gate — a newer not-yet-certified patch version whose capability probe passes is allowed to proceed.
+
+### Practical behavior
+
+- `poiesis model set <class> <id>` on `1.18.32` (newer not-yet-certified): the capability probe passes; the mutation lands. The interactive `poiesis model` flow emits a `Warning: OpenCode 1.18.32 has not yet been certified by this Poiesis release. Latest certified compatibility: 1.18.31` notice on stderr between the selector and the restart notice so the operator sees the version status BEFORE the generic restart-handling block. The warning is a CLI / interactive-flow concern; the structured `SetModelResult` does not carry a `versionWarning` field.
+- `poiesis model set <class> <id>` on a binary that rejects the V1 schema (real-world drift): the capability probe fails; the operation rejects with `OPENCODE_ADAPTER_INCOMPATIBLE` and details `{ installed, capability: "debug config schema" }` — not a generic `COMMAND_FAILED`.
+- `poiesis doctor` on `1.18.32`: the `opencode-version` check reports `status: "warn"` with `details: { installed, latestCertified }` so `doctor.ok` (which gates on `status === "fail"`) is preserved for unrelated fail-closed failures while the newer-not-certified state surfaces a clear informational notice.
+- `poiesis init`, `poiesis update`, `poiesis update --config` on `1.18.32`: the capability probe (with `validateOpenCodeConfigPayload`) accepts the V1 schema projection; the install / update proceeds.
+
+Inclusion in the certified set (`CERTIFIED_OPENCODE_VERSIONS`) is gated on probe parity, not on being a newer release: `1.18.31` is certified because `--version`, `models`, and `debug config` behave identically to the already-verified `1.18.29` / `1.18.30` probes against the V1 projection. The certified set is the smallest explicit list of tags with verified V1 probe parity, not a broad semver range. Newer OpenCode releases MUST NOT be added to `CERTIFIED_OPENCODE_VERSIONS` without explicit V1 contract verification.
 
 ### Adapter-v1 proof rationale (`1.18.31`)
 
@@ -15,7 +31,7 @@ Inclusion in the supported set is gated on probe parity, not on being a newer re
 - **Adapter-v1.** The V1 schema — singular `agent` map, singular `agent.<name>.permission` object, V1 action keys (`read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`), and `mode: "primary" | "subagent"` — is unchanged across the three tags. Any tag that drifts to a different schema fails closed at probe time before the projection is written.
 - **Authority.** Manifests produced under any of the three supported tags pass `assertManifestAuthority` because `supportedVersions` (or the legacy `supportedVersion` field for `1.18.29`-only installs) carries the explicit member. The harness-neutral adapter-v1 contract is the source of truth, not the tag's marketing version.
 
-This is the only ground on which a new tag is added to `SUPPORTED_OPENCODE_VERSIONS`: probe parity plus the same V1 schema, with `assertManifestAuthority` as the runtime gate.
+This is the only ground on which a new tag is added to `CERTIFIED_OPENCODE_VERSIONS`: probe parity plus the same V1 schema, with `assertManifestAuthority` as the runtime gate.
 
 ### Verified schema
 
@@ -33,7 +49,7 @@ agent                  object
 
 Action keys are the singular OpenCode `1.18.29` / `1.18.30` / `1.18.31` keys: `read`, `glob`, `grep`, `list`, `edit`, `webfetch`, `websearch`, `skill`, `task`, `bash`, `question`, `todowrite`. Permissions are an ordered object where the literal `"*"` denies everything else.
 
-The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by any supported tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
+The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by any certified tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
 
 ### Subagent visibility
 

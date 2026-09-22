@@ -5,54 +5,51 @@ import { doctor, init, resolveConfigForRoot, update } from "../src/maintenance.j
 import { loadManifest } from "../src/manifest.js";
 import { assertManifestAuthority } from "../src/authority.js";
 import {
-  SUPPORTED_OPENCODE_VERSIONS,
-  SUPPORTED_OPENCODE_VERSION,
-  isSupportedOpenCodeVersion,
-  verifyOpenCodeVersion,
+  CERTIFIED_OPENCODE_VERSIONS,
+  CERTIFIED_OPENCODE_VERSION,
+  isCertifiedOpenCodeVersion,
+  probeOpenCodeAdapterContract,
 } from "../src/opencode.js";
 import { run } from "../src/process.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
-describe("OpenCode version gate", () => {
-  afterEach(async () => {
-    // Per-test cleanup is handled inside each test that installs the fake.
-  });
-
+describe("OpenCode adapter-v1 supported set + certified probe", () => {
   it("exposes 1.18.29, 1.18.30 and 1.18.31 as the explicit adapter-v1 supported set", () => {
-    expect(SUPPORTED_OPENCODE_VERSIONS).toEqual(["1.18.29", "1.18.30", "1.18.31"]);
+    expect(CERTIFIED_OPENCODE_VERSIONS).toEqual(["1.18.29", "1.18.30", "1.18.31"]);
   });
 
-  it.each(["1.18.29", "1.18.30", "1.18.31"])("accepts %s via isSupportedOpenCodeVersion", (version) => {
-    expect(isSupportedOpenCodeVersion(version)).toBe(true);
+  it.each(["1.18.29", "1.18.30", "1.18.31"])("accepts %s via isCertifiedOpenCodeVersion", (version) => {
+    expect(isCertifiedOpenCodeVersion(version)).toBe(true);
   });
 
   it.each(["1.18.28", "0.0.0", "garbage"])(
-    "rejects %s via isSupportedOpenCodeVersion",
+    "rejects %s via isCertifiedOpenCodeVersion",
     (version) => {
-      expect(isSupportedOpenCodeVersion(version)).toBe(false);
+      expect(isCertifiedOpenCodeVersion(version)).toBe(false);
     },
   );
 
   it.each(["1.18.29", "1.18.30", "1.18.31"])(
-    "verifyOpenCodeVersion accepts the fake %s binary",
+    "probeOpenCodeAdapterContract reports certified = true for %s",
     async (version) => {
       const env = await installFakeOpenCode(version);
       try {
-        await expect(verifyOpenCodeVersion("/")).resolves.toBe(version);
+        const contract = await probeOpenCodeAdapterContract("/");
+        expect(contract.installed).toBe(version);
+        expect(contract.certified).toBe(true);
       } finally {
         env.restore();
       }
     },
   );
 
-  it("verifyOpenCodeVersion rejects an unsupported version with a clear error", async () => {
-    const env = await installFakeOpenCode("1.18.28");
+  it("probeOpenCodeAdapterContract reports certified = false for the newer unrecognized 1.18.32 patch", async () => {
+    const env = await installFakeOpenCode("1.18.32");
     try {
-      await expect(verifyOpenCodeVersion("/")).rejects.toMatchObject({
-        code: "OPENCODE_VERSION_UNSUPPORTED",
-        details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30", "1.18.31"] },
-      });
+      const contract = await probeOpenCodeAdapterContract("/");
+      expect(contract.installed).toBe("1.18.32");
+      expect(contract.certified).toBe(false);
     } finally {
       env.restore();
     }
@@ -79,8 +76,8 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    expect(manifest.adapter.supportedVersion).toBe(SUPPORTED_OPENCODE_VERSION);
-    expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+    expect(manifest.adapter.supportedVersion).toBe(CERTIFIED_OPENCODE_VERSION);
+    expect(manifest.adapter.supportedVersions).toEqual([...CERTIFIED_OPENCODE_VERSIONS]);
   }, 30_000);
 
   it("init succeeds against a 1.18.30 fake binary and records the explicit supportedVersions set", async () => {
@@ -92,8 +89,8 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    expect(manifest.adapter.supportedVersion).toBe(SUPPORTED_OPENCODE_VERSION);
-    expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+    expect(manifest.adapter.supportedVersion).toBe(CERTIFIED_OPENCODE_VERSION);
+    expect(manifest.adapter.supportedVersions).toEqual([...CERTIFIED_OPENCODE_VERSIONS]);
   }, 30_000);
 
   it("init succeeds against a 1.18.31 fake binary and records the explicit supportedVersions set", async () => {
@@ -105,8 +102,8 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    expect(manifest.adapter.supportedVersion).toBe(SUPPORTED_OPENCODE_VERSION);
-    expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+    expect(manifest.adapter.supportedVersion).toBe(CERTIFIED_OPENCODE_VERSION);
+    expect(manifest.adapter.supportedVersions).toEqual([...CERTIFIED_OPENCODE_VERSIONS]);
   }, 30_000);
 
   it("update preserves the explicit supportedVersions set on the next manifest", async () => {
@@ -117,7 +114,7 @@ describe("OpenCode adapter-v1 doctor/init/update against fake binaries", () => {
       allowFixtureAdapters: true,
     });
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+    expect(result.manifest.adapter.supportedVersions).toEqual([...CERTIFIED_OPENCODE_VERSIONS]);
   }, 30_000);
 
   it("doctor recognizes the 1.18.30 fake binary's version and authority against the manifest", async () => {
@@ -168,7 +165,13 @@ describe("OpenCode adapter-v1 fail-closed against unsupported fake binary", () =
   const repositories: TestRepository[] = [];
 
   beforeEach(async () => {
-    env = await installFakeOpenCode("1.18.28");
+    // The capability-based contract check uses the schema probe (via
+    // `debug config`) as the real safety boundary. The fake below
+    // exercises the fail-closed path by rejecting the V1 schema
+    // projection for any version NOT in the certified set — i.e. it
+    // simulates a real-world OpenCode whose adapter contract has
+    // drifted away from the V1 projection.
+    env = await installFakeOpenCode({ version: "1.18.28", rejectV1SchemaForUnknownVersions: true });
   });
 
   afterEach(async () => {
@@ -177,6 +180,13 @@ describe("OpenCode adapter-v1 fail-closed against unsupported fake binary", () =
   });
 
   it("init rejects 1.18.28 fail-closed before any write", async () => {
+    // The strict certified-set gate no longer hard-fails `init`; the
+    // V1 schema probe (validated separately via
+    // `validateOpenCodeConfigPayload`) is the real safety boundary.
+    // The global fake's `rejectV1SchemaForUnknownVersions: true`
+    // option simulates the real-world "binary rejected the projection"
+    // path so the capability probe fails closed with the typed
+    // `OPENCODE_ADAPTER_INCOMPATIBLE` code.
     const repository = await createTestRepository();
     repositories.push(repository);
     await expect(
@@ -185,8 +195,8 @@ describe("OpenCode adapter-v1 fail-closed against unsupported fake binary", () =
         allowFixtureAdapters: true,
       }),
     ).rejects.toMatchObject({
-      code: "OPENCODE_VERSION_UNSUPPORTED",
-      details: { installed: "1.18.28", supported: ["1.18.29", "1.18.30", "1.18.31"] },
+      code: "OPENCODE_ADAPTER_INCOMPATIBLE",
+      details: { installed: "1.18.28" },
     });
   }, 30_000);
 });
@@ -235,7 +245,7 @@ describe("OpenCode adapter-v1 manifest authority backward compatibility", () => 
       const manifest = await loadManifest(repository.root);
       const config = await resolveConfigForRoot(repository.root);
       await expect(assertManifestAuthority(repository.root, manifest, config)).resolves.toBeUndefined();
-      expect(manifest.adapter.supportedVersions).toEqual([...SUPPORTED_OPENCODE_VERSIONS]);
+      expect(manifest.adapter.supportedVersions).toEqual([...CERTIFIED_OPENCODE_VERSIONS]);
     } finally {
       env.restore();
     }

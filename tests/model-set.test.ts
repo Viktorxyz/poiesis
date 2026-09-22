@@ -238,24 +238,28 @@ describe("setModel (ticket #56)", () => {
     expectOwnedBytesUnchanged(beforeBytes, afterBytes, "MODEL_UNAVAILABLE");
   }, 30_000);
 
-  it("rejects with MODEL_INVENTORY_UNAVAILABLE before any write when OpenCode cannot list models", async () => {
+  it("rejects with MODEL_INVENTORY_UNAVAILABLE before any write when the installed OpenCode cannot list models", async () => {
+    // `setModel` probes `opencode models` directly (via the standard
+    // `run` subprocess seam) to validate the chosen model identity
+    // BEFORE any write. A non-zero-exit `opencode models` surfaces as
+    // `MODEL_INVENTORY_UNAVAILABLE` so the operator sees the same
+    // fail-closed error code the legacy `setModel` flow used before
+    // the capability-probe redesign. The `OPENCODE_ADAPTER_INCOMPATIBLE`
+    // error code is the canonical capability-probe failure (used by
+    // `assertOpenCodeAdapterContract` directly); `setModel`'s chosen-
+    // model validation reuses the existing `MODEL_*` error codes for
+    // the per-class lifecycle because those already have semantic
+    // meaning inside the CLI surface.
     const repository = await createTestRepository();
     repositories.push(repository);
     await install(repository);
     const beforeBytes = await snapshotOwnedBytes(repository);
 
-    // Override the fake `opencode models` invocation to fail. Restore the
-    // default healthy fake afterwards so subsequent tests get a fresh state.
+    // Override the fake `opencode models` invocation to fail. Restore
+    // the default healthy fake afterwards so subsequent tests get a
+    // fresh state.
     env?.restore();
-    env = await installFakeOpenCode({
-      // Empty model list simulates an OpenCode installation that cannot
-      // serve the inventory probe; `verifyModels` surfaces this as
-      // MODEL_INVENTORY_UNAVAILABLE inside the transaction, but we want
-      // to exercise the same code from `setModel` (which calls the same
-      // helper directly). Force a non-zero exit via a stub `modelList`
-      // empty + doctor gate — but for this test the simpler deterministic
-      // path is to make the fake exit non-zero via `POIESIS_TEST_OPENCODE_FAIL`.
-    });
+    env = await installFakeOpenCode();
     const prevFail = process.env.POIESIS_TEST_OPENCODE_FAIL;
     process.env.POIESIS_TEST_OPENCODE_FAIL = "1";
     try {

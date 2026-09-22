@@ -5,10 +5,10 @@ import type { PoiesisConfig } from "./config.js";
 import {
   OPENCODE_ADAPTER_VERSION,
   OPENCODE_CONFIG_RELATIVE_PATHS,
-  SUPPORTED_OPENCODE_VERSIONS,
-  SUPPORTED_OPENCODE_VERSION,
+  CERTIFIED_OPENCODE_VERSIONS,
+  CERTIFIED_OPENCODE_VERSION,
   desiredOpenCodePatches,
-  isSupportedOpenCodeVersion,
+  isCertifiedOpenCodeVersion,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
 import { templateMappings } from "./templates.js";
@@ -18,11 +18,11 @@ function isSupportedAdapterContract(manifest: Manifest): boolean {
   const explicit = manifest.adapter.supportedVersions;
   if (explicit !== undefined) {
     if (explicit.length === 0) return false;
-    if (!explicit.every(isSupportedOpenCodeVersion)) return false;
+    if (!explicit.every(isCertifiedOpenCodeVersion)) return false;
     if (!explicit.includes(manifest.adapter.supportedVersion)) return false;
     return true;
   }
-  return isSupportedOpenCodeVersion(manifest.adapter.supportedVersion);
+  return isCertifiedOpenCodeVersion(manifest.adapter.supportedVersion);
 }
 
 function patchKey(file: string, path: readonly string[]): string {
@@ -69,8 +69,8 @@ async function assertManifestAuthorityImpl(
       supported: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
-        supportedVersion: SUPPORTED_OPENCODE_VERSION,
-        supportedVersions: [...SUPPORTED_OPENCODE_VERSIONS],
+        supportedVersion: CERTIFIED_OPENCODE_VERSION,
+        supportedVersions: [...CERTIFIED_OPENCODE_VERSIONS],
       },
     });
   }

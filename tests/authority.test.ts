@@ -2,7 +2,7 @@ import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { assertManifestAuthority } from "../src/authority.js";
-import { SUPPORTED_OPENCODE_VERSIONS } from "../src/opencode.js";
+import { CERTIFIED_OPENCODE_VERSIONS } from "../src/opencode.js";
 import { doctor, init, uninstall, update } from "../src/maintenance.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { atomicWrite, exists } from "../src/fs.js";
@@ -153,9 +153,9 @@ describe("manifest authority adapter contract (ticket #33)", () => {
     repositories.push(repository);
     await installed(repository);
     const manifest = await loadManifest(repository.root);
-    // Initial supportedVersion is the first entry of SUPPORTED_OPENCODE_VERSIONS.
+    // Initial supportedVersion is the first entry of CERTIFIED_OPENCODE_VERSIONS.
     const supportedVersion = manifest.adapter.supportedVersion;
-    const otherSupported = SUPPORTED_OPENCODE_VERSIONS.find((v) => v !== supportedVersion);
+    const otherSupported = CERTIFIED_OPENCODE_VERSIONS.find((v) => v !== supportedVersion);
     expect(otherSupported).toBeDefined();
     manifest.adapter.supportedVersions = [otherSupported!];
     await expect(
@@ -168,8 +168,8 @@ describe("manifest authority adapter contract (ticket #33)", () => {
     repositories.push(repository);
     await installed(repository);
     const manifest = await loadManifest(repository.root);
-    manifest.adapter.supportedVersion = SUPPORTED_OPENCODE_VERSIONS[0]!;
-    manifest.adapter.supportedVersions = [...SUPPORTED_OPENCODE_VERSIONS, "9.9.9-not-supported"];
+    manifest.adapter.supportedVersion = CERTIFIED_OPENCODE_VERSIONS[0]!;
+    manifest.adapter.supportedVersions = [...CERTIFIED_OPENCODE_VERSIONS, "9.9.9-not-supported"];
     await expect(
       assertManifestAuthority(repository.root, manifest, testConfig(repository)),
     ).rejects.toMatchObject({ code: "MANIFEST_MIGRATION_REQUIRED" });
@@ -183,7 +183,7 @@ describe("manifest authority adapter contract (ticket #33)", () => {
     // Strip supportedVersions entirely (legacy shape).
     delete manifest.adapter.supportedVersions;
     expect(manifest.adapter.supportedVersions).toBeUndefined();
-    expect(SUPPORTED_OPENCODE_VERSIONS).toContain(manifest.adapter.supportedVersion);
+    expect(CERTIFIED_OPENCODE_VERSIONS).toContain(manifest.adapter.supportedVersion);
     await expect(
       assertManifestAuthority(repository.root, manifest, testConfig(repository)),
     ).resolves.toBeUndefined();
@@ -194,8 +194,8 @@ describe("manifest authority adapter contract (ticket #33)", () => {
     repositories.push(repository);
     await installed(repository);
     const manifest = await loadManifest(repository.root);
-    manifest.adapter.supportedVersion = SUPPORTED_OPENCODE_VERSIONS[0]!;
-    manifest.adapter.supportedVersions = [...SUPPORTED_OPENCODE_VERSIONS];
+    manifest.adapter.supportedVersion = CERTIFIED_OPENCODE_VERSIONS[0]!;
+    manifest.adapter.supportedVersions = [...CERTIFIED_OPENCODE_VERSIONS];
     await expect(
       assertManifestAuthority(repository.root, manifest, testConfig(repository)),
     ).resolves.toBeUndefined();
