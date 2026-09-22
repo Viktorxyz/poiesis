@@ -19,7 +19,7 @@ import { createTestRepository, testConfig, type TestRepository } from "./helpers
 
 /**
  * Seed a representative default skill as preexisting on disk so the
- * receipt-authenticated 1.1.1 → 1.1.3 update can prove the COMPLETE
+ * receipt-authenticated 1.1.1 → 1.1.4 update can prove the COMPLETE
  * skill installation state (source / name / path / preexisting /
  * installedRevision / hash) survives the migration, not just a count.
  *
@@ -62,7 +62,7 @@ async function seedRepresentativePreexistingSkill(
  * Mirror `installDefaultSkills`'s `manifestSkill` shape for the seeded
  * preexisting skill so the manifest carries a valid, complete
  * installation record before the 1.1.1 predecessor rebind and the
- * subsequent 1.1.1 → 1.1.3 update.
+ * subsequent 1.1.1 → 1.1.4 update.
  */
 async function attachSeededSkillToManifest(
   repository: TestRepository,
@@ -135,7 +135,7 @@ async function attachSeededSkillToManifest(
  *
  * The projection tests at the bottom prove the canonical templates
  * regenerate the corrected owned projections through both the
- * `init` install path and an exact public 1.1.1 → 1.1.3 update, while
+ * `init` install path and an exact public 1.1.1 → 1.1.4 update, while
  * preserving unrelated OpenCode config + models + tracker + delivery +
  * skill installation state.
  */
@@ -529,7 +529,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
     }, 60_000);
   });
 
-  describe("exact public 1.1.1 → 1.1.3 update regenerates the corrected owned projections and preserves unrelated state", () => {
+  describe("exact public 1.1.1 → 1.1.4 update regenerates the corrected owned projections and preserves unrelated state", () => {
     const repositories: TestRepository[] = [];
     afterEach(async () =>
       Promise.all(repositories.splice(0).map((repo) => rmLocal(repo.parent))),
@@ -539,7 +539,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
       const repository = await createTestRepository();
       repositories.push(repository);
       // Seed a non-empty representative preexisting default-skill
-      // installation BEFORE init so the 1.1.1 → 1.1.3 update can prove
+      // installation BEFORE init so the 1.1.1 → 1.1.4 update can prove
       // the COMPLETE skill record (source / name / path / preexisting /
       // installedRevision / hash) survives the migration. A test that
       // only compared `skills.length` against a 0-length baseline would
@@ -587,8 +587,8 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
 
       const result = await update(repository.root, { skipSkills: true });
 
-      // Manifest + projection advance together to 1.1.3.
-      expect(result.manifest.poiesisVersion).toBe("1.1.3");
+      // Manifest + projection advance together to 1.1.4.
+      expect(result.manifest.poiesisVersion).toBe("1.1.4");
 
       // Corrected canonical projections are written to disk and contain
       // the Spec #108 contract phrases.
@@ -660,7 +660,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
       const seededAfter = result.manifest.skills.find((skill) => skill.name === seeded.name);
       expect(
         seededAfter,
-        "Seeded preexisting skill record must survive the 1.1.1 → 1.1.3 update",
+        "Seeded preexisting skill record must survive the 1.1.1 → 1.1.4 update",
       ).toBeDefined();
       const afterSkillSnapshot = {
         source: seededAfter!.source,
@@ -685,7 +685,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
         afterManifestBytes.toString("utf8"),
         "manifest.json",
       );
-      expect(afterManifestOnDisk.poiesisVersion).toBe("1.1.3");
+      expect(afterManifestOnDisk.poiesisVersion).toBe("1.1.4");
     }, 60_000);
   });
 });

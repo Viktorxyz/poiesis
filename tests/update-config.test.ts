@@ -2000,7 +2000,7 @@ describe("update --config fixture-adapter invariant", () => {
 
     const candidatePath = await writeCandidateConfig(repository, () => undefined);
     const result = await updateFromConfig(repository.root, candidatePath);
-    expect(result.manifest.poiesisVersion).toBe("1.1.3");
+    expect(result.manifest.poiesisVersion).toBe("1.1.4");
     // Doctor report's `ok` may be false if the install used
     // `skipSkills: true` (the `install` helper does so); the
     // `skills` exemption is honored by the gate via

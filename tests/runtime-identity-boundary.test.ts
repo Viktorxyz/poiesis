@@ -458,7 +458,7 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    expect(manifest.poiesisVersion).toBe("1.1.3");
+    expect(manifest.poiesisVersion).toBe("1.1.4");
   }, 30_000);
 
   it("packageVersion() reads through the seam when the override is set", async () => {
@@ -468,10 +468,10 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
 
   it("packageVersion() falls back to the workspace package.json when the seam is cleared", async () => {
     setRuntimePackageVersionOverrideForTest(null);
-    // The workspace is the local source tree at 1.1.3 (see
+    // The workspace is the local source tree at 1.1.4 (see
     // 104__runtime-identity-boundary/package.json). The seam MUST be
     // the only override; clearing it returns the filesystem truth.
-    expect(await packageVersion()).toBe("1.1.3");
+    expect(await packageVersion()).toBe("1.1.4");
   }, 5_000);
 });
 
@@ -516,8 +516,8 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
 
   it("tracker spec get stays usable across a runtime/manifest mismatch (read-only)", async () => {
     // Setup: init creates a manifest stamped with the running package
-    // version (1.1.3). The seam then makes the runtime present as
-    // "1.0.3" while the manifest still claims "1.1.3" (Lucca-class).
+    // version (1.1.4). The seam then makes the runtime present as
+    // "1.0.3" while the manifest still claims "1.1.4" (Lucca-class).
     // The fixture adapter seeds a Spec at init time, so `spec get` is
     // a pure read.
     const repository = await createTestRepository();
@@ -528,7 +528,7 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
     });
     // First, create a Spec via the dispatcher while runtime matches so
     // the fixture tracker has an item to return.
-    setRuntimePackageVersionOverrideForTest("1.1.3");
+    setRuntimePackageVersionOverrideForTest("1.1.4");
     const { commandTracker } = await import("../src/cli.js");
     const createCapture = captureStdout();
     try {
@@ -572,7 +572,7 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    setRuntimePackageVersionOverrideForTest("1.1.3");
+    setRuntimePackageVersionOverrideForTest("1.1.4");
     const { commandTracker } = await import("../src/cli.js");
     const createSpecCapture = captureStdout();
     try {
@@ -646,7 +646,7 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    setRuntimePackageVersionOverrideForTest("1.1.3");
+    setRuntimePackageVersionOverrideForTest("1.1.4");
     const { commandTracker } = await import("../src/cli.js");
     const createSpecCapture = captureStdout();
     try {
