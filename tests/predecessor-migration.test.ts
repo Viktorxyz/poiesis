@@ -66,7 +66,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   it("predecessorProjectionV111 differs from current in agent.poiesis.permission.bash and pre-#113 worker bash", async () => {
     // Spec #104 / ticket #105: the v1.1.1 primary-bash surface
     // (`poiesis *` / `pnpm exec poiesis *` / `npx poiesis *` allows) is the
-    // primary-bash predecessor-only difference from the v1.1.2 projection.
+    // primary-bash predecessor-only difference from the v1.1.3 projection.
     // Spec #104 / ticket #114 also re-overrides the Worker bash to the
     // pre-#113 deny surface so the 1.1.1 manifest admits through the
     // legacy projection match. Every other patch's path must be identical
@@ -94,7 +94,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "pnpm exec poiesis *": "allow",
       "npx poiesis *": "allow",
     });
-    // The 1.1.2 primary bash is the exact-version canonical route.
+    // The 1.1.3 primary bash is the exact-version canonical route.
     expect(currentPermission.bash).toMatchObject({
       "*": "allow",
       "poiesis *": "deny",
@@ -102,7 +102,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "npx poiesis *": "deny",
       "pnpm dlx poiesis-cli *": "deny",
       "pnpm dlx poiesis-cli@*": "deny",
-      "pnpm dlx poiesis-cli@1.1.2 *": "allow",
+      "pnpm dlx poiesis-cli@1.1.3 *": "allow",
     });
     // Every other patch's path must be identical (paths only;
     // value-equality is intentionally not asserted so the legacy override
@@ -219,7 +219,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     const result = await update(repository.root, { skipSkills: true });
 
     expect(result.manifest.poiesisVersion).not.toBe("1.0.1");
-    expect(result.manifest.poiesisVersion).toBe("1.1.2");
+    expect(result.manifest.poiesisVersion).toBe("1.1.3");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
 
@@ -275,7 +275,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(await readFile(gitignorePath, "utf8")).not.toContain(".poiesis/workspaces/");
 
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.1.2");
+    expect(result.manifest.poiesisVersion).toBe("1.1.3");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
     expect(reviewerAfter.previousExists).toBe(false);
@@ -311,11 +311,11 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     });
   }, 60_000);
 
-  it("trusted 1.1.1 predecessor update transitions to 1.1.2, replaces primary bash with exact-version route, advances receipt once", async () => {
+  it("trusted 1.1.1 predecessor update transitions to 1.1.3, replaces primary bash with exact-version route, advances receipt once", async () => {
     // Spec #104 / ticket #105: the v1.1.1 predecessor primary-bash surface
     // (`poiesis *` / `pnpm exec poiesis *` / `npx poiesis *` allows) must
     // be accepted by an explicit receipt-authenticated `update` and
-    // replaced by the v1.1.2 exact-version canonical route.
+    // replaced by the v1.1.3 exact-version canonical route.
     const repository = await createTestRepository();
     repositories.push(repository);
     await setupCurrentInstall(repository);
@@ -325,7 +325,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
 
     const result = await update(repository.root, { skipSkills: true });
 
-    expect(result.manifest.poiesisVersion).toBe("1.1.2");
+    expect(result.manifest.poiesisVersion).toBe("1.1.3");
     const primaryAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis")!;
     const primaryBash = (primaryAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
     expect(primaryBash["*"]).toBe("allow");
@@ -334,7 +334,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(primaryBash["npx poiesis *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
-    expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
+    expect(primaryBash["pnpm dlx poiesis-cli@1.1.3 *"]).toBe("allow");
     // Worker bash advances to the current (post-#113) deny surface:
     // the trusted migration projects `pnpm dlx poiesis-cli *` and
     // `pnpm dlx poiesis-cli@*` denies so the Worker broad `*` allow
@@ -352,7 +352,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "pnpm dlx poiesis-cli@*": "deny",
     });
     expect(workerAfter.installed as { permission: { bash: Record<string, string> } }).not.toMatchObject({
-      permission: { bash: expect.objectContaining({ "pnpm dlx poiesis-cli@1.1.2 *": "allow" }) },
+      permission: { bash: expect.objectContaining({ "pnpm dlx poiesis-cli@1.1.3 *": "allow" }) },
     });
     // Receipt advances by exactly ONE.
     expect((await readOwnershipReceipt(repository.root)).generation).toBe(3);
@@ -444,10 +444,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     await rebindReceipt(repository);
 
     // The manifest equals the strict current projection, so update() succeeds.
-    // The result version advances to the installed package version (1.1.2)
+    // The result version advances to the installed package version (1.1.3)
     // because update() always bumps poiesisVersion on success.
     const result = await update(repository.root, { skipSkills: true });
-    expect(result.manifest.poiesisVersion).toBe("1.1.2");
+    expect(result.manifest.poiesisVersion).toBe("1.1.3");
     const reviewerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-reviewer")!;
     expect((reviewerAfter.installed as { permission: Record<string, unknown> }).permission).not.toHaveProperty("task");
   }, 60_000);
@@ -585,7 +585,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
   }, 60_000);
 
   it("trusted 1.1.1 predecessor update preserves unrelated OpenCode config + models + tracker + delivery + skill installation state (Spec #104 / ticket #107)", async () => {
-    // Spec #104 / ticket #107: the receipt-authenticated 1.1.1 → 1.1.2
+    // Spec #104 / ticket #107: the receipt-authenticated 1.1.1 → 1.1.3
     // update advances the manifest and the exact-version projection
     // together, and the migration must NOT disturb unrelated
     // project-bound state — OpenCode config keys Poiesis does not own,
@@ -598,7 +598,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     await rebindReceipt(repository);
 
     // Decorate the on-disk OpenCode config with project-owned keys
-    // (`mcp_servers` + `theme`) that Poiesis never writes. The 1.1.2
+    // (`mcp_servers` + `theme`) that Poiesis never writes. The 1.1.3
     // projection must leave them byte-for-byte intact.
     const openCodePath = join(repository.root, "opencode.jsonc");
     const decorated = parseJsonc<Record<string, unknown>>(
@@ -623,7 +623,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     const result = await update(repository.root, { skipSkills: true });
 
     // Manifest + projection advance together.
-    expect(result.manifest.poiesisVersion).toBe("1.1.2");
+    expect(result.manifest.poiesisVersion).toBe("1.1.3");
     const primaryAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis")!;
     const primaryBash = (primaryAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
     expect(primaryBash["*"]).toBe("allow");
@@ -632,7 +632,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
     expect(primaryBash["npx poiesis *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
     expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
-    expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
+    expect(primaryBash["pnpm dlx poiesis-cli@1.1.3 *"]).toBe("allow");
 
     // Unrelated OpenCode config is preserved byte-for-byte except for
     // the exact Poiesis-owned patches the projection rewrites.
