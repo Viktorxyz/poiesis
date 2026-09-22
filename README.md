@@ -37,16 +37,23 @@ Poiesis is published as the `poiesis-cli` npm package. The CLI binary is named `
 In a real Git repository, the human happy path is flagless:
 
 ```bash
-pnpm dlx poiesis-cli@latest init
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init
 ```
 
 The `@latest` tag is reserved for the human/operator intentional first
-install. The runtime-generated normal installed lifecycle route is
-exactly `pnpm dlx poiesis-cli@<X>` where `X` is the sole durable
+install. Every `@latest` route documented here uses the fresh-latest
+form `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest ...`
+so the documented command always resolves the current npm `@latest`
+tag rather than a 1440-minute pnpm `dlx` cache entry. The
+runtime-generated normal installed lifecycle route is exactly
+`pnpm dlx poiesis-cli@<X>` where `X` is the sole durable
 `manifest.poiesisVersion`; the OpenCode config projected into the
 consumer repository reflects this exactly. After `init`, every later
 Poiesis-driven shell command goes through the exact-version route so
-the runtime identity boundary is never ambiguous.
+the runtime identity boundary is never ambiguous. The OpenCode
+projection explicitly denies every version-qualified `pnpm dlx
+poiesis-cli@*` variant (including the bare `@latest`) so only the
+exact-version route survives.
 
 `poiesis init` with no flags runs the interactive TTY flow. It discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
 
@@ -59,7 +66,7 @@ The repository remote and integration branch are not CLI options — they are re
 For CI / scripted use, `init` accepts the same resolved config file via `--config`. The flag is reserved for non-TTY invocations and reproducible automation:
 
 ```bash
-pnpm dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
 ```
 
 A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rather than guessing; the structured path is the supported automation contract. The repository remote and integration branch are still read from the Git repository directly — `repository.remote` and `repository.integrationBranch` keys in the config file are accepted for completeness but the Git repository is the source of truth.
@@ -70,16 +77,24 @@ A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rat
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
 ```
 
-`update` re-reads the installed canonical files and re-applies the OpenCode adapter projection only against proven-owned state:
+`update` re-reads the installed canonical files and re-applies the OpenCode adapter projection only against proven-owned state. As same-version reconciliation, it stays on the exact-version route so the on-disk files match what the receipt proves is installed:
 
 ```bash
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
+The plain `update` invocation is also the **intentional human upgrade** path: when the operator explicitly wants to resolve the current `@latest` published tag (for example after a new Poiesis release), the launcher must bypass the 1440-minute `dlx` cache so the command reflects the npm tag rather than a stale entry:
+
+```bash
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update
+```
+
+Same-version reconciliation and intentional human upgrade are distinct: the former stays pinned to `manifest.poiesisVersion`, the latter uses the fresh-latest `@latest` form. The OpenCode config projection only ever admits the exact-version route; the fresh-latest form is reserved for the human/operator shell.
+
 Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
 
 ```bash
-pnpm dlx poiesis-cli@latest update --bootstrap-legacy-ownership
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --bootstrap-legacy-ownership
 ```
 
 After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
@@ -92,7 +107,7 @@ that nothing would reconcile. The supported update path is the intentional
 managed-config workflow:
 
 ```bash
-pnpm dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
 ```
 
 `update --config <path>` is the only sanctioned way to change the managed
@@ -233,7 +248,7 @@ You are operating inside a real Git repository that is being onboarded to Poiesi
 There are two phases. The bootstrap phase runs the published package through a package runner because Poiesis is not yet installed in this project. Once `init` succeeds, the local Poiesis CLI is available and the runtime-generated exact-version route `pnpm dlx poiesis-cli@<X>` is the only Poiesis-launcher route the projected OpenCode config admits. The bare `poiesis`, `pnpm exec poiesis`, `npx poiesis`, and unversioned `pnpm dlx poiesis-cli` forms are explicitly denied.
 
 Bootstrap (Poiesis is not installed yet):
-  1. Run `pnpm dlx poiesis-cli@latest init` (TTY). Poiesis prints every detection and asks only the remaining Author-owned choices. After success, tell the human to restart OpenCode.
+  1. Run `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init` (TTY). Poiesis prints every detection and asks only the remaining Author-owned choices. After success, tell the human to restart OpenCode.
 
 After init (Poiesis is installed locally):
   2. Inspect: `poiesis inspect` for bounded project and Git facts.
