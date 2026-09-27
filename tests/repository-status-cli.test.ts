@@ -102,11 +102,26 @@ describe("ticket #121 CLI surface: poiesis repository status", () => {
     uv = await installFakeUv();
     const { init } = await import("../src/maintenance.js");
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
+    // The new layout requires the `activeGeneration` pointer to
+    // reference a real directory inside `generations/`.
+    const { mkdir, writeFile } = await import("node:fs/promises");
+    const generationId = "generation-status-1";
+    const generationDir = join(
+      repository.root,
+      ".poiesis",
+      "cache",
+      "repository-intelligence",
+      "generations",
+      generationId,
+    );
+    await mkdir(generationDir, { recursive: true });
+    await writeFile(join(generationDir, "graph.json"), "{}\n");
     await writeRepositoryIntelligenceState(repository.root, {
       schema: 1,
       engine: "graphify",
       engineVersion: GRAPHIFY_VERSION,
       mode: "code-only",
+      activeGeneration: generationId,
     });
     const { stdout } = await captureStdout(() => commandRepository(["status", "--cwd", repository.root]));
     const envelope = JSON.parse(stdout) as { result: { cachePresent: boolean; cacheValid: boolean; reason: string } };
@@ -125,10 +140,12 @@ describe("ticket #121 CLI surface: poiesis repository status", () => {
     // the typed `UNKNOWN_COMMAND` error; the CLI `main()` catches and
     // emits the canonical envelope via `writeFailure`. We verify the
     // thrown error directly here to keep the test focused on the
-    // typed contract.
-    await expect(commandRepository(["query", "--cwd", repository.root])).rejects.toMatchObject({
+    // typed contract. As of ticket #122, `poiesis repository query`
+    // is a supported subcommand; this test exercises an UNSUPPORTED
+    // subcommand so the UNKNOWN_COMMAND surface stays covered.
+    await expect(commandRepository(["nuke", "--cwd", repository.root])).rejects.toMatchObject({
       code: "UNKNOWN_COMMAND",
-      details: { supported: ["status"] },
+      details: { supported: ["status", "query"] },
     });
   }, 30_000);
 });

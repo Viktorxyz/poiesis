@@ -178,6 +178,22 @@ const forbiddenFunctions = [
   "REPOSITORY_INTELLIGENCE_CACHE_RELATIVE_DIRECTORY",
   "REPOSITORY_INTELLIGENCE_GRAPHIFY_RELATIVE_PATH",
   "REPOSITORY_INTELLIGENCE_GITIGNORE_LINE",
+  // Ticket #122: query runtime surface (constants, runner seam, and
+  // the top-level query entry point). Every name stays internal so
+  // the Graphify invocation shape, the env-sanitization contract,
+  // and the typed fallback envelope cannot freeze into the public
+  // API before later tickets stabilize them.
+  "REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS",
+  "REPOSITORY_INTELLIGENCE_QUERY_TIMEOUT_MS",
+  "REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS",
+  "REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH",
+  "REPOSITORY_INTELLIGENCE_GENERATIONS_RELATIVE_DIRECTORY",
+  "repositoryIntelligenceGenerationsPath",
+  "repositoryIntelligenceGenerationPath",
+  "sanitizeGraphifyEnvironment",
+  "buildGraphifyInvocation",
+  "defaultGraphifyRunner",
+  "queryRepositoryIntelligence",
   // Path-derivation helpers
   "repositoryIntelligenceCachePath",
   "repositoryIntelligenceStatePath",
@@ -276,6 +292,23 @@ const forbiddenTypes = [
   "RepositoryIntelligenceState",
   "RepositoryIntelligenceCacheValidation",
   "RepositoryIntelligenceRemovalResult",
+  // Ticket #122: query runtime type surface (runner request /
+  // result, refresh decision, query success / fallback, options).
+  // Every name stays internal so the typed non-blocking fallback
+  // envelope, the refresh-kind label, and the Graphify runner seam
+  // cannot freeze into a public API.
+  "GraphifyRunner",
+  "GraphifyRunnerRequest",
+  "GraphifyRunnerResult",
+  "GraphifyRunnerSuccess",
+  "GraphifyRunnerError",
+  "RepositoryIntelligenceQueryOptions",
+  "RepositoryIntelligenceQueryOutcome",
+  "RepositoryIntelligenceQuerySuccess",
+  "RepositoryIntelligenceQueryFallback",
+  "RepositoryIntelligenceQueryReason",
+  "RepositoryIntelligenceRefresh",
+  "RepositoryIntelligenceRefreshKind",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

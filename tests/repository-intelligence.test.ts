@@ -263,11 +263,23 @@ describe("repositoryIntelligenceStatus", () => {
     const root = await makeRepo();
     const env = await installFakeUv();
     try {
+      const generationId = "generation-test-1";
+      const generationDir = join(
+        root,
+        ".poiesis",
+        "cache",
+        "repository-intelligence",
+        "generations",
+        generationId,
+      );
+      await mkdir(generationDir, { recursive: true });
+      await writeFile(join(generationDir, "graph.json"), "{}\n");
       await writeRepositoryIntelligenceState(root, {
         schema: 1,
         engine: "graphify",
         engineVersion: GRAPHIFY_VERSION,
         mode: "code-only",
+        activeGeneration: generationId,
       });
       const status = await repositoryIntelligenceStatus(root);
       expect(status.uvAvailable).toBe(true);

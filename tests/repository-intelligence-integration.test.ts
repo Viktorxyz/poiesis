@@ -187,11 +187,26 @@ describe("ticket #121 init / doctor / uninstall integration", () => {
     repositories.push(repository);
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
     // Stamp a fresh owned cache so the runtime sees a valid state.
+    // The new layout requires a real generation directory the
+    // `activeGeneration` pointer references; the doctor treats a
+    // missing / unsafe pointer as a soft warn.
+    const generationId = "generation-doctor-1";
+    const generationDir = join(
+      repository.root,
+      ".poiesis",
+      "cache",
+      "repository-intelligence",
+      "generations",
+      generationId,
+    );
+    await mkdir(generationDir, { recursive: true });
+    await writeFile(join(generationDir, "graph.json"), "{}\n");
     await writeRepositoryIntelligenceState(repository.root, {
       schema: 1,
       engine: "graphify",
       engineVersion: GRAPHIFY_VERSION,
       mode: "code-only",
+      activeGeneration: generationId,
     });
     const report = await doctor(repository.root);
     const check = report.checks.find((entry) => entry.id === "repository-intelligence-runner");

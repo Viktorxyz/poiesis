@@ -36,7 +36,7 @@
   "homepage": "https://github.com/Viktorxyz/poiesis",
   "bugs": "https://github.com/Viktorxyz/poiesis/issues",
   "scripts": {
-    "build": "tsup src/cli.ts src/index.ts --format esm --dts --clean",
+    "build": "tsup src/cli.ts --format esm --clean && tsup src/index.ts --format esm --dts",
     "check": "tsc --noEmit",
     "test": "vitest run --pool=forks --poolOptions.forks.maxForks=4",
     "test:watch": "vitest",

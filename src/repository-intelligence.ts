@@ -1,4 +1,5 @@
-import { lstat, mkdir, readdir, readFile, rm, rmdir, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, rename, rm, rmdir, unlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { exists } from "./fs.js";
 import { PoiesisError } from "./errors.js";
@@ -97,10 +98,32 @@ export const REPOSITORY_INTELLIGENCE_STATE_RELATIVE_PATH =
   ".poiesis/cache/repository-intelligence/state.json";
 
 /**
- * Local-state relative path for the Graphify working directory.
+ * Local-state relative path for the `graphify` working directory.
+ *
+ * As of ticket #122 the cache uses an immutable generation directory
+ * layout: each successful refresh produces a new
+ * `<cache>/repository-intelligence/generations/<uuid>/` directory and
+ * commits it via the `state.json` `activeGeneration` pointer. The
+ * legacy single-graph path above is RETIRED — kept only as the
+ * gitignore line so an install that already has the line in
+ * `.gitignore` does not need to be re-initialized. New writes go
+ * through the generation directory; old directories are GC'd after a
+ * successful activation.
  */
 export const REPOSITORY_INTELLIGENCE_GRAPHIFY_RELATIVE_PATH =
   ".poiesis/cache/repository-intelligence/graphify";
+
+/**
+ * Local-state relative path for the immutable generation directory.
+ * Each successful refresh creates a fresh `<uuid>/` subdirectory
+ * here, runs the extract / update into it, validates the resulting
+ * graph.json, then commits the generation by atomically rewriting
+ * `state.json` with the new `activeGeneration` field. The previous
+ * active generation is preserved until best-effort GC after the
+ * activation succeeds.
+ */
+export const REPOSITORY_INTELLIGENCE_GENERATIONS_RELATIVE_DIRECTORY =
+  ".poiesis/cache/repository-intelligence/generations";
 
 /**
  * Local-state relative path for the `graphify` data directory under
@@ -115,6 +138,25 @@ export interface RepositoryIntelligenceState {
   engine: "graphify";
   engineVersion: string;
   mode: "code-only";
+  /**
+   * Ticket #122 — additive optional fields. The strict reader
+   * accepts missing values so legacy state.json (written before this
+   * ticket) keeps working; the writer always stamps the current
+   * fields so a fresh stamp carries both.
+   *
+   * `repoRoot` is the resolved git root the stamp was produced for.
+   * The query path treats a missing / mismatched `repoRoot` as a
+   * rebuild trigger so a state.json inherited from a different work
+   * tree cannot survive into this repo.
+   *
+   * `activeGeneration` is the basename of the immutable generation
+   * directory inside `.poiesis/cache/repository-intelligence/generations/`
+   * that the runtime must query. A missing / empty value is treated
+   * as a generation-pointer rebuild trigger; the next query creates a
+   * new generation and commits it.
+   */
+  repoRoot?: string;
+  activeGeneration?: string;
 }
 
 export interface RepositoryIntelligenceStatus {
@@ -206,11 +248,57 @@ export function repositoryIntelligenceStatePath(root: string): string {
 }
 
 /**
- * Resolve the absolute path of the Graphify working directory inside
- * the cache (the directory pointed at by `GRAPHIFY_OUT`).
+ * Resolve the absolute path of the legacy Graphify working directory
+ * inside the cache. RETIRED as of ticket #122 — kept as a pure path
+ * helper so the gitignore line + uninstall / purge code paths can
+ * still resolve the historical location. New writes go through the
+ * generation directory; the legacy path is no longer produced.
  */
 export function repositoryIntelligenceGraphifyPath(root: string): string {
   return resolve(root, REPOSITORY_INTELLIGENCE_GRAPHIFY_RELATIVE_PATH);
+}
+
+/**
+ * Resolve the absolute path of the immutable generation directory
+ * `<root>/.poiesis/cache/repository-intelligence/generations`. The
+ * directory may not exist on disk; this helper only normalizes the
+ * path.
+ */
+export function repositoryIntelligenceGenerationsPath(root: string): string {
+  return resolve(root, REPOSITORY_INTELLIGENCE_GENERATIONS_RELATIVE_DIRECTORY);
+}
+
+/**
+ * Resolve the absolute path of a specific generation directory inside
+ * the generations root. `generationId` is the basename of the
+ * directory (no path separators, no `.` or `..`); rejected ids throw
+ * `REPOSITORY_INTELLIGENCE_GENERATION_INVALID` so the runtime cannot
+ * be tricked into reading or removing an entry outside the
+ * generations root.
+ */
+export function repositoryIntelligenceGenerationPath(root: string, generationId: string): string {
+  if (typeof generationId !== "string" || generationId.length === 0) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GENERATION_INVALID",
+      "Generation id must be a non-empty string",
+      { generationId },
+    );
+  }
+  if (generationId.includes("/") || generationId.includes("\\") || generationId.includes("\u0000")) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GENERATION_INVALID",
+      "Generation id must not contain path separators or NUL bytes",
+      { generationId },
+    );
+  }
+  if (generationId === "." || generationId === "..") {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GENERATION_INVALID",
+      "Generation id must not be `.` or `..`",
+      { generationId },
+    );
+  }
+  return join(repositoryIntelligenceGenerationsPath(root), generationId);
 }
 
 /**
@@ -302,6 +390,12 @@ export async function assertUvRequirement(env: NodeJS.ProcessEnv = process.env):
  * when the file is absent. Throws `REPOSITORY_INTELLIGENCE_STATE_INVALID`
  * when the file is present but malformed or carries an unsupported
  * schema / engine.
+ *
+ * Ticket #122: `repoRoot` and `activeGeneration` are accepted as
+ * OPTIONAL fields. The strict reader ignores any unknown key, so a
+ * legacy state.json (written before this ticket) keeps loading; the
+ * query path treats missing / mismatched values as rebuild triggers
+ * so a fresh stamp carries the new fields automatically.
  */
 export async function readRepositoryIntelligenceState(root: string): Promise<RepositoryIntelligenceState | undefined> {
   const statePath = repositoryIntelligenceStatePath(root);
@@ -331,7 +425,20 @@ export async function readRepositoryIntelligenceState(root: string): Promise<Rep
       { path: relative(root, statePath) },
     );
   }
-  return raw as RepositoryIntelligenceState;
+  const candidate = raw as Record<string, unknown>;
+  const repoRoot = typeof candidate.repoRoot === "string" ? candidate.repoRoot : undefined;
+  const activeGeneration =
+    typeof candidate.activeGeneration === "string" && candidate.activeGeneration.length > 0
+      ? candidate.activeGeneration
+      : undefined;
+  return {
+    schema: REPOSITORY_INTELLIGENCE_STATE_SCHEMA,
+    engine: "graphify",
+    engineVersion: (raw as { engineVersion: string }).engineVersion,
+    mode: "code-only",
+    ...(repoRoot === undefined ? {} : { repoRoot }),
+    ...(activeGeneration === undefined ? {} : { activeGeneration }),
+  };
 }
 
 /**
@@ -339,6 +446,13 @@ export async function readRepositoryIntelligenceState(root: string): Promise<Rep
  * `repository-intelligence/` directory if it does not exist. The file
  * is written with restrictive permissions (0o600) so foreign users on
  * a shared host cannot read the local-cache stamp.
+ *
+ * The write is atomic: the file is staged as `state.json.tmp` and
+ * renamed over the canonical path. `rename(2)` is atomic on the same
+ * filesystem, so a concurrent reader either sees the old stamp or the
+ * new stamp — never a half-written file. This is the only atomicity
+ * guarantee the activation step needs: the active-generation pointer
+ * flips in a single observable instant.
  */
 export async function writeRepositoryIntelligenceState(
   root: string,
@@ -346,7 +460,9 @@ export async function writeRepositoryIntelligenceState(
 ): Promise<void> {
   const statePath = repositoryIntelligenceStatePath(root);
   await mkdir(join(statePath, ".."), { recursive: true });
-  await writeFile(statePath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  const stagingPath = `${statePath}.tmp`;
+  await writeFile(stagingPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+  await rename(stagingPath, statePath);
 }
 
 /**
@@ -354,6 +470,12 @@ export async function writeRepositoryIntelligenceState(
  * probed once via `uv --version`; the cache directory is checked via
  * `lstat` (not `stat`) so a symlinked cache is reported as invalid
  * rather than silently followed.
+ *
+ * Ticket #122: the status also verifies that the
+ * `state.json.activeGeneration` pointer resolves to a directory
+ * inside the generations root. A missing or symlinked generation
+ * marks the cache as `engine-version-mismatch` so the next query
+ * rebuilds without manual intervention.
  */
 export async function repositoryIntelligenceStatus(root: string): Promise<RepositoryIntelligenceStatus> {
   const uvAvailable = await probeUvAvailability();
@@ -389,6 +511,24 @@ export async function repositoryIntelligenceStatus(root: string): Promise<Reposi
         } else if (state.engineVersion !== GRAPHIFY_VERSION) {
           valid = false;
           reason = "engine-version-mismatch";
+        } else if (typeof state.activeGeneration !== "string" || state.activeGeneration.length === 0) {
+          // Legacy state.json (or a state.json written by a future
+          // Poiesis that did not stamp the generation pointer). The
+          // next query rebuilds.
+          valid = false;
+          reason = "engine-version-mismatch";
+        } else {
+          const generationPath = repositoryIntelligenceGenerationPath(root, state.activeGeneration);
+          if (!(await exists(generationPath))) {
+            valid = false;
+            reason = "engine-version-mismatch";
+          } else {
+            const genDetails = await lstat(generationPath);
+            if (genDetails.isSymbolicLink() || !genDetails.isDirectory()) {
+              valid = false;
+              reason = "engine-version-mismatch";
+            }
+          }
         }
       }
     } catch {
@@ -676,3 +816,1129 @@ export function describeRepositoryIntelligenceState(
 // so the init gitignore block can include it without hard-coding the
 // string in a different module.
 export const REPOSITORY_INTELLIGENCE_GITIGNORE_LINE = REPOSITORY_INTELLIGENCE_RELATIVE_DIRECTORY;
+
+/**
+ * Spec #120 / ticket #122 — `poiesis repository query --question`.
+ *
+ * End-to-end runtime seam that wires a single invocation of Graphify
+ * against the Poiesis-owned local cache. The contract is fixed:
+ *
+ *   1. Every invocation serializes refresh per repo (process-local lock
+ *      + best-effort file lock inside the cache; no concurrent refresh
+ *      for the same repo root).
+ *   2. Refresh builds into an IMMUTABLE generation directory
+ *      `.poiesis/cache/repository-intelligence/generations/<uuid>/`.
+ *      The previous active generation is left in place; the runtime
+ *      never mutates a generation after it has been committed.
+ *   3. The staged generation's `graph.json` (and every other graphify
+ *      output) is validated (parseable JSON, contains `nodes` and
+ *      `edges`, not empty) before activation.
+ *   4. Activation is an atomic rewrite of `state.json` (temp file +
+ *      rename). The new state carries the new `activeGeneration`
+ *      pointer; the runtime never `rm`s the previous active generation
+ *      before commit, so a crash mid-activation leaves the previous
+ *      generation queryable.
+ *   5. Initial / engine-version / mode / root-mismatch refreshes run
+ *      a true full `graphify extract <root> --code-only --no-cluster`
+ *      into an EMPTY generation (no seeding of prior output).
+ *   6. Incremental refreshes clone the COMPLETE validated active
+ *      generation (every graphify output, not just graph.json) into
+ *      a new generation, then run `graphify update <root>` (no
+ *      `--force`, no `--no-viz` since it is not a valid `update` flag)
+ *      so graphify merges new code into the seeded baseline.
+ *   7. Only after activation does the runner execute `graphify query
+ *      <question> --budget <N> --graph <active-graph>` against the
+ *      generation selected by the NEWLY committed state.
+ *   8. A failed refresh NEVER queries the old active graph. The
+ *      fallback envelope surfaces `reason` and `detail` so the CLI
+ *      can render a typed message without throwing.
+ *   9. The refresh runner runs with a 10-minute timeout, byte-bounded
+ *      stdout/stderr capture, and exactly ONE attempt (no retries, no
+ *      `--force`).
+ *  10. The runner env is sanitized: every known model-provider
+ *      credential prefix and every generic *_API_KEY / *_TOKEN /
+ *      *_SECRET / *_PASSWORD / *_CREDENTIALS suffix is stripped, plus
+ *      tracker credentials (GH_*, GITHUB_*, GITLAB_*, GL_*) and the
+ *      POIESIS_* namespace (to prevent nested recursion).
+ *  11. Operational failures (uv-unavailable, refresh-failed,
+ *      refresh-timeout, graph-invalid, graph-empty, query-failed,
+ *      query-timeout) return a typed non-blocking fallback envelope.
+ *      Unsafe paths (symlinked cache, missing cache directory,
+ *      traversal, invalid generation id) and invalid args (empty /
+ *      oversized / NUL-bearing question) hard-fail with a typed
+ *      `PoiesisError` because the caller asked for something that
+ *      cannot be served.
+ *  12. Garbage collection of stale generations runs best-effort AFTER
+ *      a successful activation. A GC failure must never invalidate
+ *      the just-committed state; the next successful activation will
+ *      retry.
+ */
+
+/**
+ * Fixed 10-minute refresh budget. Per Spec #120 / ticket #122 the
+ * runtime owns the timeout — callers cannot extend or shorten it
+ * because doing so would let one query monopolize the box or hide a
+ * runaway extract.
+ */
+export const REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS = 10 * 60_000;
+
+/**
+ * Fixed query budget (in Graphify tokens) for `graphify query`. The
+ * pin matches Graphify 0.9.70's documented default (2000) and is
+ * encoded explicitly so the runtime cannot drift to a different
+ * answer-shape per query. The value is passed via `--budget
+ * REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS` on every query
+ * invocation.
+ */
+export const REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS = 2000;
+
+/**
+ * Bounded query timeout for the `graphify query` invocation. The
+ * refresh budget is 10 minutes; the query budget is short because the
+ * active graph is already loaded and the BFS-over-graph.json call is
+ * bounded by `--budget` and the graph size.
+ */
+export const REPOSITORY_INTELLIGENCE_QUERY_TIMEOUT_MS = 30_000;
+
+/**
+ * Bounded input length for `--question`. Graphify parses the question
+ * into a single string and forwards it to its BFS traversal; a 4 KiB
+ * cap is generous for natural-language prompts and refuses buffer
+ * abuse.
+ */
+export const REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH = 4096;
+
+/**
+ * Sanitization allow-list: environment variables that Poiesis is
+ * willing to forward to the `uvx graphify` child process. Every other
+ * variable is dropped so a poisoned parent shell cannot leak model
+ * credentials, tracker tokens, or nested Poiesis recursion state into
+ * the subprocess.
+ */
+const SANITIZED_ENV_ALLOWLIST = new Set([
+  "PATH",
+  "Path", // Windows spelling
+  "HOME",
+  "USER",
+  "LOGNAME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "LC_MESSAGES",
+  "TMPDIR",
+  "TMP",
+  "TEMP",
+  "XDG_RUNTIME_DIR",
+  "XDG_CACHE_HOME",
+  "SHELL",
+]);
+
+/**
+ * Hard-deny prefixes: every env var whose name starts with one of
+ * these is dropped regardless of allow-list membership. Covers every
+ * documented model-provider credential, the tracker credentials that
+ * should never reach an extraction process, and the POIESIS namespace
+ * so a runtime recursion (e.g. `POIESIS_DEBUG=1`) cannot leak into the
+ * child.
+ */
+const SANITIZED_ENV_DENY_PREFIXES = [
+  "OPENAI_",
+  "ANTHROPIC_",
+  "AZURE_",
+  "GOOGLE_",
+  "GEMINI_",
+  "COHERE_",
+  "MISTRAL_",
+  "GROQ_",
+  "REPLICATE_",
+  "HUGGINGFACE_",
+  "HF_",
+  "AWS_",
+  "GH_",
+  "GITHUB_",
+  "GITLAB_",
+  "GL_",
+  "POIESIS_",
+];
+
+/**
+ * Hard-deny suffixes: generic credential patterns. The model-provider
+ * prefixes above cover the documented names; these catch custom
+ * vendor prefixes that follow the conventional naming.
+ */
+const SANITIZED_ENV_DENY_SUFFIXES = [
+  "_API_KEY",
+  "_APIKEY",
+  "_API_TOKEN",
+  "_TOKEN",
+  "_SECRET",
+  "_SECRET_KEY",
+  "_PASSWORD",
+  "_PASSWD",
+  "_CREDENTIALS",
+  "_CREDENTIAL",
+  "_PRIVATE_KEY",
+  "_ACCESS_KEY",
+];
+
+/**
+ * Produce a sanitized replacement environment for `uvx graphify`. The
+ * returned object is a fresh copy: mutating it never mutates the
+ * input, and the input is never mutated. The runtime owns this seam so
+ * the credential-stripping rules cannot drift between call sites.
+ */
+export function sanitizeGraphifyEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const sanitized: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value !== "string") continue;
+    if (SANITIZED_ENV_DENY_PREFIXES.some((prefix) => key.startsWith(prefix))) continue;
+    if (SANITIZED_ENV_DENY_SUFFIXES.some((suffix) => key.endsWith(suffix))) continue;
+    if (!SANITIZED_ENV_ALLOWLIST.has(key)) continue;
+    sanitized[key] = value;
+  }
+  return sanitized;
+}
+
+/**
+ * Subprocess runner seam. The default implementation runs
+ * `uvx --python <pin> --from <pkg> graphify <args>` through
+ * `process.run`; tests inject a fake to drive deterministic outcomes
+ * without spawning a real `uvx` child.
+ */
+export interface GraphifyRunnerRequest {
+  args: string[];
+  cwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  maxBytes?: number;
+}
+
+export interface GraphifyRunnerSuccess {
+  ok: true;
+  exitCode: number;
+  stdout: string;
+  stderr: string;
+  stdoutTruncated: boolean;
+  stderrTruncated: boolean;
+  durationMs: number;
+  /**
+   * Test-only hook. The default runner ignores this field; fake
+   * runners use it to write a canned `graph.json` to `GRAPHIFY_OUT`
+   * inside the runner's env so the runtime's validation path can
+   * exercise both success and failure shapes. Production callers MUST
+   * leave this undefined.
+   */
+  post?: (env: NodeJS.ProcessEnv) => Promise<void>;
+}
+
+export interface GraphifyRunnerError {
+  ok: false;
+  code:
+    | "GRAPHIFY_NOT_INSTALLED"
+    | "GRAPHIFY_TIMEOUT"
+    | "GRAPHIFY_IO_ERROR"
+    | "GRAPHIFY_FAILED"
+    | "GRAPHIFY_INVALID_INVOCATION";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+export type GraphifyRunnerResult = GraphifyRunnerSuccess | GraphifyRunnerError;
+
+export type GraphifyRunner = (request: GraphifyRunnerRequest) => Promise<GraphifyRunnerResult>;
+
+/**
+ * Build the exact `uvx` argv for a Graphify invocation. The launcher
+ * shape is fixed by Spec #120: `uvx --python <pin> --from
+ * graphifyy==<pin> graphify <subcommand-and-flags>`. Centralizing it
+ * here means the only place the launcher argv can drift is this
+ * function, and the test suite can assert against the literal argv.
+ */
+export function buildGraphifyInvocation(args: string[]): { command: string; args: string[] } {
+  return {
+    command: "uvx",
+    args: ["--python", GRAPHIFY_PYTHON, "--from", GRAPHIFY_PACKAGE, "graphify", ...args],
+  };
+}
+
+/**
+ * Default `uvx graphify` runner. The runner takes the sanitized env,
+ * the bounded timeout, and the byte cap, and translates `process.run`
+ * failures into the typed `GraphifyRunnerError` envelope the runtime
+ * expects.
+ */
+export const defaultGraphifyRunner: GraphifyRunner = async (request) => {
+  const { command, args } = buildGraphifyInvocation(request.args);
+  try {
+    const result = await run(command, args, {
+      cwd: request.cwd,
+      env: request.env,
+      timeoutMs: request.timeoutMs,
+      ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
+      allowFailure: true,
+    });
+    if (result.timedOut) {
+      return {
+        ok: false,
+        code: "GRAPHIFY_TIMEOUT",
+        message: `${command} exceeded ${request.timeoutMs}ms timeout`,
+        detail: {
+          args: request.args,
+          timeoutMs: request.timeoutMs,
+          durationMs: result.durationMs,
+          stderr: result.stderr.slice(0, 8_000),
+        },
+      };
+    }
+    if (result.exitCode === 0) {
+      return {
+        ok: true,
+        exitCode: 0,
+        stdout: result.stdout,
+        stderr: result.stderr,
+        stdoutTruncated: result.stdoutTruncated,
+        stderrTruncated: result.stderrTruncated,
+        durationMs: result.durationMs,
+      };
+    }
+    return {
+      ok: false,
+      code: "GRAPHIFY_FAILED",
+      message: `${command} exited with code ${result.exitCode}`,
+      detail: {
+        args: request.args,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+        stderr: result.stderr.slice(0, 8_000),
+      },
+    };
+  } catch (error) {
+    // `process.run` only throws on infrastructure / spawn failures
+    // (e.g. `uvx` not on PATH). Translate to the typed envelope so
+    // the runtime can surface `uv-unavailable` without inspecting
+    // Node errors.
+    const err = error as NodeJS.ErrnoException;
+    return {
+      ok: false,
+      code: err.code === "ENOENT" ? "GRAPHIFY_NOT_INSTALLED" : "GRAPHIFY_IO_ERROR",
+      message: err.message || `${command} failed to start`,
+      detail: { args: request.args, code: err.code ?? "UNKNOWN" },
+    };
+  }
+};
+
+export type RepositoryIntelligenceRefreshKind =
+  | "none"
+  | "initial-extract"
+  | "incremental-update"
+  | "engine-version-mismatch"
+  | "mode-mismatch"
+  | "root-mismatch";
+
+export interface RepositoryIntelligenceRefresh {
+  action: "rebuilt";
+  kind: RepositoryIntelligenceRefreshKind;
+  durationMs: number;
+}
+
+export interface RepositoryIntelligenceQuerySuccess {
+  ok: true;
+  operation: "repository.query";
+  engine: "graphify";
+  engineVersion: string;
+  graphPath: string;
+  refresh: RepositoryIntelligenceRefresh;
+  answer: string;
+  truncated: boolean;
+}
+
+export type RepositoryIntelligenceQueryReason =
+  | "uv-unavailable"
+  | "refresh-failed"
+  | "refresh-timeout"
+  | "graph-invalid"
+  | "graph-empty"
+  | "query-failed"
+  | "query-timeout";
+
+export interface RepositoryIntelligenceQueryFallback {
+  ok: false;
+  operation: "repository.query";
+  engine: "graphify";
+  engineVersion: string;
+  reason: RepositoryIntelligenceQueryReason;
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+export type RepositoryIntelligenceQueryOutcome =
+  | RepositoryIntelligenceQuerySuccess
+  | RepositoryIntelligenceQueryFallback;
+
+export interface RepositoryIntelligenceQueryOptions {
+  question: string;
+  /**
+   * Override the subprocess runner. Default: `defaultGraphifyRunner`,
+   * which spawns the real `uvx` against the pinned Graphify package.
+   * Production callers (the CLI dispatcher) leave this undefined; the
+   * test seam injects a deterministic fake.
+   */
+  runner?: GraphifyRunner;
+  /**
+   * Process env to derive the sanitized env from. Default:
+   * `process.env`. Exposed for deterministic tests; production callers
+   * leave this undefined.
+   */
+  env?: NodeJS.ProcessEnv;
+  /**
+   * Refresh timeout override. The runtime always clamps to
+   * `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS`; the override exists
+   * so the test seam can prove the clamp behavior without depending
+   * on the constant's value.
+   */
+  refreshTimeoutMs?: number;
+}
+
+interface RefreshDecision {
+  action: "rebuilt";
+  kind: RepositoryIntelligenceRefreshKind;
+  /**
+   * Identifier of the prior active generation, used as the source
+   * for incremental cloning. Empty string when the kind requires
+   * a full extract (no prior generation is trusted).
+   */
+  priorGenerationId: string;
+}
+
+const LOCK_FILENAME = ".refresh.lock";
+const GENERATION_PREFIX = "generation-";
+const QUESTION_MAX_LENGTH = REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH;
+const REFRESH_MAX_BYTES = 32 * 1024 * 1024;
+const QUERY_MAX_BYTES = 4 * 1024 * 1024;
+
+function lockPath(root: string): string {
+  return resolve(root, ".poiesis/cache/repository-intelligence", LOCK_FILENAME);
+}
+
+/**
+ * Build the typed non-blocking fallback envelope. Centralized so the
+ * `operation` / `engine` / `engineVersion` fields stay identical to
+ * the success envelope and the CLI can render both through the same
+ * writer.
+ */
+function toQueryFallback(
+  reason: RepositoryIntelligenceQueryReason,
+  message: string,
+  detail: Record<string, unknown>,
+): RepositoryIntelligenceQueryFallback {
+  return {
+    ok: false,
+    operation: "repository.query",
+    engine: "graphify",
+    engineVersion: GRAPHIFY_VERSION,
+    reason,
+    message,
+    detail,
+  };
+}
+
+function refreshTimeoutMs(options: RepositoryIntelligenceQueryOptions): number {
+  // Caller cannot extend or shorten the budget; clamp to the constant
+  // so a future ticket cannot accidentally widen this seam.
+  return REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS;
+}
+
+/**
+ * Acquire the per-repo refresh lock. The lock is an exclusive-create
+ * file (`.refresh.lock`) inside the Poiesis-owned cache. A stale lock
+ * (held by a dead process whose PID is no longer alive) is reclaimed
+ * so a previous crash cannot wedge subsequent queries forever. The
+ * wait is bounded by `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS` so a
+ * wedged neighbor cannot hang the caller indefinitely; on timeout,
+ * the runtime returns a typed `uv-unavailable` / `refresh-failed`
+ * fallback rather than throwing.
+ */
+async function acquireRefreshLock(root: string): Promise<() => Promise<void>> {
+  const path = lockPath(root);
+  await mkdir(resolve(path, ".."), { recursive: true });
+  const deadline = Date.now() + REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS;
+  while (true) {
+    try {
+      await writeFile(path, `${process.pid}\n${Date.now()}\n`, { flag: "wx", mode: 0o600 });
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      // Stale-lock detection: if the holder PID is no longer alive,
+      // reclaim the lock so a previous crash does not wedge us.
+      if (await isLockStale(path)) {
+        await unlink(path).catch(() => undefined);
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new PoiesisError(
+          "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT",
+          "Refresh lock could not be acquired within the bounded wait",
+          { path: relative(root, path), timeoutMs: REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS },
+        );
+      }
+      await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, 50));
+    }
+  }
+  return async () => {
+    await unlink(path).catch(() => undefined);
+  };
+}
+
+async function isLockStale(path: string): Promise<boolean> {
+  try {
+    const raw = await readFile(path, "utf8");
+    const firstLine = raw.split("\n", 1)[0]?.trim();
+    if (firstLine === undefined || firstLine.length === 0) return true;
+    const pid = Number(firstLine);
+    if (!Number.isInteger(pid) || pid <= 0) return true;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * Read `state.json` without enforcing the strict `mode === "code-only"`
+ * invariant. Used by `decideRefresh` to classify WHICH invariant
+ * forced a rebuild so the operator sees a precise kind label instead
+ * of a generic "engine-version-mismatch". The strict reader remains
+ * the authority for the doctor / status surface.
+ */
+async function readRelaxedRepositoryIntelligenceState(
+  root: string,
+): Promise<(RepositoryIntelligenceState & { repoRoot?: string }) | undefined> {
+  const statePath = repositoryIntelligenceStatePath(root);
+  if (!(await exists(statePath))) return undefined;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(await readFile(statePath, "utf8"));
+  } catch {
+    return undefined;
+  }
+  if (typeof raw !== "object" || raw === null) return undefined;
+  const candidate = raw as Partial<RepositoryIntelligenceState> & { repoRoot?: unknown };
+  if (
+    candidate.schema !== REPOSITORY_INTELLIGENCE_STATE_SCHEMA ||
+    candidate.engine !== REPOSITORY_INTELLIGENCE_ENGINE ||
+    typeof candidate.engineVersion !== "string" ||
+    candidate.engineVersion.length === 0
+  ) {
+    return undefined;
+  }
+  return candidate as RepositoryIntelligenceState & { repoRoot?: string };
+}
+
+/**
+ * Decide what kind of refresh the runtime must perform. Per
+ * Spec #120 / ticket #122 every query serializes a refresh — there is
+ * no "reuse" path that skips the Graphify invocation. The decision
+ * picks between:
+ *
+ *   - `initial-extract`: no state.json (or no trusted state.json).
+ *     The runtime runs `graphify extract <root> --code-only
+ *     --no-cluster --out <new>` into an empty generation.
+ *
+ *   - `engine-version-mismatch` / `mode-mismatch` / `root-mismatch`:
+ *     a prior state.json exists but violates one of the invariants.
+ *     The runtime does NOT trust the prior generation's contents
+ *     (it could be poisoned or from a different repo), so it runs a
+ *     true full extract into an empty generation just like the
+ *     initial case. The `kind` label carries the specific mismatch
+ *     for operator visibility.
+ *
+ *   - `incremental-update`: the prior state.json is fully valid
+ *     AND `activeGeneration` resolves to a real, non-symlink
+ *     directory with a parseable `graph.json`. The runtime clones
+ *     the COMPLETE prior generation into a new generation (every
+ *     graphify output, not just `graph.json`) and then runs
+ *     `graphify update <root> --out <new>` so Graphify merges
+ *     freshly-extracted code into the cloned baseline.
+ *
+ * The decision NEVER returns `action: "reused"`. Every invocation
+ * must hit the Graphify runner at least once.
+ */
+async function decideRefresh(root: string): Promise<RefreshDecision> {
+  const state = await readRelaxedRepositoryIntelligenceState(root);
+  if (state === undefined) {
+    return { action: "rebuilt", kind: "initial-extract", priorGenerationId: "" };
+  }
+  if (state.engineVersion !== GRAPHIFY_VERSION) {
+    return { action: "rebuilt", kind: "engine-version-mismatch", priorGenerationId: "" };
+  }
+  if (state.mode !== "code-only") {
+    return { action: "rebuilt", kind: "mode-mismatch", priorGenerationId: "" };
+  }
+  if (typeof state.repoRoot !== "string" || state.repoRoot !== root) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  if (typeof state.activeGeneration !== "string" || state.activeGeneration.length === 0) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  let generationPath: string;
+  try {
+    generationPath = repositoryIntelligenceGenerationPath(root, state.activeGeneration);
+  } catch {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  if (!(await exists(generationPath))) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  const genDetails = await lstat(generationPath);
+  if (genDetails.isSymbolicLink() || !genDetails.isDirectory()) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  const graphJson = join(generationPath, "graph.json");
+  if (!(await exists(graphJson))) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  const graphDetails = await lstat(graphJson);
+  if (graphDetails.isSymbolicLink() || !graphDetails.isFile()) {
+    return { action: "rebuilt", kind: "root-mismatch", priorGenerationId: "" };
+  }
+  return { action: "rebuilt", kind: "incremental-update", priorGenerationId: state.activeGeneration };
+}
+
+/**
+ * Validate a `graph.json` produced by Graphify's `update --no-cluster`
+ * extraction. The shape we accept is intentionally narrow: a JSON
+ * object with `nodes` and `edges` arrays. The runtime does NOT parse
+ * every graph.json field because the Graphify schema can grow new
+ * optional metadata between minor versions; we only assert the two
+ * fields the BFS query needs.
+ */
+async function readAndValidateStagedGraph(stagedGraphJson: string): Promise<void> {
+  if (!(await exists(stagedGraphJson))) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GRAPH_INVALID",
+      "Staged graph.json was not produced by the Graphify refresh",
+      { path: stagedGraphJson },
+    );
+  }
+  const details = await lstat(stagedGraphJson);
+  if (details.isSymbolicLink() || !details.isFile()) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GRAPH_INVALID",
+      "Staged graph.json is not a regular file",
+      { path: stagedGraphJson },
+    );
+  }
+  let parsed: unknown;
+  try {
+    const raw = await readFile(stagedGraphJson, "utf8");
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GRAPH_INVALID",
+      "Staged graph.json is not parseable JSON",
+      { cause: error instanceof Error ? error.message : String(error) },
+    );
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    !Array.isArray((parsed as { nodes?: unknown }).nodes) ||
+    !Array.isArray((parsed as { edges?: unknown }).edges)
+  ) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GRAPH_INVALID",
+      "Staged graph.json is missing nodes/edges arrays",
+      {},
+    );
+  }
+  const nodes = (parsed as { nodes: unknown[] }).nodes;
+  const edges = (parsed as { edges: unknown[] }).edges;
+  if (nodes.length === 0 && edges.length === 0) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_GRAPH_EMPTY",
+      "Staged graph.json contains no nodes and no edges",
+      { nodes: 0, edges: 0 },
+    );
+  }
+}
+
+/**
+ * Build a fresh stamped state envelope that captures the resolved
+ * repo root AND the freshly committed generation id. The stamp is
+ * written AFTER the generation directory is built and validated;
+ * `writeRepositoryIntelligenceState` itself does the atomic
+ * temp-file-then-rename dance so a crash mid-write leaves the
+ * previous stamp in place.
+ */
+async function stampRepositoryIntelligenceCacheForRoot(
+  root: string,
+  generationId: string,
+): Promise<void> {
+  await writeRepositoryIntelligenceState(root, {
+    schema: REPOSITORY_INTELLIGENCE_STATE_SCHEMA,
+    engine: "graphify",
+    engineVersion: GRAPHIFY_VERSION,
+    mode: "code-only",
+    repoRoot: root,
+    activeGeneration: generationId,
+  });
+}
+
+/**
+ * Best-effort garbage collection of stale generation directories
+ * inside the generations root. A failure is intentionally swallowed:
+ * the GC is opportunistic, and the next successful activation will
+ * retry. The runtime MUST NOT refuse to commit a new generation
+ * because the GC of a previous one failed.
+ *
+ * `keepGenerationId` is preserved verbatim; every other generation
+ * directory under the generations root is removed.
+ */
+async function garbageCollectGenerations(
+  root: string,
+  keepGenerationId: string,
+): Promise<void> {
+  const generationsRoot = repositoryIntelligenceGenerationsPath(root);
+  if (!(await exists(generationsRoot))) return;
+  const entries = await readdir(generationsRoot, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    if (entry.name === keepGenerationId) continue;
+    const entryPath = join(generationsRoot, entry.name);
+    try {
+      const details = await lstat(entryPath);
+      if (details.isSymbolicLink()) continue;
+      await rm(entryPath, { recursive: true, force: true });
+    } catch {
+      // Best-effort: keep going even if one entry refuses to delete.
+    }
+  }
+}
+
+/**
+ * Recursively copy the contents of `src` into `dst`. Both must be
+ * directories. Symlinks are NOT followed: the source path is read
+ * with `lstat` and the destination is created with the same
+ * regular-file / directory shape so a poisoned source cannot inject
+ * a symlink into the staging tree.
+ */
+async function copyDirectoryContents(src: string, dst: string): Promise<void> {
+  const details = await lstat(src);
+  if (details.isSymbolicLink()) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_CACHE_UNSAFE",
+      "Refusing to clone a symlinked source directory",
+      { path: src },
+    );
+  }
+  if (!details.isDirectory()) {
+    throw new PoiesisError(
+      "REPOSITORY_INTELLIGENCE_CACHE_UNSAFE",
+      "Refusing to clone a non-directory source",
+      { path: src },
+    );
+  }
+  await mkdir(dst, { recursive: true });
+  for (const entry of await readdir(src, { withFileTypes: true })) {
+    const srcChild = join(src, entry.name);
+    const dstChild = join(dst, entry.name);
+    const childLstat = await lstat(srcChild);
+    if (childLstat.isSymbolicLink()) {
+      throw new PoiesisError(
+        "REPOSITORY_INTELLIGENCE_CACHE_UNSAFE",
+        "Refusing to clone a symlinked source entry",
+        { path: srcChild },
+      );
+    }
+    if (childLstat.isDirectory()) {
+      await copyDirectoryContents(srcChild, dstChild);
+    } else if (childLstat.isFile()) {
+      await mkdir(join(dstChild, ".."), { recursive: true });
+      const raw = await readFile(srcChild);
+      await writeFile(dstChild, raw);
+    }
+  }
+}
+
+/**
+ * Validate the `--question` argument. Empty, whitespace-only, NUL-bearing,
+ * and over-length prompts are hard-fail typed errors because the caller
+ * asked for something the runtime cannot serve. Operational failures
+ * (uvx crashes, timeouts) come later as soft fallbacks.
+ */
+function validateQuestion(question: string): void {
+  if (typeof question !== "string") {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required --question", { key: "question" });
+  }
+  if (question.trim().length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", "Missing required --question", { key: "question" });
+  }
+  if (question.length > QUESTION_MAX_LENGTH) {
+    throw new PoiesisError(
+      "INVALID_ARGUMENT",
+      `--question exceeds ${QUESTION_MAX_LENGTH} bytes`,
+      { length: question.length, maxLength: QUESTION_MAX_LENGTH },
+    );
+  }
+  if (question.includes("\u0000")) {
+    throw new PoiesisError("INVALID_ARGUMENT", "--question contains a NUL byte", {});
+  }
+}
+
+/**
+ * Top-level query entry point. The function NEVER throws on operational
+ * failures (uvx missing, refresh crash, query crash, timeout,
+ * graph-invalid, graph-empty) — those return a typed fallback envelope.
+ * Hard failures are limited to argument-validation errors and unsafe
+ * cache paths.
+ */
+export async function queryRepositoryIntelligence(
+  root: string,
+  options: RepositoryIntelligenceQueryOptions,
+): Promise<RepositoryIntelligenceQueryOutcome> {
+  validateQuestion(options.question);
+  // Defensive cache safety: refuse to run when the cache directory
+  // is a symlink or escapes the cache root. `validateRepositoryIntelligenceCache`
+  // is the canonical ownership check; the runtime runs it BEFORE any
+  // subprocess to fail closed.
+  const cacheRoot = repositoryIntelligenceCachePath(root);
+  if (await exists(cacheRoot)) {
+    await validateRepositoryIntelligenceCache(root, cacheRoot);
+  }
+  if (!(await probeUvAvailability(options.env))) {
+    return {
+      ok: false,
+      operation: "repository.query",
+      engine: "graphify",
+      engineVersion: GRAPHIFY_VERSION,
+      reason: "uv-unavailable",
+      message:
+        "Poiesis v1.2 requires `uv` on PATH to launch the pinned Graphify engine; install `uv` from https://docs.astral.sh/uv/",
+      detail: { requirement: "uv", hint: "missing-binary" },
+    };
+  }
+  const runner = options.runner ?? defaultGraphifyRunner;
+  const envSource = options.env ?? process.env;
+  const sanitizedEnv = sanitizeGraphifyEnvironment(envSource);
+
+  const release = await acquireRefreshLock(root);
+  try {
+    // Decide the refresh kind. Every query serializes a refresh
+    // (per Spec #120 / ticket #122); there is no "reuse" path that
+    // skips Graphify.
+    const decision = await decideRefresh(root);
+    const refreshResult = await performRefresh(root, decision, runner, sanitizedEnv);
+    if (!refreshResult.ok) {
+      return toQueryFallback(refreshResult.reason, refreshResult.message, refreshResult.detail);
+    }
+    const queryResult = await performQuery(root, refreshResult.graphPath, options.question, runner, sanitizedEnv);
+    if (!queryResult.ok) {
+      return toQueryFallback(queryResult.reason, queryResult.message, queryResult.detail);
+    }
+    return {
+      ok: true,
+      operation: "repository.query",
+      engine: "graphify",
+      engineVersion: GRAPHIFY_VERSION,
+      graphPath: refreshResult.graphPath,
+      refresh: { action: "rebuilt", kind: refreshResult.kind, durationMs: refreshResult.durationMs },
+      answer: queryResult.answer,
+      truncated: queryResult.truncated,
+    };
+  } catch (error) {
+    if (error instanceof PoiesisError && error.code === "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT") {
+      return {
+        ok: false,
+        operation: "repository.query",
+        engine: "graphify",
+        engineVersion: GRAPHIFY_VERSION,
+        reason: "refresh-failed",
+        message: error.message,
+        detail: error.details,
+      };
+    }
+    throw error;
+  } finally {
+    await release();
+  }
+}
+
+interface RefreshSuccess {
+  ok: true;
+  graphPath: string;
+  kind: RepositoryIntelligenceRefreshKind;
+  durationMs: number;
+}
+
+interface RefreshFailure {
+  ok: false;
+  reason: "refresh-failed" | "refresh-timeout" | "graph-invalid" | "graph-empty";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+type RefreshResult = RefreshSuccess | RefreshFailure;
+
+/**
+ * Perform an immutable-generation refresh:
+ *
+ *   1. Allocate a fresh `<cache>/repository-intelligence/generations/<uuid>/`
+ *      directory. This directory is the immutable generation the
+ *      runtime will commit once the build + validate sequence
+ *      succeeds.
+ *   2. If the refresh kind is `incremental-update`, copy the COMPLETE
+ *      active generation's contents into the new generation so
+ *      `graphify update <root>` merges into a baseline. Initial
+ *      extract and every mismatch kind run with an empty generation
+ *      so the build is a true full extract.
+ *   3. Run `graphify extract <root> --code-only --no-cluster --out
+ *      <generation>` for initial / mismatch, or `graphify update
+ *      <root> --out <generation>` for incremental. The `--out` flag
+ *      tells Graphify where to write its output; the runtime does
+ *      NOT pass `--force` (no override of stale graphs by force) and
+ *      does NOT pass `--no-viz` to `update` (it is not a valid
+ *      `update` flag in 0.9.70).
+ *   4. Validate the generation's `graph.json` (parseable JSON,
+ *      `nodes` and `edges` arrays, not both empty). On validation
+ *      failure, remove the in-progress generation directory and
+ *      return a typed fallback. The previous active generation (if
+ *      any) is untouched.
+ *   5. Atomically commit the new generation by rewriting
+ *      `state.json` (temp + rename) with the new `activeGeneration`
+ *      pointer. A failure here leaves the previous stamp + previous
+ *      active generation in place; the in-progress generation is left
+ *      on disk and will be GC'd by the next successful activation.
+ *   6. Best-effort GC of every other generation directory under
+ *      the generations root. GC failures are swallowed; they do not
+ *      invalidate the just-committed state.
+ *
+ * The query step then reads `state.json` and queries the generation
+ * selected by the NEWLY committed state pointer; a failed activation
+ * never reaches the query step (the orchestrator returns a typed
+ * fallback envelope).
+ */
+async function performRefresh(
+  root: string,
+  decision: RefreshDecision,
+  runner: GraphifyRunner,
+  sanitizedEnv: NodeJS.ProcessEnv,
+): Promise<RefreshResult> {
+  const startedAt = Date.now();
+  const generationsRoot = repositoryIntelligenceGenerationsPath(root);
+  await mkdir(generationsRoot, { recursive: true });
+  const generationId = `${GENERATION_PREFIX}${randomUUID()}`;
+  const generationPath = join(generationsRoot, generationId);
+  await mkdir(generationPath, { recursive: true });
+
+  // For incremental refresh, clone the COMPLETE validated active
+  // generation contents into the new generation so `graphify update`
+  // merges into a baseline. Copying only `graph.json` is insufficient
+  // — the seed must include every graphify output that the new
+  // generation should preserve (graph.html, .graphify_analysis.json,
+  // .graphify_labels.json, …) so update reads the same baseline it
+  // would have read if the previous generation was the working
+  // directory.
+  if (decision.kind === "incremental-update" && decision.priorGenerationId !== "") {
+    const activeGenerationPath = repositoryIntelligenceGenerationPath(root, decision.priorGenerationId);
+    try {
+      await copyDirectoryContents(activeGenerationPath, generationPath);
+    } catch (error) {
+      await rm(generationPath, { recursive: true, force: true }).catch(() => undefined);
+      const message = error instanceof Error ? error.message : String(error);
+      return {
+        ok: false,
+        reason: "refresh-failed",
+        message: "Failed to clone the active generation contents into the new generation",
+        detail: { cause: message, from: relative(root, activeGenerationPath) },
+      };
+    }
+  }
+
+  // Build argv. `--out <generationPath>` keeps the output inside the
+  // owned generations root; `--code-only` and `--no-cluster` ensure
+  // the extract stays code-only and never invokes an LLM. We pass
+  // `--out` explicitly so the argv alone documents the contract.
+  // `GRAPHIFY_OUT` is also set in the env so any tool that reads it
+  // (and the test seam, which inspects `env.GRAPHIFY_OUT` to write
+  // canned output) agrees with the `--out` flag.
+  const refreshArgs: string[] =
+    decision.kind === "incremental-update"
+      ? ["update", root, "--out", generationPath]
+      : ["extract", root, "--code-only", "--no-cluster", "--out", generationPath];
+
+  const refreshResult = await runner({
+    args: refreshArgs,
+    cwd: root,
+    env: { ...sanitizedEnv, GRAPHIFY_OUT: generationPath },
+    timeoutMs: REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS,
+    maxBytes: REFRESH_MAX_BYTES,
+  });
+  // NOTE: the runner's contract is that it ALREADY invokes any
+  // `post` callback on the response before returning (the default
+  // runner ignores the field; fake runners use it to simulate
+  // graphify's side-effects). The runtime does NOT invoke `post`
+  // itself — calling it here would double-invoke the side-effects
+  // and break tests that count `post` calls.
+  void sanitizedEnv;
+  if (!refreshResult.ok) {
+    await rm(generationPath, { recursive: true, force: true }).catch(() => undefined);
+    if (refreshResult.code === "GRAPHIFY_TIMEOUT") {
+      return {
+        ok: false,
+        reason: "refresh-timeout",
+        message: refreshResult.message,
+        detail: refreshResult.detail,
+      };
+    }
+    if (refreshResult.code === "GRAPHIFY_NOT_INSTALLED") {
+      return {
+        ok: false,
+        reason: "refresh-failed",
+        message: refreshResult.message,
+        detail: { ...refreshResult.detail, hint: "missing-binary" },
+      };
+    }
+    return {
+      ok: false,
+      reason: "refresh-failed",
+      message: refreshResult.message,
+      detail: refreshResult.detail,
+    };
+  }
+
+  // Validate the just-built generation's `graph.json`. A failure
+  // here removes the in-progress generation (the previous active
+  // generation, if any, is untouched) and surfaces the typed reason.
+  const stagedGraphJson = join(generationPath, "graph.json");
+  try {
+    await readAndValidateStagedGraph(stagedGraphJson);
+  } catch (error) {
+    await rm(generationPath, { recursive: true, force: true }).catch(() => undefined);
+    if (error instanceof PoiesisError && error.code === "REPOSITORY_INTELLIGENCE_GRAPH_EMPTY") {
+      return {
+        ok: false,
+        reason: "graph-empty",
+        message: error.message,
+        detail: error.details,
+      };
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    return {
+      ok: false,
+      reason: "graph-invalid",
+      message,
+      detail: error instanceof PoiesisError ? error.details : { cause: message },
+    };
+  }
+
+  // Atomic activation: rewrite `state.json` so the new generation
+  // is the active one. The previous active generation is NOT removed
+  // — it is preserved until best-effort GC after this commit
+  // succeeds. A failure of the commit leaves the previous stamp in
+  // place; the in-progress generation is left on disk and the next
+  // successful activation will GC it.
+  try {
+    await stampRepositoryIntelligenceCacheForRoot(root, generationId);
+  } catch (error) {
+    await rm(generationPath, { recursive: true, force: true }).catch(() => undefined);
+    return {
+      ok: false,
+      reason: "refresh-failed",
+      message: "Atomic state.json commit failed; the previous active generation is unchanged",
+      detail: { cause: error instanceof Error ? error.message : String(error) },
+    };
+  }
+
+  // Best-effort GC of stale generations. The just-committed
+  // generation is preserved; every other generation directory under
+  // the generations root is removed. GC failures are intentionally
+  // swallowed so they cannot invalidate the just-committed state.
+  await garbageCollectGenerations(root, generationId).catch(() => undefined);
+
+  return {
+    ok: true,
+    graphPath: stagedGraphJson,
+    kind: decision.kind,
+    durationMs: Date.now() - startedAt,
+  };
+}
+
+interface QuerySuccess {
+  ok: true;
+  answer: string;
+  truncated: boolean;
+}
+
+interface QueryFailure {
+  ok: false;
+  reason: "query-failed" | "query-timeout";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+type QueryResult = QuerySuccess | QueryFailure;
+
+/**
+ * Run `graphify query <question> --budget <N> --graph <active>` and
+ * surface the answer. The query target is the active generation's
+ * `graph.json` selected by the just-committed (or reused) state
+ * pointer — never a partial / in-progress generation. The fixed
+ * `--budget` argument matches Graphify 0.9.70's documented default
+ * (2000) and is encoded explicitly so the runtime cannot drift to a
+ * different answer-shape per query.
+ */
+async function performQuery(
+  root: string,
+  graphPath: string,
+  question: string,
+  runner: GraphifyRunner,
+  sanitizedEnv: NodeJS.ProcessEnv,
+): Promise<QueryResult> {
+  const queryResult = await runner({
+    args: [
+      "query",
+      question,
+      "--budget",
+      String(REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS),
+      "--graph",
+      graphPath,
+    ],
+    cwd: root,
+    env: sanitizedEnv,
+    timeoutMs: REPOSITORY_INTELLIGENCE_QUERY_TIMEOUT_MS,
+    maxBytes: QUERY_MAX_BYTES,
+  });
+  if (!queryResult.ok) {
+    if (queryResult.code === "GRAPHIFY_TIMEOUT") {
+      return {
+        ok: false,
+        reason: "query-timeout",
+        message: queryResult.message,
+        detail: queryResult.detail,
+      };
+    }
+    return {
+      ok: false,
+      reason: "query-failed",
+      message: queryResult.message,
+      detail: queryResult.detail,
+    };
+  }
+  if (queryResult.exitCode !== 0) {
+    return {
+      ok: false,
+      reason: "query-failed",
+      message: `graphify query exited with code ${queryResult.exitCode}`,
+      detail: { exitCode: queryResult.exitCode, stderr: queryResult.stderr.slice(0, 8_000) },
+    };
+  }
+  return {
+    ok: true,
+    answer: queryResult.stdout,
+    truncated: queryResult.stdoutTruncated,
+  };
+}
