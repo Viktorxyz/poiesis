@@ -350,6 +350,14 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "npx poiesis *": "deny",
       "pnpm dlx poiesis-cli *": "deny",
       "pnpm dlx poiesis-cli@*": "deny",
+      // Spec #120 / ticket #123 — the four narrow Repository
+      // Intelligence subcommand allows are appended AFTER the
+      // `pnpm dlx poiesis-cli@*` deny so OpenCode's last-match-wins
+      // resolver grants only the documented operations.
+      "pnpm dlx poiesis-cli@1.1.4 repository status": "allow",
+      "pnpm dlx poiesis-cli@1.1.4 repository query *": "allow",
+      "pnpm dlx poiesis-cli@1.1.4 repository path *": "allow",
+      "pnpm dlx poiesis-cli@1.1.4 repository explain *": "allow",
     });
     expect(workerAfter.installed as { permission: { bash: Record<string, string> } }).not.toMatchObject({
       permission: { bash: expect.objectContaining({ "pnpm dlx poiesis-cli@1.1.4 *": "allow" }) },

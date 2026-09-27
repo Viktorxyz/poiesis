@@ -56,6 +56,8 @@ Usage:
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
   poiesis repository status                              # Spec #120 / ticket #121 — mechanical uv / cache state; never downloads, never asks the Author
   poiesis repository query --question <text>              # Spec #120 / ticket #122 — refresh code-only graph if needed, then run graphify query; never queries an old graph after a failed refresh
+  poiesis repository path --from <node> --to <node>       # Spec #120 / ticket #123 — refresh code-only graph if needed, then run graphify path; never queries an old graph after a failed refresh
+  poiesis repository explain --node <node>                # Spec #120 / ticket #123 — refresh code-only graph if needed, then run graphify explain; never queries an old graph after a failed refresh
 
 All commands accept --cwd <path>. Output and errors are structured JSON.
 `;
@@ -765,8 +767,8 @@ async function commandSession(args: string[]): Promise<void> {
 }
 
 /**
- * Spec #120 / ticket #121 + ticket #122 — `poiesis repository
- * <status|query>`.
+ * Spec #120 / ticket #121 + ticket #122 + ticket #123 — `poiesis
+ * repository <status|query|path|explain>`.
  *
  * `status` (ticket #121) reports the mechanical Repository
  * Intelligence state without downloading anything: `uv` availability,
@@ -784,6 +786,14 @@ async function commandSession(args: string[]): Promise<void> {
  * runner is injected through the second parameter so the test seam
  * can drive deterministic mocked behavior without spawning a real
  * `uvx`.
+ *
+ * `path --from <node> --to <node>` and `explain --node <node>`
+ * (ticket #123) reuse the exact same refresh + lock + cache-validation
+ * pipeline as `query`; only the post-refresh graphify invocation
+ * differs. Poiesis named flags (`--from`, `--to`, `--node`) translate
+ * to Graphify's positional args (`path <from> <to>`, `explain <node>`)
+ * plus the explicit `--graph <active>` pointer so the runtime owns
+ * every CLI argv shape.
  *
  * Exported as a library seam (matching the `commandInit` /
  * `commandUpdate` / `commandModel` / `commandTracker` pattern) so the
@@ -834,9 +844,69 @@ export async function commandRepository(
     }
     return;
   }
+  if (operation === "path") {
+    const values = options(args.slice(1), {
+      from: { type: "string" },
+      to: { type: "string" },
+      cwd: { type: "string" },
+    });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { pathRepositoryIntelligence } = await import("./repository-intelligence.js");
+    const fromValue = values.from;
+    const toValue = values.to;
+    if (typeof fromValue !== "string" || fromValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --from", { key: "from" });
+    }
+    if (typeof toValue !== "string" || toValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --to", { key: "to" });
+    }
+    const outcome = await pathRepositoryIntelligence(repoRoot, {
+      from: fromValue,
+      to: toValue,
+      ...(dispatcherOptions.runner === undefined ? {} : { runner: dispatcherOptions.runner }),
+    });
+    if (outcome.ok) {
+      writeSuccess("repository.path", outcome);
+    } else {
+      throw new PoiesisError(
+        outcome.reason.toUpperCase().replace(/-/g, "_"),
+        outcome.message,
+        outcome.detail,
+      );
+    }
+    return;
+  }
+  if (operation === "explain") {
+    const values = options(args.slice(1), {
+      node: { type: "string" },
+      cwd: { type: "string" },
+    });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { explainRepositoryIntelligence } = await import("./repository-intelligence.js");
+    const nodeValue = values.node;
+    if (typeof nodeValue !== "string" || nodeValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --node", { key: "node" });
+    }
+    const outcome = await explainRepositoryIntelligence(repoRoot, {
+      node: nodeValue,
+      ...(dispatcherOptions.runner === undefined ? {} : { runner: dispatcherOptions.runner }),
+    });
+    if (outcome.ok) {
+      writeSuccess("repository.explain", outcome);
+    } else {
+      throw new PoiesisError(
+        outcome.reason.toUpperCase().replace(/-/g, "_"),
+        outcome.message,
+        outcome.detail,
+      );
+    }
+    return;
+  }
   throw new PoiesisError("UNKNOWN_COMMAND", `Unknown repository subcommand: ${operation ?? ""}`, {
     subcommand: operation ?? "",
-    supported: ["status", "query"],
+    supported: ["status", "query", "path", "explain"],
   });
 }
 

@@ -140,12 +140,13 @@ describe("ticket #121 CLI surface: poiesis repository status", () => {
     // the typed `UNKNOWN_COMMAND` error; the CLI `main()` catches and
     // emits the canonical envelope via `writeFailure`. We verify the
     // thrown error directly here to keep the test focused on the
-    // typed contract. As of ticket #122, `poiesis repository query`
-    // is a supported subcommand; this test exercises an UNSUPPORTED
-    // subcommand so the UNKNOWN_COMMAND surface stays covered.
+    // typed contract. As of ticket #123, `poiesis repository <status|
+    // query|path|explain>` are all supported subcommands; this test
+    // exercises an UNSUPPORTED subcommand so the UNKNOWN_COMMAND
+    // surface stays covered.
     await expect(commandRepository(["nuke", "--cwd", repository.root])).rejects.toMatchObject({
       code: "UNKNOWN_COMMAND",
-      details: { supported: ["status", "query"] },
+      details: { supported: ["status", "query", "path", "explain"] },
     });
   }, 30_000);
 });

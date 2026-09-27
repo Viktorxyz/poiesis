@@ -194,6 +194,17 @@ const forbiddenFunctions = [
   "buildGraphifyInvocation",
   "defaultGraphifyRunner",
   "queryRepositoryIntelligence",
+  // Ticket #123: path / explain runtime surface (identifier-length
+  // bound, node-call timeout, top-level entry points, and the
+  // operation-specific fallback envelopes). Every name stays
+  // internal for the same reason as the query seam: the post-refresh
+  // graphify argv, the typed fallback reason code, and the
+  // success-envelope shape must be free to evolve as later tickets
+  // (#124, #125, …) stabilize them.
+  "REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH",
+  "REPOSITORY_INTELLIGENCE_NODE_TIMEOUT_MS",
+  "pathRepositoryIntelligence",
+  "explainRepositoryIntelligence",
   // Path-derivation helpers
   "repositoryIntelligenceCachePath",
   "repositoryIntelligenceStatePath",

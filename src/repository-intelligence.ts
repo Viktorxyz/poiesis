@@ -872,6 +872,16 @@ export const REPOSITORY_INTELLIGENCE_GITIGNORE_LINE = REPOSITORY_INTELLIGENCE_RE
  *      a successful activation. A GC failure must never invalidate
  *      the just-committed state; the next successful activation will
  *      retry.
+ *
+ * Spec #120 / ticket #123 extends the same contract to
+ * `poiesis repository path --from --to` and
+ * `poiesis repository explain --node`. The three operations share the
+ * exact same refresh / lock / validation / activation pipeline; only
+ * the post-refresh graphify invocation, the input validators, the
+ * output envelope, and the operation label differ. Poiesis named flags
+ * (`--from`, `--to`, `--node`) translate to Graphify positional args
+ * plus the explicit `--graph <active>` pointer so the runtime owns
+ * every CLI argv shape.
  */
 
 /**
@@ -907,6 +917,22 @@ export const REPOSITORY_INTELLIGENCE_QUERY_TIMEOUT_MS = 30_000;
  * abuse.
  */
 export const REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH = 4096;
+
+/**
+ * Spec #120 / ticket #123 — bounded input length for `path --from`,
+ * `path --to`, and `explain --node`. Graphify resolves each identifier
+ * against the active graph's nodes; a 512-byte cap is generous for a
+ * fully-qualified symbol path and refuses buffer abuse.
+ */
+export const REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH = 512;
+
+/**
+ * Spec #120 / ticket #123 — bounded timeout (ms) for the
+ * `graphify path` / `graphify explain` post-refresh invocation.
+ * Identical to the query timeout because all three BFS-over-graph
+ * calls share the same bounded-by-`--budget` / graph-size shape.
+ */
+export const REPOSITORY_INTELLIGENCE_NODE_TIMEOUT_MS = 30_000;
 
 /**
  * Sanitization allow-list: environment variables that Poiesis is
@@ -1197,6 +1223,125 @@ export interface RepositoryIntelligenceQueryOptions {
    * on the constant's value.
    */
   refreshTimeoutMs?: number;
+}
+
+/**
+ * Spec #120 / ticket #123 — `poiesis repository path --from <node>
+ * --to <node>`.
+ *
+ * The Poiesis CLI accepts named flags (`--from`, `--to`) for ergonomic
+ * shell parsing; the runtime translates them to Graphify's positional
+ * `<from> <to>` invocation plus the explicit `--graph <active>` pointer.
+ * The post-refresh invocation runs `graphify path <from> <to> --graph
+ * <active>` so the BFS-over-graph traversal operates against the
+ * committed generation — never a stale or in-progress directory.
+ */
+export interface RepositoryIntelligencePathSuccess {
+  ok: true;
+  operation: "repository.path";
+  engine: "graphify";
+  engineVersion: string;
+  graphPath: string;
+  from: string;
+  to: string;
+  refresh: RepositoryIntelligenceRefresh;
+  answer: string;
+  truncated: boolean;
+}
+
+export type RepositoryIntelligencePathReason =
+  | "uv-unavailable"
+  | "refresh-failed"
+  | "refresh-timeout"
+  | "graph-invalid"
+  | "graph-empty"
+  | "path-failed"
+  | "path-timeout";
+
+export interface RepositoryIntelligencePathFallback {
+  ok: false;
+  operation: "repository.path";
+  engine: "graphify";
+  engineVersion: string;
+  reason: RepositoryIntelligencePathReason;
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+export type RepositoryIntelligencePathOutcome =
+  | RepositoryIntelligencePathSuccess
+  | RepositoryIntelligencePathFallback;
+
+export interface RepositoryIntelligencePathOptions {
+  from: string;
+  to: string;
+  /**
+   * Override the subprocess runner. Same contract as the query
+   * option; production callers leave this undefined.
+   */
+  runner?: GraphifyRunner;
+  /**
+   * Process env to derive the sanitized env from. Same contract as
+   * the query option; production callers leave this undefined.
+   */
+  env?: NodeJS.ProcessEnv;
+}
+
+/**
+ * Spec #120 / ticket #123 — `poiesis repository explain --node <node>`.
+ *
+ * The Poiesis CLI accepts the named `--node` flag; the runtime
+ * translates it to Graphify's positional invocation
+ * `graphify explain <node> --graph <active>` so the BFS traversal
+ * operates against the committed generation.
+ */
+export interface RepositoryIntelligenceExplainSuccess {
+  ok: true;
+  operation: "repository.explain";
+  engine: "graphify";
+  engineVersion: string;
+  graphPath: string;
+  node: string;
+  refresh: RepositoryIntelligenceRefresh;
+  answer: string;
+  truncated: boolean;
+}
+
+export type RepositoryIntelligenceExplainReason =
+  | "uv-unavailable"
+  | "refresh-failed"
+  | "refresh-timeout"
+  | "graph-invalid"
+  | "graph-empty"
+  | "explain-failed"
+  | "explain-timeout";
+
+export interface RepositoryIntelligenceExplainFallback {
+  ok: false;
+  operation: "repository.explain";
+  engine: "graphify";
+  engineVersion: string;
+  reason: RepositoryIntelligenceExplainReason;
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+export type RepositoryIntelligenceExplainOutcome =
+  | RepositoryIntelligenceExplainSuccess
+  | RepositoryIntelligenceExplainFallback;
+
+export interface RepositoryIntelligenceExplainOptions {
+  node: string;
+  /**
+   * Override the subprocess runner. Same contract as the query
+   * option; production callers leave this undefined.
+   */
+  runner?: GraphifyRunner;
+  /**
+   * Process env to derive the sanitized env from. Same contract as
+   * the query option; production callers leave this undefined.
+   */
+  env?: NodeJS.ProcessEnv;
 }
 
 interface RefreshDecision {
@@ -1590,6 +1735,101 @@ function validateQuestion(question: string): void {
 }
 
 /**
+ * Spec #120 / ticket #123 — validate a graphify identifier argument
+ * (`--from`, `--to`, `--node`). Mirrors `validateQuestion`'s contract:
+ * empty / whitespace-only / NUL-bearing / over-length identifiers are
+ * hard-fail typed errors because the caller asked for something the
+ * runtime cannot serve. The runtime accepts a non-empty trimmed
+ * identifier of any byte content (Graphify's identifier parser is the
+ * authority on what constitutes a valid node); this validator only
+ * enforces Poiesis-side bounds.
+ */
+function validateNodeIdentifier(value: string, key: "from" | "to" | "node"): void {
+  if (typeof value !== "string") {
+    throw new PoiesisError("MISSING_ARGUMENT", `Missing required --${key}`, { key });
+  }
+  if (value.trim().length === 0) {
+    throw new PoiesisError("MISSING_ARGUMENT", `Missing required --${key}`, { key });
+  }
+  if (value.length > REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH) {
+    throw new PoiesisError(
+      "INVALID_ARGUMENT",
+      `--${key} exceeds ${REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH} bytes`,
+      { key, length: value.length, maxLength: REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH },
+    );
+  }
+  if (value.includes("\u0000")) {
+    throw new PoiesisError("INVALID_ARGUMENT", `--${key} contains a NUL byte`, { key });
+  }
+}
+
+/**
+ * Spec #120 / tickets #121 / #122 / #123 — common refresh setup for
+ * the three `poiesis repository <query|path|explain>` runtime entry
+ * points. Performs, in order:
+ *
+ *   1. Symlink-safe ownership validation of the existing cache
+ *      directory (hard-fails with `REPOSITORY_INTELLIGENCE_CACHE_UNSAFE`
+ *      on a poisoned cache; the entry points surface this as a typed
+ *      `PoiesisError`).
+ *   2. `uv` availability probe. A missing `uv` returns a typed
+ *      `uv-unavailable` setup error so the entry point can translate
+ *      it to its operation-specific fallback envelope without
+ *      spawning a subprocess.
+ *   3. Sanitization of the runner environment (model / tracker /
+ *      POIESIS credentials stripped).
+ *   4. Per-repo refresh lock acquisition so two concurrent invocations
+ *      on the same repo never race the immutable-generation commit.
+ *
+ * Returns the ready-to-use runtime context on success, or a typed
+ * `uv-unavailable` setup error on uv-missing. The `release` callback
+ * MUST be awaited in the caller's `finally` to keep the lock lifetime
+ * bounded by the operation's actual duration.
+ */
+interface RepositoryIntelligenceRefreshContext {
+  ok: true;
+  release: () => Promise<void>;
+  runner: GraphifyRunner;
+  sanitizedEnv: NodeJS.ProcessEnv;
+}
+
+interface RepositoryIntelligenceRefreshContextError {
+  ok: false;
+  reason: "uv-unavailable";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+async function prepareRefreshContext(
+  root: string,
+  env: NodeJS.ProcessEnv | undefined,
+  runner: GraphifyRunner | undefined,
+): Promise<RepositoryIntelligenceRefreshContext | RepositoryIntelligenceRefreshContextError> {
+  // Defensive cache safety: refuse to run when the cache directory
+  // is a symlink or escapes the cache root. `validateRepositoryIntelligenceCache`
+  // is the canonical ownership check; the runtime runs it BEFORE any
+  // subprocess to fail closed.
+  const cacheRoot = repositoryIntelligenceCachePath(root);
+  if (await exists(cacheRoot)) {
+    await validateRepositoryIntelligenceCache(root, cacheRoot);
+  }
+  if (!(await probeUvAvailability(env))) {
+    return {
+      ok: false,
+      reason: "uv-unavailable",
+      message:
+        "Poiesis v1.2 requires `uv` on PATH to launch the pinned Graphify engine; install `uv` from https://docs.astral.sh/uv/",
+      detail: { requirement: "uv", hint: "missing-binary" },
+    };
+  }
+  const resolvedRunner = runner ?? defaultGraphifyRunner;
+  const envSource = env ?? process.env;
+  const sanitizedEnv = sanitizeGraphifyEnvironment(envSource);
+  const release = await acquireRefreshLock(root);
+  return { ok: true, release, runner: resolvedRunner, sanitizedEnv };
+}
+
+/**
  * Top-level query entry point. The function NEVER throws on operational
  * failures (uvx missing, refresh crash, query crash, timeout,
  * graph-invalid, graph-empty) — those return a typed fallback envelope.
@@ -1601,41 +1841,20 @@ export async function queryRepositoryIntelligence(
   options: RepositoryIntelligenceQueryOptions,
 ): Promise<RepositoryIntelligenceQueryOutcome> {
   validateQuestion(options.question);
-  // Defensive cache safety: refuse to run when the cache directory
-  // is a symlink or escapes the cache root. `validateRepositoryIntelligenceCache`
-  // is the canonical ownership check; the runtime runs it BEFORE any
-  // subprocess to fail closed.
-  const cacheRoot = repositoryIntelligenceCachePath(root);
-  if (await exists(cacheRoot)) {
-    await validateRepositoryIntelligenceCache(root, cacheRoot);
+  const ctx = await prepareRefreshContext(root, options.env, options.runner);
+  if (!ctx.ok) {
+    return toQueryFallback(ctx.reason, ctx.message, ctx.detail);
   }
-  if (!(await probeUvAvailability(options.env))) {
-    return {
-      ok: false,
-      operation: "repository.query",
-      engine: "graphify",
-      engineVersion: GRAPHIFY_VERSION,
-      reason: "uv-unavailable",
-      message:
-        "Poiesis v1.2 requires `uv` on PATH to launch the pinned Graphify engine; install `uv` from https://docs.astral.sh/uv/",
-      detail: { requirement: "uv", hint: "missing-binary" },
-    };
-  }
-  const runner = options.runner ?? defaultGraphifyRunner;
-  const envSource = options.env ?? process.env;
-  const sanitizedEnv = sanitizeGraphifyEnvironment(envSource);
-
-  const release = await acquireRefreshLock(root);
   try {
     // Decide the refresh kind. Every query serializes a refresh
     // (per Spec #120 / ticket #122); there is no "reuse" path that
     // skips Graphify.
     const decision = await decideRefresh(root);
-    const refreshResult = await performRefresh(root, decision, runner, sanitizedEnv);
+    const refreshResult = await performRefresh(root, decision, ctx.runner, ctx.sanitizedEnv);
     if (!refreshResult.ok) {
       return toQueryFallback(refreshResult.reason, refreshResult.message, refreshResult.detail);
     }
-    const queryResult = await performQuery(root, refreshResult.graphPath, options.question, runner, sanitizedEnv);
+    const queryResult = await performQuery(root, refreshResult.graphPath, options.question, ctx.runner, ctx.sanitizedEnv);
     if (!queryResult.ok) {
       return toQueryFallback(queryResult.reason, queryResult.message, queryResult.detail);
     }
@@ -1651,20 +1870,178 @@ export async function queryRepositoryIntelligence(
     };
   } catch (error) {
     if (error instanceof PoiesisError && error.code === "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT") {
-      return {
-        ok: false,
-        operation: "repository.query",
-        engine: "graphify",
-        engineVersion: GRAPHIFY_VERSION,
-        reason: "refresh-failed",
-        message: error.message,
-        detail: error.details,
-      };
+      return toQueryFallback("refresh-failed", error.message, error.details);
     }
     throw error;
   } finally {
-    await release();
+    await ctx.release();
   }
+}
+
+/**
+ * Spec #120 / ticket #123 — top-level `poiesis repository path
+ * --from <node> --to <node>` entry point. Mirrors the query entry
+ * point's refresh + lock + cache-validation pipeline; the only
+ * differences are:
+ *
+ *   - `--from` / `--to` are validated by `validateNodeIdentifier`
+ *     against `REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH` bytes;
+ *   - the post-refresh graphify invocation runs `graphify path
+ *     <from> <to> --graph <active>` (Graphify's positional API);
+ *   - the success / fallback envelopes carry `from` / `to` /
+ *     `path-failed` / `path-timeout` labels instead of the query
+ *     labels so the CLI can render the right typed message.
+ *
+ * Operational failures (uvx missing, refresh crash, path crash,
+ * timeout, graph-invalid, graph-empty) return the typed
+ * `path-failed` / `path-timeout` fallback envelope; the function
+ * NEVER throws on operational failures. Hard failures are limited
+ * to argument-validation errors and unsafe cache paths.
+ */
+export async function pathRepositoryIntelligence(
+  root: string,
+  options: RepositoryIntelligencePathOptions,
+): Promise<RepositoryIntelligencePathOutcome> {
+  validateNodeIdentifier(options.from, "from");
+  validateNodeIdentifier(options.to, "to");
+  const ctx = await prepareRefreshContext(root, options.env, options.runner);
+  if (!ctx.ok) {
+    return toPathFallback(ctx.reason, ctx.message, ctx.detail);
+  }
+  try {
+    const decision = await decideRefresh(root);
+    const refreshResult = await performRefresh(root, decision, ctx.runner, ctx.sanitizedEnv);
+    if (!refreshResult.ok) {
+      return toPathFallback(refreshResult.reason, refreshResult.message, refreshResult.detail);
+    }
+    const pathResult = await performPath(root, refreshResult.graphPath, options.from, options.to, ctx.runner, ctx.sanitizedEnv);
+    if (!pathResult.ok) {
+      return toPathFallback(pathResult.reason, pathResult.message, pathResult.detail);
+    }
+    return {
+      ok: true,
+      operation: "repository.path",
+      engine: "graphify",
+      engineVersion: GRAPHIFY_VERSION,
+      graphPath: refreshResult.graphPath,
+      from: options.from,
+      to: options.to,
+      refresh: { action: "rebuilt", kind: refreshResult.kind, durationMs: refreshResult.durationMs },
+      answer: pathResult.answer,
+      truncated: pathResult.truncated,
+    };
+  } catch (error) {
+    if (error instanceof PoiesisError && error.code === "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT") {
+      return toPathFallback("refresh-failed", error.message, error.details);
+    }
+    throw error;
+  } finally {
+    await ctx.release();
+  }
+}
+
+/**
+ * Spec #120 / ticket #123 — top-level `poiesis repository explain
+ * --node <node>` entry point. Mirrors the query entry point's
+ * refresh + lock + cache-validation pipeline; the only differences
+ * are:
+ *
+ *   - `--node` is validated by `validateNodeIdentifier` against
+ *     `REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH` bytes;
+ *   - the post-refresh graphify invocation runs `graphify explain
+ *     <node> --graph <active>` (Graphify's positional API);
+ *   - the success / fallback envelopes carry `node` /
+ *     `explain-failed` / `explain-timeout` labels instead of the
+ *     query labels so the CLI can render the right typed message.
+ *
+ * Operational failures (uvx missing, refresh crash, explain crash,
+ * timeout, graph-invalid, graph-empty) return the typed
+ * `explain-failed` / `explain-timeout` fallback envelope; the
+ * function NEVER throws on operational failures. Hard failures are
+ * limited to argument-validation errors and unsafe cache paths.
+ */
+export async function explainRepositoryIntelligence(
+  root: string,
+  options: RepositoryIntelligenceExplainOptions,
+): Promise<RepositoryIntelligenceExplainOutcome> {
+  validateNodeIdentifier(options.node, "node");
+  const ctx = await prepareRefreshContext(root, options.env, options.runner);
+  if (!ctx.ok) {
+    return toExplainFallback(ctx.reason, ctx.message, ctx.detail);
+  }
+  try {
+    const decision = await decideRefresh(root);
+    const refreshResult = await performRefresh(root, decision, ctx.runner, ctx.sanitizedEnv);
+    if (!refreshResult.ok) {
+      return toExplainFallback(refreshResult.reason, refreshResult.message, refreshResult.detail);
+    }
+    const explainResult = await performExplain(root, refreshResult.graphPath, options.node, ctx.runner, ctx.sanitizedEnv);
+    if (!explainResult.ok) {
+      return toExplainFallback(explainResult.reason, explainResult.message, explainResult.detail);
+    }
+    return {
+      ok: true,
+      operation: "repository.explain",
+      engine: "graphify",
+      engineVersion: GRAPHIFY_VERSION,
+      graphPath: refreshResult.graphPath,
+      node: options.node,
+      refresh: { action: "rebuilt", kind: refreshResult.kind, durationMs: refreshResult.durationMs },
+      answer: explainResult.answer,
+      truncated: explainResult.truncated,
+    };
+  } catch (error) {
+    if (error instanceof PoiesisError && error.code === "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT") {
+      return toExplainFallback("refresh-failed", error.message, error.details);
+    }
+    throw error;
+  } finally {
+    await ctx.release();
+  }
+}
+
+/**
+ * Spec #120 / ticket #123 — centralize the typed non-blocking
+ * fallback envelope for `repository.path`. Mirrors `toQueryFallback`'s
+ * shape so the CLI dispatcher can render both envelopes through the
+ * same writer.
+ */
+function toPathFallback(
+  reason: RepositoryIntelligencePathReason,
+  message: string,
+  detail: Record<string, unknown>,
+): RepositoryIntelligencePathFallback {
+  return {
+    ok: false,
+    operation: "repository.path",
+    engine: "graphify",
+    engineVersion: GRAPHIFY_VERSION,
+    reason,
+    message,
+    detail,
+  };
+}
+
+/**
+ * Spec #120 / ticket #123 — centralize the typed non-blocking
+ * fallback envelope for `repository.explain`. Mirrors
+ * `toQueryFallback`'s shape so the CLI dispatcher can render both
+ * envelopes through the same writer.
+ */
+function toExplainFallback(
+  reason: RepositoryIntelligenceExplainReason,
+  message: string,
+  detail: Record<string, unknown>,
+): RepositoryIntelligenceExplainFallback {
+  return {
+    ok: false,
+    operation: "repository.explain",
+    engine: "graphify",
+    engineVersion: GRAPHIFY_VERSION,
+    reason,
+    message,
+    detail,
+  };
 }
 
 interface RefreshSuccess {
@@ -1940,5 +2317,148 @@ async function performQuery(
     ok: true,
     answer: queryResult.stdout,
     truncated: queryResult.stdoutTruncated,
+  };
+}
+
+interface NodeSuccess {
+  ok: true;
+  answer: string;
+  truncated: boolean;
+}
+
+interface NodeFailure {
+  ok: false;
+  reason: "path-failed" | "path-timeout";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+type PathResult = NodeSuccess | NodeFailure;
+
+/**
+ * Spec #120 / ticket #123 — run `graphify path <from> <to> --graph
+ * <active>` and surface the answer. Poiesis named flags translate to
+ * Graphify positional args plus the explicit `--graph` pointer. The
+ * path target is the active generation's `graph.json` selected by
+ * the just-committed (or reused) state pointer — never a partial /
+ * in-progress generation. A non-zero exit code or runner error
+ * surfaces as the typed `path-failed` / `path-timeout` fallback that
+ * `pathRepositoryIntelligence` translates to its operation-specific
+ * envelope.
+ */
+async function performPath(
+  root: string,
+  graphPath: string,
+  from: string,
+  to: string,
+  runner: GraphifyRunner,
+  sanitizedEnv: NodeJS.ProcessEnv,
+): Promise<PathResult> {
+  const pathResult = await runner({
+    args: ["path", from, to, "--graph", graphPath],
+    cwd: root,
+    env: sanitizedEnv,
+    timeoutMs: REPOSITORY_INTELLIGENCE_NODE_TIMEOUT_MS,
+    maxBytes: QUERY_MAX_BYTES,
+  });
+  if (!pathResult.ok) {
+    if (pathResult.code === "GRAPHIFY_TIMEOUT") {
+      return {
+        ok: false,
+        reason: "path-timeout",
+        message: pathResult.message,
+        detail: pathResult.detail,
+      };
+    }
+    return {
+      ok: false,
+      reason: "path-failed",
+      message: pathResult.message,
+      detail: pathResult.detail,
+    };
+  }
+  if (pathResult.exitCode !== 0) {
+    return {
+      ok: false,
+      reason: "path-failed",
+      message: `graphify path exited with code ${pathResult.exitCode}`,
+      detail: { exitCode: pathResult.exitCode, stderr: pathResult.stderr.slice(0, 8_000) },
+    };
+  }
+  return {
+    ok: true,
+    answer: pathResult.stdout,
+    truncated: pathResult.stdoutTruncated,
+  };
+}
+
+interface ExplainSuccess {
+  ok: true;
+  answer: string;
+  truncated: boolean;
+}
+
+interface ExplainFailure {
+  ok: false;
+  reason: "explain-failed" | "explain-timeout";
+  message: string;
+  detail: Record<string, unknown>;
+}
+
+type ExplainResult = ExplainSuccess | ExplainFailure;
+
+/**
+ * Spec #120 / ticket #123 — run `graphify explain <node> --graph
+ * <active>` and surface the answer. Poiesis named flags translate
+ * to Graphify positional args plus the explicit `--graph` pointer.
+ * The explain target is the active generation's `graph.json`
+ * selected by the just-committed (or reused) state pointer — never a
+ * partial / in-progress generation. A non-zero exit code or runner
+ * error surfaces as the typed `explain-failed` / `explain-timeout`
+ * fallback that `explainRepositoryIntelligence` translates to its
+ * operation-specific envelope.
+ */
+async function performExplain(
+  root: string,
+  graphPath: string,
+  node: string,
+  runner: GraphifyRunner,
+  sanitizedEnv: NodeJS.ProcessEnv,
+): Promise<ExplainResult> {
+  const explainResult = await runner({
+    args: ["explain", node, "--graph", graphPath],
+    cwd: root,
+    env: sanitizedEnv,
+    timeoutMs: REPOSITORY_INTELLIGENCE_NODE_TIMEOUT_MS,
+    maxBytes: QUERY_MAX_BYTES,
+  });
+  if (!explainResult.ok) {
+    if (explainResult.code === "GRAPHIFY_TIMEOUT") {
+      return {
+        ok: false,
+        reason: "explain-timeout",
+        message: explainResult.message,
+        detail: explainResult.detail,
+      };
+    }
+    return {
+      ok: false,
+      reason: "explain-failed",
+      message: explainResult.message,
+      detail: explainResult.detail,
+    };
+  }
+  if (explainResult.exitCode !== 0) {
+    return {
+      ok: false,
+      reason: "explain-failed",
+      message: `graphify explain exited with code ${explainResult.exitCode}`,
+      detail: { exitCode: explainResult.exitCode, stderr: explainResult.stderr.slice(0, 8_000) },
+    };
+  }
+  return {
+    ok: true,
+    answer: explainResult.stdout,
+    truncated: explainResult.stdoutTruncated,
   };
 }
