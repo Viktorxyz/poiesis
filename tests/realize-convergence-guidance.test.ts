@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   init,
+  packageVersion,
   update,
 } from "../src/maintenance.js";
 import { loadManifest, serializeManifest } from "../src/manifest.js";
@@ -529,7 +530,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
     }, 60_000);
   });
 
-  describe("exact public 1.1.1 → 1.1.4 update regenerates the corrected owned projections and preserves unrelated state", () => {
+  describe("exact public 1.1.1 → current update regenerates the corrected owned projections and preserves unrelated state", () => {
     const repositories: TestRepository[] = [];
     afterEach(async () =>
       Promise.all(repositories.splice(0).map((repo) => rmLocal(repo.parent))),
@@ -538,8 +539,9 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
     it("trusted 1.1.1 predecessor update (Spec #108 / ticket #109) preserves unrelated OpenCode + models + tracker + delivery + complete skill installation state while regenerating the corrected owned projections", async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
+      const currentVersion = await packageVersion();
       // Seed a non-empty representative preexisting default-skill
-      // installation BEFORE init so the 1.1.1 → 1.1.4 update can prove
+      // installation BEFORE init so the 1.1.1 → current update can prove
       // the COMPLETE skill record (source / name / path / preexisting /
       // installedRevision / hash) survives the migration. A test that
       // only compared `skills.length` against a 0-length baseline would
@@ -587,8 +589,8 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
 
       const result = await update(repository.root, { skipSkills: true });
 
-      // Manifest + projection advance together to 1.1.4.
-      expect(result.manifest.poiesisVersion).toBe("1.1.4");
+      // Manifest + projection advance together to the current version.
+      expect(result.manifest.poiesisVersion).toBe(currentVersion);
 
       // Corrected canonical projections are written to disk and contain
       // the Spec #108 contract phrases.
@@ -685,7 +687,7 @@ describe("Spec #108 / ticket #109 Realize convergence guidance", () => {
         afterManifestBytes.toString("utf8"),
         "manifest.json",
       );
-      expect(afterManifestOnDisk.poiesisVersion).toBe("1.1.4");
+      expect(afterManifestOnDisk.poiesisVersion).toBe(currentVersion);
     }, 60_000);
   });
 });
