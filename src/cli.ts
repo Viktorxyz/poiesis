@@ -54,6 +54,7 @@ Usage:
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
+  poiesis repository status                              # Spec #120 / ticket #121 — mechanical uv / cache state; never downloads, never asks the Author
 
 All commands accept --cwd <path>. Output and errors are structured JSON.
 `;
@@ -104,6 +105,8 @@ async function main(argv: string[]): Promise<void> {
       return commandTracker(rest);
     case "session":
       return commandSession(rest);
+    case "repository":
+      return commandRepository(rest);
     default:
       throw new PoiesisError("UNKNOWN_COMMAND", `Unknown command: ${command}`, { command });
   }
@@ -758,6 +761,36 @@ async function commandSession(args: string[]): Promise<void> {
       strict: boolean(values, "strict"),
     }),
   );
+}
+
+/**
+ * Spec #120 / ticket #121 — `poiesis repository status`.
+ *
+ * The first (and for now only) subcommand of `poiesis repository`. It
+ * reports the mechanical Repository Intelligence state without
+ * downloading anything: `uv` availability, cache presence, cache
+ * validity, and the engine-stamp reason code. The status command MUST
+ * NOT spawn a network-bound subprocess; it is intentionally read-only
+ * so agents and operators can probe the integration health without
+ * altering the cache.
+ *
+ * Exported as a library seam (matching the `commandInit` /
+ * `commandUpdate` / `commandModel` / `commandTracker` pattern) so the
+ * structured-JSON contract can be tested directly.
+ */
+export async function commandRepository(args: string[]): Promise<void> {
+  const operation = args[0];
+  if (operation !== "status") {
+    throw new PoiesisError("UNKNOWN_COMMAND", `Unknown repository subcommand: ${operation ?? ""}`, {
+      subcommand: operation ?? "",
+      supported: ["status"],
+    });
+  }
+  const values = options(args.slice(1), { cwd: { type: "string" } });
+  const cwd = cwdOf(values);
+  const repoRoot = await resolveGitRoot(cwd);
+  const { repositoryIntelligenceStatus } = await import("./repository-intelligence.js");
+  writeSuccess("repository.status", await repositoryIntelligenceStatus(repoRoot));
 }
 
 function options(

@@ -24,6 +24,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 - Node.js `>=22.20.0`
 - Git
 - OpenCode `1.18.29`, `1.18.30`, or `1.18.31` (see [COMPATIBILITY.md](./COMPATIBILITY.md) for the verified adapter-v1 contract)
+- **Repository Intelligence standard requirement (Poiesis v1.2):** `uv` (https://docs.astral.sh/uv/) on PATH. `uv` is the exact-version runtime that launches the pinned Graphify engine; it is invoked via `uvx --python 3.12 --from graphifyy==<pin> graphify ...`. A missing `uv` makes `poiesis init` and `poiesis update` fail closed before any canonical mutation with the typed `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` error; `poiesis doctor` reports the same condition as a hard `fail`. Poiesis does not install `uv`, does not vendor Python, does not offer a fallback flag, and does not ask the Author a question about it.
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
 - A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))

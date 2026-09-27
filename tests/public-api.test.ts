@@ -155,6 +155,45 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
+  // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
+  // capability stays internal to the CLI / runtime. No value, no
+  // constant, no helper, no status probe, and no destructive cache
+  // seam reaches the package root. The capability is reached only
+  // through `poiesis repository status` (CLI) and the init / update /
+  // doctor / uninstall maintenance flows. Promoting any of these
+  // names would lock the Graphify pin, the cache layout, the
+  // ownership-validator contract, and the uv requirement gate into a
+  // public API before later tickets (#122, #123, #124) stabilize
+  // them. Every currently-leaked name is enumerated below so the
+  // public-API regression test fails fast if the package root
+  // accidentally re-exports any of them.
+  // Constants and pinned-runtime identifiers
+  "REPOSITORY_INTELLIGENCE_ENGINE",
+  "GRAPHIFY_VERSION",
+  "GRAPHIFY_PACKAGE",
+  "GRAPHIFY_PYTHON",
+  "REPOSITORY_INTELLIGENCE_STATE_SCHEMA",
+  "REPOSITORY_INTELLIGENCE_RELATIVE_DIRECTORY",
+  "REPOSITORY_INTELLIGENCE_STATE_RELATIVE_PATH",
+  "REPOSITORY_INTELLIGENCE_CACHE_RELATIVE_DIRECTORY",
+  "REPOSITORY_INTELLIGENCE_GRAPHIFY_RELATIVE_PATH",
+  "REPOSITORY_INTELLIGENCE_GITIGNORE_LINE",
+  // Path-derivation helpers
+  "repositoryIntelligenceCachePath",
+  "repositoryIntelligenceStatePath",
+  "repositoryIntelligenceGraphifyPath",
+  // Status / availability probes
+  "repositoryIntelligenceStatus",
+  "probeUvAvailability",
+  "assertUvRequirement",
+  // Destructive cache seams owned by init / uninstall
+  "purgeRepositoryIntelligenceCache",
+  "validateRepositoryIntelligenceCache",
+  "removeValidatedRepositoryIntelligenceCache",
+  "stampRepositoryIntelligenceCache",
+  // Internal path predicate + state descriptor
+  "isCachePathInside",
+  "describeRepositoryIntelligenceState",
 ] as const;
 
 const forbiddenTypes = [
@@ -227,6 +266,16 @@ const forbiddenTypes = [
   "ModelSelection",
   // Ticket #68: the settle-once prompt's argument bag stays internal.
   "SettleOnceLinePromptArgs",
+  // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
+  // type surface stays internal to the CLI / runtime. No status
+  // shape, no state envelope, no destructive cache result type
+  // reaches the package root. Every currently-leaked type is
+  // enumerated below so a future re-export regresses immediately
+  // instead of silently freezing the v1.2 contract.
+  "RepositoryIntelligenceStatus",
+  "RepositoryIntelligenceState",
+  "RepositoryIntelligenceCacheValidation",
+  "RepositoryIntelligenceRemovalResult",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
