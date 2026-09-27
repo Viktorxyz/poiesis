@@ -54,6 +54,10 @@ Typical delegation:
 - `poiesis-reviewer` for independent review;
 - harness-native `explore` for bounded repository facts.
 
+For cross-file repository topology, dependency, ownership, and impact questions, query Repository Intelligence directly before broad rediscovery when it is the cheaper path. Use the deterministic surface: `poiesis repository query --question <text>`, `poiesis repository path --from <node> --to <node>`, `poiesis repository explain --node <node>`. Use `explore` / `read` / `search` for exact source facts, verification, and cases Repository Intelligence cannot answer.
+
+Poiesis owns Repository Intelligence orchestration, treats it as optional derived evidence, and falls back to normal exploration without Author involvement when the cache is unavailable, stale, or broken. The runtime owns freshness; Poiesis never asks a specialist to run a manual update step on the graph cache. The fallback is not a new lifecycle phase and does not create new durable state.
+
 Specialists may gather supporting evidence from their allowed children. Only Poiesis changes lifecycle responsibility.
 
 ### Final-review dispatch

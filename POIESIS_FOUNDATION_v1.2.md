@@ -1,10 +1,10 @@
-# Poiesis — Foundation v1
+# Poiesis — Foundation v1.2
 
 > **A philosophy and method for turning human intent into working, proven software.**
 
 **Canonical design document**  
-**Status:** Foundation v1.1 — implementation handoff baseline  
-**Date:** 2026-09-07  
+**Status:** Foundation v1.2 — implementation handoff baseline for the Poiesis v1.2 release  
+**Date:** 2026-09-25  
 **Product name:** Poiesis  
 **Recommended pronunciation:** **poy-EE-sis** (`/pɔɪˈiːsɪs/`)  
 **CLI name:** `poiesis`  
@@ -15,7 +15,7 @@
 
 ## 0. How to read this document
 
-This file is the **single canonical source of truth for the Poiesis v1.1 design**.
+This file is the **single canonical source of truth for the Poiesis v1.2 design**.
 
 For exact operational wording, the installed `PHILOSOPHY.md`, `METHOD.md`, and role files in this bundle are normative projections of this Foundation and should remain behaviorally consistent with it.
 
@@ -671,6 +671,74 @@ Understand is complete when:
 - acceptance can be stated;
 - consequential constraints are known;
 - no unresolved Author-owned decision blocks realization.
+
+---
+
+## 11.5 Repository Intelligence (v1.2)
+
+Poiesis v1.2 adds a harness-neutral internal capability called **Repository Intelligence**: a rebuildable, non-canonical, deterministic representation of repository structure used to reduce broad source rediscovery.
+
+### 11.5.1 What it is
+
+Repository Intelligence is a deterministic index built from the current source. The first v1.2 implementation engine behind the deterministic `poiesis repository query | path | explain | status` surface is Graphify, run through `uvx --python 3.12 --from graphifyy==<pin> graphify ...`. The engine is owned by the runtime; the harness-neutral name ("Repository Intelligence") is what appears in Poiesis canon.
+
+The engine is the v1.2 default, not the design. A future release can replace the engine without rewriting the Foundation canon.
+
+### 11.5.2 What it is not
+
+- Not a new lifecycle stage.
+- Not a new Author-visible workflow.
+- Not a workflow database or durable project history.
+- Not a global cross-project graph.
+- Not hosted, remote, or backed by Neo4j / FalkorDB / MCP.
+
+Repository Intelligence must be the cheapest path to a repository fact when it can answer the question economically. It is never the only path.
+
+### 11.5.3 Three trust rules
+
+1. **EXTRACTED relationships** may be used as structural evidence, subject to normal source freshness.
+2. **INFERRED relationships** are useful leads. They must be verified against the relevant current source before they become a consequential architecture commitment, an implementation constraint, a blocking review finding, or a security/reliability conclusion.
+3. **AMBIGUOUS relationships** are navigation hints only. They do not resolve a fact.
+
+### 11.5.4 Canonical role phrasing
+
+Canonical semantics should say **Repository Intelligence**. Current implementation should say **Graphify**. The wording rule preserves tool neutrality even though Graphify is the v1.2 default engine.
+
+Poiesis does NOT install, configure, or invoke:
+
+- the Graphify installer (`graphify install`, `graphify install --project --platform opencode`);
+- the Graphify OpenCode plugin;
+- the Graphify skill (`POIESIS_SKILLS.defaults` is never extended with a Graphify skill);
+- any Graphify hook or watch daemon;
+- the Graphify hosted graph server, MCP server, memory, lessons, PR dashboard, Obsidian export, GraphML, or SVG visualizations;
+- docs / PDFs / images / audio / video semantic extraction.
+
+Poiesis never modifies project `AGENTS.md` for this feature.
+
+### 11.5.5 Fallback invariant
+
+Poiesis must still be able to complete the normal Method if Repository Intelligence disappears entirely. Deleting `.poiesis/cache/repository-intelligence/` must only make the next repository query slower or force fallback to ordinary source exploration. It must not destroy:
+
+- Spec;
+- tickets;
+- workspaces;
+- Proof;
+- checkpoints;
+- tracker history;
+- delivery state;
+- project source.
+
+When Repository Intelligence is unavailable, broken, or stale, the runtime returns a typed fallback envelope (e.g. `reason: "uv-unavailable" | "engine-version-mismatch" | "cache-invalid" | "refresh-failed" | "graph-invalid" | "graph-empty" | "query-failed" | "query-timeout"`) and Poiesis continues with ordinary `explore` / `read` / `search`. The fallback is not a new lifecycle phase.
+
+### 11.5.6 Freshness is runtime-owned
+
+Models are never asked to decide whether the graph is stale. The runtime owns freshness: every `poiesis repository query | path | explain` call ensures a current graph before it answers. A failed refresh never silently serves stale graph evidence.
+
+The runtime builds the initial code-only graph through `graphify extract . --code-only --no-viz`. Subsequent updates run `graphify update . --no-viz` against the pinned engine. Refactor / shrink conditions do NOT trigger automatic `--force`; a bounded typed failure surfaces and Poiesis falls back.
+
+### 11.5.7 Engine pinning
+
+A Poiesis release owns an exact Graphify pin. The pin lives in the runtime source. Moving the pin in a future Poiesis release is an `update`-driven cache invalidation, not a Graphify-managed migration. The Manifest does NOT record a separate `graphifyVersion`; the canonical `manifest.poiesisVersion` already identifies the exact runtime, and the runtime owns the engine pin.
 
 ---
 

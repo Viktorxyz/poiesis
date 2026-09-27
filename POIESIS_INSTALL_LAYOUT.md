@@ -4,6 +4,10 @@ This source bundle is intentionally flat so it can live in `/poiesis` during imp
 
 The installer must project these source files into a consumer repository as follows.
 
+The canonical design document is `POIESIS_FOUNDATION_v1.2.md` (kept in the GitHub repository, not the npm tarball). The Foundation is the single source of truth for the Poiesis v1.2 design; older Foundation revisions are not shipped and not canonical — Git history preserves prior versions.
+
+The Repository Intelligence cache is owned Poiesis local state under `.poiesis/cache/repository-intelligence/`. The directory is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. Foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
+
 ## Canonical Poiesis files
 
 These source files are projected into the consumer repo by the runtime (`src/templates.ts::templateMappings` and the `init`/`update`/`update --config` transactions). They are also included in the published `poiesis-cli` package per `package.json::files[]`.

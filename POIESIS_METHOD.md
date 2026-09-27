@@ -16,6 +16,8 @@ Determine the intended outcome, acceptance, and consequential constraints.
 
 Discover technical facts from the repository, tracker history, project documentation, and current external documentation instead of asking the Author for discoverable facts.
 
+For cross-file repository topology, dependency, ownership, or impact questions, query **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) before broad source rediscovery when it is the cheaper path. Verify consequential conclusions against the relevant current source.
+
 Ask the Author only for consequential decisions they actually own.
 
 Use maintained questioning/domain methods when ambiguity materially affects behavior, architecture, security, compatibility, data ownership, or other hard-to-reverse choices.
@@ -81,6 +83,10 @@ Do not rely on stale model knowledge when current specialized knowledge material
 
 Use a fresh strong Planner.
 
+For architecture, dependency, ownership, impact, and cross-file questions, the Planner queries **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) before broad repository search when that is likely to reduce exploration. Verifies consequential graph-derived conclusions against the relevant current source.
+
+An `INFERRED` or `AMBIGUOUS` graph relationship is a lead, not sufficient evidence for a consequential commitment.
+
 The Planner resolves consequential technical design:
 - architectural placement;
 - responsibilities;
@@ -93,6 +99,8 @@ The Planner resolves consequential technical design:
 - ticket-decomposition constraints.
 
 The Planner should be architecturally decisive and implementation-permissive.
+
+Do not paste large graph output into the Spec. Only actual consequential conclusions survive into the Spec.
 
 Do not create a separate durable local plan file in the primary method.
 
@@ -140,6 +148,8 @@ Execute tickets in dependency order on one Poiesis-owned change branch.
 Realize continues only for a concrete unsatisfied authorized obligation or for new evidence the current realization cannot satisfy. Poiesis does not continue work merely because more work can be done.
 
 Worker runs relevant focused ticket checks and returns `ready_for_review` only when implementation exists, focused checks pass, and no known ticket-blocking defect remains. Unrelated failures absent causal evidence are bounded Concerns in the return, not new debugging missions. Do not rerun the same failing command absent relevant mutation or a concrete new hypothesis.
+
+Worker may use **Repository Intelligence** for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful. Worker always reads the actual files being changed; Worker never implements from graph summaries alone. Repository Intelligence is bounded discovery evidence; the candidate source is review evidence.
 
 Reviewer findings are evidence, not commands. Distinguish material correctness, security, reliability, spec, standards, and design issues from optional preferences; only material contract-relevant issues block. Return bounded PASS, or actionable bounded FAIL grouped by root cause. Repeated reopening of one semantic area triggers reassessment/Replan, not one-finding/one-ticket churn. Tickets are the smallest coherent engineering outcomes. Child context/returns stay bounded and do not duplicate irrelevant discovery.
 
@@ -204,6 +214,8 @@ The exact candidate identity that flows from Prove into Publish and Preview is o
 - `standardsReview`: `{ verdict: PASS, reviewerIdentity }` from a fresh reasoning Standards Review.
 
 Every required field must be present for the same clean candidate. Publish and Preview both consume that exact proof and refuse to operate without it.
+
+Reviewers may use **Repository Intelligence** as bounded discovery evidence (callers, impact radius, cross-module dependencies), but the exact candidate source remains authoritative. Repository Intelligence is not part of Proof identity; graph hashes and cache state must never appear in `candidateSha`, `candidateTree`, `verified`, `specReview`, `standardsReview`, or any Publish / Preview / Integration evidence field.
 
 ### Verify
 
@@ -388,3 +400,5 @@ Then:
 - Durable project truth must be recoverable from ordinary project infrastructure.
 - Session cleanup is hygiene, not a correctness dependency.
 - Do not repeat work without new evidence or a meaningful change in approach.
+- Prefer focused Repository Intelligence queries over broad mechanical rediscovery when the index can answer the question economically.
+- Repository Intelligence is a rebuildable, non-canonical local state, not durable project truth; an unavailable or stale cache falls back to ordinary source exploration without blocking the Method. The fallback is not a new lifecycle phase and does not create new durable state.
