@@ -42,6 +42,22 @@ const GRAPHIFY_AS_ENGINE =
 
 const VERSION_ANCHOR = "v1.2";
 
+// Spec #120 / ticket #126 — the Foundation must prescribe the SAME
+// Graphify invocation shape that the runtime actually issues. The
+// pinned engine is Graphify 0.9.70 (per `GRAPHIFY_VERSION` in
+// `src/repository-intelligence.ts`); 0.9.70's supported flags are
+// `extract <root> --code-only --no-cluster --out <generation>` and
+// `update <root> --out <generation>` (the runtime builds these
+// argvs in `refreshRepositoryIntelligence` at the bottom of
+// `src/repository-intelligence.ts`). `--no-viz` was an older
+// visualization-suppression flag that is not in the supported
+// 0.9.70 surface; the Foundation MUST NOT prescribe it.
+const FOUNDATION_REFRESH_ARGV = /extract[^`\n]*--code-only[^`\n]*--no-cluster[^`\n]*--out[^`\n]*<generation>|extract[^`\n]*<root>[^`\n]*--code-only[^`\n]*--no-cluster[^`\n]*--out/i;
+
+const FOUNDATION_UPDATE_ARGV = /update[^`\n]*--out[^`\n]*<generation>|update[^`\n]*<root>[^`\n]*--out/i;
+
+const FOUNDATION_NO_VIZ = /--no-viz/;
+
 describe("Spec #120 / ticket #124 Foundation v1.2 rename / update", () => {
   it("POIESIS_FOUNDATION_v1.2.md exists as the single canonical Foundation file", () => {
     const path = join(REPO_ROOT, "POIESIS_FOUNDATION_v1.2.md");
@@ -112,5 +128,34 @@ describe("Spec #120 / ticket #124 Foundation v1.2 rename / update", () => {
     expect(foundation).toMatch(/INFERRED[\s\S]*verif|verif[\s\S]*INFERRED/i);
     expect(foundation).toMatch(/AMBIGUOUS[\s\S]*navigation|AMBIGUOUS[\s\S]*hint/i);
     expect(foundation).toMatch(/verif[\s\S]{0,200}?current source|current source[\s\S]{0,200}?verif/i);
+  });
+
+  it("POIESIS_FOUNDATION_v1.2.md prescribes the runtime's actual Graphify extract argv (--code-only --no-cluster --out <generation>)", async () => {
+    const foundation = await readRepoFile("POIESIS_FOUNDATION_v1.2.md");
+    expect(foundation).toMatch(FOUNDATION_REFRESH_ARGV);
+  });
+
+  it("POIESIS_FOUNDATION_v1.2.md prescribes the runtime's actual Graphify update argv (--out <generation>)", async () => {
+    const foundation = await readRepoFile("POIESIS_FOUNDATION_v1.2.md");
+    expect(foundation).toMatch(FOUNDATION_UPDATE_ARGV);
+  });
+
+  it("POIESIS_FOUNDATION_v1.2.md does not prescribe the unsupported `--no-viz` flag (not in the pinned Graphify 0.9.70 surface)", async () => {
+    const foundation = await readRepoFile("POIESIS_FOUNDATION_v1.2.md");
+    expect(foundation).not.toMatch(FOUNDATION_NO_VIZ);
+  });
+
+  it("README_DOWNLOAD_LIST.md ships as the v1.2 source bundle (the singular canonical Foundation)", async () => {
+    // Spec #120 / ticket #126 — the v1.2 release must not leave a
+    // v1.1 download list in the repo. The canonical Foundation is
+    // singular (`POIESIS_FOUNDATION_v1.2.md`); the v1.1 Foundation
+    // is preserved only in Git history. A parallel v1.1 download list
+    // that still references `POIESIS_FOUNDATION_v1.1.md` would
+    // invite drift back to the old canon.
+    const downloadList = await readRepoFile("README_DOWNLOAD_LIST.md");
+    expect(downloadList).toContain("v1.2");
+    expect(downloadList).not.toMatch(/v1\.1/i);
+    expect(downloadList).toContain("POIESIS_FOUNDATION_v1.2.md");
+    expect(downloadList).not.toMatch(/POIESIS_FOUNDATION_v1\.1\.md/);
   });
 });

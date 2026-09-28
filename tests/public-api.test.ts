@@ -320,6 +320,24 @@ const forbiddenTypes = [
   "RepositoryIntelligenceQueryReason",
   "RepositoryIntelligenceRefresh",
   "RepositoryIntelligenceRefreshKind",
+  // Ticket #123: every path / explain runtime type stays internal. The
+  // success envelope, the operation-specific fallback envelope, the
+  // reason code, the outcome union, and the caller-options shape must
+  // all stay internal so the post-refresh graphify argv, the typed
+  // fallback reason code, and the success-envelope shape can evolve
+  // without freezing into a public API before later tickets (#124,
+  // #125, …) stabilize them. Every name is enumerated below so a
+  // future re-export regresses immediately.
+  "RepositoryIntelligencePathOptions",
+  "RepositoryIntelligencePathOutcome",
+  "RepositoryIntelligencePathSuccess",
+  "RepositoryIntelligencePathFallback",
+  "RepositoryIntelligencePathReason",
+  "RepositoryIntelligenceExplainOptions",
+  "RepositoryIntelligenceExplainOutcome",
+  "RepositoryIntelligenceExplainSuccess",
+  "RepositoryIntelligenceExplainFallback",
+  "RepositoryIntelligenceExplainReason",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

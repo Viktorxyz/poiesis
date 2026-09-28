@@ -734,7 +734,7 @@ When Repository Intelligence is unavailable, broken, or stale, the runtime retur
 
 Models are never asked to decide whether the graph is stale. The runtime owns freshness: every `poiesis repository query | path | explain` call ensures a current graph before it answers. A failed refresh never silently serves stale graph evidence.
 
-The runtime builds the initial code-only graph through `graphify extract . --code-only --no-viz`. Subsequent updates run `graphify update . --no-viz` against the pinned engine. Refactor / shrink conditions do NOT trigger automatic `--force`; a bounded typed failure surfaces and Poiesis falls back.
+The runtime builds the initial code-only graph through `graphify extract <root> --code-only --no-cluster --out <generation>`. Subsequent updates run `graphify update <root> --out <generation>` against the pinned engine. Refactor / shrink conditions do NOT trigger automatic `--force`; a bounded typed failure surfaces and Poiesis falls back. The argv mirrors the runtime's exact `refreshArgs` construction in `src/repository-intelligence.ts` (`extract` vs `update` is decided by the refresh kind; `--out <generationPath>` keeps the output inside the owned generations root; `--code-only --no-cluster` keeps the extract code-only and never invokes an LLM).
 
 ### 11.5.7 Engine pinning
 
