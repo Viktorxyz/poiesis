@@ -255,7 +255,10 @@ describe("ticket #127 identity-safe refresh lock: release identity", () => {
     expect(afterRelease!.token).toBe(foreignToken);
     expect(afterRelease!.token).not.toBe(tokenA);
 
-    // No leaked guard or sidecar files from the release protocol.
+    // No leaked guard or captured-sidecar files from the release
+    // protocol — the protocol does NOT use a rename/sidecar capture
+    // path; the foreign lock is preserved verbatim at the canonical
+    // path.
     expect(await listLockArtifacts(root)).toEqual([".refresh.lock"]);
 
     await rm(lockPath(root), { force: true });
@@ -280,8 +283,12 @@ describe("ticket #127 identity-safe refresh lock: release identity", () => {
     const releaseA = await acquireRefreshLock(root);
     // Replace the lock with a completely malformed blob — neither a
     // valid JSON envelope nor a known token. The release must NOT
-    // delete this foreign content; it must preserve it so the next
-    // acquirer can decide.
+    // delete this foreign content; it must preserve it at the
+    // canonical path. The runtime cannot tell "absent" from "malformed"
+    // by the snapshot alone, so the next acquirer's `wx` against the
+    // canonical path will hit `EEXIST` and the acquire will time out
+    // with `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT`; recovery
+    // from a malformed canonical is the operator's responsibility.
     const path = lockPath(root);
     await mkdir(join(path, ".."), { recursive: true });
     await writeFile(path, "definitely-not-json-payload", { mode: 0o600 });
@@ -528,6 +535,125 @@ describe("ticket #127 identity-safe refresh lock: end-to-end concurrency invaria
     // reclamation); recovery is the operator's responsibility.
     expect(await exists(guardPath(root))).toBe(true);
     expect(await exists(path)).toBe(false);
+
+    await rm(guardPath(root), { force: true });
+  });
+});
+
+// ---- Ticket #128 regression: protocol artifact whitelist ----------------------
+
+/**
+ * Spec #120 / ticket #128 — refresh-lock artifact whitelist.
+ *
+ * The current `.refresh.lock.guard` `wx` protocol is the documented
+ * refresh-lock invariant: every canonical-lock mutation runs UNDER the
+ * guard via a direct read-decide-write against the canonical path
+ * with `wx` (and an exact-observation `unlink` for stale reclamation).
+ * There is intentionally NO `rename(2)` capture, NO sidecar file, and
+ * NO restore-back path. The only files that may ever appear under
+ * `.poiesis/cache/repository-intelligence/` as a side effect of the
+ * refresh-lock protocol are:
+ *
+ *   - `.refresh.lock` — the canonical lock envelope (present while
+ *     held; absent when no one holds the lock);
+ *   - `.refresh.lock.guard` — the short-lived guard file (present for
+ *     microseconds-to-milliseconds during a critical section; absent
+ *     when no contender is mutating the canonical path).
+ *
+ * This regression assertion walks the cache directory after every
+ * realistic lock-protocol scenario and asserts the file set is a
+ * subset of that whitelist. A future regression to a rename/sidecar
+ * capture path would surface as an extra `.refresh.lock.*` artifact
+ * and fail this assertion immediately.
+ */
+describe("ticket #128 identity-safe refresh lock: no sidecar / no rename-back artifact", () => {
+  let root: string;
+
+  const ALLOWED_ARTIFACT_NAMES = new Set<string>([
+    ".refresh.lock",
+    ".refresh.lock.guard",
+  ]);
+
+  async function assertOnlyWhitelistedArtifacts(label: string): Promise<void> {
+    const cacheDir = join(root, ".poiesis", "cache", "repository-intelligence");
+    if (!(await exists(cacheDir))) return;
+    const entries = await readdir(cacheDir, { withFileTypes: true });
+    const files = entries
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name)
+      .sort();
+    const unexpected = files.filter((name) => !ALLOWED_ARTIFACT_NAMES.has(name));
+    expect(
+      unexpected,
+      `unexpected refresh-lock artifact(s) after "${label}": ${unexpected.join(", ")}`,
+    ).toEqual([]);
+  }
+
+  beforeEach(async () => {
+    root = await makeRepo();
+  });
+
+  afterEach(async () => {
+    await rm(root, { recursive: true, force: true });
+  });
+
+  it("clean acquire + release leaves only the whitelisted artifacts (no sidecar)", async () => {
+    const release = await acquireRefreshLock(root);
+    // While held: only `.refresh.lock` (and possibly the short-lived
+    // `.refresh.lock.guard` if a poll catches the critical section).
+    await assertOnlyWhitelistedArtifacts("hold");
+    await release();
+    // After release: no files at all.
+    await assertOnlyWhitelistedArtifacts("release");
+    expect(await listLockArtifacts(root)).toEqual([]);
+  });
+
+  it("stale reclamation leaves only the whitelisted artifacts (no sidecar)", async () => {
+    const path = lockPath(root);
+    await writeLockSnapshot(path, { token: "stale", pid: 2_147_483_647 });
+
+    const release = await acquireRefreshLock(root);
+    await assertOnlyWhitelistedArtifacts("reclaim+hold");
+    await release();
+    await assertOnlyWhitelistedArtifacts("reclaim+release");
+
+    await rm(path, { force: true });
+  });
+
+  it("foreign replacement under release leaves only the whitelisted artifacts (no captured sidecar)", async () => {
+    const releaseA = await acquireRefreshLock(root);
+    const foreignToken = "55555555-6666-7777-8888-999999999999";
+    await writeLockSnapshot(lockPath(root), {
+      token: foreignToken,
+      pid: process.pid,
+    });
+
+    await releaseA();
+    await assertOnlyWhitelistedArtifacts("foreign-replace+release");
+
+    await rm(lockPath(root), { force: true });
+  });
+
+  it("malformed foreign replacement under release leaves only the whitelisted artifacts (no captured sidecar)", async () => {
+    const releaseA = await acquireRefreshLock(root);
+    const path = lockPath(root);
+    await mkdir(join(path, ".."), { recursive: true });
+    await writeFile(path, "definitely-not-json-payload", { mode: 0o600 });
+
+    await releaseA();
+    await assertOnlyWhitelistedArtifacts("malformed-replace+release");
+
+    await rm(path, { force: true });
+  });
+
+  it("bounded-wait failure against a stuck guard leaves only the whitelisted artifacts (no sidecar)", async () => {
+    await writeGuardSnapshot(guardPath(root), "stuck-guard-token");
+    await expect(
+      acquireRefreshLockWithTimeout(root, 500),
+    ).rejects.toMatchObject({
+      code: "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT",
+    });
+    await assertOnlyWhitelistedArtifacts("stuck-guard+timeout");
 
     await rm(guardPath(root), { force: true });
   });

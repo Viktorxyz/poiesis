@@ -1380,8 +1380,12 @@ const REFRESH_RELEASE_GUARD_TIMEOUT_MS = 5_000;
  *
  * The canonical lock file is a JSON object stamped with:
  *
- *   - `version`: a literal `1` so future tickets can evolve the shape
- *     while keeping the malformed/unknown branch reclaimable;
+ *   - `version`: a literal `1` so future tickets can evolve the shape;
+ *     a malformed or unknown envelope is collapsed to `null` by
+ *     `readCanonicalLockSnapshot` and is NEVER reclaimed by the
+ *     runtime — the acquire path fails closed with
+ *     `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT` and recovery is
+ *     the operator's responsibility;
  *   - `token`: a random UUID v4 unique to this acquisition. The token
  *     is the identity-safe ownership proof; every check below
  *     compares against `token`, never against the PID, so PID
@@ -1482,57 +1486,118 @@ function refreshTimeoutMs(options: RepositoryIntelligenceQueryOptions): number {
  *      reclaimer) could remove the replacement lock and leave the
  *      canonical path empty.
  *
- * The fix is identity-safe end-to-end:
+ * The first review pass attempted a `rename(path, sidecar)` capture
+ * with a `rename(sidecar, path)` restore on token mismatch. That
+ * protocol was withdrawn because the conditional restore could
+ * overwrite a legitimate foreign lock installed between the capture
+ * and the restore — displacement is equivalent to removal.
+ *
+ * The current fix is identity-safe end-to-end, built on a fixed
+ * `.refresh.lock.guard` file acquired atomically with `writeFile(path,
+ * payload, { flag: "wx", mode: 0o600 })`. POSIX `wx` is atomic on the
+ * same filesystem: exactly ONE contender's `wx` succeeds; everyone
+ * else observes `EEXIST` and waits. The guard is short-lived
+ * (microseconds to a few milliseconds). Every canonical-lock mutation
+ * — acquire, stale reclaim, release — runs UNDER the guard:
+ *
+ *   - Acquire (canonical absent): under the guard, `wx` a fresh UUID
+ *     token at the canonical path. On success the caller owns the
+ *     lock. On the rare `EEXIST` (pre-guard contender slipped in) the
+ *     caller retries the loop.
+ *
+ *   - Acquire (canonical present, snapshot stale): under the guard,
+ *     re-read canonical; if the second read confirms the EXACT
+ *     observed token + PID, `unlink(canonical)` then `wx` with our
+ *     fresh UUID token. If the second read sees a DIFFERENT token
+ *     (state changed under us, defensive against external observers),
+ *     refuse to mutate and let the outer loop retry. The unlink is
+ *     exact-observation-only — we never unlink a token we did not
+ *     observe.
+ *
+ *   - Acquire (canonical present, snapshot live): leave alone. The
+ *     outer loop sleeps briefly and retries until the bounded wait
+ *     expires.
+ *
+ *   - Acquire (canonical present, malformed envelope): fail closed.
+ *     `readCanonicalLockSnapshot` collapses a malformed blob (bad
+ *     JSON or an envelope with the wrong shape) to `null` rather than
+ *     throwing, so the caller cannot distinguish "absent" from
+ *     "malformed" by the snapshot alone. Under the guard the function
+ *     attempts `wx` against the canonical path; the malformed blob is
+ *     still on disk, so `wx` returns `EEXIST` and
+ *     `tryAcquireUnderGuard` returns `false`. The outer loop retries
+ *     the same shape forever until the bounded wait expires and the
+ *     runtime surfaces `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT`.
+ *     The malformed blob is NEVER unlinked by this protocol —
+ *     clearing it is the operator's responsibility (the runtime
+ *     refuses to guess which unknown bytes are stale vs. a foreign
+ *     lock it does not own).
+ *
+ *   - Release: under the guard, re-read canonical. If the observed
+ *     token matches our identity, `unlink(canonical)`. If the token
+ *     does NOT match (canonical was replaced by a foreign lock) the
+ *     release is a strict no-op: the foreign lock is preserved
+ *     verbatim at the canonical path, and the release NEVER
+ *     overwrites a foreign lock.
  *
  *   - The lock file carries a unique UUID ownership token stamped by
- *     the writer. Every atomic check below compares against `token`,
- *     not against the PID; PID recycling cannot inherit another
+ *     the writer. Every atomic check above compares against `token`,
+ *     never against the PID; PID recycling cannot inherit another
  *     process's lock.
  *
- *   - Stale reclamation is serialized through `rename(2)`. Each
- *     contender atomically renames the canonical lock file into a
- *     unique sidecar; POSIX `rename` is atomic on the same
- *     filesystem, so exactly ONE contender's rename succeeds. The
- *     other contender receives `ENOENT` and returns `"raced"` without
- *     touching the file system. The winner inspects the captured
- *     sidecar: stale → unlink; live → rename back to the canonical
- *     path. Either way, only the winner ever holds the file under a
- *     sidecar, and live locks are NEVER deleted by the protocol.
+ *   - Acquisition is bounded by
+ *     `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS` so a wedged
+ *     neighbor cannot hang the caller indefinitely; on timeout the
+ *     runtime surfaces the typed
+ *     `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT` error. A stuck
+ *     guard is the same boundary: the acquire loop polls the guard
+ *     with `REFRESH_GUARD_POLL_INTERVAL_MS` per iteration and the
+ *     release path uses the bounded `REFRESH_RELEASE_GUARD_TIMEOUT_MS`
+ *     wait. The runtime NEVER auto-reclaims a stuck guard — recovery
+ *     is the operator's responsibility.
  *
- *   - Release atomically captures the canonical file via `rename`
- *     into a unique sidecar and inspects the captured token. If the
- *     token matches the releaser's identity, the sidecar is unlinked.
- *     If the token does NOT match (the canonical file was a foreign
- *     lock), the sidecar is renamed BACK to the canonical path so
- *     the foreign lock is preserved at its current location. The
- *     release NEVER removes a foreign lock.
+ *   - There is NO `rename(2)` capture / sidecar / restore path in
+ *     this protocol. Every canonical-lock mutation under the guard is
+ *     a direct read-decide-write against the canonical path with
+ *     `wx`, so the only files that ever appear under the cache's
+ *     refresh-lock directory are `.refresh.lock` (the canonical
+ *     envelope) and `.refresh.lock.guard` (the short-lived guard).
  *
- *   - Acquisition is bounded by `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS`
- *     so a wedged neighbor cannot hang the caller indefinitely; on
- *     timeout, the runtime surfaces the typed
- *     `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT` error.
+ * Bounded residual failure modes actually observed by this protocol:
  *
- * Bounded failure modes documented in the helpers below:
+ *   - Lost `unlink`: if the exact-observed-token `unlink` itself
+ *     fails (e.g. concurrent external observer between the snapshot
+ *     read and the unlink), the `.catch(() => undefined)` absorbs
+ *     the error and the subsequent `wx` either succeeds (the path
+ *     is now free) or returns `false` on `EEXIST` (a contender
+ *     already wrote under us) and the outer loop retries against the
+ *     new state.
  *
- *   - Live-restoration race: between a reclaimer / releaser's
- *     initial `rename(path, sidecar)` and its conditional
- *     `rename(sidecar, path)` restore, another contender may write a
- *     fresh lock at the canonical path. The restore overwrites the
- *     fresh lock atomically. Per Spec #120 / ticket #127 this is a
- *     bounded failure: the leaked lock content is preserved at the
- *     sidecar's name and never deleted.
+ *   - Stale-reclaimer race under guard: the second-read verify in
+ *     `tryAcquireUnderGuard` only unlinks when `verify.token ===
+ *     snapshot.token` AND `verify.pid === snapshot.pid`. If the
+ *     canonical state changed between the two reads, the function
+ *     returns `false` and the outer loop retries — no foreign lock
+ *     is ever displaced by a stale reclaimer.
  *
- *   - Restored-corrupt-lock: if the captured sidecar parses to
- *     `null` (malformed JSON), the release treats the captured file
- *     as foreign and restores it. The next acquirer will see a
- *     malformed file and the atomic reclaimer will treat it as
- *     stale; the captured content is preserved at the canonical
- *     path.
+ *   - Release against foreign lock: `releaseUnderGuard` re-reads
+ *     canonical and unlinks only when `snapshot.token === lockToken`.
+ *     A token mismatch is a strict no-op; a foreign lock is preserved
+ *     verbatim at the canonical path with no overwrite and no
+ *     captured-sidecar artifact.
  *
- *   - Orphaned sidecar: if the restore fails (rare; e.g. the sidecar
- *     was concurrently removed by an external observer), the
- *     captured content is preserved at the sidecar's unique name. It
- *     is never unlinked by this protocol.
+ *   - Stuck guard (acquire): every waiter observes `EEXIST`, sleeps
+ *     `REFRESH_GUARD_POLL_INTERVAL_MS`, and ultimately fails closed
+ *     with `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT`. The
+ *     stuck guard file is left on disk for the operator to clear.
+ *
+ *   - Stuck guard (release): `releaseRefreshLockAtomic` returns
+ *     without mutating canonical if the guard cannot be acquired
+ *     within `REFRESH_RELEASE_GUARD_TIMEOUT_MS`. A stuck release
+ *     guard leaves the canonical file alone — the next acquire
+ *     cycle either reclaims (if the holder PID is now dead) or
+ *     fails closed with the same typed error. No automatic
+ *     recursive reclamation.
  */
 function formatRefreshLockContent(token: string): string {
   const content: RefreshLockContent = {
@@ -1666,9 +1731,15 @@ async function releaseRefreshGuard(root: string): Promise<void> {
  *   - Canonical present, live PID → leave alone. Caller retries
  *     after a bounded sleep.
  *
- *   - Canonical present, malformed envelope → treat as stale. The
- *     exact observed blob is unlinked; the next attempt `wx`-s the
- *     new unique token.
+ *   - Canonical present, malformed envelope → fail closed.
+ *     `readCanonicalLockSnapshot` collapses a malformed blob (bad
+ *     JSON or an envelope with the wrong shape) to `null`, so the
+ *     caller cannot distinguish "absent" from "malformed" by the
+ *     snapshot alone. The function attempts `wx` against the
+ *     canonical path; the malformed blob is still on disk, so `wx`
+ *     returns `EEXIST` and the function returns `false`. The
+ *     malformed blob is NEVER unlinked — clearing it is the
+ *     operator's responsibility.
  */
 async function tryAcquireUnderGuard(
   root: string,

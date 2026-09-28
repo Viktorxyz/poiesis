@@ -357,7 +357,7 @@ const forbiddenTypes = [
   // never reach the package root.
   "RefreshLockContent",
   "RefreshGuardContent",
-  "RefreshLockReclaimOutcome",
+  "REFRESH_LOCK_CONTENT_VERSION",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
