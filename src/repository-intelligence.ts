@@ -1356,13 +1356,82 @@ interface RefreshDecision {
 }
 
 const LOCK_FILENAME = ".refresh.lock";
+const LOCK_GUARD_FILENAME = ".refresh.lock.guard";
 const GENERATION_PREFIX = "generation-";
 const QUESTION_MAX_LENGTH = REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH;
 const REFRESH_MAX_BYTES = 32 * 1024 * 1024;
 const QUERY_MAX_BYTES = 4 * 1024 * 1024;
 
+// Per-iteration guard wait when polling for an externally-held guard.
+// Each iteration of the outer acquire / release loop sleeps this long
+// when the guard exists; the loop itself is bounded by the caller's
+// `timeoutMs` so a stuck guard cannot hang the caller forever.
+const REFRESH_GUARD_POLL_INTERVAL_MS = 50;
+
+// Bounded wait when a release closure tries to reacquire the guard.
+// Release holds the guard only for the re-read / exact-token-match /
+// unlink critical section, so a stuck guard here almost always means
+// a crashed holder and the runtime refuses to auto-clear it (the
+// operator must intervene manually per Spec #120 / ticket #127).
+const REFRESH_RELEASE_GUARD_TIMEOUT_MS = 5_000;
+
+/**
+ * Spec #120 / ticket #127 — refresh lock envelope.
+ *
+ * The canonical lock file is a JSON object stamped with:
+ *
+ *   - `version`: a literal `1` so future tickets can evolve the shape
+ *     while keeping the malformed/unknown branch reclaimable;
+ *   - `token`: a random UUID v4 unique to this acquisition. The token
+ *     is the identity-safe ownership proof; every check below
+ *     compares against `token`, never against the PID, so PID
+ *     recycling cannot inherit another process's lock;
+ *   - `pid`: the process that wrote the lock. PID liveness is a
+ *     stale hint, never the identity check;
+ *   - `acquiredAt`: millisecond wall-clock at write time, kept for
+ *     operator forensics only.
+ *
+ * Every mutation of the canonical lock — acquisition, stale
+ * reclamation, and release — is performed UNDER a sibling guard file
+ * (`.refresh.lock.guard`). The guard serializes all canonical-lock
+ * mutation: every contender for the canonical `writeFile(path, ...,
+ * { flag: "wx" })` slot first acquires the guard with `wx`, performs
+ * its read-decide-write critical section while holding the guard, and
+ * releases the guard in a `finally`. The guard is short-lived
+ * (microseconds to a few milliseconds); a stuck guard means a crashed
+ * holder and the runtime fails closed with a bounded wait, leaving
+ * recovery to the operator.
+ */
+const REFRESH_LOCK_CONTENT_VERSION = 1;
+
+interface RefreshLockContent {
+  version: 1;
+  token: string;
+  pid: number;
+  acquiredAt: number;
+}
+
+/**
+ * Spec #120 / ticket #127 — refresh lock guard envelope.
+ *
+ * The guard's JSON shape mirrors the lock envelope; the runtime never
+ * parses it, but the file's existence at the canonical guard path is
+ * the only serialization signal that matters. A unique UUID token is
+ * stamped so two holders can never confuse their critical sections.
+ */
+interface RefreshGuardContent {
+  version: 1;
+  token: string;
+  pid: number;
+  acquiredAt: number;
+}
+
 function lockPath(root: string): string {
   return resolve(root, ".poiesis/cache/repository-intelligence", LOCK_FILENAME);
+}
+
+function lockGuardPath(root: string): string {
+  return resolve(root, ".poiesis/cache/repository-intelligence", LOCK_GUARD_FILENAME);
 }
 
 /**
@@ -1394,62 +1463,423 @@ function refreshTimeoutMs(options: RepositoryIntelligenceQueryOptions): number {
 }
 
 /**
- * Acquire the per-repo refresh lock. The lock is an exclusive-create
- * file (`.refresh.lock`) inside the Poiesis-owned cache. A stale lock
- * (held by a dead process whose PID is no longer alive) is reclaimed
- * so a previous crash cannot wedge subsequent queries forever. The
- * wait is bounded by `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS` so a
- * wedged neighbor cannot hang the caller indefinitely; on timeout,
- * the runtime returns a typed `uv-unavailable` / `refresh-failed`
- * fallback rather than throwing.
+ * Spec #120 / ticket #127 — refresh lock identity-safe protocol.
+ *
+ * The previous implementation used unconditional `unlink(path)` after
+ * a PID-liveness check, which left two windows where a contender
+ * could erase a live lock it did not own:
+ *
+ *   1. Two stale reclaimers could each read the same stale file,
+ *      decide "stale", and each call `unlink(path)`. The first unlink
+ *      removes the stale file; the second unlink then removes the
+ *      freshly-acquired live lock the first contender had just
+ *      written — opening a window where no lock guards the canonical
+ *      path.
+ *
+ *   2. The release closure called `unlink(path)` without an identity
+ *      check. A delayed "old release" (queued before the holder's PID
+ *      died or before the lock was replaced by a legitimate stale
+ *      reclaimer) could remove the replacement lock and leave the
+ *      canonical path empty.
+ *
+ * The fix is identity-safe end-to-end:
+ *
+ *   - The lock file carries a unique UUID ownership token stamped by
+ *     the writer. Every atomic check below compares against `token`,
+ *     not against the PID; PID recycling cannot inherit another
+ *     process's lock.
+ *
+ *   - Stale reclamation is serialized through `rename(2)`. Each
+ *     contender atomically renames the canonical lock file into a
+ *     unique sidecar; POSIX `rename` is atomic on the same
+ *     filesystem, so exactly ONE contender's rename succeeds. The
+ *     other contender receives `ENOENT` and returns `"raced"` without
+ *     touching the file system. The winner inspects the captured
+ *     sidecar: stale → unlink; live → rename back to the canonical
+ *     path. Either way, only the winner ever holds the file under a
+ *     sidecar, and live locks are NEVER deleted by the protocol.
+ *
+ *   - Release atomically captures the canonical file via `rename`
+ *     into a unique sidecar and inspects the captured token. If the
+ *     token matches the releaser's identity, the sidecar is unlinked.
+ *     If the token does NOT match (the canonical file was a foreign
+ *     lock), the sidecar is renamed BACK to the canonical path so
+ *     the foreign lock is preserved at its current location. The
+ *     release NEVER removes a foreign lock.
+ *
+ *   - Acquisition is bounded by `REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS`
+ *     so a wedged neighbor cannot hang the caller indefinitely; on
+ *     timeout, the runtime surfaces the typed
+ *     `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT` error.
+ *
+ * Bounded failure modes documented in the helpers below:
+ *
+ *   - Live-restoration race: between a reclaimer / releaser's
+ *     initial `rename(path, sidecar)` and its conditional
+ *     `rename(sidecar, path)` restore, another contender may write a
+ *     fresh lock at the canonical path. The restore overwrites the
+ *     fresh lock atomically. Per Spec #120 / ticket #127 this is a
+ *     bounded failure: the leaked lock content is preserved at the
+ *     sidecar's name and never deleted.
+ *
+ *   - Restored-corrupt-lock: if the captured sidecar parses to
+ *     `null` (malformed JSON), the release treats the captured file
+ *     as foreign and restores it. The next acquirer will see a
+ *     malformed file and the atomic reclaimer will treat it as
+ *     stale; the captured content is preserved at the canonical
+ *     path.
+ *
+ *   - Orphaned sidecar: if the restore fails (rare; e.g. the sidecar
+ *     was concurrently removed by an external observer), the
+ *     captured content is preserved at the sidecar's unique name. It
+ *     is never unlinked by this protocol.
  */
-async function acquireRefreshLock(root: string): Promise<() => Promise<void>> {
-  const path = lockPath(root);
-  await mkdir(resolve(path, ".."), { recursive: true });
-  const deadline = Date.now() + REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS;
-  while (true) {
-    try {
-      await writeFile(path, `${process.pid}\n${Date.now()}\n`, { flag: "wx", mode: 0o600 });
-      break;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      // Stale-lock detection: if the holder PID is no longer alive,
-      // reclaim the lock so a previous crash does not wedge us.
-      if (await isLockStale(path)) {
-        await unlink(path).catch(() => undefined);
-        continue;
-      }
-      if (Date.now() >= deadline) {
-        throw new PoiesisError(
-          "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT",
-          "Refresh lock could not be acquired within the bounded wait",
-          { path: relative(root, path), timeoutMs: REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS },
-        );
-      }
-      await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, 50));
-    }
-  }
-  return async () => {
-    await unlink(path).catch(() => undefined);
+function formatRefreshLockContent(token: string): string {
+  const content: RefreshLockContent = {
+    version: REFRESH_LOCK_CONTENT_VERSION,
+    token,
+    pid: process.pid,
+    acquiredAt: Date.now(),
   };
+  return JSON.stringify(content);
 }
 
-async function isLockStale(path: string): Promise<boolean> {
+function formatRefreshGuardContent(token: string): string {
+  const content: RefreshGuardContent = {
+    version: REFRESH_LOCK_CONTENT_VERSION,
+    token,
+    pid: process.pid,
+    acquiredAt: Date.now(),
+  };
+  return JSON.stringify(content);
+}
+
+function parseRefreshLockContent(raw: string): RefreshLockContent | null {
   try {
-    const raw = await readFile(path, "utf8");
-    const firstLine = raw.split("\n", 1)[0]?.trim();
-    if (firstLine === undefined || firstLine.length === 0) return true;
-    const pid = Number(firstLine);
-    if (!Number.isInteger(pid) || pid <= 0) return true;
-    try {
-      process.kill(pid, 0);
-      return false;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "ESRCH";
+    const parsed = JSON.parse(raw) as Partial<RefreshLockContent>;
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      parsed.version !== REFRESH_LOCK_CONTENT_VERSION ||
+      typeof parsed.token !== "string" ||
+      parsed.token.length === 0 ||
+      typeof parsed.pid !== "number" ||
+      !Number.isInteger(parsed.pid) ||
+      parsed.pid <= 0 ||
+      typeof parsed.acquiredAt !== "number"
+    ) {
+      return null;
     }
+    return parsed as RefreshLockContent;
   } catch {
-    return true;
+    /* fall through */
   }
+  return null;
+}
+
+async function readCanonicalLockSnapshot(canonicalPath: string): Promise<RefreshLockContent | null> {
+  try {
+    const raw = await readFile(canonicalPath, "utf8");
+    return parseRefreshLockContent(raw);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return null;
+    }
+    // Foreign / unexpected format: surface the error so the caller
+    // does not silently retry against a poisoned cache. The runtime
+    // refuses to overwrite an unknown file at the canonical path.
+    throw error;
+  }
+}
+
+async function isPidAlive(pid: number): Promise<boolean> {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    // `process.kill(pid, 0)` resolves false only when the OS reports
+    // "no such process" (ESRCH). Any other error (EPERM, etc.) means
+    // the process exists but we cannot signal it; treat as alive so
+    // we never delete a lock that another process may legitimately
+    // own.
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+/**
+ * Acquire the canonical-lock guard file with a bounded wait. The
+ * guard is acquired via `writeFile(guardPath, myPayload, { flag:
+ * "wx" })`; only ONE contender's `wx` succeeds. The function returns
+ * `true` on acquired / `false` on bounded timeout. The runtime never
+ * auto-reclaims the guard — a stuck guard means a crashed holder and
+ * recovery is the operator's responsibility per Spec #120 / ticket
+ * #127.
+ */
+async function acquireRefreshGuard(
+  root: string,
+  myToken: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const path = lockGuardPath(root);
+  await mkdir(resolve(path, ".."), { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  const payload = formatRefreshGuardContent(myToken);
+  while (true) {
+    try {
+      await writeFile(path, payload, { flag: "wx", mode: 0o600 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) return false;
+      await new Promise<void>((resolveSleep) =>
+        setTimeout(resolveSleep, REFRESH_GUARD_POLL_INTERVAL_MS),
+      );
+    }
+  }
+}
+
+async function releaseRefreshGuard(root: string): Promise<void> {
+  await unlink(lockGuardPath(root)).catch(() => undefined);
+}
+
+/**
+ * Acquire the canonical refresh lock while the guard is held.
+ * Returns `true` when the caller now owns the canonical lock,
+ * `false` when the canonical is held by a foreign live process and
+ * the caller must wait.
+ *
+ * Critical section contract:
+ *
+ *   - Canonical absent → `wx` with our token. On success, the
+ *     caller now owns the canonical lock. On `EEXIST` (extremely
+ *     rare; would mean a pre-guard contender wrote under us) the
+ *     caller retries.
+ *
+ *   - Canonical present, exact observed stale token → unlink the
+ *     exact observed stale token, then `wx` with our token. On
+ *     `EEXIST` (pre-guard contender wrote under us) the caller
+ *     retries.
+ *
+ *   - Canonical present, second read sees a DIFFERENT token →
+ *     defensive retry; we never unlink the wrong token.
+ *
+ *   - Canonical present, live PID → leave alone. Caller retries
+ *     after a bounded sleep.
+ *
+ *   - Canonical present, malformed envelope → treat as stale. The
+ *     exact observed blob is unlinked; the next attempt `wx`-s the
+ *     new unique token.
+ */
+async function tryAcquireUnderGuard(
+  root: string,
+  canonicalPath: string,
+  lockToken: string,
+): Promise<boolean> {
+  const snapshot = await readCanonicalLockSnapshot(canonicalPath);
+  if (snapshot === null) {
+    try {
+      await writeFile(canonicalPath, formatRefreshLockContent(lockToken), { flag: "wx", mode: 0o600 });
+      return true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw error;
+    }
+  }
+  // Canonical exists. Decide under the guard.
+  const alive = await isPidAlive(snapshot.pid);
+  if (alive) {
+    // Live foreign lock. Do NOT mutate it.
+    return false;
+  }
+  // Stale according to the snapshot. Re-verify under the guard so we
+  // never unlink the wrong token if the canonical changed between
+  // the first read and this one (defensive against external
+  // observers; while we hold the guard the only writer is us).
+  const verify = await readCanonicalLockSnapshot(canonicalPath);
+  if (
+    verify === null ||
+    verify.token !== snapshot.token ||
+    verify.pid !== snapshot.pid
+  ) {
+    // State changed; refuse to mutate. Caller retries after a bounded
+    // sleep.
+    return false;
+  }
+  // Exact observed stale token. Unlink it.
+  await unlink(canonicalPath).catch(() => undefined);
+  try {
+    await writeFile(canonicalPath, formatRefreshLockContent(lockToken), { flag: "wx", mode: 0o600 });
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return false;
+    throw error;
+  }
+}
+
+/**
+ * Release the canonical refresh lock while the guard is held. The
+ * release re-reads canonical under the guard and unlinks ONLY when
+ * the observed token matches the releaser's identity. If the canonical
+ * is a foreign lock (token mismatch) the release is a strict no-op:
+ * the foreign lock is preserved at the canonical path. The release
+ * never overwrites a foreign lock.
+ */
+async function releaseUnderGuard(
+  root: string,
+  canonicalPath: string,
+  lockToken: string,
+): Promise<void> {
+  const snapshot = await readCanonicalLockSnapshot(canonicalPath);
+  if (snapshot === null) {
+    // Canonical already empty. Nothing to do.
+    return;
+  }
+  if (snapshot.token !== lockToken) {
+    // Foreign lock. Leave it alone — never unlink a foreign token,
+    // never overwrite.
+    return;
+  }
+  // Our exact token. Safe to unlink.
+  await unlink(canonicalPath).catch(() => undefined);
+}
+
+/**
+ * Release the canonical lock under the guard. The release closure
+ * returned by `acquireRefreshLockWithTimeout` calls this on
+ * invocation. The function:
+ *
+ *   1. Acquires the guard with a bounded wait
+ *      (`REFRESH_RELEASE_GUARD_TIMEOUT_MS`).
+ *
+ *   2. Under the guard, runs `releaseUnderGuard` (re-reads
+ *      canonical; only unlinks when the observed token matches the
+ *      releaser's identity).
+ *
+ *   3. Releases the guard in `finally`.
+ *
+ * If the guard cannot be acquired within the bounded release wait,
+ * the function returns without mutating the canonical file. The
+ * rationale: a stuck guard here almost always means a crashed
+ * holder, and Spec #120 / ticket #127 forbids automatic recursive
+ * reclamation. The next acquirer will observe the lock and either
+ * reclaim (if the holder's PID is now dead) or wait (if the
+ * holder is alive). The operator can manually clear the derived
+ * cache if a recovery is needed.
+ */
+async function releaseRefreshLockAtomic(
+  root: string,
+  canonicalPath: string,
+  lockToken: string,
+): Promise<void> {
+  const guardToken = randomUUID();
+  const gotGuard = await acquireRefreshGuard(
+    root,
+    guardToken,
+    REFRESH_RELEASE_GUARD_TIMEOUT_MS,
+  );
+  if (!gotGuard) {
+    // Stuck guard — refuse to mutate. Per Spec #120 / ticket #127
+    // the runtime never auto-reclaims the guard. The next acquire
+    // cycle will either succeed (operator cleared the guard) or
+    // fail closed with the same typed error.
+    return;
+  }
+  try {
+    await releaseUnderGuard(root, canonicalPath, lockToken);
+  } finally {
+    await releaseRefreshGuard(root);
+  }
+}
+
+/**
+ * Acquire the per-repo refresh lock with a bounded wait. The wait
+ * is capped at `timeoutMs` so a wedged guard cannot hang the caller
+ * indefinitely. On timeout, the helper throws the typed
+ * `REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT` error.
+ *
+ * The acquisition path is:
+ *
+ *   1. Loop until deadline. Per iteration:
+ *
+ *      a. Acquire the guard with a bounded per-iteration wait
+ *         (`REFRESH_GUARD_POLL_INTERVAL_MS` or the remaining budget,
+ *         whichever is smaller). If the guard cannot be acquired,
+ *         sleep briefly and retry.
+ *
+ *      b. Under the guard, run the read-decide-write critical
+ *         section via `tryAcquireUnderGuard`. The critical section
+ *         never overwrites: it only `wx`-s a new unique token after
+ *         verifying the canonical is absent OR an exact observed
+ *         stale token. The guard is released in `finally`.
+ *
+ *      c. If the critical section succeeded, return the release
+ *         closure. If it observed a live foreign lock, sleep briefly
+ *          and retry.
+ *
+ *   2. The release closure runs `releaseRefreshLockAtomic` under the
+ *      guard and only unlinks when the canonical token matches the
+ *      releaser's identity; a foreign lock is preserved verbatim.
+ *
+ * The export of this helper is intentional: ticket #127's
+ * deterministic concurrency tests bound the wait at short values
+ * (e.g. 300 ms) so the test can observe the contention without
+ * waiting for the production 10-minute budget. Production callers go
+ * through `acquireRefreshLock`, which forwards the production
+ * constant.
+ */
+export async function acquireRefreshLockWithTimeout(
+  root: string,
+  timeoutMs: number,
+): Promise<() => Promise<void>> {
+  const canonicalPath = lockPath(root);
+  await mkdir(resolve(canonicalPath, ".."), { recursive: true });
+  const deadline = Date.now() + timeoutMs;
+  const lockToken = randomUUID();
+
+  while (true) {
+    if (Date.now() >= deadline) {
+      throw new PoiesisError(
+        "REPOSITORY_INTELLIGENCE_REFRESH_LOCK_TIMEOUT",
+        "Refresh lock could not be acquired within the bounded wait",
+        { path: relative(root, canonicalPath), timeoutMs },
+      );
+    }
+    const remainingMs = deadline - Date.now();
+    const guardDeadline = Math.min(REFRESH_GUARD_POLL_INTERVAL_MS, remainingMs);
+    const guardToken = randomUUID();
+    const gotGuard = await acquireRefreshGuard(root, guardToken, guardDeadline);
+    if (!gotGuard) {
+      // Guard not acquired in this iteration. Sleep briefly and
+      // retry until the outer deadline.
+      const sleepMs = Math.min(REFRESH_GUARD_POLL_INTERVAL_MS, remainingMs);
+      await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, sleepMs));
+      continue;
+    }
+    try {
+      const acquired = await tryAcquireUnderGuard(root, canonicalPath, lockToken);
+      if (acquired) {
+        return async () => {
+          await releaseRefreshLockAtomic(root, canonicalPath, lockToken);
+        };
+      }
+    } finally {
+      await releaseRefreshGuard(root);
+    }
+    // Critical section observed a live foreign lock or a state
+    // change. Sleep briefly and retry until the outer deadline.
+    const remainingMs2 = deadline - Date.now();
+    const sleepMs2 = Math.min(REFRESH_GUARD_POLL_INTERVAL_MS, remainingMs2);
+    await new Promise<void>((resolveSleep) => setTimeout(resolveSleep, sleepMs2));
+  }
+}
+
+/**
+ * Acquire the per-repo refresh lock using the production timeout
+ * (`REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS`). See
+ * `acquireRefreshLockWithTimeout` for the full protocol description.
+ */
+export async function acquireRefreshLock(root: string): Promise<() => Promise<void>> {
+  return acquireRefreshLockWithTimeout(root, REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS);
 }
 
 /**

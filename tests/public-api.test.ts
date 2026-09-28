@@ -221,6 +221,16 @@ const forbiddenFunctions = [
   // Internal path predicate + state descriptor
   "isCachePathInside",
   "describeRepositoryIntelligenceState",
+  // Ticket #127 (Standards finding correction): the canonical-lock
+  // acquisition seams stay internal to the CLI / runtime. The
+  // guard-serialized acquisition helper and the production entry
+  // point both live in `src/repository-intelligence.ts` and MUST
+  // NOT reach the package root. Promoting them through `src/index.ts`
+  // would lock the guard-file shape, the per-iteration guard wait,
+  // and the lock-envelope JSON into a public surface before later
+  // tickets stabilize them.
+  "acquireRefreshLock",
+  "acquireRefreshLockWithTimeout",
 ] as const;
 
 const forbiddenTypes = [
@@ -338,6 +348,16 @@ const forbiddenTypes = [
   "RepositoryIntelligenceExplainSuccess",
   "RepositoryIntelligenceExplainFallback",
   "RepositoryIntelligenceExplainReason",
+  // Ticket #127 (Standards finding correction): the canonical-lock
+  // and guard envelopes stay internal. The JSON shape, the
+  // identity-check contract, and the bounded-timeout constant must
+  // be free to evolve as later tickets stabilize them. The runtime
+  // test surface in `tests/repository-intelligence-lock-identity-safety.test.ts`
+  // reaches these through the source module directly; they must
+  // never reach the package root.
+  "RefreshLockContent",
+  "RefreshGuardContent",
+  "RefreshLockReclaimOutcome",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
