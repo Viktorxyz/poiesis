@@ -458,7 +458,7 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    expect(manifest.poiesisVersion).toBe("1.1.4");
+    expect(manifest.poiesisVersion).toBe(await packageVersion());
   }, 30_000);
 
   it("packageVersion() reads through the seam when the override is set", async () => {
@@ -468,10 +468,14 @@ describe("runtime identity boundary — helper seam (ticket #106)", () => {
 
   it("packageVersion() falls back to the workspace package.json when the seam is cleared", async () => {
     setRuntimePackageVersionOverrideForTest(null);
-    // The workspace is the local source tree at 1.1.4 (see
-    // 104__runtime-identity-boundary/package.json). The seam MUST be
-    // the only override; clearing it returns the filesystem truth.
-    expect(await packageVersion()).toBe("1.1.4");
+    // The workspace is the local source tree at the published version
+    // (see `120__repository-intelligence-v1.2/package.json`). The seam
+    // MUST be the only override; clearing it returns the filesystem
+    // truth. The expected value is sourced from the same `package.json`
+    // the seam falls back to so a version bump (e.g. 1.1.4 → 1.2.0)
+    // does not silently regress this test.
+    const fromDisk = JSON.parse(await readFile(join(import.meta.dirname, "..", "package.json"), "utf8")) as { version: string };
+    expect(await packageVersion()).toBe(fromDisk.version);
   }, 5_000);
 });
 
@@ -516,19 +520,20 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
 
   it("tracker spec get stays usable across a runtime/manifest mismatch (read-only)", async () => {
     // Setup: init creates a manifest stamped with the running package
-    // version (1.1.4). The seam then makes the runtime present as
-    // "1.0.3" while the manifest still claims "1.1.4" (Lucca-class).
-    // The fixture adapter seeds a Spec at init time, so `spec get` is
-    // a pure read.
+    // version (the workspace's published version). The seam then makes
+    // the runtime present as a mismatching version while the manifest
+    // still claims the published version (Lucca-class). The fixture
+    // adapter seeds a Spec at init time, so `spec get` is a pure read.
     const repository = await createTestRepository();
     trackerRepositories.push(repository);
+    const publishedVersion = await packageVersion();
     await init(repository.root, testConfig(repository), {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
     // First, create a Spec via the dispatcher while runtime matches so
     // the fixture tracker has an item to return.
-    setRuntimePackageVersionOverrideForTest("1.1.4");
+    setRuntimePackageVersionOverrideForTest(publishedVersion);
     const { commandTracker } = await import("../src/cli.js");
     const createCapture = captureStdout();
     try {
@@ -568,11 +573,12 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
   it("tracker ticket get stays usable across a runtime/manifest mismatch (read-only)", async () => {
     const repository = await createTestRepository();
     trackerRepositories.push(repository);
+    const publishedVersion = await packageVersion();
     await init(repository.root, testConfig(repository), {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    setRuntimePackageVersionOverrideForTest("1.1.4");
+    setRuntimePackageVersionOverrideForTest(publishedVersion);
     const { commandTracker } = await import("../src/cli.js");
     const createSpecCapture = captureStdout();
     try {
@@ -642,11 +648,12 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
   it("tracker ticket update rejects a runtime/manifest mismatch BEFORE the adapter mutation", async () => {
     const repository = await createTestRepository();
     trackerRepositories.push(repository);
+    const publishedVersion = await packageVersion();
     await init(repository.root, testConfig(repository), {
       skipSkills: true,
       allowFixtureAdapters: true,
     });
-    setRuntimePackageVersionOverrideForTest("1.1.4");
+    setRuntimePackageVersionOverrideForTest(publishedVersion);
     const { commandTracker } = await import("../src/cli.js");
     const createSpecCapture = captureStdout();
     try {

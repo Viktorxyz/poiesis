@@ -4,7 +4,7 @@ import { EventEmitter } from "node:events";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { bounded, run } from "../src/process.js";
 
 const fixtures: string[] = [];
@@ -153,6 +153,151 @@ describe("process runner", () => {
     await expect(
       run("/no/such/poiesis-process-fixture-binary", [], { cwd: tmpdir() }),
     ).rejects.toMatchObject({ code: "COMMAND_IO_ERROR" });
+  });
+});
+
+describe("replacement environment seam (ticket #129)", () => {
+  // Local child fixture: spawn a Node subprocess that writes its own
+  // process.env as JSON to stdout. This is the deterministic, network-
+  // free / project-free boundary probe required by the ticket #129
+  // standards security finding: it proves the actual child receives
+  // the env the runner intended, not the parent env.
+  const ENV_PROBE_SCRIPT = "process.stdout.write(JSON.stringify(process.env))";
+  const PROBE_ARGS = ["-e", ENV_PROBE_SCRIPT];
+
+  async function probeChildEnv(options: {
+    replacementEnv?: NodeJS.ProcessEnv;
+    env?: NodeJS.ProcessEnv;
+  }): Promise<Record<string, string>> {
+    const result = await run(process.execPath, PROBE_ARGS, {
+      cwd: tmpdir(),
+      allowFailure: true,
+      ...options,
+    });
+    expect(result.exitCode).toBe(0);
+    return JSON.parse(result.stdout) as Record<string, string>;
+  }
+
+  // Snapshot + restore the parent env around each probe so the
+  // standards-security test does not leak fake credentials into the
+  // rest of the suite. Only the keys this test touches are managed.
+  const PARENT_SECRET_KEYS = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "POIESIS_API_KEY",
+    "POIESIS_TOKEN",
+    "POIESIS_DEBUG",
+    "POIESIS_TEST_SECRET",
+  ] as const;
+
+  let parentEnvSnapshots: Map<string, string | undefined> | null = null;
+
+  function seedParentSecrets(): void {
+    parentEnvSnapshots = new Map();
+    for (const key of PARENT_SECRET_KEYS) {
+      parentEnvSnapshots.set(key, process.env[key]);
+      process.env[key] = `parent-secret-${key}`;
+    }
+  }
+
+  function restoreParentSecrets(): void {
+    if (parentEnvSnapshots === null) return;
+    for (const [key, value] of parentEnvSnapshots) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    parentEnvSnapshots = null;
+  }
+
+  beforeEach(seedParentSecrets);
+  afterEach(restoreParentSecrets);
+
+  it("child lacks provider/tracker/POIESIS secrets when replacementEnv omits them, while allowed vars reach the child", async () => {
+    const replacementEnv: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin:/bin",
+      Path: "/usr/bin:/bin",
+      HOME: "/home/sanitized-test",
+      USER: "sanitized-test",
+      LOGNAME: "sanitized-test",
+      LANG: "C.UTF-8",
+      LC_ALL: "C.UTF-8",
+      TMPDIR: "/tmp",
+      TMP: "/tmp",
+      TEMP: "/tmp",
+      XDG_RUNTIME_DIR: "/run/user/0",
+      XDG_CACHE_HOME: "/home/sanitized-test/.cache",
+      SHELL: "/bin/sh",
+    };
+    const childEnv = await probeChildEnv({ replacementEnv });
+    // Every secret the parent process owned MUST be absent from the
+    // child's env. None of these are in the sanitized replacement,
+    // so the runner must NOT re-merge them.
+    for (const key of PARENT_SECRET_KEYS) {
+      expect(childEnv[key]).toBeUndefined();
+    }
+    // Every allow-listed variable the replacement env carries MUST
+    // reach the child untouched. PATH/Path in particular must remain
+    // available so `uvx` (and any other binary the child spawns) can
+    // resolve.
+    for (const [key, value] of Object.entries(replacementEnv)) {
+      expect(childEnv[key]).toBe(value);
+    }
+  });
+
+  it("replacementEnv also strips provider/tracker/POIESIS secrets when the sanitized env includes unrelated keys", async () => {
+    // The real `defaultGraphifyRunner` passes the result of
+    // `sanitizeGraphifyEnvironment(process.env)`, which keeps only
+    // the allow-listed safe variables. Even if a future allow-list
+    // change adds unrelated-but-safe keys (e.g. CI metadata), the
+    // runner MUST NOT silently re-merge the parent secrets that the
+    // sanitization explicitly stripped.
+    const replacementEnv: NodeJS.ProcessEnv = {
+      PATH: "/usr/bin:/bin",
+      HOME: "/home/test",
+      USER: "test",
+      // An unrelated, non-secret key intentionally present in the
+      // sanitized env — proves the runner does NOT collapse the
+      // replacement env to a fixed allowlist, only that it does not
+      // re-merge the parent env on top.
+      POIESIS_REFRESH_LOCK_DIR: "/var/lock/poiesis",
+    };
+    const childEnv = await probeChildEnv({ replacementEnv });
+    expect(childEnv.POIESIS_REFRESH_LOCK_DIR).toBe("/var/lock/poiesis");
+    for (const key of PARENT_SECRET_KEYS) {
+      expect(childEnv[key]).toBeUndefined();
+    }
+  });
+
+  it("default behavior (no replacementEnv) still merges the parent env via the legacy `env` option", async () => {
+    // Backward-compatibility invariant for every existing caller.
+    // When `replacementEnv` is NOT supplied, the runner MUST continue
+    // to merge `{...process.env, ...options.env}` so existing call
+    // sites (git, gh, glab, init, update, doctor, skills, ...) keep
+    // their parent-env inheritance.
+    const childEnv = await probeChildEnv({
+      env: { POIESIS_PROBE_OVERLAY: "overlay-value" },
+    });
+    expect(childEnv.POIESIS_PROBE_OVERLAY).toBe("overlay-value");
+    // A parent secret that the test seeded above must still be
+    // present in the child, because the legacy merge path does not
+    // strip — that is the documented behavior every existing caller
+    // depends on.
+    expect(childEnv.OPENAI_API_KEY).toBe("parent-secret-OPENAI_API_KEY");
+    expect(childEnv.POIESIS_API_KEY).toBe("parent-secret-POIESIS_API_KEY");
+  });
+
+  it("rejects passing both env and replacementEnv as INVALID_RUN_OPTIONS (fail-closed)", async () => {
+    await expect(
+      run(process.execPath, PROBE_ARGS, {
+        cwd: tmpdir(),
+        allowFailure: true,
+        env: { POIESIS_PROBE: "env" },
+        replacementEnv: { POIESIS_PROBE: "replacement" },
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_RUN_OPTIONS" });
   });
 });
 

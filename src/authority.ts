@@ -252,10 +252,34 @@ export function predecessorProjectionV100V101V102(
       }
       if (patch.path[1] === "poiesis-reviewer") {
         const installed = patch.value as Record<string, unknown>;
-        const permission = {
-          ...(installed.permission as Record<string, unknown>),
-          task: { explore: "allow" },
-        };
+        // Spec #120 / ticket #123 — the 1.0.x predecessor projection
+        // had NO bash surface for the ticket Reviewer; strip the
+        // v1.2 narrow Repository Intelligence bash surface so the
+        // projection stays byte-for-byte equivalent to what the
+        // legacy 1.0.0 / 1.0.1 / 1.0.2 install actually wrote to
+        // disk.
+        const permission = { ...(installed.permission as Record<string, unknown>) };
+        delete permission.bash;
+        permission.task = { explore: "allow" };
+        return { ...patch, value: { ...installed, permission } };
+      }
+      // Spec #120 / ticket #123 — the 1.0.x predecessor projection
+      // had NO bash surface for the planner / final-reviewer /
+      // research subagents. A predecessor manifest that matches the
+      // 1.0.x shape therefore must not carry the v1.2 narrow
+      // Repository Intelligence bash surface for those agents. Strip
+      // the bash key from every non-primary/non-worker/reviewer agent
+      // so the predecessor projection stays byte-for-byte equivalent
+      // to what the legacy 1.0.0 / 1.0.1 / 1.0.2 install actually
+      // wrote to disk.
+      if (
+        patch.path[1] === "poiesis-planner" ||
+        patch.path[1] === "poiesis-final-reviewer" ||
+        patch.path[1] === "poiesis-research"
+      ) {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = { ...(installed.permission as Record<string, unknown>) };
+        delete permission.bash;
         return { ...patch, value: { ...installed, permission } };
       }
     }

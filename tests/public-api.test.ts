@@ -155,6 +155,82 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
+  // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
+  // capability stays internal to the CLI / runtime. No value, no
+  // constant, no helper, no status probe, and no destructive cache
+  // seam reaches the package root. The capability is reached only
+  // through `poiesis repository status` (CLI) and the init / update /
+  // doctor / uninstall maintenance flows. Promoting any of these
+  // names would lock the Graphify pin, the cache layout, the
+  // ownership-validator contract, and the uv requirement gate into a
+  // public API before later tickets (#122, #123, #124) stabilize
+  // them. Every currently-leaked name is enumerated below so the
+  // public-API regression test fails fast if the package root
+  // accidentally re-exports any of them.
+  // Constants and pinned-runtime identifiers
+  "REPOSITORY_INTELLIGENCE_ENGINE",
+  "GRAPHIFY_VERSION",
+  "GRAPHIFY_PACKAGE",
+  "GRAPHIFY_PYTHON",
+  "REPOSITORY_INTELLIGENCE_STATE_SCHEMA",
+  "REPOSITORY_INTELLIGENCE_RELATIVE_DIRECTORY",
+  "REPOSITORY_INTELLIGENCE_STATE_RELATIVE_PATH",
+  "REPOSITORY_INTELLIGENCE_CACHE_RELATIVE_DIRECTORY",
+  "REPOSITORY_INTELLIGENCE_GRAPHIFY_RELATIVE_PATH",
+  "REPOSITORY_INTELLIGENCE_GITIGNORE_LINE",
+  // Ticket #122: query runtime surface (constants, runner seam, and
+  // the top-level query entry point). Every name stays internal so
+  // the Graphify invocation shape, the env-sanitization contract,
+  // and the typed fallback envelope cannot freeze into the public
+  // API before later tickets stabilize them.
+  "REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS",
+  "REPOSITORY_INTELLIGENCE_QUERY_TIMEOUT_MS",
+  "REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS",
+  "REPOSITORY_INTELLIGENCE_QUESTION_MAX_LENGTH",
+  "REPOSITORY_INTELLIGENCE_GENERATIONS_RELATIVE_DIRECTORY",
+  "repositoryIntelligenceGenerationsPath",
+  "repositoryIntelligenceGenerationPath",
+  "sanitizeGraphifyEnvironment",
+  "buildGraphifyInvocation",
+  "defaultGraphifyRunner",
+  "queryRepositoryIntelligence",
+  // Ticket #123: path / explain runtime surface (identifier-length
+  // bound, node-call timeout, top-level entry points, and the
+  // operation-specific fallback envelopes). Every name stays
+  // internal for the same reason as the query seam: the post-refresh
+  // graphify argv, the typed fallback reason code, and the
+  // success-envelope shape must be free to evolve as later tickets
+  // (#124, #125, …) stabilize them.
+  "REPOSITORY_INTELLIGENCE_NODE_MAX_LENGTH",
+  "REPOSITORY_INTELLIGENCE_NODE_TIMEOUT_MS",
+  "pathRepositoryIntelligence",
+  "explainRepositoryIntelligence",
+  // Path-derivation helpers
+  "repositoryIntelligenceCachePath",
+  "repositoryIntelligenceStatePath",
+  "repositoryIntelligenceGraphifyPath",
+  // Status / availability probes
+  "repositoryIntelligenceStatus",
+  "probeUvAvailability",
+  "assertUvRequirement",
+  // Destructive cache seams owned by init / uninstall
+  "purgeRepositoryIntelligenceCache",
+  "validateRepositoryIntelligenceCache",
+  "removeValidatedRepositoryIntelligenceCache",
+  "stampRepositoryIntelligenceCache",
+  // Internal path predicate + state descriptor
+  "isCachePathInside",
+  "describeRepositoryIntelligenceState",
+  // Ticket #127 (Standards finding correction): the canonical-lock
+  // acquisition seams stay internal to the CLI / runtime. The
+  // guard-serialized acquisition helper and the production entry
+  // point both live in `src/repository-intelligence.ts` and MUST
+  // NOT reach the package root. Promoting them through `src/index.ts`
+  // would lock the guard-file shape, the per-iteration guard wait,
+  // and the lock-envelope JSON into a public surface before later
+  // tickets stabilize them.
+  "acquireRefreshLock",
+  "acquireRefreshLockWithTimeout",
 ] as const;
 
 const forbiddenTypes = [
@@ -227,6 +303,61 @@ const forbiddenTypes = [
   "ModelSelection",
   // Ticket #68: the settle-once prompt's argument bag stays internal.
   "SettleOnceLinePromptArgs",
+  // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
+  // type surface stays internal to the CLI / runtime. No status
+  // shape, no state envelope, no destructive cache result type
+  // reaches the package root. Every currently-leaked type is
+  // enumerated below so a future re-export regresses immediately
+  // instead of silently freezing the v1.2 contract.
+  "RepositoryIntelligenceStatus",
+  "RepositoryIntelligenceState",
+  "RepositoryIntelligenceCacheValidation",
+  "RepositoryIntelligenceRemovalResult",
+  // Ticket #122: query runtime type surface (runner request /
+  // result, refresh decision, query success / fallback, options).
+  // Every name stays internal so the typed non-blocking fallback
+  // envelope, the refresh-kind label, and the Graphify runner seam
+  // cannot freeze into a public API.
+  "GraphifyRunner",
+  "GraphifyRunnerRequest",
+  "GraphifyRunnerResult",
+  "GraphifyRunnerSuccess",
+  "GraphifyRunnerError",
+  "RepositoryIntelligenceQueryOptions",
+  "RepositoryIntelligenceQueryOutcome",
+  "RepositoryIntelligenceQuerySuccess",
+  "RepositoryIntelligenceQueryFallback",
+  "RepositoryIntelligenceQueryReason",
+  "RepositoryIntelligenceRefresh",
+  "RepositoryIntelligenceRefreshKind",
+  // Ticket #123: every path / explain runtime type stays internal. The
+  // success envelope, the operation-specific fallback envelope, the
+  // reason code, the outcome union, and the caller-options shape must
+  // all stay internal so the post-refresh graphify argv, the typed
+  // fallback reason code, and the success-envelope shape can evolve
+  // without freezing into a public API before later tickets (#124,
+  // #125, …) stabilize them. Every name is enumerated below so a
+  // future re-export regresses immediately.
+  "RepositoryIntelligencePathOptions",
+  "RepositoryIntelligencePathOutcome",
+  "RepositoryIntelligencePathSuccess",
+  "RepositoryIntelligencePathFallback",
+  "RepositoryIntelligencePathReason",
+  "RepositoryIntelligenceExplainOptions",
+  "RepositoryIntelligenceExplainOutcome",
+  "RepositoryIntelligenceExplainSuccess",
+  "RepositoryIntelligenceExplainFallback",
+  "RepositoryIntelligenceExplainReason",
+  // Ticket #127 (Standards finding correction): the canonical-lock
+  // and guard envelopes stay internal. The JSON shape, the
+  // identity-check contract, and the bounded-timeout constant must
+  // be free to evolve as later tickets stabilize them. The runtime
+  // test surface in `tests/repository-intelligence-lock-identity-safety.test.ts`
+  // reaches these through the source module directly; they must
+  // never reach the package root.
+  "RefreshLockContent",
+  "RefreshGuardContent",
+  "REFRESH_LOCK_CONTENT_VERSION",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

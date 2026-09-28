@@ -854,6 +854,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     templateMappings.map((mapping) => ({ path: mapping.destination })),
   );
 
+  // Spec #120 / ticket #121 — `uv` is a STANDARD Poiesis v1.2
+  // requirement, not an optional optimization. The exact-version
+  // `uvx --python 3.12 --from graphifyy==<X> graphify ...` runner is
+  // the only supported way to launch Graphify. The requirement gate
+  // runs BEFORE any canonical mutation (no manifest write, no
+  // `.poiesis/` directory creation, no OpenCode config write, no
+  // skills install, no receipt write) so a missing `uv` leaves the
+  // repository byte-for-byte unchanged. The typed error names the
+  // missing dependency and the install entry point so an operator
+  // can retry the same `poiesis init` command once `uv` is
+  // available. No Author question is asked; no fallback flag is
+  // offered.
+  await (await import("./repository-intelligence.js")).assertUvRequirement();
+
   const openCodeConfigPath = await detectOpenCodeConfigForInit(resolvedRoot);
   await assertSafeParents(resolvedRoot, openCodeConfigPath);
   // The Poiesis version is the sole durable source of the exact-version
@@ -1520,6 +1534,93 @@ export async function doctor(root: string): Promise<DoctorReport> {
     checks.push({ id: "delivery", status: "fail", message: "Delivery configuration is invalid or missing" });
   }
 
+  // Spec #120 / ticket #121: `uv` is a STANDARD Poiesis requirement as
+  // of v1.2. A missing `uv` is a HARD doctor failure (`status: "fail"`)
+  // because every canonical lifecycle surface — init, update,
+  // uninstall, `poiesis repository status`, and (in later tickets)
+  // query / path / explain — depends on the exact-version `uvx`
+  // runner. The same condition that fails init at
+  // `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` is surfaced here as
+  // a typed actionable detail so an operator sees ONE consistent
+  // message instead of a cascading series of unrelated failures.
+  // `update` and `updateFromConfig` inherit the same failure through
+  // the existing `assertUpdateDoctorGate` predicate (which throws
+  // `UPDATE_DOCTOR_FAILED` and reverses the bounded journal).
+  // Runtime repository operations may still return a typed fallback
+  // when a previously working dependency disappears; that surface
+  // belongs to `poiesis repository status` and to later tickets'
+  // query / path / explain runtime paths, NOT to doctor.
+  try {
+    const status = await (await import("./repository-intelligence.js")).repositoryIntelligenceStatus(resolvedRoot);
+    if (!status.uvAvailable) {
+      checks.push({
+        id: "repository-intelligence-runner",
+        status: "fail",
+        message:
+          "Repository Intelligence requires `uv` on PATH (Poiesis v1.2 standard requirement); install `uv` from https://docs.astral.sh/uv/ and re-run the same Poiesis command",
+        details: {
+          engine: status.engine,
+          engineVersion: status.engineVersion,
+          python: (await import("./repository-intelligence.js")).GRAPHIFY_PYTHON,
+          uvAvailable: false,
+          requirement: "uv",
+          hint: "missing-binary",
+          action: "install-uv",
+        },
+      });
+    } else if (!status.cachePresent) {
+      checks.push({
+        id: "repository-intelligence-runner",
+        status: "pass",
+        message: "Repository Intelligence is ready; the next query will build the local cache",
+        details: {
+          engine: status.engine,
+          engineVersion: status.engineVersion,
+          uvAvailable: true,
+          cachePresent: false,
+          action: "build-on-first-query",
+        },
+      });
+    } else if (!status.cacheValid) {
+      // A stale cache (engine version mismatch or unsafe structure)
+      // is a soft `warn` because the runtime can rebuild on the next
+      // query without operator intervention; the missing `uv` case
+      // above is the only HARD failure this check reports.
+      checks.push({
+        id: "repository-intelligence-runner",
+        status: "warn",
+        message: `Repository Intelligence cache is stale (${status.reason}); the next query will rebuild it with the pinned engine`,
+        details: {
+          engine: status.engine,
+          engineVersion: status.engineVersion,
+          uvAvailable: true,
+          cachePresent: true,
+          reason: status.reason,
+          action: "rebuild-on-next-query",
+        },
+      });
+    } else {
+      checks.push({
+        id: "repository-intelligence-runner",
+        status: "pass",
+        message: "Repository Intelligence is ready",
+        details: { engine: status.engine, engineVersion: status.engineVersion, uvAvailable: true, cachePresent: true },
+      });
+    }
+  } catch (error) {
+    // A status probe failure (e.g. an unsafe cache directory) is
+    // reported as `fail` with the underlying error so the operator
+    // can investigate without guessing. The runtime cannot claim the
+    // installation is healthy when the status probe itself cannot
+    // answer.
+    checks.push({
+      id: "repository-intelligence-runner",
+      status: "fail",
+      message: "Repository Intelligence status probe failed",
+      details: errorDetails(error),
+    });
+  }
+
   return { root: resolvedRoot, ok: !checks.some((check) => check.status === "fail"), checks };
 }
 
@@ -1583,6 +1684,14 @@ async function listTree(root: string, directory: string): Promise<string[]> {
 
 function knownPoiesisPaths(manifest: Manifest): Set<string> {
   const known = new Set<string>([".poiesis", ".poiesis/manifest.json", ".poiesis/roles"]);
+  // Spec #120 / ticket #121: the Poiesis-owned Repository Intelligence
+  // cache lives under `.poiesis/cache/repository-intelligence/`. It
+  // is non-canonical local state (never recorded in the manifest), but
+  // the uninstall walker still considers it a known Poiesis path so an
+  // operator does not see "unknown content under .poiesis" warnings
+  // for cache directories the runtime owns.
+  known.add(".poiesis/cache");
+  known.add(".poiesis/cache/repository-intelligence");
   for (const file of manifest.files) {
     if (!file.path.startsWith(".poiesis/")) continue;
     known.add(file.path);
@@ -2011,6 +2120,14 @@ export async function uninstall(root: string): Promise<UninstallResult> {
 
   const known = knownPoiesisPaths(manifest);
   for (const path of await listTree(resolvedRoot, poiesisPath(resolvedRoot))) {
+    // Spec #120 / ticket #121: the Poiesis-owned Repository
+    // Intelligence cache directory (`.poiesis/cache/`) is non-canonical
+    // local state and the uninstall walker must not report its
+    // contents as "unknown content under .poiesis". Cache cleanup is
+    // owned by `removeValidatedRepositoryIntelligenceCache` below,
+    // which preserves foreign siblings and reports them via
+    // `foreignPreserved` with the canonical "foreign content" reason.
+    if (path === ".poiesis/cache" || path.startsWith(".poiesis/cache/")) continue;
     if (!known.has(path)) result.preserved.push({ path, reason: "unknown content under .poiesis" });
   }
 
@@ -2069,6 +2186,32 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   const skillResult = await removeOwnedSkills(resolvedRoot, manifest.skills);
   result.removed.push(...skillResult.removed);
   result.preserved.push(...skillResult.preserved);
+
+  // Spec #120 / ticket #121: Repository Intelligence cache cleanup.
+  // The cache is Poiesis-owned local state and is removed here so a
+  // full uninstall leaves no stale derived artifacts behind. The
+  // helper validates the cache first and refuses to delete a cache
+  // whose owned subdirectory contains a symlink (the Spec #120 §35
+  // fallback invariant: deleting the cache must only make the next
+  // query slower or force fallback, never destroy non-cache content).
+  // Foreign top-level siblings under `.poiesis/cache/` are preserved
+  // and reported in the uninstall result.
+  try {
+    const cacheRemoval = await (await import("./repository-intelligence.js")).removeValidatedRepositoryIntelligenceCache(resolvedRoot);
+    if (cacheRemoval.removed) result.removed.push(".poiesis/cache/repository-intelligence");
+    for (const entry of cacheRemoval.foreignPreserved) {
+      result.preserved.push({
+        path: `.poiesis/cache/${entry}`,
+        reason: "foreign content under Poiesis-owned cache root; uninstall only removes owned entries",
+      });
+    }
+  } catch (error) {
+    // A symlinked / unsafe cache is reported as preserved so the
+    // operator can investigate, but it does NOT block uninstall of
+    // the canonical manifest paths.
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({ path: ".poiesis/cache/", reason: `cache validation refused removal: ${message}` });
+  }
 
   if (result.preserved.length === 0) {
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
