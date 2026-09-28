@@ -24,6 +24,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 - Node.js `>=22.20.0`
 - Git
 - OpenCode `1.18.29`, `1.18.30`, or `1.18.31` (see [COMPATIBILITY.md](./COMPATIBILITY.md) for the verified adapter-v1 contract)
+- **Repository Intelligence standard requirement (Poiesis v1.2):** `uv` (https://docs.astral.sh/uv/) on PATH. `uv` is the exact-version runtime that launches the pinned default engine behind the deterministic `poiesis repository` surface; it is invoked via `uvx --python 3.12 --from graphifyy==<pin> graphify ...`. A missing `uv` makes `poiesis init` and `poiesis update` fail closed before any canonical mutation with the typed `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` error; `poiesis doctor` reports the same condition as a hard `fail`. Poiesis does not install `uv`, does not vendor Python, does not offer a fallback flag, and does not ask the Author a question about it.
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
 - A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))
@@ -261,6 +262,42 @@ Ask the human only for decisions that materially affect their product (intent, a
 
 Paste that block into a fresh coding-agent session (Cursor, Claude Code, OpenCode chat, etc.) before asking it to do work in the project. It does not teach adapter internals, it does not ask the agent to invent Poiesis flows, and it routes every external auth step through a copy-paste command.
 
+## One-shot setup-agent prompt (Poiesis v1.2)
+
+When the human/operator wants to hand the project to a fresh full-access coding agent and have the agent stand up the entire Poiesis environment without further human intervention, paste the following single block into the agent session. The agent installs `uv`, runs the fresh-latest `init` (or `update`, on an already-installed checkout), runs `doctor`, and reports readiness. There is no hidden setup agent and no new role file: this is just a recipe for one Poiesis-aware operator prompt.
+
+```text
+You are a full-access setup agent for Poiesis v1.2 inside this Git repository. Your job is to install the official runtime requirements, run the fresh-latest `init` (or `update` if `.poiesis/manifest.json` already exists), run `doctor`, and report a single readiness summary. Do not implement any product change. Do not commit. Do not push. Do not open a PR. Do not modify `AGENTS.md`. Do not install the Graphify installer, hook, plugin, MCP, memory, hosted mode, or docs/media semantic extraction. Do not ask the Author about Repository Intelligence; the runtime owns it.
+
+Steps (run in order, stop on first fail-closed error and report it verbatim):
+
+  1. Install the standard Poiesis v1.2 runtime requirement on PATH: `uv` (https://docs.astral.sh/uv/). Use the official installer for the host platform (macOS / Linux / Windows). Do not vendor Python; `uv` will manage its own interpreter on demand. Confirm with `uv --version`. If `uv` cannot be installed in this environment, report it as `BLOCKED: uv install failed` and stop.
+
+  2. Run the fresh-latest interactive bootstrap if Poiesis is not yet installed in this repo:
+       pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init
+     On a TTY this is interactive; follow every printed prompt, choose the Author-owned model slots via the live OpenCode inventory, supply the real preview/staging/production argv with `{sha}`, and only stop when `init` reports success. If `.poiesis/manifest.json` already exists, instead run the same-version reconciliation:
+       pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
+     If the operator explicitly wants the freshest published runtime, use the fresh-latest form:
+       pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update
+     Each command must succeed before continuing.
+
+  3. Run the manifest-pinned deterministic health check (does not download, does not mutate, does not require a model call):
+       pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
+     `doctor` must report `report.ok === true`. A `fail` entry that names `uv`, `Graphify`, or the Repository Intelligence runner is BLOCKED until `uv` is installed.
+
+  4. Run the mechanical Repository Intelligence status probe (does not download, does not build a graph):
+       pnpm dlx poiesis-cli@<manifest.poiesisVersion> repository status
+     The status envelope's `uvAvailable`, `cachePresent`, `cacheValid`, and `reason` fields are part of the readiness report.
+
+  5. Report readiness in one short block:
+       READY: poiesisVersion=<X>; uvAvailable=<true|false>; doctor.ok=<true|false>; repository.reason=<ready|uv-unavailable|cache-absent|engine-version-mismatch|cache-invalid>; opencodeRestart=<required|not-required>.
+     If anything is not READY, report the failing step verbatim and stop.
+
+You are done. Do not run additional commands, do not implement product work, do not commit, do not push.
+```
+
+Use this prompt when the human/operator wants a single agent to stand up the whole Poiesis environment end-to-end without intermediate questions. The prompt is the only sanctioned setup-agent recipe; Poiesis does not install or expose any hidden setup agent or new role.
+
 ## Safety
 
 - Poiesis never overwrites or deletes a file, config value, skill, worktree, or branch it cannot prove ownership of.
@@ -278,7 +315,7 @@ pnpm test
 pnpm build
 ```
 
-The canonical design is `POIESIS_FOUNDATION_v1.1.md` (kept in the GitHub repository, not the npm tarball). The installed operational projections are `POIESIS_PHILOSOPHY.md` and `POIESIS_METHOD.md`.
+The canonical design is `POIESIS_FOUNDATION_v1.2.md` (kept in the GitHub repository, not the npm tarball). The installed operational projections are `POIESIS_PHILOSOPHY.md` and `POIESIS_METHOD.md`.
 
 ## License
 

@@ -54,6 +54,10 @@ Usage:
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
   poiesis tracker <spec|ticket> <create|get|update|comment|close|supersede> [options]
   poiesis session cleanup --id <session-id> [--server <url>] [--directory <path>]
+  poiesis repository status                              # Spec #120 / ticket #121 — mechanical uv / cache state; never downloads, never asks the Author
+  poiesis repository query --question <text>              # Spec #120 / ticket #122 — refresh code-only graph if needed, then run graphify query; never queries an old graph after a failed refresh
+  poiesis repository path --from <node> --to <node>       # Spec #120 / ticket #123 — refresh code-only graph if needed, then run graphify path; never queries an old graph after a failed refresh
+  poiesis repository explain --node <node>                # Spec #120 / ticket #123 — refresh code-only graph if needed, then run graphify explain; never queries an old graph after a failed refresh
 
 All commands accept --cwd <path>. Output and errors are structured JSON.
 `;
@@ -104,6 +108,8 @@ async function main(argv: string[]): Promise<void> {
       return commandTracker(rest);
     case "session":
       return commandSession(rest);
+    case "repository":
+      return commandRepository(rest);
     default:
       throw new PoiesisError("UNKNOWN_COMMAND", `Unknown command: ${command}`, { command });
   }
@@ -758,6 +764,150 @@ async function commandSession(args: string[]): Promise<void> {
       strict: boolean(values, "strict"),
     }),
   );
+}
+
+/**
+ * Spec #120 / ticket #121 + ticket #122 + ticket #123 — `poiesis
+ * repository <status|query|path|explain>`.
+ *
+ * `status` (ticket #121) reports the mechanical Repository
+ * Intelligence state without downloading anything: `uv` availability,
+ * cache presence, cache validity, and the engine-stamp reason code.
+ * The status command MUST NOT spawn a network-bound subprocess; it is
+ * intentionally read-only so agents and operators can probe the
+ * integration health without altering the cache.
+ *
+ * `query --question <text>` (ticket #122) is the end-to-end runtime
+ * seam: it serializes a single refresh per repo, builds the active
+ * graph either as an initial code-only extract or as a valid
+ * incremental update, and only then runs `graphify query` against the
+ * explicit active `graph.json`. A failed refresh NEVER queries the old
+ * active graph; instead it returns a typed fallback envelope. The
+ * runner is injected through the second parameter so the test seam
+ * can drive deterministic mocked behavior without spawning a real
+ * `uvx`.
+ *
+ * `path --from <node> --to <node>` and `explain --node <node>`
+ * (ticket #123) reuse the exact same refresh + lock + cache-validation
+ * pipeline as `query`; only the post-refresh graphify invocation
+ * differs. Poiesis named flags (`--from`, `--to`, `--node`) translate
+ * to Graphify's positional args (`path <from> <to>`, `explain <node>`)
+ * plus the explicit `--graph <active>` pointer so the runtime owns
+ * every CLI argv shape.
+ *
+ * Exported as a library seam (matching the `commandInit` /
+ * `commandUpdate` / `commandModel` / `commandTracker` pattern) so the
+ * structured-JSON contract can be tested directly.
+ */
+export async function commandRepository(
+  args: string[],
+  dispatcherOptions: { runner?: import("./repository-intelligence.js").GraphifyRunner } = {},
+): Promise<void> {
+  const operation = args[0];
+  if (operation === "status") {
+    const values = options(args.slice(1), { cwd: { type: "string" } });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { repositoryIntelligenceStatus } = await import("./repository-intelligence.js");
+    writeSuccess("repository.status", await repositoryIntelligenceStatus(repoRoot));
+    return;
+  }
+  if (operation === "query") {
+    const values = options(args.slice(1), {
+      question: { type: "string" },
+      cwd: { type: "string" },
+    });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { queryRepositoryIntelligence } = await import("./repository-intelligence.js");
+    const question = values.question;
+    if (typeof question !== "string" || question.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --question", { key: "question" });
+    }
+    const outcome = await queryRepositoryIntelligence(repoRoot, {
+      question,
+      ...(dispatcherOptions.runner === undefined ? {} : { runner: dispatcherOptions.runner }),
+    });
+    if (outcome.ok) {
+      writeSuccess("repository.query", outcome);
+    } else {
+      // Operational failure: typed non-blocking fallback. The CLI
+      // surfaces the envelope as a structured-JSON error so the
+      // operator sees the same `code` / `details` shape they would
+      // get from a hard failure, but with the explicit `reason` field
+      // making the failure category machine-readable.
+      throw new PoiesisError(
+        outcome.reason.toUpperCase().replace(/-/g, "_"),
+        outcome.message,
+        outcome.detail,
+      );
+    }
+    return;
+  }
+  if (operation === "path") {
+    const values = options(args.slice(1), {
+      from: { type: "string" },
+      to: { type: "string" },
+      cwd: { type: "string" },
+    });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { pathRepositoryIntelligence } = await import("./repository-intelligence.js");
+    const fromValue = values.from;
+    const toValue = values.to;
+    if (typeof fromValue !== "string" || fromValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --from", { key: "from" });
+    }
+    if (typeof toValue !== "string" || toValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --to", { key: "to" });
+    }
+    const outcome = await pathRepositoryIntelligence(repoRoot, {
+      from: fromValue,
+      to: toValue,
+      ...(dispatcherOptions.runner === undefined ? {} : { runner: dispatcherOptions.runner }),
+    });
+    if (outcome.ok) {
+      writeSuccess("repository.path", outcome);
+    } else {
+      throw new PoiesisError(
+        outcome.reason.toUpperCase().replace(/-/g, "_"),
+        outcome.message,
+        outcome.detail,
+      );
+    }
+    return;
+  }
+  if (operation === "explain") {
+    const values = options(args.slice(1), {
+      node: { type: "string" },
+      cwd: { type: "string" },
+    });
+    const cwd = cwdOf(values);
+    const repoRoot = await resolveGitRoot(cwd);
+    const { explainRepositoryIntelligence } = await import("./repository-intelligence.js");
+    const nodeValue = values.node;
+    if (typeof nodeValue !== "string" || nodeValue.trim().length === 0) {
+      throw new PoiesisError("MISSING_ARGUMENT", "Missing required --node", { key: "node" });
+    }
+    const outcome = await explainRepositoryIntelligence(repoRoot, {
+      node: nodeValue,
+      ...(dispatcherOptions.runner === undefined ? {} : { runner: dispatcherOptions.runner }),
+    });
+    if (outcome.ok) {
+      writeSuccess("repository.explain", outcome);
+    } else {
+      throw new PoiesisError(
+        outcome.reason.toUpperCase().replace(/-/g, "_"),
+        outcome.message,
+        outcome.detail,
+      );
+    }
+    return;
+  }
+  throw new PoiesisError("UNKNOWN_COMMAND", `Unknown repository subcommand: ${operation ?? ""}`, {
+    subcommand: operation ?? "",
+    supported: ["status", "query", "path", "explain"],
+  });
 }
 
 function options(

@@ -36,6 +36,8 @@ Review, the final Reviewer may dispatch at most one bounded Explore child
 total, and only when genuinely necessary for read-only context. Never
 dispatch parallel or multiple children; otherwise inspect directly.
 
+**Repository Intelligence** may be used to locate likely impact, callers, implementations, and cross-module dependencies. A blocking finding must be grounded in the actual candidate source, not only an inferred or ambiguous graph edge. Verify the current source before treating a graph-derived conclusion as a consequential commitment. Repository Intelligence is bounded discovery evidence; the candidate source is review evidence. This applies to ticket, Spec, and Standards review.
+
 ### Bounded evidence gathering (final review)
 
 Final Reviewers must gather filesystem evidence strictly from the exact

@@ -1,11 +1,11 @@
-# Poiesis v1.1 Source Bundle — Download List
+# Poiesis v1.2 Source Bundle — Download List
 
 Put **all files from this bundle directly in `/poiesis` root**. Do not organize them into subfolders.
 
 The implementation agent will use `POIESIS_INSTALL_LAYOUT.md` to project them into the correct consumer-repository paths.
 
 ## Canonical design
-- `POIESIS_FOUNDATION_v1.1.md`
+- `POIESIS_FOUNDATION_v1.2.md` (the single canonical Foundation; older revisions are preserved only in Git history, not shipped)
 - `POIESIS_PHILOSOPHY.md`
 - `POIESIS_METHOD.md`
 

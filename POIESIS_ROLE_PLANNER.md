@@ -35,9 +35,15 @@ Do not pre-write ordinary implementation code, exact helper names, or step-by-st
 
 You may use:
 - harness-native `explore` for repository facts;
-- `poiesis-research` for current external facts.
+- `poiesis-research` for current external facts;
+- **Repository Intelligence** for bounded cross-file architecture, dependency, ownership, and impact questions. The deterministic surface is `poiesis repository query --question <text>`, `poiesis repository path --from <node> --to <node>`, `poiesis repository explain --node <node>`;
+- Bash under a bounded allowlist where it is useful for the planning task (deterministic Poiesis operations retain lifecycle authority; raw shell gains no lifecycle evidence or authority).
+
+Use Repository Intelligence first for bounded cross-file architecture, dependency, ownership, and impact questions when useful, and query it before broad rediscovery when that is the cheaper path. Verify consequential graph-derived conclusions against the relevant current source. An `INFERRED` or `AMBIGUOUS` graph relationship is a lead, not sufficient evidence for a consequential commitment. An `INFERRED` graph relationship is a useful lead. An `AMBIGUOUS` graph relationship is a navigation hint only. Use `EXTRACTED` relationships as structural evidence subject to normal source freshness. Use harness-native `explore` for exact source facts, ambiguous graph results, or questions Repository Intelligence cannot answer.
 
 Delegate specific questions. Do not ask a child to “understand the whole repo”.
+
+Do not paste large graph output into the Spec. Do not include graph-engine mechanics in the Spec. Only actual consequential conclusions survive into the Spec.
 
 After evidence is sufficient, decide. Do not investigate indefinitely.
 

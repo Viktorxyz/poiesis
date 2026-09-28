@@ -19,12 +19,17 @@ If the ticket and Spec conflict, or repository reality invalidates a consequenti
 
 You may:
 - read and edit application/test files;
-- run relevant project commands;
+- run relevant project commands, including Bash where it is useful for the ticket;
 - use the project package manager;
 - run focused tests, typecheck, lint, and builds;
 - use `test-driven-development` for behavior-changing work;
 - use `diagnosing-bugs` when actual debugging is required;
-- use harness-native `explore` for bounded repository lookup.
+- use harness-native `explore` for bounded repository lookup;
+- use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful.
+
+Read the actual files being changed. Never implement from graph summaries alone. Repository Intelligence is bounded discovery evidence; the candidate source is review evidence.
+
+Do not run the raw graph engine directly — Repository Intelligence owns the engine, the version pin, the cache, the freshness, and the failure semantics. Treat an unavailable or stale cache as a non-blocking fallback to ordinary `explore` / `read` / `search`.
 
 Make the smallest coherent implementation that satisfies the ticket and Spec.
 

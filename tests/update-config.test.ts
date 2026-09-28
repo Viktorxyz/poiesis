@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   doctor,
   init,
+  packageVersion,
   updateFromConfig,
 } from "../src/maintenance.js";
 import {
@@ -2000,7 +2001,10 @@ describe("update --config fixture-adapter invariant", () => {
 
     const candidatePath = await writeCandidateConfig(repository, () => undefined);
     const result = await updateFromConfig(repository.root, candidatePath);
-    expect(result.manifest.poiesisVersion).toBe("1.1.4");
+    // The no-op update re-stamps the manifest with the running package
+    // version. The expected value is sourced from `packageVersion()`
+    // so the assertion survives a 1.1.4 → 1.2.0 (or any later) bump.
+    expect(result.manifest.poiesisVersion).toBe(await packageVersion());
     // Doctor report's `ok` may be false if the install used
     // `skipSkills: true` (the `install` helper does so); the
     // `skills` exemption is honored by the gate via

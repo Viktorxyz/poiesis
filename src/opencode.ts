@@ -247,6 +247,67 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
   };
 }
 
+/**
+ * Spec #120 / ticket #123 — narrow Repository Intelligence bash
+ * permission for sub-agents. The four exact-version allows are the
+ * ONLY bash entries that survive the `*` deny; every other command is
+ * blocked. The keys are emitted in the documented order so OpenCode's
+ * last-match-wins resolver still applies, but every key here is an
+ * exact match (no glob patterns beyond the documented `--question`,
+ * `--from`, `--to`, `--node` arg trailing wildcard) so the resolver
+ * matches one and only one command per invocation.
+ *
+ * The narrow allows cover the four deterministic repository subcommands
+ * (ticket #121 `status`, ticket #122 `query`, ticket #123 `path`,
+ * ticket #123 `explain`). They never grant:
+ *
+ *   - `workspace *` (lifecycle ownership);
+ *   - `checkpoint *`, `verify *`, `publish *`, `preview *`;
+ *   - `integrate *`, `promote *`, `release *`;
+ *   - `tracker *` (tracker mutation);
+ *   - `capability *` (capability installation);
+ *   - any broader read/write on the harness or filesystem.
+ *
+ * Bare `pnpm dlx poiesis-cli`, `npx poiesis`, and version-qualified
+ * alternate routes (`pnpm dlx poiesis-cli@latest`) are intentionally
+ * absent: only the exact `<manifest.poiesisVersion>` route survives.
+ */
+function repositoryIntelligenceBashPermissions(poiesisVersion: string): Record<string, string> {
+  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  return {
+    "*": "deny",
+    [`${exact} repository status`]: "allow",
+    [`${exact} repository query *`]: "allow",
+    [`${exact} repository path *`]: "allow",
+    [`${exact} repository explain *`]: "allow",
+  };
+}
+
+/**
+ * Spec #120 / ticket #123 — narrow additive allow for the Worker
+ * sub-agent. The Worker already owns broad project bash with ordered
+ * lifecycle denies (Spec #104 / ticket #110 + #113). This helper
+ * appends the four Repository Intelligence subcommand allows AFTER
+ * the existing `pnpm dlx poiesis-cli@*` deny so OpenCode's
+ * last-match-wins resolver grants only the documented operations and
+ * leaves every other `pnpm dlx poiesis-cli@…` invocation denied.
+ *
+ * Returns a NEW object; the caller's existing deny map is not
+ * mutated. The exact-version route semantics are preserved: a Worker
+ * that launches `pnpm dlx poiesis-cli@latest` (or any other
+ * non-manifest version) still sees a `deny` because the broad deny
+ * precedes the exact-version allow keys.
+ */
+function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<string, string> {
+  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  return {
+    [`${exact} repository status`]: "allow",
+    [`${exact} repository query *`]: "allow",
+    [`${exact} repository path *`]: "allow",
+    [`${exact} repository explain *`]: "allow",
+  };
+}
+
 function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {
   const reasoning = config.models.reasoning;
   const execution = config.models.execution;
@@ -294,6 +355,14 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         list: "allow",
         skill: { "codebase-design": "allow" },
         task: { explore: "allow", "poiesis-research": "allow" },
+        // Spec #120 / ticket #123 — Planner reaches Repository
+        // Intelligence through the deterministic Poiesis CLI only.
+        // No broad shell is granted; only the four exact-version
+        // repository subcommands survive. The Planner must still rely
+        // on Explore/read/grep for any non-Repository-Intelligence
+        // fact and may not bypass the canonical role's bash
+        // boundaries.
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
       },
     },
     "poiesis-worker": {
@@ -318,10 +387,17 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           // Spec #104 / ticket #113: deny package-runner lifecycle
           // launchers as well so the broad `*` allow cannot be used to
           // invoke the same authorized primary canonical route through
-          // `pnpm dlx`. Worker retains no exact-version allow; only the
-          // primary does.
+          // `pnpm dlx`. Worker retains no exact-version allow for
+          // arbitrary Poiesis lifecycle; only the primary does.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
+          // Spec #120 / ticket #123: append the four Repository
+          // Intelligence subcommand allows AFTER the `pnpm dlx
+          // poiesis-cli@*` deny so OpenCode's last-match-wins
+          // resolver grants only the exact-version repository
+          // operations and leaves every other Poiesis lifecycle
+          // invocation denied.
+          ...workerRepositoryIntelligenceAllows(poiesisVersion),
         },
       },
     },
@@ -335,6 +411,11 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         webfetch: "allow",
         websearch: "allow",
         skill: { research: "allow" },
+        // Spec #120 / ticket #123 — Research owns external facts, not
+        // repository structure. NO Repository Intelligence bash
+        // permission is granted here so a Research subagent cannot
+        // accidentally invoke `uvx graphify` against the consumer
+        // repository.
       },
     },
     "poiesis-reviewer": {
@@ -348,6 +429,10 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         grep: "allow",
         list: "allow",
         skill: { "code-review": "allow" },
+        // Spec #120 / ticket #123 — Ticket Reviewer reaches Repository
+        // Intelligence through the deterministic Poiesis CLI only;
+        // no arbitrary bash is granted.
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
       },
     },
     "poiesis-final-reviewer": {
@@ -362,6 +447,13 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         list: "allow",
         skill: { "code-review": "allow" },
         task: { explore: "allow" },
+        // Spec #120 / ticket #123 — Final Reviewer reaches Repository
+        // Intelligence through the deterministic Poiesis CLI only;
+        // its filesystem allowlist remains the exact candidate
+        // workspace. The repository wrapper must run with the
+        // dispatched candidate workspace as `cwd`; it may not inspect
+        // a parent or another checkout.
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
       },
     },
   };

@@ -144,6 +144,41 @@ Production authorization is JSON bound to the candidate SHA/tree, Staging artifa
 
 Fixture delivery is test-only, requires `--allow-fixtures`, and writes outside the repository root.
 
+## Repository Intelligence (v1.2)
+
+Poiesis v1.2 adds a rebuildable, non-canonical local graph as a default internal capability. The engine is Graphify, pinned to an exact version, run through `uvx` so Poiesis owns neither a global Graphify install nor a global Python interpreter.
+
+### Standard requirement: `uv`
+
+`uv` is a STANDARD Poiesis requirement as of v1.2, not an optional optimization. The exact-pinned invocation form is:
+
+```text
+uvx --python 3.12 --from graphifyy==<pin> graphify <subcommand>
+```
+
+A missing `uv` makes every canonical lifecycle surface fail closed:
+
+- `poiesis init` fails before any canonical mutation with the typed `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` error. The error names the missing dependency (`uv`), the install entry point (`https://docs.astral.sh/uv/`), and the canonical Python pin (`3.12`). No manifest write, no `.poiesis/` directory creation, no OpenCode config write, no skills install, no receipt write.
+- `poiesis update` and `poiesis update --config` inherit the same failure through the existing `assertUpdateDoctorGate` predicate (which throws `UPDATE_DOCTOR_FAILED` and reverses the bounded journal rollback path).
+- `poiesis doctor` reports the same condition as a hard `fail` with details `{ requirement: "uv", python: "3.12", engine: "graphify", engineVersion, uvAvailable: false, hint: "missing-binary", action: "install-uv" }`. The overall `report.ok` is `false`.
+
+Poiesis never installs `uv`, never vendors Python, never offers a fallback flag, and never asks the Author a question about it.
+
+Runtime repository operations (`poiesis repository query` / `path` / `explain` in later tickets) may still return a typed fallback via `poiesis repository status`'s `reason: "uv-unavailable"` when a previously working dependency disappears after installation. The requirement is on fresh `init` / `update` transactions and on doctor; the runtime query path keeps the Spec #120 §35 fallback invariant ("Poiesis must still be able to complete the normal Method if Repository Intelligence disappears entirely").
+
+### Pinned Graphify runtime
+
+- engine: `graphify`
+- pinned package: `graphifyy==0.9.70`
+- Python: `3.12`
+- invocation: `uvx --python 3.12 --from graphifyy==0.9.70 graphify ...`
+
+The runtime owns the pin; moving the pin in a future Poiesis release is an `update`-driven cache invalidation, not a Graphify-managed migration. A newer or older `state.json` `engineVersion` is reported by `poiesis repository status` as `reason: "engine-version-mismatch"` and by `poiesis doctor` as a `warn` that the next query will rebuild with the pinned engine.
+
+### Local-state cache
+
+The derived cache lives under `.poiesis/cache/` (Poiesis-owned local state). It is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. The directory is owned by Poiesis only at `.poiesis/cache/repository-intelligence/`; foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
+
 ## Process execution
 
 All external command execution is bounded:

@@ -40,6 +40,15 @@ export const POIESIS_DURABLE_PATHS: readonly string[] = templateMappings
 export const POIESIS_LOCAL_STATE_PATHS: readonly string[] = [
   ".poiesis/manifest.json",
   ".poiesis/workspaces/",
+  // Spec #120 / ticket #121: Repository Intelligence lives under the
+  // Poiesis-owned `.poiesis/cache/` directory. It is non-canonical
+  // derived state (graph files, the local `state.json` envelope, the
+  // Graphify working directory) and must never be tracked. Adding the
+  // path here makes init write the ignore rule through the same
+  // `ensureGitignore` transaction the manifest / workspaces rules
+  // already use, so uninstall / update never observe drift between
+  // the source list and the on-disk `.gitignore`.
+  ".poiesis/cache/",
 ];
 
 export async function ensureGitignore(root: string, lines: string[], expected?: Buffer | null): Promise<string | undefined> {

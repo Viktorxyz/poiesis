@@ -15,6 +15,31 @@ const IS_WINDOWS = process.platform === "win32";
 export interface RunOptions {
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Spec #120 / ticket #129 — explicit replacement-environment seam.
+   *
+   * When set, the child process receives EXACTLY this env object as
+   * its environment, with NO `{...process.env, ...options.env}` merge.
+   * This is the secure boundary for spawning `uvx graphify`: the
+   * default `GraphifyRunner` hands the pre-sanitized env (the result
+   * of `sanitizeGraphifyEnvironment`) to the runner and the runner
+   * MUST NOT silently re-merge parent credentials into the child.
+   *
+   * The caller is responsible for putting every variable the child
+   * needs into this object. In particular, PATH (and the Windows
+   * spelling `Path`) MUST be present or the child cannot resolve
+   * binaries; `sanitizeGraphifyEnvironment` already preserves PATH
+   * via its allow-list, so the default Graphify runner satisfies
+   * this requirement automatically.
+   *
+   * Setting BOTH `env` and `replacementEnv` is rejected with
+   * `INVALID_RUN_OPTIONS` so the seam cannot accidentally fall back
+   * to the merge path. When `replacementEnv` is NOT set, the runner
+   * falls back to the legacy `{...process.env, ...options.env}`
+   * merge — preserving every existing caller's parent-env
+   * inheritance (git, gh, glab, init, update, doctor, skills, …).
+   */
+  replacementEnv?: NodeJS.ProcessEnv;
   input?: string;
   allowFailure?: boolean;
   timeoutMs?: number;
@@ -44,6 +69,7 @@ interface Capture {
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
   const maxBytes = normalizeMaxBytes(options.maxBytes);
+  const childEnv = resolveChildEnvironment(options);
   const startedAt = Date.now();
 
   return await new Promise<RunResult>((resolve, reject) => {
@@ -51,7 +77,7 @@ export async function run(command: string, args: string[], options: RunOptions):
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        env: { ...process.env, ...options.env },
+        env: childEnv,
         stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
         killSignal: "SIGTERM",
         ...(IS_WINDOWS ? {} : { detached: true }),
@@ -552,4 +578,49 @@ function normalizeMaxBytes(value: number | undefined): number {
     throw new PoiesisError("INVALID_MAX_BYTES", "Max bytes must be a positive safe integer", { value });
   }
   return value;
+}
+
+/**
+ * Spec #120 / ticket #129 — resolve the env passed to `spawn`.
+ *
+ * Three contracts, in priority order:
+ *
+ *   1. `replacementEnv` set AND `env` set → `INVALID_RUN_OPTIONS`.
+ *      The two options are mutually exclusive; passing both is a
+ *      fail-closed caller bug that must NOT silently fall back to the
+ *      merge path (which is the very leak the replacement seam
+ *      exists to prevent).
+ *
+ *   2. `replacementEnv` set → the child env is EXACTLY the supplied
+ *      object. No `{...process.env, ...replacementEnv}` merge. This
+ *      is the secure boundary for `uvx graphify`: the caller hands
+ *      the pre-sanitized env (the result of
+ *      `sanitizeGraphifyEnvironment`) and the runner must not
+ *      silently re-merge parent credentials. The caller is
+ *      responsible for including PATH/Path and any other variable
+ *      the child needs; `sanitizeGraphifyEnvironment` already
+ *      preserves PATH via its allow-list.
+ *
+ *   3. `replacementEnv` NOT set → the legacy
+ *      `{...process.env, ...options.env}` merge. Every existing
+ *      caller (git, gh, glab, init, update, doctor, skills, …)
+ *      inherits the parent env unchanged; the merge only overrides
+ *      keys the caller explicitly supplied.
+ *
+ * The resolved env is a fresh object so the caller can mutate
+ * `options.replacementEnv` / `options.env` after the call without
+ * leaking back into the spawned child.
+ */
+function resolveChildEnvironment(options: RunOptions): NodeJS.ProcessEnv {
+  if (options.replacementEnv !== undefined) {
+    if (options.env !== undefined) {
+      throw new PoiesisError(
+        "INVALID_RUN_OPTIONS",
+        "run() cannot accept both env and replacementEnv; pass exactly one",
+        { hasEnv: true, hasReplacementEnv: true },
+      );
+    }
+    return { ...options.replacementEnv };
+  }
+  return { ...process.env, ...options.env };
 }
