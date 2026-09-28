@@ -1092,13 +1092,24 @@ export function buildGraphifyInvocation(args: string[]): { command: string; args
  * the bounded timeout, and the byte cap, and translates `process.run`
  * failures into the typed `GraphifyRunnerError` envelope the runtime
  * expects.
+ *
+ * Spec #120 / ticket #129 — the runner hands the sanitized env to
+ * `process.run` via `replacementEnv`, NOT `env`. The legacy
+ * `env`-merge path would silently re-introduce every parent env
+ * variable that `sanitizeGraphifyEnvironment` had just stripped
+ * (model credentials, tracker tokens, POIESIS_* keys, …). Using
+ * `replacementEnv` makes the secure boundary explicit: the child
+ * receives EXACTLY the sanitized env the runtime built for it.
+ * PATH/Path and the documented safe variables remain in the child
+ * because `sanitizeGraphifyEnvironment` preserves them via its
+ * allow-list.
  */
 export const defaultGraphifyRunner: GraphifyRunner = async (request) => {
   const { command, args } = buildGraphifyInvocation(request.args);
   try {
     const result = await run(command, args, {
       cwd: request.cwd,
-      env: request.env,
+      replacementEnv: request.env,
       timeoutMs: request.timeoutMs,
       ...(request.maxBytes === undefined ? {} : { maxBytes: request.maxBytes }),
       allowFailure: true,

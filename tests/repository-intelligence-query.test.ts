@@ -10,7 +10,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   GRAPHIFY_PACKAGE,
   GRAPHIFY_PYTHON,
@@ -18,6 +18,7 @@ import {
   REPOSITORY_INTELLIGENCE_GENERATIONS_RELATIVE_DIRECTORY,
   REPOSITORY_INTELLIGENCE_QUERY_BUDGET_TOKENS,
   REPOSITORY_INTELLIGENCE_REFRESH_TIMEOUT_MS,
+  defaultGraphifyRunner,
   repositoryIntelligenceGenerationPath,
   repositoryIntelligenceGenerationsPath,
   repositoryIntelligenceStatePath,
@@ -29,6 +30,7 @@ import {
   type RepositoryIntelligenceQueryOutcome,
   queryRepositoryIntelligence,
 } from "../src/repository-intelligence.js";
+import * as processModule from "../src/process.js";
 
 // ---- Test harness ------------------------------------------------------------
 
@@ -334,6 +336,116 @@ describe("sanitizeGraphifyEnvironment", () => {
     expect(sanitized).not.toBe(input);
     expect(input.OPENAI_API_KEY).toBe("leak");
     expect(sanitized.OPENAI_API_KEY).toBeUndefined();
+  });
+});
+
+// ---- Spec #120 / ticket #129 — defaultGraphifyRunner uses replacementEnv seam
+//
+// The default Graphify runner hands the sanitized env to `process.run`
+// via `replacementEnv`, NOT `env`. The legacy `env`-merge path would
+// silently re-introduce every parent env variable that
+// `sanitizeGraphifyEnvironment` had just stripped (model credentials,
+// tracker tokens, POIESIS_* keys, …). This block spies on the real
+// `run` seam and asserts that the default runner opts into the
+// replacement path: `options.replacementEnv` is set, `options.env` is
+// NOT set, and the supplied env equals the sanitized env. The
+// process-level child-boundary proof lives in
+// `tests/process.test.ts` (the `replacement environment seam`
+// describe block); this block proves the integration between the
+// Graphify runner and the runner seam.
+
+describe("defaultGraphifyRunner (ticket #129)", () => {
+  // Seed a fake parent shell with model credentials, tracker tokens,
+  // and POIESIS_* keys so the test proves the sanitization holds even
+  // when the parent env is hostile.
+  const PARENT_SECRET_KEYS = [
+    "OPENAI_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "POIESIS_API_KEY",
+    "POIESIS_TOKEN",
+    "POIESIS_DEBUG",
+  ] as const;
+  let parentEnvSnapshots: Map<string, string | undefined> | null = null;
+
+  function seedParentSecrets(): void {
+    parentEnvSnapshots = new Map();
+    for (const key of PARENT_SECRET_KEYS) {
+      parentEnvSnapshots.set(key, process.env[key]);
+      process.env[key] = `parent-secret-${key}`;
+    }
+  }
+
+  function restoreParentSecrets(): void {
+    if (parentEnvSnapshots === null) return;
+    for (const [key, value] of parentEnvSnapshots) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    parentEnvSnapshots = null;
+  }
+
+  beforeEach(seedParentSecrets);
+  afterEach(restoreParentSecrets);
+
+  it("passes the sanitized env to process.run via replacementEnv (not via env)", async () => {
+    const realRun = processModule.run;
+    const capturedCalls: Array<{
+      command: string;
+      args: string[];
+      options: Parameters<typeof realRun>[2];
+    }> = [];
+    const spy = vi.spyOn(processModule, "run").mockImplementation(async (command, args, options) => {
+      // Snapshot the options object the runner actually passed. The
+      // replacementEnv seam is fail-closed when `env` and
+      // `replacementEnv` are both supplied, so just recording the
+      // options is enough to prove which path the runner took.
+      capturedCalls.push({ command, args, options: { ...options } });
+      return {
+        command,
+        args,
+        exitCode: 0,
+        stdout: "",
+        stderr: "",
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        timedOut: false,
+        signal: null,
+        durationMs: 1,
+      };
+    });
+    try {
+      const sanitizedEnv = sanitizeGraphifyEnvironment(process.env);
+      const result = await defaultGraphifyRunner({
+        args: ["extract", "/tmp/fake-root", "--code-only", "--no-cluster"],
+        cwd: "/tmp/fake-cwd",
+        env: sanitizedEnv,
+        timeoutMs: 5_000,
+      });
+      expect(result.ok).toBe(true);
+      // Exactly one `run` invocation per Graphify call.
+      expect(capturedCalls).toHaveLength(1);
+      const captured = capturedCalls[0]!;
+      // The legacy merge path is NOT allowed. The runner MUST NOT
+      // pass `env`, only `replacementEnv`.
+      expect(captured.options.env).toBeUndefined();
+      expect(captured.options.replacementEnv).toBeDefined();
+      // The replacement env must be the sanitized env the runner
+      // received — no further mutation, no parent-env merge.
+      expect(captured.options.replacementEnv).toEqual(sanitizedEnv);
+      // Belt-and-suspenders: the secrets the parent shell owns must
+      // not be present in the env actually handed to `spawn`.
+      const handedEnv = captured.options.replacementEnv as NodeJS.ProcessEnv;
+      for (const key of PARENT_SECRET_KEYS) {
+        expect(handedEnv[key]).toBeUndefined();
+      }
+      // PATH/Path must remain in the replacement env so the child
+      // can resolve binaries.
+      expect(handedEnv.PATH ?? handedEnv.Path).toBeDefined();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
