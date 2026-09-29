@@ -294,15 +294,15 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
  * so this invariant is the only line of defense against an introduced
  * or altered fixture configuration in this transaction.
  */
-function detectFixtureAdapter(config: { tracker: { provider: string; project?: string | undefined }; delivery: Record<string, { adapter: string; path?: string | undefined }> }): { fixture: boolean; targets: string[]; signature: string } {
+function detectFixtureAdapter(config: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined }): { fixture: boolean; targets: string[]; signature: string } {
   const targets: string[] = [];
   const parts: string[] = [];
-  if (config.tracker.provider === "fixture") {
+  if (config.tracker?.provider === "fixture") {
     targets.push("tracker");
     parts.push(`tracker=${config.tracker.provider}:${config.tracker.project ?? ""}`);
   }
   for (const target of ["preview", "staging", "production"] as const) {
-    const adapter = config.delivery[target];
+    const adapter = config.delivery?.[target];
     if (adapter?.adapter === "fixture") {
       targets.push(`delivery.${target}`);
       parts.push(`delivery.${target}=${adapter.adapter}:${adapter.path ?? ""}`);
@@ -313,7 +313,7 @@ function detectFixtureAdapter(config: { tracker: { provider: string; project?: s
 
 function assertUpdateConfigNoFixtureIntroduceOrAlter(
   proposed: ResolvedPoiesisConfig,
-  current: { tracker: { provider: string; project?: string | undefined }; delivery: Record<string, { adapter: string; path?: string | undefined }> },
+  current: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined },
   poiesisConfigBytesMatch: boolean,
   openCodeBytesMatch: boolean,
 ): void {

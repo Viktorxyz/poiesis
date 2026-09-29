@@ -39,6 +39,7 @@
  *     the exact auth login command in the error message.
  */
 import type { PoiesisConfig } from "./config.js";
+import { defaultDeliveryAdapter } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import {
   composeInitDiscovery,
@@ -140,6 +141,20 @@ const FORBIDDEN_DELIVERY_ADAPTERS: ReadonlySet<string> = new Set([
  * `writeSuccess` / `writeFailure` caller, which is the only writer that
  * produces structured stdout.
  */
+export /**
+ * Spec #138: a delivery target that was neither detected nor asked about still
+ * needs a real value, because the config type requires all three. init writes
+ * the corresponding generated script, so the generated adapter is the correct
+ * answer rather than a placeholder.
+ */
+function resolveDeliveryDefaults(): NonNullable<PoiesisConfig["delivery"]> {
+  return {
+    preview: defaultDeliveryAdapter("preview"),
+    staging: defaultDeliveryAdapter("staging"),
+    production: defaultDeliveryAdapter("production"),
+  };
+}
+
 export async function runInteractiveInit(args: InteractiveInitOptions): Promise<Manifest> {
   try {
     if (!args.io.isTTY) {
@@ -402,11 +417,11 @@ async function resolveAuthorChoices(
         { provider: raw, supported: ["github", "gitlab"] },
       );
     }
-    next.tracker = { ...(next.tracker ?? {}), provider: raw };
+    next.tracker = { ...(next.tracker ?? {}), provider: raw as "github" | "gitlab" | "fixture" };
   }
   if (discovery.unresolved.includes("tracker.project")) {
     const project = await promptWithDefault(io, "Tracker project", "");
-    next.tracker = { ...next.tracker, project };
+    next.tracker = { ...(next.tracker ?? ({} as NonNullable<PoiesisConfig["tracker"]>)), project };
   }
 
   // Delivery command argv: real command line containing `{sha}`. The
@@ -420,19 +435,13 @@ async function resolveAuthorChoices(
   for (const { target } of DELIVERY_TARGET_PROMPTS) {
     const detection = discovery.detections.delivery[target];
     if (detection !== null) {
-      next.delivery = {
-        ...next.delivery,
-        [target]: detection.config,
-      };
+      next.delivery = { ...resolveDeliveryDefaults(), ...next.delivery, [target]: detection.config };
       continue;
     }
     if (discovery.unresolved.includes(`delivery.${target}`)) {
       const label = target.charAt(0).toUpperCase() + target.slice(1);
       const argv = await promptDeliveryCommand(io, label);
-      next.delivery = {
-        ...next.delivery,
-        [target]: { adapter: "command", command: argv },
-      };
+      next.delivery = { ...resolveDeliveryDefaults(), ...next.delivery, [target]: { adapter: "command", command: argv } };
     }
   }
 
@@ -561,8 +570,11 @@ async function promptWithDefault(io: InteractiveInitIO, label: string, fallback:
 }
 
 async function probeTrackerAuthBeforeInstall(io: InteractiveInitIO, config: PoiesisConfig): Promise<void> {
-  const provider = config.tracker.provider;
+  const provider = config.tracker?.provider;
   if (provider === "fixture") return; // test-only path; init() handles authorization
+  // A provider is resolved before this point on every supported path; the guard
+  // keeps the type honest rather than asserting a non-null.
+  if (provider === undefined) return;
   const result = await io.probeTrackerAuth(provider);
   if (result.available) return;
   const loginCommand = provider === "github" ? "gh auth login" : "glab auth login";
@@ -586,8 +598,16 @@ function formatRestartNotice(): string {
   return [
     "",
     "Poiesis init succeeded.",
-    "Restart OpenCode to load the new agent projections, harnesses, and skill installs.",
-    "Poiesis did not restart OpenCode; you must do that yourself.",
+    "",
+    "Next:",
+    "  1. Restart OpenCode. The agent projections, permissions, and skills only",
+    "     take effect on a fresh start. Poiesis does not restart it for you.",
+    "  2. Confirm it is healthy:   pnpm poiesis doctor",
+    "  3. Ask the repository a question:",
+    "       pnpm poiesis repository query --question \"...\"",
+    "",
+    "Every Poiesis command from here is just `pnpm poiesis <command>`.",
+    "You never need to name a version, and you never need a cache flag.",
     "",
   ].join("\n");
 }

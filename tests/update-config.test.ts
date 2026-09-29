@@ -1941,9 +1941,11 @@ describe("update --config fixture-adapter invariant", () => {
     const beforeManifest = await loadManifest(repository.root);
 
     const candidatePath = await writeCandidateConfig(repository, (config) => {
-      config.delivery.preview = { adapter: "fixture", path: "/different/fixture/path/preview" } as never;
-      config.delivery.staging = { adapter: "fixture", path: "/different/fixture/path/staging" } as never;
-      config.delivery.production = { adapter: "fixture", path: "/different/fixture/path/production" } as never;
+      config.delivery = {
+        preview: { adapter: "fixture", path: "/different/fixture/path/preview" } as never,
+        staging: { adapter: "fixture", path: "/different/fixture/path/staging" } as never,
+        production: { adapter: "fixture", path: "/different/fixture/path/production" } as never,
+      } as never;
     });
 
     await expect(updateFromConfig(repository.root, candidatePath)).rejects.toMatchObject({

@@ -32,7 +32,23 @@ export async function createTestRepository(): Promise<TestRepository> {
   return { parent, root, remote, fixtures, baseSha };
 }
 
-export function testConfig(repository: TestRepository): PoiesisConfig {
+export interface TestConfigOptions {
+  /**
+   * Spec #138: drop the `tracker` and `delivery` blocks so the test exercises
+   * the fresh-project path where those facts are INFERRED or DEFAULTED rather
+   * than supplied. Defaults to supplying them, which is what the rest of the
+   * suite depends on.
+   */
+  withTracker?: boolean;
+  withDelivery?: boolean;
+}
+
+export function testConfig(
+  repository: TestRepository,
+  options: TestConfigOptions = {},
+): PoiesisConfig {
+  const withTracker = options.withTracker ?? true;
+  const withDelivery = options.withDelivery ?? true;
   return {
     schema: 1,
     models: {
@@ -40,12 +56,18 @@ export function testConfig(repository: TestRepository): PoiesisConfig {
       execution: "minimax/MiniMax-M3",
     },
     repository: { remote: "origin", integrationBranch: "main" },
-    tracker: { provider: "fixture", project: join(repository.fixtures, "tracker") },
-    delivery: {
-      preview: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
-      staging: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
-      production: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
-    },
+    ...(withTracker
+      ? { tracker: { provider: "fixture" as const, project: join(repository.fixtures, "tracker") } }
+      : {}),
+    ...(withDelivery
+      ? {
+          delivery: {
+            preview: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
+            staging: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
+            production: { adapter: "fixture", path: join(repository.fixtures, "delivery") },
+          },
+        }
+      : {}),
     verification: { commands: ["test -f README.md"] },
   };
 }

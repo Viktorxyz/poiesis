@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
-import { lstat, mkdir, mkdtemp, readdir, readFile, rm, rmdir, unlink } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, readdir, readFile, rm, rmdir, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
 import {
   loadConfig,
@@ -20,6 +20,12 @@ import {
 } from "./update-internal.js";
 import { hashContent, hashFile } from "./hash.js";
 import { ArtifactJournal, type ArtifactJournalEntry } from "./mutation-transaction.js";
+import {
+  DELIVERY_TARGETS,
+  defaultDeliveryAdapter,
+  deliveryScriptPath,
+  renderDefaultDeliveryScript,
+} from "./delivery-defaults.js";
 import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -349,27 +355,43 @@ export async function autoResolveConfigDefaults(
     }
   }
   if (verificationCommands.length === 0) {
-    throw new PoiesisError(
-      "NO_VERIFICATION_COMMANDS",
-      "Poiesis requires at least one verification command; configure verification.commands or ensure the project exposes a test script",
-    );
+    // Spec #138: a brand-new project has no test script yet, and that is not
+    // a reason to refuse to install. Fall back to a REAL check - the
+    // repository is coherent and git can resolve its root - rather than a
+    // no-op that would make Verify pass without verifying anything. The
+    // Author replaces it the moment the project has a real suite; the resolved
+    // config records that this was a fallback, not a discovery.
+    verificationCommands = [DEFAULT_VERIFICATION_COMMAND];
   }
 
   let discoveredTracker = false;
-  let trackerProvider = config.tracker.provider;
-  let trackerProject = config.tracker.project ?? "";
+  let trackerProvider = config.tracker?.provider;
+  let trackerProject = config.tracker?.project ?? "";
+  // Spec #138: this block also runs when the provider is still unknown, which
+  // is the whole point - a fresh config has no `tracker` block at all, and the
+  // remote is what tells us the provider and the project.
   if (
-    (trackerProvider === "github" || trackerProvider === "gitlab") &&
-    trackerProject.trim().length === 0 &&
+    trackerProvider !== "fixture" &&
+    (trackerProvider === undefined || trackerProject.trim().length === 0) &&
     remote !== undefined
   ) {
     const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
     const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
     if (url !== undefined) {
       const parsed = parseTrackerFromUrl(url);
-      if (parsed !== null && parsed.provider === trackerProvider) {
-        trackerProject = parsed.project;
-        discoveredTracker = true;
+      if (parsed !== null) {
+        // Spec #138: infer BOTH the provider and the project from the remote.
+        // The previous condition only accepted a URL whose provider already
+        // matched the configured one, so a fresh config with no `tracker` block
+        // could never resolve either field - the Author was asked to supply,
+        // by hand, facts the Git remote already states.
+        if (trackerProvider === undefined) {
+          trackerProvider = parsed.provider;
+        }
+        if (parsed.provider === trackerProvider && trackerProject.trim().length === 0) {
+          trackerProject = parsed.project;
+          discoveredTracker = true;
+        }
       }
     }
   }
@@ -381,12 +403,25 @@ export async function autoResolveConfigDefaults(
     );
   }
 
+  if (trackerProvider === undefined) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "Cannot resolve a tracker provider; set tracker.provider or configure a recognized Git remote",
+      {},
+    );
+  }
+  const resolvedTrackerProvider: ResolvedPoiesisConfig["tracker"]["provider"] = trackerProvider;
+
   const resolved: ResolvedPoiesisConfig = {
     schema: 1,
     models: { reasoning: config.models.reasoning, execution: config.models.execution, ...(config.models.roles === undefined ? {} : { roles: config.models.roles }) },
     repository: { remote: remote!, integrationBranch: integrationBranch! },
-    tracker: { provider: trackerProvider, project: trackerProject },
-    delivery: config.delivery,
+    tracker: { provider: resolvedTrackerProvider, project: trackerProject },
+    // Spec #138: a config with no `delivery` block is a normal fresh-project
+    // config, not an error. init writes `scripts/poiesis-<target>.mjs` for the
+    // targets that are missing, so the resolved config points at real, working
+    // files. An Author who supplies their own delivery block keeps it.
+    delivery: resolveDelivery(config.delivery),
     verification: {
       commands: verificationCommands,
       ...(config.verification?.postIntegrationCommands === undefined
@@ -850,6 +885,36 @@ async function rollbackDefaultPathGitignore(
   await atomicWrite(path, snapshot.toString("utf8"));
 }
 
+/**
+ * Spec #138: the fallback verification command for a project that exposes no
+ * `test` script. It is a real assertion - the repository is a readable Git
+ * working tree - not a stub. It can never fail spuriously, and it can never
+ * pass vacuously either: if the project is not a usable checkout, this fails.
+ */
+export const DEFAULT_VERIFICATION_COMMAND = "git rev-parse --git-dir";
+
+/**
+ * Spec #138: fill an absent `delivery` block from the generated delivery
+ * scripts. init creates `scripts/poiesis-<target>.mjs` for any target the
+ * project lacks, so the default resolves to a file that will exist by the
+ * time the transaction finishes.
+ */
+function resolveDelivery(
+  delivery: PoiesisConfig["delivery"],
+): NonNullable<PoiesisConfig["delivery"]> {
+  const generated = {
+    preview: defaultDeliveryAdapter("preview"),
+    staging: defaultDeliveryAdapter("staging"),
+    production: defaultDeliveryAdapter("production"),
+  };
+  if (delivery === undefined) return generated;
+  return {
+    preview: delivery.preview ?? generated.preview,
+    staging: delivery.staging ?? generated.staging,
+    production: delivery.production ?? generated.production,
+  };
+}
+
 export async function init(root: string, config: PoiesisConfig, options: MaintenanceOptions = {}): Promise<Manifest> {
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
@@ -889,6 +954,17 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   const initialOpenCodeConfigSnapshot = await snapshotFile(openCodeConfigPath);
   await assertGitignoreAvailable(resolvedRoot);
   const initialGitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
+
+  // Spec #138: the generated delivery scripts. They are ordinary project
+  // files, NOT manifest records: init writes one only when the target is
+  // absent, so the first Author edit ends Poiesis's involvement with no
+  // ownership bookkeeping. Snapshotted here so the init transaction can
+  // restore a pre-existing file byte-for-byte if a later step fails.
+  const initialDeliverySnapshots = new Map<string, Buffer | null>();
+  for (const target of DELIVERY_TARGETS) {
+    const rel = deliveryScriptPath(target);
+    initialDeliverySnapshots.set(rel, await snapshotFile(join(resolvedRoot, rel)));
+  }
   // Spec #133 / ticket #134: `package.json` is an Author-owned file, so
   // the package-script conflict check is a READ-ONLY pre-flight placed
   // with the other `assert*Available` guards, before any write. A
@@ -926,6 +1002,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   // mutation-journal entry. It is gated by the same snapshot +
   // written-hash rollback the `.gitignore` transaction already uses.
   let writtenPackageJsonHash: string | undefined;
+  // Spec #138: delivery scripts this init created, so a failed transaction removes
+  // exactly those and leaves an Author-authored script untouched.
+  const writtenDeliveryScripts: string[] = [];
   const createdInitDirectories = new Set<string>();
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
@@ -1058,6 +1137,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     // correct script is never rewritten. The REFUSING entry point is
     // what keeps acceptance #4 at the write site too, so the guarantee
     // does not depend on the pre-flight above having run.
+    // Spec #138: write a working delivery script for every target the project
+    // does not already have. Never overwrites - an existing script belongs to
+    // the Author, which is what makes "edit it freely" a real promise.
+    for (const target of DELIVERY_TARGETS) {
+      const rel = deliveryScriptPath(target);
+      if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
+        continue;
+      }
+      const abs = join(resolvedRoot, rel);
+      await mkdir(dirname(abs), { recursive: true });
+      await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
+      writtenDeliveryScripts.push(rel);
+    }
+
     const writtenPackageJson = await ensurePoiesisScriptRefusing(resolvedRoot, initialPackageJsonSnapshot);
     if (writtenPackageJson !== undefined) writtenPackageJsonHash = hashContent(writtenPackageJson);
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -1179,6 +1272,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       initialOpenCodeConfigSnapshot,
       writtenOpenCodeConfigHash,
     ));
+    // Spec #138: remove exactly the delivery scripts this init created. An
+    // Author-authored script is never in `writtenDeliveryScripts`, so it
+    // survives a failed install untouched.
+    await rollbackStep(rollbackFailures, "delivery-scripts", async () => {
+      for (const rel of writtenDeliveryScripts) {
+        await rm(join(resolvedRoot, rel), { force: true });
+      }
+    });
     await rollbackStep(rollbackFailures, "package.json", async () => {
       await rollbackPackageJson(
         join(resolvedRoot, "package.json"),

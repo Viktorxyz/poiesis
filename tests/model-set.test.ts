@@ -149,8 +149,8 @@ describe("setModel (ticket #56)", () => {
     // The other class is preserved byte-for-byte.
     expect(afterConfig.models.execution).toBe(beforeConfig.models.execution);
     // Unrelated config is preserved.
-    expect(afterConfig.tracker.provider).toBe(beforeConfig.tracker.provider);
-    expect(afterConfig.delivery.preview.adapter).toBe(beforeConfig.delivery.preview.adapter);
+    expect(afterConfig.tracker?.provider).toBe(beforeConfig.tracker?.provider);
+    expect(afterConfig.delivery?.preview.adapter).toBe(beforeConfig.delivery?.preview.adapter);
     expect(afterConfig.verification?.commands).toEqual(beforeConfig.verification?.commands);
 
     // The OpenCode projection reflects the new reasoning model.

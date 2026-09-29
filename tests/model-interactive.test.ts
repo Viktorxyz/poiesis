@@ -391,7 +391,7 @@ describe("runInteractiveModel (ticket #59)", () => {
 
     expect(after.models.reasoning).toBe("openai/gpt-5.6-fallback");
     expect(after.models.execution).toBe(before.models.execution);
-    expect(after.tracker.provider).toBe(before.tracker.provider);
+    expect(after.tracker?.provider).toBe(before.tracker?.provider);
 
     // Receipt generation advanced exactly once (the single write).
     const afterReceipt = await readOwnershipReceipt(repo.root);

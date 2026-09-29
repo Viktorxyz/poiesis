@@ -124,6 +124,8 @@ const OPENCODE_CONFIG_RELATIVE_PATHS = [
 
 const POIESIS_MANIFEST_RELATIVE = ".poiesis/manifest.json";
 
+import { deliveryScriptPath } from "./delivery-defaults.js";
+
 const DELIVERY_SCRIPT_PREFIX: Record<DeliveryTargetKey, string> = {
   preview: "poiesis-preview",
   staging: "poiesis-staging",
@@ -167,7 +169,7 @@ export async function composeInitDiscovery(
     unresolved.push("tracker.project");
   }
   if (
-    draft?.tracker.provider === undefined &&
+    draft?.tracker?.provider === undefined &&
     trackerDetection.provider === undefined
   ) {
     unresolved.push("tracker.provider");
@@ -178,9 +180,15 @@ export async function composeInitDiscovery(
   if (draft?.models.execution === undefined || draft.models.execution.trim().length === 0) {
     unresolved.push("models.execution");
   }
-  if (deliveryDetection.preview === null) unresolved.push("delivery.preview");
-  if (deliveryDetection.staging === null) unresolved.push("delivery.staging");
-  if (deliveryDetection.production === null) unresolved.push("delivery.production");
+  // Spec #138: a missing delivery target is no longer a question. init writes a
+  // working `scripts/poiesis-<target>.mjs` when the target is absent, so the
+  // composer resolves to the generated script instead of surfacing an
+  // unresolved field. The Author can still replace the script afterwards.
+  for (const target of DELIVERY_TARGETS) {
+    if (deliveryDetection[target] !== null) continue;
+    if (await exists(join(root, deliveryScriptPath(target)))) continue;
+    unresolved.push(`delivery.${target}`);
+  }
 
   if (unresolved.length === 0) {
     try {
@@ -338,8 +346,8 @@ async function detectTracker(
   draft: PoiesisConfig | undefined,
   remoteUrl: string | undefined,
 ): Promise<TrackerDetection> {
-  const provider = draft?.tracker.provider;
-  const explicitProject = draft?.tracker.project;
+  const provider = draft?.tracker?.provider;
+  const explicitProject = draft?.tracker?.project;
   if (provider !== undefined && explicitProject !== undefined && explicitProject.trim().length > 0) {
     return { provider, project: explicitProject, source: "explicit" };
   }

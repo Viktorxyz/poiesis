@@ -32,6 +32,7 @@ type Values = Record<string, string | boolean | string[] | undefined>;
 const HELP = `Poiesis deterministic runtime
 
 Usage:
+  poiesis bootstrap --print                            # print the one paste-able prompt that installs Poiesis into a project
   poiesis init                                          # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
   poiesis init --config <file> [--allow-fixtures]
   poiesis doctor
@@ -106,6 +107,8 @@ async function main(argv: string[]): Promise<void> {
       return commandPromote(rest);
     case "tracker":
       return commandTracker(rest);
+    case "bootstrap":
+      return commandBootstrap(rest);
     case "session":
       return commandSession(rest);
     case "repository":
@@ -183,6 +186,22 @@ export async function commandInit(args: string[]): Promise<void> {
     }
     throw error;
   }
+}
+
+/**
+ * Spec #138: print the one paste-able prompt that installs Poiesis.
+ *
+ * The Author asked for something they can hand to any agent and walk away
+ * from. This is that artifact, and it lives in the CLI so it can never drift
+ * from the install path it describes.
+ */
+async function commandBootstrap(args: string[]): Promise<void> {
+  const values = options(args, { "print": { type: "boolean" }, cwd: { type: "string" } });
+  void cwdOf(values);
+  const { BOOTSTRAP_PROMPT } = await import("./bootstrap-prompt.js");
+  // Human feedback, not a lifecycle envelope: this is text for a human or an
+  // agent to read, so it goes to stdout verbatim.
+  process.stdout.write(BOOTSTRAP_PROMPT);
 }
 
 async function commandDoctor(args: string[]): Promise<void> {

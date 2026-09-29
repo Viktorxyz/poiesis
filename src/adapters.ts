@@ -667,7 +667,7 @@ function fixtureRecord(store: FixtureTrackerStore, id: string, kind?: TrackerIte
 }
 
 export function createTrackerAdapter(
-  config: TrackerConfig | PoiesisConfig["tracker"],
+  config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>,
   root = process.cwd(),
 ): TrackerAdapter {
   const project = config.project ?? "";
@@ -772,7 +772,7 @@ export interface FixtureDeliveryConfig {
 }
 
 export type DeliveryAdapterConfig = CommandDeliveryConfig | FixtureDeliveryConfig;
-export type ConfiguredDeliveryTarget = PoiesisConfig["delivery"][DeliveryTarget];
+export type ConfiguredDeliveryTarget = NonNullable<PoiesisConfig["delivery"]>[DeliveryTarget];
 
 class CommandDeliveryAdapter implements DeliveryAdapter {
   readonly kind = "command" as const;

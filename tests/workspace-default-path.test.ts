@@ -182,7 +182,11 @@ describe("workspace prepare default path", () => {
         !line.includes(".poiesis/") &&
         !line.includes(".opencode/") &&
         line !== "?? opencode.jsonc" &&
-        line !== "?? .gitignore",
+        line !== "?? .gitignore" &&
+        // Spec #138: init writes the generated delivery scripts, so `scripts/`
+        // is Poiesis-created work in the same sense as `.gitignore` - not
+        // foreign work leaking into the Author's checkout.
+        !line.startsWith("?? scripts/"),
       );
     expect(foreignLines.join("\n")).toBe("?? foreign.txt");
     await workspacePrepare({
@@ -201,7 +205,11 @@ describe("workspace prepare default path", () => {
         !line.includes(".poiesis/") &&
         !line.includes(".opencode/") &&
         line !== "?? opencode.jsonc" &&
-        line !== "?? .gitignore",
+        line !== "?? .gitignore" &&
+        // Spec #138: init writes the generated delivery scripts, so `scripts/`
+        // is Poiesis-created work in the same sense as `.gitignore` - not
+        // foreign work leaking into the Author's checkout.
+        !line.startsWith("?? scripts/"),
       );
     expect(afterForeignLines.join("\n")).toBe("?? foreign.txt");
   }, 30_000);

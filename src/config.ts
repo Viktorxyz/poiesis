@@ -24,17 +24,27 @@ export const configSchema = z.strictObject({
       integrationBranch: z.string().optional(),
     })
     .optional(),
+  // Spec #138: optional. Provider and project are inferred from the Git
+  // remote (github.com -> github, gitlab.com -> gitlab) plus its URL path, so
+  // a fresh project does not have to state them. An Author who does state them
+  // keeps them.
   tracker: z
     .object({
       provider: z.enum(["github", "gitlab", "fixture"]),
       project: z.string().optional(),
     })
-    .loose(),
-  delivery: z.strictObject({
-    preview: adapterTargetSchema,
-    staging: adapterTargetSchema,
-    production: adapterTargetSchema,
-  }),
+    .loose()
+    .optional(),
+  // Spec #138: optional. A fresh project should not have to hand-write three
+  // delivery commands before `poiesis init` will start; init writes working
+  // `scripts/poiesis-<target>.mjs` files and resolves the config to them.
+  delivery: z
+    .strictObject({
+      preview: adapterTargetSchema,
+      staging: adapterTargetSchema,
+      production: adapterTargetSchema,
+    })
+    .optional(),
   verification: z
     .strictObject({
       commands: z.array(z.string().min(1)).optional(),
@@ -49,7 +59,7 @@ export type ResolvedPoiesisConfig = {
   models: { reasoning: string; execution: string; roles?: Record<string, string> };
   repository: { remote: string; integrationBranch: string };
   tracker: { provider: "github" | "gitlab" | "fixture"; project: string };
-  delivery: PoiesisConfig["delivery"];
+  delivery: NonNullable<PoiesisConfig["delivery"]>;
   verification: { commands: string[]; postIntegrationCommands?: string[] };
 };
 
