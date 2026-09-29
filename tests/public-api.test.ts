@@ -231,6 +231,14 @@ const forbiddenFunctions = [
   // tickets stabilize them.
   "acquireRefreshLock",
   "acquireRefreshLockWithTimeout",
+  // Spec #131 / ticket #132 — the v1.1.3 / v1.1.4 predecessor
+  // projection helper is a migration-only seam that lives in
+  // `src/authority.ts` and MUST NOT reach the package root.
+  // Promoting it would lock the predecessor projection shape
+  // (exact-version allow key, pre-#123 Worker bash surface, and
+  // the Specialist agent `permission.bash` strip) into a public
+  // API before the v1.2 surface stabilizes.
+  "predecessorProjectionV113V114",
 ] as const;
 
 const forbiddenTypes = [

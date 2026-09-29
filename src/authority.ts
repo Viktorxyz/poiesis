@@ -371,6 +371,107 @@ export function predecessorProjectionV111(
 }
 
 /**
+ * The exact v1.1.3 / v1.1.4 predecessor projection for the OpenCode
+ * adapter. Differs from the current projection in THREE fields:
+ *
+ *   - `agent.poiesis-worker.permission.bash` retains the pre-#123
+ *     Worker deny surface (`*` allow + `git *` / `poiesis *` /
+ *     `pnpm exec poiesis *` / `npx poiesis *` /
+ *     `pnpm dlx poiesis-cli *` / `pnpm dlx poiesis-cli@*` denies);
+ *     Spec #120 / ticket #123 appended the four Repository
+ *     Intelligence additive allows (status / query / path / explain)
+ *     AFTER the `pnpm dlx poiesis-cli@*` deny so the v1.2 Worker
+ *     bash surface is a strict superset of the 1.1.3 / 1.1.4 surface.
+ *     The 1.1.3 / 1.1.4 install never shipped the Repository
+ *     Intelligence additive allows.
+ *   - `agent.poiesis-planner.permission.bash` is STRIPPED entirely:
+ *     the 1.1.3 / 1.1.4 Planner carried no bash surface; the v1.2
+ *     Planner gained the narrow Repository Intelligence bash
+ *     surface (tickets #121 / #123).
+ *   - `agent.poiesis-reviewer.permission.bash` is STRIPPED entirely:
+ *     the 1.1.3 / 1.1.4 Ticket Reviewer carried no bash surface;
+ *     the v1.2 Ticket Reviewer gained the narrow Repository
+ *     Intelligence bash surface (ticket #123).
+ *   - `agent.poiesis-final-reviewer.permission.bash` is STRIPPED
+ *     entirely: the 1.1.3 / 1.1.4 Final Reviewer carried no bash
+ *     surface; the v1.2 Final Reviewer gained the narrow Repository
+ *     Intelligence bash surface (ticket #123).
+ *
+ * The primary bash surface (`agent.poiesis.permission.bash`) and the
+ * Specialist `poiesis-research` permission are UNCHANGED between the
+ * 1.1.3 / 1.1.4 install and the current 1.2.x projection because the
+ * exact-version canonical route `pnpm dlx poiesis-cli@<X>` already
+ * shipped in 1.1.3 / 1.1.4 (the v1.1.2 / Spec #104 / ticket #105
+ * primary-bash refactor) and Research already carried no bash
+ * surface in 1.1.3 / 1.1.4. The helper therefore only mutates the
+ * four fields listed above.
+ *
+ * The `poiesisVersion` parameter MUST equal `"1.1.3"` or `"1.1.4"`.
+ * It drives the exact-version allow key
+ * `pnpm dlx poiesis-cli@<poiesisVersion> *` on the primary agent;
+ * `desiredOpenCodePatches` already produces the correct primary
+ * surface for either value because the exact-version canonical route
+ * was introduced in v1.1.2 and unchanged in 1.1.3 / 1.1.4. Passing
+ * any other value is undefined behavior (the helper makes no
+ * structural promise; the authority gate that uses it rejects
+ * non-1.1.3 / non-1.1.4 predecessors upstream).
+ *
+ * Kept intentionally narrow: this is a migration-only exact
+ * predecessor projection, not a general historical-normalization
+ * helper. New patches must NOT be added here without an explicit
+ * ticket and migration contract.
+ */
+export function predecessorProjectionV113V114(
+  config: PoiesisConfig,
+  poiesisVersion: "1.1.3" | "1.1.4",
+): Array<{ path: string[]; value: unknown }> {
+  const v113V114WorkerBash: Record<string, string> = {
+    "*": "allow",
+    "git *": "deny",
+    "poiesis *": "deny",
+    "pnpm exec poiesis *": "deny",
+    "npx poiesis *": "deny",
+    "pnpm dlx poiesis-cli *": "deny",
+    "pnpm dlx poiesis-cli@*": "deny",
+  };
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
+    if (patch.path.length === 2 && patch.path[0] === "agent") {
+      if (patch.path[1] === "poiesis-worker") {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = {
+          ...(installed.permission as Record<string, unknown>),
+          bash: v113V114WorkerBash,
+        };
+        return { ...patch, value: { ...installed, permission } };
+      }
+      // Spec #131 / ticket #132 — the 1.1.3 / 1.1.4 install carried
+      // NO bash surface for the Planner / Ticket Reviewer / Final
+      // Reviewer Specialist agents. The v1.2 narrow Repository
+      // Intelligence bash surface (Spec #120 / tickets #121 / #123)
+      // is a post-1.1.4 additive. Strip the `permission.bash` key
+      // from those three agents so the predecessor projection stays
+      // byte-for-byte equivalent to what the legacy 1.1.3 / 1.1.4
+      // install actually wrote to disk. The Ticket Reviewer's
+      // `permission.task = { explore: "allow" }` (which the
+      // 1.0.x predecessor projection strips — Spec #120 / ticket
+      // #123) is absent from the v1.1.3 / 1.1.4 projection AND the
+      // current projection, so no task key needs to be re-added.
+      if (
+        patch.path[1] === "poiesis-planner" ||
+        patch.path[1] === "poiesis-reviewer" ||
+        patch.path[1] === "poiesis-final-reviewer"
+      ) {
+        const installed = patch.value as Record<string, unknown>;
+        const permission = { ...(installed.permission as Record<string, unknown>) };
+        delete permission.bash;
+        return { ...patch, value: { ...installed, permission } };
+      }
+    }
+    return patch;
+  });
+}
+
+/**
  * Returns true if `manifest.configPatches` exactly matches the given projection:
  * same length, same `(file, path)` keys, and `isDeepStrictEqual` values.
  * Used to verify that a predecessor manifest is byte-for-byte the v1.0.0/1.0.1/1.0.2
@@ -396,7 +497,9 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
  * (which retained `poiesis-reviewer.permission.task = { explore: "allow" }`
  * and the pre-#113 Worker bash surface) and, when explicitly accepted,
  * the exact v1.1.1 predecessor primary-bash + pre-#113 Worker bash
- * projection.
+ * projection and the exact v1.1.3 / v1.1.4 predecessor projection
+ * (which stripped the v1.2 narrow Repository Intelligence bash
+ * surface from the Specialist agents).
  *
  * Use this ONLY after authenticating the receipt: the receipt binds the
  * trusted manifest digest, this function then proves the manifest's projection
@@ -406,10 +509,14 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
  * Callers MUST pass the explicit predecessor version set they accept. The
  * default accepts the three v1.0.0/1.0.1/1.0.2 versions, but bootstrap and
  * update paths use different subsets per ticket #24 Replan:
- *   - receipt-authenticated update: `["1.0.1", "1.0.2", "1.1.1"]`
+ *   - receipt-authenticated update: `["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4"]`
  *     (1.1.1 is accepted only here, on explicit `update`, because the
  *     primary-bash surface changed in 1.1.2 and any pre-existing 1.1.1
- *     install must be transitioned through the receipt-gated update path)
+ *     install must be transitioned through the receipt-gated update path;
+ *     1.1.3 / 1.1.4 are accepted for the same reason — the v1.2
+ *     Specialist bash surface is a post-1.1.4 additive, so any
+ *     pre-existing 1.1.3 / 1.1.4 install must be transitioned through
+ *     the receipt-gated update path)
  *   - bootstrap legacy ownership: `["1.0.0"]` (the version is already pinned
  *     by `validateLegacyInstallation`, so this is defense-in-depth)
  *
@@ -420,7 +527,7 @@ export async function assertManifestAuthorityToleratingPredecessor(
   root: string,
   manifest: Manifest,
   config: PoiesisConfig,
-  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1"> = [
+  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4"> = [
     "1.0.0",
     "1.0.1",
     "1.0.2",
@@ -450,6 +557,23 @@ export async function assertManifestAuthorityToleratingPredecessor(
   // both differ from current.
   if (manifest.poiesisVersion === "1.1.1") {
     const predecessor = predecessorProjectionV111(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, predecessor);
+      return;
+    }
+  }
+  // Spec #131 / ticket #132 — 1.1.3 / 1.1.4 predecessor projection:
+  // Worker bash carries the pre-#123 surface (no Repository
+  // Intelligence additive allows) and the Specialist agents
+  // (Planner / Ticket Reviewer / Final Reviewer) carry NO `bash`
+  // key at all. The primary bash surface and the `poiesis-research`
+  // permission are unchanged from the current projection because
+  // the exact-version canonical route `pnpm dlx poiesis-cli@<X>`
+  // already shipped in 1.1.3 / 1.1.4. Both predecessor versions
+  // share the same surface; the supplied `poiesisVersion` parameter
+  // drives only the exact-version allow key.
+  if (manifest.poiesisVersion === "1.1.3" || manifest.poiesisVersion === "1.1.4") {
+    const predecessor = predecessorProjectionV113V114(config, manifest.poiesisVersion);
     if (isExactProjection(manifest, predecessor)) {
       await assertManifestAuthorityImpl(root, manifest, predecessor);
       return;

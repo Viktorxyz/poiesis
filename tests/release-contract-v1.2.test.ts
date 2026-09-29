@@ -1,11 +1,11 @@
 /**
- * Spec #120 / ticket #125 — Poiesis 1.2.0 release / update contract.
+ * Spec #120 / ticket #125 — Poiesis 1.2.1 release / update contract.
  *
- * This file proves the 1.2.0 release contract at the existing seams the
+ * This file proves the 1.2.1 release contract at the existing seams the
  * runtime already exposes for the same version-bounded invariants:
  *
  *   - `packageVersion()` (the runtime identity seam) reads the published
- *     package version and the value is exactly `1.2.0`. This is the
+ *     package version and the value is exactly `1.2.1`. This is the
  *     durable half of the runtime identity boundary the OpenCode
  *     projection keys off (`pnpm dlx poiesis-cli@<manifest.poiesisVersion>`).
  *
@@ -24,11 +24,21 @@
  *     before any real publish.
  *
  *   - the same-version reconciliation contract still holds when the
- *     package is at 1.2.0: a receipt-authenticated `update` on a
- *     v1.2 install stamps `manifest.poiesisVersion = "1.2.0"`. This
+ *     package is at 1.2.1: a receipt-authenticated `update` on a
+ *     v1.2 install stamps `manifest.poiesisVersion = "1.2.1"`. This
  *     pins the new exact-version route the OpenCode projection
- *     admits so a fresh consumer install lands on the 1.2.0
+ *     admits so a fresh consumer install lands on the 1.2.1
  *     canonical surface.
+ *
+ *   - Spec #131 / ticket #132 — the package at 1.2.1 still admits
+ *     the v1.1.3 / v1.1.4 predecessor projection through the
+ *     receipt-authenticated ordinary `update` transaction. A 1.1.3 /
+ *     1.1.4 install with a trusted receipt is accepted, the manifest
+ *     version advances to 1.2.1, the primary bash is keyed off
+ *     `pnpm dlx poiesis-cli@1.2.1 *`, the Worker carries the v1.2
+ *     Repository Intelligence additive allows, and the Specialist
+ *     bash is restored. (Covered by
+ *     `tests/authority-1.1.x-predecessor.test.ts`.)
  *
  * The tests are deterministic, offline, and free of:
  *   - real npm publish;
@@ -138,14 +148,14 @@ const FORBIDDEN_PACKED_PATHS = [
   "node_modules/",
 ] as const;
 
-describe("Spec #120 / ticket #125 Poiesis 1.2.0 release / update contract", () => {
-  it("package.json version is the 1.2.0 release", async () => {
+describe("Spec #120 / ticket #125 Poiesis 1.2.1 release / update contract", () => {
+  it("package.json version is the 1.2.1 release", async () => {
     const pkg = await readPackageJson();
-    expect(pkg.version).toBe("1.2.0");
+    expect(pkg.version).toBe("1.2.1");
   });
 
-  it("packageVersion() runtime seam returns the 1.2.0 release", async () => {
-    expect(await packageVersion()).toBe("1.2.0");
+  it("packageVersion() runtime seam returns the 1.2.1 release", async () => {
+    expect(await packageVersion()).toBe("1.2.1");
   });
 
   it("package.json::files enumerates every required canonical doc / role / runtime output", async () => {
@@ -252,11 +262,11 @@ describe("Spec #120 / ticket #125 Poiesis 1.2.0 release / update contract", () =
   });
 
   it(
-    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.2.0 and advances the receipt once",
+    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.2.1 and advances the receipt once",
     async () => {
       // The receipt-authenticated ordinary `update` is the same-version
       // reconciliation path. A successful run on a v1.2 install must
-      // stamp the manifest with the current package version (1.2.0)
+      // stamp the manifest with the current package version (1.2.1)
       // and advance the receipt generation by exactly one. This is the
       // deterministic contract the OpenCode projection's
       // `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` allow key
@@ -281,7 +291,7 @@ describe("Spec #120 / ticket #125 Poiesis 1.2.0 release / update contract", () =
           skipSkills: true,
           allowFixtureAdapters: true,
         });
-        expect(initial.poiesisVersion).toBe("1.2.0");
+        expect(initial.poiesisVersion).toBe("1.2.1");
 
         const beforeReceipt = await readOwnershipReceipt(repository.root);
         const result = await update(repository.root, { skipSkills: true });
@@ -289,11 +299,11 @@ describe("Spec #120 / ticket #125 Poiesis 1.2.0 release / update contract", () =
         // Same-version reconciliation succeeds and re-stamps the
         // manifest version (no-op semantically, but the projection is
         // re-applied against proven-owned state).
-        expect(result.manifest.poiesisVersion).toBe("1.2.0");
+        expect(result.manifest.poiesisVersion).toBe("1.2.1");
 
         // The on-disk manifest reflects the re-stamped version.
         const reloaded = await loadManifest(repository.root);
-        expect(reloaded.poiesisVersion).toBe("1.2.0");
+        expect(reloaded.poiesisVersion).toBe("1.2.1");
 
         // Receipt advanced by exactly one.
         const afterReceipt = await readOwnershipReceipt(repository.root);
