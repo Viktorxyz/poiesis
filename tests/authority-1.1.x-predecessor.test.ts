@@ -68,8 +68,9 @@
  * `tests/release-contract-v1.2.test.ts`.
  */
 import { spawnSync } from "node:child_process";
-import { readFile, rm } from "node:fs/promises";
+import { access, mkdir, readFile, rm } from "node:fs/promises";
 import { isDeepStrictEqual } from "node:util";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -136,10 +137,44 @@ const TARBALL_PRIMARY_CHUNK_BY_VERSION = {
   "1.1.3": "package/dist/chunk-HU4WOHR7.js",
   "1.1.4": "package/dist/chunk-XL54HICJ.js",
 } as const;
-const TARBALL_PATH_BY_VERSION = {
-  "1.1.3": "/tmp/opencode/poiesis-cli-1.1.3.tgz",
-  "1.1.4": "/tmp/opencode/poiesis-cli-1.1.4.tgz",
-} as const;
+const PREDECESSOR_TARBALL_CACHE = join(tmpdir(), "poiesis-predecessor-tarballs");
+
+/**
+ * Resolve the published npm tarball for a predecessor version, caching it
+ * under the OS temp directory and downloading it from the registry on
+ * first use.
+ *
+ * The published tarball is the source of truth for the byte-equality
+ * assertions below, so it has to come from the registry. A hardcoded
+ * machine-local path makes the result depend on unrelated files that
+ * happen to exist on one developer machine, which is how these
+ * assertions previously passed locally and failed everywhere else.
+ */
+async function predecessorTarball(poiesisVersion: "1.1.3" | "1.1.4"): Promise<string> {
+  await mkdir(PREDECESSOR_TARBALL_CACHE, { recursive: true });
+  const expectedName = "poiesis-cli-" + poiesisVersion + ".tgz";
+  const expectedPath = join(PREDECESSOR_TARBALL_CACHE, expectedName);
+  try {
+    await access(expectedPath);
+    return expectedPath;
+  } catch {
+    // Not cached yet; fall through and fetch it.
+  }
+  const packed = spawnSync(
+    "npm",
+    ["pack", "poiesis-cli@" + poiesisVersion, "--pack-destination", PREDECESSOR_TARBALL_CACHE, "--silent"],
+    { encoding: "utf8" },
+  );
+  if (packed.status !== 0) {
+    throw new Error("npm pack poiesis-cli@" + poiesisVersion + " failed: " + packed.stderr);
+  }
+  const packedName = packed.stdout.trim().split("\n").pop() ?? "";
+  if (packedName !== expectedName) {
+    await rm(join(PREDECESSOR_TARBALL_CACHE, packedName), { force: true });
+    throw new Error("Unexpected tarball filename for poiesis-cli@" + poiesisVersion + ": " + packedName);
+  }
+  return expectedPath;
+}
 
 /**
  * Extract the body of a top-level `function NAME(...) { ... }`
@@ -201,8 +236,8 @@ function extractFunctionDeclaration(chunkText: string, functionName: string): st
  * the supplied lexical scope. The returned object is the literal
  * PRIMARY bash map as the tarball would project it for that version.
  */
-function readTarballPrimaryBash(poiesisVersion: "1.1.3" | "1.1.4"): Record<string, string> {
-  const chunk = readTarballFile(TARBALL_PATH_BY_VERSION[poiesisVersion], TARBALL_PRIMARY_CHUNK_BY_VERSION[poiesisVersion]);
+async function readTarballPrimaryBash(poiesisVersion: "1.1.3" | "1.1.4"): Promise<Record<string, string>> {
+  const chunk = readTarballFile(await predecessorTarball(poiesisVersion), TARBALL_PRIMARY_CHUNK_BY_VERSION[poiesisVersion]);
   const declaration = extractFunctionDeclaration(chunk, "primaryBashPermissions");
   const fn = new Function("poiesisVersion", `${declaration}\nreturn primaryBashPermissions(poiesisVersion);`) as (
     version: string,
@@ -223,8 +258,8 @@ function readTarballPrimaryBash(poiesisVersion: "1.1.3" | "1.1.4"): Record<strin
  * `poiesis-final-reviewer`) and each entry's `permission` field
  * carries the legacy 1.1.3 / 1.1.4 permission surface.
  */
-function readTarballPermissions(poiesisVersion: "1.1.3" | "1.1.4"): Record<string, { permission: Record<string, unknown> }> {
-  const chunk = readTarballFile(TARBALL_PATH_BY_VERSION[poiesisVersion], TARBALL_PRIMARY_CHUNK_BY_VERSION[poiesisVersion]);
+async function readTarballPermissions(poiesisVersion: "1.1.3" | "1.1.4"): Promise<Record<string, { permission: Record<string, unknown> }>> {
+  const chunk = readTarballFile(await predecessorTarball(poiesisVersion), TARBALL_PRIMARY_CHUNK_BY_VERSION[poiesisVersion]);
   const primaryDeclaration = extractFunctionDeclaration(chunk, "primaryBashPermissions");
   const permissionsDeclaration = extractFunctionDeclaration(chunk, "permissions");
   const fn = new Function(
@@ -308,22 +343,22 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
   });
 
   describe("tarball byte-equality (primary / worker / Specialist agents)", () => {
-    it("helper primary bash is byte-for-byte equal to the 1.1.3 tarball primary bash", () => {
-      const tarballBash = readTarballPrimaryBash("1.1.3");
+    it("helper primary bash is byte-for-byte equal to the 1.1.3 tarball primary bash", async () => {
+      const tarballBash = await readTarballPrimaryBash("1.1.3");
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.3");
       const helperPrimary = (helperOutput.find((p) => p.path[1] === "poiesis")!.value as { permission: { bash: Record<string, string> } }).permission.bash;
       expect(isDeepStrictEqual(helperPrimary, tarballBash)).toBe(true);
     });
 
-    it("helper primary bash is byte-for-byte equal to the 1.1.4 tarball primary bash", () => {
-      const tarballBash = readTarballPrimaryBash("1.1.4");
+    it("helper primary bash is byte-for-byte equal to the 1.1.4 tarball primary bash", async () => {
+      const tarballBash = await readTarballPrimaryBash("1.1.4");
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.4");
       const helperPrimary = (helperOutput.find((p) => p.path[1] === "poiesis")!.value as { permission: { bash: Record<string, string> } }).permission.bash;
       expect(isDeepStrictEqual(helperPrimary, tarballBash)).toBe(true);
     });
 
     it("helper worker bash is byte-for-byte equal to the 1.1.3 tarball worker bash (pre-#123, no Repository Intelligence additive allows)", async () => {
-      const tarballPermissions = readTarballPermissions("1.1.3");
+      const tarballPermissions = await readTarballPermissions("1.1.3");
       const tarballWorkerBash = (tarballPermissions["poiesis-worker"]!.permission as { bash: Record<string, string> }).bash;
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.3");
       const helperWorker = (helperOutput.find((p) => p.path[1] === "poiesis-worker")!.value as { permission: { bash: Record<string, string> } }).permission.bash;
@@ -337,16 +372,16 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       expect(Object.keys(helperWorker)).not.toContain("pnpm dlx poiesis-cli@1.1.3 repository explain *");
     });
 
-    it("helper worker bash is byte-for-byte equal to the 1.1.4 tarball worker bash (pre-#123, no Repository Intelligence additive allows)", () => {
-      const tarballPermissions = readTarballPermissions("1.1.4");
+    it("helper worker bash is byte-for-byte equal to the 1.1.4 tarball worker bash (pre-#123, no Repository Intelligence additive allows)", async () => {
+      const tarballPermissions = await readTarballPermissions("1.1.4");
       const tarballWorkerBash = (tarballPermissions["poiesis-worker"]!.permission as { bash: Record<string, string> }).bash;
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.4");
       const helperWorker = (helperOutput.find((p) => p.path[1] === "poiesis-worker")!.value as { permission: { bash: Record<string, string> } }).permission.bash;
       expect(isDeepStrictEqual(helperWorker, tarballWorkerBash)).toBe(true);
     });
 
-    it("1.1.3 Specialist agents (Planner / Reviewer / Final Reviewer) carry NO permission.bash key (helper matches tarball)", () => {
-      const tarballPermissions = readTarballPermissions("1.1.3");
+    it("1.1.3 Specialist agents (Planner / Reviewer / Final Reviewer) carry NO permission.bash key (helper matches tarball)", async () => {
+      const tarballPermissions = await readTarballPermissions("1.1.3");
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.3");
       for (const agentName of ["poiesis-planner", "poiesis-reviewer", "poiesis-final-reviewer"] as const) {
         const tarballAgentPermission = tarballPermissions[agentName]!.permission;
@@ -356,8 +391,8 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       }
     });
 
-    it("1.1.4 Specialist agents (Planner / Reviewer / Final Reviewer) carry NO permission.bash key (helper matches tarball)", () => {
-      const tarballPermissions = readTarballPermissions("1.1.4");
+    it("1.1.4 Specialist agents (Planner / Reviewer / Final Reviewer) carry NO permission.bash key (helper matches tarball)", async () => {
+      const tarballPermissions = await readTarballPermissions("1.1.4");
       const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), "1.1.4");
       for (const agentName of ["poiesis-planner", "poiesis-reviewer", "poiesis-final-reviewer"] as const) {
         const tarballAgentPermission = tarballPermissions[agentName]!.permission;
@@ -367,9 +402,9 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       }
     });
 
-    it("1.1.3 / 1.1.4 Research agent carries NO permission.bash key (helper matches tarball)", () => {
+    it("1.1.3 / 1.1.4 Research agent carries NO permission.bash key (helper matches tarball)", async () => {
       for (const version of ["1.1.3", "1.1.4"] as const) {
-        const tarballPermissions = readTarballPermissions(version);
+        const tarballPermissions = await readTarballPermissions(version);
         const helperOutput = predecessorProjectionV113V114(testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" }), version);
         const tarballResearchPermission = tarballPermissions["poiesis-research"]!.permission;
         expect(tarballResearchPermission, `${version} tarball research permission carries no bash key`).not.toHaveProperty("bash");
