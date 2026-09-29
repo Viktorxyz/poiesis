@@ -559,6 +559,17 @@ async function runLockedUpdateConfigTransaction(
   //    that patch-only ownership intact while recognizing that the projection
   //    would write exactly the bytes already on disk. Do NOT advance generation;
   //    return the existing manifest unchanged.
+  // Spec #133 / ticket #138: the Author-owned `package.json` state, declared
+  // before the no-op branch so BOTH branches can bind the post-write identity.
+  // `package.json` is neither a manifest record nor a journal artifact; it is
+  // reversed by its own written-hash-gated helper, exactly as the ordinary
+  // update path does.
+  const packageJson: { snapshot: Buffer | null; writtenHash: string | undefined } = {
+    snapshot: null,
+    writtenHash: undefined,
+  };
+  const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+
   const poiesisConfigBytesMatch = currentConfigBytes.equals(Buffer.from(newConfigContent, "utf8"));
   const openCodeBytesMatch = openCodeConfigCurrentBytes.equals(Buffer.from(preflightSerialized, "utf8"));
   // Adapter-fixture invariant. Must run AFTER the bytes are computed
@@ -587,9 +598,31 @@ async function runLockedUpdateConfigTransaction(
     // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
     // on schema rejection.
     await hooks?.preNoopDoctor?.();
-    const report = await doctor(resolvedRoot);
-    assertUpdateConfigDoctorGate(report, manifest);
-    return { manifest, doctor: report };
+
+    // Spec #133 / ticket #138: a config no-op is NOT a whole-project no-op.
+    // The `pnpm poiesis` package script is an artifact independent of the
+    // config bytes, so it must still be reconciled here. Without this,
+    // `poiesis model set reasoning <already-current-model>` silently left a
+    // missing or drifted script unrepaired, because that path lands in this
+    // branch and returned before the write site below.
+    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
+    await hooks?.prePoiesisScriptEnsure?.();
+    try {
+      await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
+        onWritten: (content) => {
+          packageJson.writtenHash = hashContent(content);
+        },
+      });
+      await hooks?.postPoiesisScriptEnsure?.();
+      const report = await doctor(resolvedRoot);
+      assertUpdateConfigDoctorGate(report, manifest);
+      return { manifest, doctor: report };
+    } catch (error) {
+      // Reversal is hash-gated, so a foreign replacement of `package.json`
+      // during this window is preserved rather than clobbered.
+      await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
+      throw error;
+    }
   }
 
   // 8. Validate the projected (post-write) OpenCode config payload against the
@@ -642,13 +675,6 @@ async function runLockedUpdateConfigTransaction(
   // Declared here (before the try) so the catch block can close over the
   // locals, and so a throw from a post-write step still leaves the
   // rollback identity bound. Same snapshot + written-hash-gated contract
-  // as `src/update-internal.ts`: `package.json` is neither a manifest
-  // record nor a journal artifact.
-  const packageJson: { snapshot: Buffer | null; writtenHash: string | undefined } = {
-    snapshot: null,
-    writtenHash: undefined,
-  };
-  const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
 
   try {
     // 10. Write the new Poiesis config atomically.

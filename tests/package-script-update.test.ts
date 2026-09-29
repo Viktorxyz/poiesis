@@ -563,4 +563,61 @@ describe("update --config and setModel reconcile the package script (acceptance 
     expect(contentAtWriteTime).toContain(POIESIS_SCRIPT_COMMAND);
     expect(await readFile(packageJsonPath(repository), "utf8")).toBe(foreign);
   }, 60_000);
+
+  describe("ticket #138 - a config no-op still reconciles the package script", () => {
+    // The no-op branch in runUpdateConfigTransaction used to return before the
+    // package-script write site. `poiesis model set <class> <already-current
+    // model>` lands exactly there, so the everyday Author command silently
+    // left a missing or drifted script unrepaired. These pin the fix.
+    it("setModel to the already-current model still repairs a drifted value", async () => {
+      const repository = await createInstalledRepository();
+      const pkgPath = packageJsonPath(repository);
+      const drifted = (await readFile(pkgPath, "utf8")).replace(
+        JSON.stringify(POIESIS_SCRIPT_COMMAND),
+        JSON.stringify("pnpm dlx poiesis-cli@0.0.1"),
+      );
+      await writeFile(pkgPath, drifted);
+
+      const configPath = join(repository.root, ".poiesis", "config.jsonc");
+      const configBefore = await readFile(configPath, "utf8");
+      const current = parseJsonc<PoiesisConfig>(configBefore, configPath);
+
+      // Set the class to the value it ALREADY holds: a pure no-op.
+      await setModel(repository.root, "reasoning", current.models.reasoning);
+
+      // The config is untouched, because this genuinely was a no-op...
+      expect(await readFile(configPath, "utf8")).toBe(configBefore);
+      // ...but the package script WAS reconciled.
+      const after = await readFile(pkgPath, "utf8");
+      expect(after).toContain(JSON.stringify(POIESIS_SCRIPT_COMMAND));
+      expect(after).not.toContain("poiesis-cli@0.0.1");
+    }, 60_000);
+
+    it("setModel to the already-current model still ADDS a missing script", async () => {
+      const repository = await createInstalledRepository();
+      await downgradeToPreFeaturePackageJson(repository);
+      expect((await readPackageJson(repository)).scripts).not.toHaveProperty([POIESIS_SCRIPT_NAME]);
+
+      const configPath = join(repository.root, ".poiesis", "config.jsonc");
+      const current = parseJsonc<PoiesisConfig>(await readFile(configPath, "utf8"), configPath);
+
+      await setModel(repository.root, "execution", current.models.execution);
+
+      const after = await readFile(packageJsonPath(repository), "utf8");
+      expect(after).toBe(PRE_FEATURE_PACKAGE_JSON.replace('  "scripts": {\n', `  "scripts": {\n${INSERTED_2_SPACE}`));
+    }, 60_000);
+
+    it("a no-op leaves package.json completely untouched when the value is already correct", async () => {
+      const repository = await createInstalledRepository();
+      const before = await fileIdentity(packageJsonPath(repository));
+      const configPath = join(repository.root, ".poiesis", "config.jsonc");
+      const current = parseJsonc<PoiesisConfig>(await readFile(configPath, "utf8"), configPath);
+
+      await setModel(repository.root, "reasoning", current.models.reasoning);
+
+      const after = await fileIdentity(packageJsonPath(repository));
+      expect(after.ino).toBe(before.ino);
+      expect(after.mtimeNs).toBe(before.mtimeNs);
+    }, 60_000);
+  });
 });
