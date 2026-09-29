@@ -4,3 +4,5 @@ coverage/
 .poiesis/tmp/
 *.tgz
 .DS_Store
+# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)
+.poiesis/workspaces/
