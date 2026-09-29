@@ -56,6 +56,11 @@ import {
   validateOpenCodeConfig,
 } from "./opencode.js";
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
+import {
+  assertPoiesisScriptAvailable,
+  ensurePoiesisScriptRefusing,
+  rollbackPackageJson,
+} from "./package-script.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
@@ -884,6 +889,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   const initialOpenCodeConfigSnapshot = await snapshotFile(openCodeConfigPath);
   await assertGitignoreAvailable(resolvedRoot);
   const initialGitignoreSnapshot = await snapshotFile(join(resolvedRoot, ".gitignore"));
+  // Spec #133 / ticket #134: `package.json` is an Author-owned file, so
+  // the package-script conflict check is a READ-ONLY pre-flight placed
+  // with the other `assert*Available` guards, before any write. A
+  // conflicting `scripts.poiesis` therefore fails closed without leaving
+  // any other file mutated. A project with no `package.json` is not an
+  // error; it simply gets no script.
+  await assertPoiesisScriptAvailable(resolvedRoot);
+  const initialPackageJsonSnapshot = await snapshotFile(join(resolvedRoot, "package.json"));
   const initialSkills = options.skipSkills
     ? undefined
     : await assertDefaultSkillDestinationsAvailable(resolvedRoot);
@@ -908,6 +921,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   let writtenManifestHash: string | undefined;
   const gitignorePath = join(resolvedRoot, ".gitignore");
   let writtenGitignoreHash: string | undefined;
+  // Spec #133 / ticket #134: the package script is a bounded, reversible
+  // edit to an Author-owned file, not a manifest record and not a
+  // mutation-journal entry. It is gated by the same snapshot +
+  // written-hash rollback the `.gitignore` transaction already uses.
+  let writtenPackageJsonHash: string | undefined;
   const createdInitDirectories = new Set<string>();
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
@@ -1034,6 +1052,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       ...POIESIS_LOCAL_STATE_PATHS,
     ], initialGitignoreSnapshot ?? null);
     if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
+    // Spec #133 / ticket #134: the `pnpm poiesis` package script. The
+    // `expected` snapshot is the drift guard taken before any write; the
+    // helper returns `undefined` for an already-correct value so a
+    // correct script is never rewritten. The REFUSING entry point is
+    // what keeps acceptance #4 at the write site too, so the guarantee
+    // does not depend on the pre-flight above having run.
+    const writtenPackageJson = await ensurePoiesisScriptRefusing(resolvedRoot, initialPackageJsonSnapshot);
+    if (writtenPackageJson !== undefined) writtenPackageJsonHash = hashContent(writtenPackageJson);
     await assertInitDestinationsAbsent(resolvedRoot, files);
     await createInitFileParents(resolvedRoot, files, createdInitDirectories);
     for (const file of files) {
@@ -1153,6 +1179,13 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       initialOpenCodeConfigSnapshot,
       writtenOpenCodeConfigHash,
     ));
+    await rollbackStep(rollbackFailures, "package.json", async () => {
+      await rollbackPackageJson(
+        join(resolvedRoot, "package.json"),
+        initialPackageJsonSnapshot,
+        writtenPackageJsonHash,
+      );
+    });
     await rollbackStep(rollbackFailures, ".gitignore", async () => {
       await rollbackInitGitignore(gitignorePath, initialGitignoreSnapshot, writtenGitignoreHash);
     });

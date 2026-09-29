@@ -17,6 +17,23 @@
  * The public `UpdateConfigOptions` type intentionally does NOT expose
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
+ *
+ * Spec #133 / ticket #137 — the Author-owned `pnpm poiesis` package
+ * script IS reconciled here, which deliberately differs from the
+ * `.gitignore` carve-out documented in `src/maintenance.ts`. That
+ * carve-out exists because the default-path ignore rule is a safety
+ * invariant of the default workspace layout, which this config-only
+ * transaction never creates. The package script is different: it is a
+ * declared feature of an installed project, and `setModel` — reachable
+ * from the `pnpm poiesis model set ...` command the README advertises —
+ * runs this transaction. If this path skipped the script, the Author's
+ * most-used command would be the one command able to leave the everyday
+ * command surface broken, in direct violation of acceptance #7.
+ *
+ * The script keeps the `src/update-internal.ts` contract exactly: no
+ * manifest record, no journal entry, snapshot before the write, and a
+ * written-hash-gated `rollbackPackageJson` in the catch in reverse write
+ * order.
  */
 import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -39,6 +56,11 @@ import {
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
+import {
+  PACKAGE_JSON_RELATIVE,
+  repairPoiesisScript,
+  rollbackPackageJson,
+} from "./package-script.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { ResolvedPoiesisConfig } from "./config.js";
@@ -78,6 +100,18 @@ export interface UpdateTransactionHooks {
   prePoiesisConfigWrite?: () => void | Promise<void>;
   /** Called immediately after writing the new Poiesis config. */
   postPoiesisConfigWrite?: () => void | Promise<void>;
+  /**
+   * Called immediately BEFORE the `pnpm poiesis` package script is
+   * reconciled on the Author's `package.json`. Ticket #137.
+   */
+  prePoiesisScriptEnsure?: () => void | Promise<void>;
+  /**
+   * Called immediately AFTER the package script is reconciled. Fires
+   * even when the value was already correct and no write happened. Tests
+   * use this to land a concurrent foreign write to `package.json` and
+   * prove the transaction fails closed without clobbering it.
+   */
+  postPoiesisScriptEnsure?: () => void | Promise<void>;
   /** Called immediately before applying the OpenCode projection to the managed config. */
   preOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately after writing the new OpenCode config. */
@@ -161,8 +195,27 @@ function assertCompatibleUpdateConfigOptions(options: UpdateConfigOptions): void
  * pulling maintenance into this module's load cycle.
  */
 async function isRegularFileNoFollow(path: string): Promise<boolean> {
-  const details = await lstat(path);
-  return details.isFile() && !details.isSymbolicLink();
+  try {
+    const details = await lstat(path);
+    return details.isFile() && !details.isSymbolicLink();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
+/**
+ * Exact preimage bytes of the Author's `package.json`, or `null` when it
+ * does not exist. Absence is meaningful here: it is what lets
+ * `rollbackPackageJson` unlink a file the transaction created.
+ */
+async function snapshotPackageJson(path: string): Promise<Buffer | null> {
+  try {
+    return await readFile(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
 }
 
 async function assertPoiesisConfigOwnership(root: string, manifest: Manifest): Promise<{ content: Buffer; record: ManagedFile }> {
@@ -585,11 +638,44 @@ async function runLockedUpdateConfigTransaction(
   }
   await hooks.onJournalReady?.(journal.entries);
 
+  // Spec #133 / ticket #137: the Author-owned `package.json` state.
+  // Declared here (before the try) so the catch block can close over the
+  // locals, and so a throw from a post-write step still leaves the
+  // rollback identity bound. Same snapshot + written-hash-gated contract
+  // as `src/update-internal.ts`: `package.json` is neither a manifest
+  // record nor a journal artifact.
+  const packageJson: { snapshot: Buffer | null; writtenHash: string | undefined } = {
+    snapshot: null,
+    writtenHash: undefined,
+  };
+  const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+
   try {
     // 10. Write the new Poiesis config atomically.
     await hooks?.prePoiesisConfigWrite?.();
     await journal.replace(poiesisConfigArtifact, newConfigContent);
     await hooks.postPoiesisConfigWrite?.();
+
+    // 10b. Reconcile the `pnpm poiesis` package script (acceptance #7).
+    //      Written after the config and before the OpenCode projection, so
+    //      the catch block reverses it in exact reverse write order.
+    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
+    await hooks?.prePoiesisScriptEnsure?.();
+    await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
+      onWritten: (content) => {
+        packageJson.writtenHash = hashContent(content);
+      },
+    });
+    await hooks?.postPoiesisScriptEnsure?.();
+    if (packageJson.writtenHash !== undefined && (await exists(packageJsonPath))) {
+      if (hashContent(await readFile(packageJsonPath)) !== packageJson.writtenHash) {
+        throw new PoiesisError(
+          "PACKAGE_JSON_CHANGED",
+          "package.json changed between transaction write and manifest materialization",
+          { file: PACKAGE_JSON_RELATIVE },
+        );
+      }
+    }
 
     // 11. Write the already validated, deterministic OpenCode projection
     //     through the same journal guard used for every other artifact.
@@ -667,6 +753,10 @@ async function runLockedUpdateConfigTransaction(
     // 16. Exact rollback is journal-driven and always runs in reverse write
     //     order. Foreign replacements are preserved and reported explicitly.
     const diagnostics = await journal.rollback();
+    // Ticket #137: the Author-owned `package.json` is reversed AFTER the
+    // journal (it was written after the journal's first artifact) and
+    // its helper no-ops on any foreign replacement.
+    await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
     if (diagnostics.length > 0) {
       if (error instanceof PoiesisError) {
         error.details.incompleteRollback = diagnostics;

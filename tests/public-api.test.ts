@@ -155,6 +155,21 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
+  // Spec #133 / tickets #134-#137: the `pnpm poiesis` package-script
+  // module (`src/package-script.ts`) stays internal. These are the
+  // init/update transaction seams and the single source of truth for the
+  // script value; promoting them would freeze the Author-owned
+  // `package.json` edit contract (including the refusing/repairing
+  // entry-point split that forces each caller to choose deliberately)
+  // into the packed public surface.
+  "POIESIS_SCRIPT_NAME",
+  "POIESIS_SCRIPT_COMMAND",
+  "PACKAGE_JSON_RELATIVE",
+  "assertPoiesisScriptAvailable",
+  "ensurePoiesisScriptRefusing",
+  "repairPoiesisScript",
+  "rollbackPackageJson",
+  "EnsurePoiesisScriptOptions",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache

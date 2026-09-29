@@ -100,6 +100,43 @@ pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --bootstrap-lega
 
 After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
 
+### Everyday commands: `pnpm poiesis <command>`
+
+Once a project is installed, you rarely need to spell out a launcher at
+all. `poiesis init` and `poiesis update` maintain a single `poiesis`
+script in the project's own `package.json`, so the everyday human command
+surface is:
+
+```bash
+pnpm poiesis doctor
+pnpm poiesis model set reasoning openai/gpt-5.6-sol
+pnpm poiesis update
+```
+
+Poiesis writes exactly one entry, and never overwrites a `poiesis` script
+you defined yourself — a conflicting script fails `init` closed instead:
+
+```json
+"scripts": {
+  "poiesis": "pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest"
+}
+```
+
+The value is deliberately `@latest`, not a pinned version: you are never
+asked to remember or type one. It also carries
+`--config.dlx-cache-max-age=0` so the command bypasses pnpm's 1440-minute
+`dlx` resolution cache and always resolves the newest published release —
+without that flag a `pnpm poiesis update` could silently run a stale
+cached version. The flag lives in `package.json`, so you never type it.
+
+This is the **human** route only. The exact-version route
+`pnpm dlx poiesis-cli@<X>` (where `X` is the sole durable
+`manifest.poiesisVersion`) remains the runtime identity the OpenCode
+config projection admits, and the projected agent permissions still deny
+every version-qualified and `@latest` `dlx` variant. The script is
+inert after `uninstall` — it reports that the project is not installed,
+which is also how you reinstall.
+
 ### Updating the managed config
 
 `.poiesis/config.jsonc` is a managed surface — Poiesis generated it from a

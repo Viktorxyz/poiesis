@@ -61,6 +61,7 @@ import {
 import { assertOpenCodeOwnershipAgainstSnapshot } from "./opencode-preflight.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { ownedPath, poiesisPath } from "./paths.js";
+import { PACKAGE_JSON_RELATIVE, repairPoiesisScript, rollbackPackageJson } from "./package-script.js";
 import { parseJsonc } from "./config.js";
 import {
   acquireWorkspaceMutationLock,
@@ -124,6 +125,19 @@ interface GitignoreTransactionState {
 }
 
 /**
+ * Captured state for the Author-owned `package.json`, for the same reason
+ * and under the same contract as `GitignoreTransactionState`: the file is
+ * NOT a Poiesis-owned artifact under the journal's contract, so it is
+ * excluded from the manifest and from the bounded journal, and its
+ * reversal is gated on the hash this transaction actually wrote.
+ *
+ * Spec #133 / ticket #135. `package.json` is the Author's file; the only
+ * mutation is the single `scripts.poiesis` entry, and `rollbackPackageJson`
+ * restores the exact preimage (or unlinks, when there was no preimage).
+ */
+type PackageJsonTransactionState = GitignoreTransactionState;
+
+/**
  * Test-only deterministic fault-injection hooks used by
  * `runUpdateTransaction` and `runBootstrapLegacyOwnershipTransaction`.
  * Each callback fires immediately BEFORE the corresponding write step
@@ -183,6 +197,19 @@ export interface UpdateBootstrapTransactionHooks {
   preDefaultPathGitignoreEnsure?: () => void | Promise<void>;
   /** Called immediately AFTER the default-path `.gitignore` rule has been appended. */
   postDefaultPathGitignoreEnsure?: () => void | Promise<void>;
+  /**
+   * Called immediately BEFORE the `pnpm poiesis` package script is
+   * ensured on the Author's `package.json`. Ticket #135.
+   */
+  prePoiesisScriptEnsure?: () => void | Promise<void>;
+  /**
+   * Called immediately AFTER the `pnpm poiesis` package script has been
+   * ensured. Fires even when the value was already correct and no write
+   * happened. Tests use this to land a concurrent foreign write to
+   * `package.json` and prove the transaction fails closed without
+   * clobbering it. Ticket #135.
+   */
+  postPoiesisScriptEnsure?: () => void | Promise<void>;
   /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
   preManifestWrite?: () => void | Promise<void>;
   /** Called immediately AFTER atomic-writing the new `.poiesis/manifest.json`. */
@@ -237,6 +264,58 @@ async function rollbackDefaultPathGitignore(
 async function snapshotFile(path: string): Promise<Buffer | null> {
   if (!(await exists(path))) return null;
   return readFile(path);
+}
+
+/**
+ * Spec #133 / ticket #135 — ensure the `pnpm poiesis` package script on
+ * the Author's `package.json` inside the update / bootstrap transaction.
+ *
+ * The preimage is snapshotted immediately before the write, so the drift
+ * window is exactly as narrow as the `.gitignore` transaction's, and the
+ * repair fails closed if the Author touched the file in between.
+ *
+ * `repairPoiesisScript` (not the refusing entry point) is deliberate:
+ * acceptance #7 makes each update transaction a reconciliation boundary
+ * that restores a missing or drifted value, while `init` keeps the
+ * refusing entry point for acceptance #4.
+ *
+ * `state.writtenHash` is bound through the `onWritten` callback INSIDE
+ * the repair, immediately after the write lands. If the return value
+ * were captured by assignment instead, a throw from the post-write hook
+ * or from the identity check below would leave `writtenHash` undefined
+ * and the catch's `rollbackPackageJson` would silently leave Poiesis's
+ * own write to an Author file unreversed.
+ *
+ * The post-write identity check mirrors the OpenCode config check
+ * further down: a foreign replacement that lands between our write and
+ * the next step fails closed instead of being adopted as this
+ * transaction's state. Note the reversal of a FOREIGN write is still
+ * prevented by `rollbackPackageJson`'s own hash gate, not by the absence
+ * of a recorded hash.
+ */
+async function ensureUpdatePoiesisScript(
+  root: string,
+  state: PackageJsonTransactionState,
+  hooks: UpdateBootstrapTransactionHooks,
+): Promise<void> {
+  const path = join(root, PACKAGE_JSON_RELATIVE);
+  state.snapshot = await snapshotFile(path);
+  await hooks?.prePoiesisScriptEnsure?.();
+  await repairPoiesisScript(root, state.snapshot, {
+    onWritten: (content) => {
+      state.writtenHash = hashContent(content);
+    },
+  });
+  await hooks?.postPoiesisScriptEnsure?.();
+  if (state.writtenHash !== undefined && (await exists(path))) {
+    if (hashContent(await readFile(path)) !== state.writtenHash) {
+      throw new PoiesisError(
+        "PACKAGE_JSON_CHANGED",
+        "package.json changed between transaction write and manifest materialization",
+        { file: PACKAGE_JSON_RELATIVE },
+      );
+    }
+  }
 }
 
 /**
@@ -454,6 +533,12 @@ async function runLockedUpdateTransaction(
   // block's rollback. Declared here so the catch block can close over
   // the locals without re-reading the file.
   let gitignore: GitignoreTransactionState = { snapshot: null, writtenHash: undefined };
+  // Spec #133 / ticket #135: the Author-owned `package.json` state,
+  // declared here so the catch block can close over the locals without
+  // re-reading the file. Same snapshot + written-hash-gated contract as
+  // the `.gitignore` state, because the file is likewise not a
+  // Poiesis-owned artifact under the journal's contract.
+  let packageJson: PackageJsonTransactionState = { snapshot: null, writtenHash: undefined };
 
   try {
     await hooks?.preSkillsInstall?.();
@@ -501,6 +586,14 @@ async function runLockedUpdateTransaction(
     const result = await ensureDefaultPathGitignore(resolvedRoot, gitignore.snapshot);
     gitignore = { snapshot: gitignore.snapshot, writtenHash: result.writtenHash };
     await hooks?.postDefaultPathGitignoreEnsure?.();
+
+    // 2b. Author-owned `package.json`: the `pnpm poiesis` package script
+    //     (Spec #133 / ticket #135). Same reasoning as the `.gitignore`
+    //     rule above — not a Poiesis-owned artifact, so no manifest
+    //     record and no journal entry; the snapshot + written-hash
+    //     rollback in the catch block owns its reversal. Written AFTER
+    //     `.gitignore` so the catch block's reverse order is exact.
+    await ensureUpdatePoiesisScript(resolvedRoot, packageJson, hooks);
 
     // 3. OpenCode config: captured as `patch`-mode entry so physical
     //    existence and exact preimage are recorded independently of
@@ -631,6 +724,12 @@ async function runLockedUpdateTransaction(
     // Foreign replacements that land between this transaction's last
     // write and the rollback are preserved and reported explicitly.
     const diagnostics = await journal.rollback();
+    // 5b. Author-owned `package.json` (ticket #135), reversed BEFORE the
+    //     `.gitignore` rule because it was written after it. The helper
+    //     no-ops unless the current bytes still hash to what this
+    //     transaction wrote, so a foreign concurrent write is preserved
+    //     rather than clobbered with the preimage.
+    await rollbackPackageJson(join(resolvedRoot, PACKAGE_JSON_RELATIVE), packageJson.snapshot, packageJson.writtenHash);
     // 5. Transactional `.gitignore` (last shared helper, byte-exact already).
     await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignore.snapshot, gitignore.writtenHash);
     if (diagnostics.length > 0) {
@@ -792,6 +891,12 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
   await hooks?.onJournalReady?.(journal.entries);
 
   let gitignore: GitignoreTransactionState = { snapshot: null, writtenHash: undefined };
+  // Bootstrap parity with the ordinary update transaction (ticket #135):
+  // the same Author-owned `package.json` state, the same snapshot +
+  // written-hash-gated reversal. `poiesis update
+  // --bootstrap-legacy-ownership` is still `poiesis update`, so Spec
+  // acceptance #6/#7/#9/#10 apply to it unchanged.
+  let packageJson: PackageJsonTransactionState = { snapshot: null, writtenHash: undefined };
 
   try {
     await hooks?.preSkillsInstall?.();
@@ -829,6 +934,11 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     const result = await ensureDefaultPathGitignore(resolvedRoot, gitignore.snapshot);
     gitignore = { snapshot: gitignore.snapshot, writtenHash: result.writtenHash };
     await hooks?.postDefaultPathGitignoreEnsure?.();
+
+    // 2b. Bootstrap parity: the Author-owned `pnpm poiesis` package
+    //     script (ticket #135), same contract and same position in the
+    //     write order as the ordinary update transaction.
+    await ensureUpdatePoiesisScript(resolvedRoot, packageJson, hooks);
 
     const openCodeEntry = journal.entries.find((candidate) => candidate.path === openCodeConfigPath);
     if (openCodeEntry === undefined) {
@@ -931,6 +1041,10 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     // rollback (NOT in the journal) because the file is not a
     // Poiesis-owned artifact.
     const diagnostics = await journal.rollback();
+    // Bootstrap parity: the Author-owned `package.json` is reversed
+    // BEFORE the `.gitignore` rule because it was written after it, and
+    // its helper no-ops on any foreign replacement (ticket #135).
+    await rollbackPackageJson(join(resolvedRoot, PACKAGE_JSON_RELATIVE), packageJson.snapshot, packageJson.writtenHash);
     await rollbackDefaultPathGitignore(join(resolvedRoot, ".gitignore"), gitignore.snapshot, gitignore.writtenHash);
     if (diagnostics.length > 0) {
       if (error instanceof PoiesisError) {
