@@ -2,10 +2,10 @@
 import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { readUtf8 } from "./fs.js";
-import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
+import { parseJsonc, requireConfiguredDelivery, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, resolvePublishCoordinates, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -568,6 +568,11 @@ async function commandPublish(args: string[]): Promise<void> {
   const repoRoot = await resolveGitRoot(cwd);
   const configRoot = await resolveConfigRoot(repoRoot);
   const config = await resolveConfigForRoot(configRoot);
+  // Spec #139 / ticket #140: publishing coordinates come from the
+  // configured Git remote, never from tracker identity. A Linear or
+  // clone-local tracker still publishes to the repository its remote
+  // points at, and an unresolvable remote fails closed before any push.
+  const coordinates = await resolvePublishCoordinates(repoRoot, config);
   writeSuccess(
     "publish",
     await publish({
@@ -576,8 +581,8 @@ async function commandPublish(args: string[]): Promise<void> {
       integrationBranch: config.repository.integrationBranch,
       candidateSha: required(values, "sha"),
       candidateTree: required(values, "candidate-tree"),
-      provider: config.tracker.provider,
-      project: config.tracker.project,
+      provider: coordinates.provider,
+      project: coordinates.project,
       title: required(values, "title"),
       body: required(values, "body"),
       proof: json<ProofPayload>(required(values, "proof"), "proof"),
@@ -601,7 +606,7 @@ async function commandPreview(args: string[]): Promise<void> {
   writeSuccess(
     "preview",
     await previewDelivery(
-      config.delivery.preview,
+      requireConfiguredDelivery(config.delivery, "poiesis preview").preview,
       {
         sha: required(values, "sha"),
         candidateTree: required(values, "candidate-tree"),
@@ -672,8 +677,12 @@ async function commandPromote(args: string[]): Promise<void> {
   const identity = json<DeliveryIdentity>(required(values, "identity"), "identity");
   const sha = required(values, "sha");
   const candidateTree = required(values, "candidate-tree");
+  // Spec #139 / ticket #140: promotion is a delivery mutation, so a
+  // deferred install refuses it with a typed error before any adapter is
+  // constructed or any artifact is written.
+  const delivery = requireConfiguredDelivery(config.delivery, `poiesis promote --target ${target}`);
   if (target === "staging") {
-    writeSuccess("promote", await promoteDelivery(config.delivery.staging, {
+    writeSuccess("promote", await promoteDelivery(delivery.staging, {
       sha,
       target,
       candidateTree,
@@ -681,7 +690,7 @@ async function commandPromote(args: string[]): Promise<void> {
     }, repoRoot));
     return;
   }
-  writeSuccess("promote", await promoteDelivery(config.delivery.production, {
+  writeSuccess("promote", await promoteDelivery(delivery.production, {
     sha,
     target,
     candidateTree,

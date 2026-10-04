@@ -3,10 +3,23 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { run } from "../src/process.js";
 import { composeInitDiscovery } from "../src/init-discovery.js";
-import type { PoiesisConfig } from "../src/config.js";
+import { requireConfiguredDelivery } from "../src/config.js";
+import type { PoiesisConfig, ResolvedPoiesisConfig } from "../src/config.js";
 import { createTestRepository, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode } from "./fake-opencode.js";
 import { autoResolveConfigDefaults } from "../src/maintenance.js";
+
+/**
+ * Ticket #140: the resolved `delivery` block is a discriminated union —
+ * three complete targets, or the explicit `{ mode: "deferred" }` state.
+ * Every assertion below inspects the complete branch, so it narrows
+ * through the same fail-closed helper the runtime uses rather than
+ * assuming the property always exists.
+ */
+function configuredDelivery(config: ResolvedPoiesisConfig | undefined) {
+  if (config === undefined) throw new Error("expected a resolved discovery config");
+  return requireConfiguredDelivery(config.delivery, "init discovery test");
+}
 
 const repositories: TestRepository[] = [];
 afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
@@ -95,7 +108,7 @@ describe("composeInitDiscovery", () => {
     expect(result.config!.tracker).toEqual({ provider: "github", project: "poiesis-test/init-discovery" });
     expect(result.config!.verification.commands).toEqual(["test -f README.md"]);
     // The resolved config carries the user's concrete argv; delivery stays explicit.
-    expect(result.config!.delivery.preview).toEqual({ adapter: "command", command: ["./delivery-runner", "preview", "{sha}"] });
+    expect(configuredDelivery(result.config).preview).toEqual({ adapter: "command", command: ["./delivery-runner", "preview", "{sha}"] });
     expect(result.detections.remote.source).toBe("git-origin");
     expect(result.detections.integrationBranch.source).toBe("git-local-main");
     expect(result.detections.tracker.source).toBe("explicit");
@@ -122,9 +135,9 @@ describe("composeInitDiscovery", () => {
     const result = await composeInitDiscovery(repository.root, baseDraft());
     expect(result.unresolved).toEqual([]);
     expect(result.config).toBeDefined();
-    expect(result.config!.delivery.preview).toEqual({ adapter: "command", command: ["scripts/poiesis-preview", "{sha}"] });
-    expect(result.config!.delivery.staging).toEqual({ adapter: "command", command: ["scripts/poiesis-staging", "{sha}"] });
-    expect(result.config!.delivery.production).toEqual({ adapter: "command", command: ["scripts/poiesis-production", "{sha}"] });
+    expect(configuredDelivery(result.config).preview).toEqual({ adapter: "command", command: ["scripts/poiesis-preview", "{sha}"] });
+    expect(configuredDelivery(result.config).staging).toEqual({ adapter: "command", command: ["scripts/poiesis-staging", "{sha}"] });
+    expect(configuredDelivery(result.config).production).toEqual({ adapter: "command", command: ["scripts/poiesis-production", "{sha}"] });
     expect(result.detections.delivery.preview?.source).toEqual({ kind: "script", path: "scripts/poiesis-preview" });
   });
 
@@ -220,15 +233,15 @@ describe("composeInitDiscovery", () => {
     };
     const result = await composeInitDiscovery(repository.root, draft);
     expect(result.config).toBeDefined();
-    expect(result.config!.delivery.preview).toEqual({
+    expect(configuredDelivery(result.config).preview).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-preview", "{sha}"],
     });
-    expect(result.config!.delivery.staging).toEqual({
+    expect(configuredDelivery(result.config).staging).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-staging", "{sha}"],
     });
-    expect(result.config!.delivery.production).toEqual({
+    expect(configuredDelivery(result.config).production).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-production", "{sha}"],
     });
@@ -262,7 +275,7 @@ describe("composeInitDiscovery", () => {
     // The forbidden adapter families never appear in the resolved config either.
     if (result.config !== undefined) {
       for (const target of ["preview", "staging", "production"] as const) {
-        const adapter = result.config.delivery[target].adapter;
+        const adapter = configuredDelivery(result.config)[target].adapter;
         expect(adapter).not.toBe("vercel");
         expect(adapter).not.toBe("netlify");
         expect(adapter).not.toBe("cloudflare");
@@ -288,7 +301,7 @@ describe("composeInitDiscovery", () => {
       },
     };
     const result = await composeInitDiscovery(repository.root, draft);
-    expect(result.config?.delivery.preview).toEqual({
+    expect(configuredDelivery(result.config).preview).toEqual({
       adapter: "command",
       command: ["./custom-preview", "{sha}"],
     });

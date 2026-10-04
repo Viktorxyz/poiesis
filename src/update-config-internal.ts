@@ -37,7 +37,8 @@
  */
 import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { loadConfig, parseJsonc, serializeConfig, validateConfig, type PoiesisConfig } from "./config.js";
+import { loadConfig, parseJsonc, serializeConfig, trackerProjectOf, validateConfig, type PoiesisConfig } from "./config.js";
+import { DELIVERY_TARGETS } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import { exists, readUtf8 } from "./fs.js";
 import { hashContent } from "./hash.js";
@@ -293,27 +294,45 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
  * `update --config` rejects the `allowFixtureAdapters` option up front,
  * so this invariant is the only line of defense against an introduced
  * or altered fixture configuration in this transaction.
+ *
+ * Ticket #140: both the tracker and the delivery block are discriminated
+ * unions now. A deferred delivery block has no adapter at all, so it is
+ * neither a fixture introduction nor an alteration — an install may
+ * legitimately transition between a complete delivery block and an
+ * explicit deferred state, and neither direction fabricates a fixture.
  */
-function detectFixtureAdapter(config: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined }): { fixture: boolean; targets: string[]; signature: string } {
+function detectFixtureAdapter(config: {
+  tracker?: { provider: string; project?: unknown } | undefined;
+  delivery?: { mode?: unknown; preview?: unknown; staging?: unknown; production?: unknown } | undefined;
+}): { fixture: boolean; targets: string[]; signature: string } {
   const targets: string[] = [];
   const parts: string[] = [];
   if (config.tracker?.provider === "fixture") {
     targets.push("tracker");
-    parts.push(`tracker=${config.tracker.provider}:${config.tracker.project ?? ""}`);
+    parts.push(`tracker=${config.tracker.provider}:${trackerProjectOf(config.tracker) ?? ""}`);
   }
-  for (const target of ["preview", "staging", "production"] as const) {
+  for (const target of DELIVERY_TARGETS) {
     const adapter = config.delivery?.[target];
-    if (adapter?.adapter === "fixture") {
+    if (
+      typeof adapter === "object" &&
+      adapter !== null &&
+      (adapter as { adapter?: unknown }).adapter === "fixture"
+    ) {
       targets.push(`delivery.${target}`);
-      parts.push(`delivery.${target}=${adapter.adapter}:${adapter.path ?? ""}`);
+      parts.push(`delivery.${target}=fixture:${fixturePath(adapter)}`);
     }
   }
   return { fixture: targets.length > 0, targets, signature: parts.join("|") };
 }
 
+function fixturePath(adapter: object): string {
+  const path = (adapter as { path?: unknown }).path;
+  return typeof path === "string" ? path : "";
+}
+
 function assertUpdateConfigNoFixtureIntroduceOrAlter(
   proposed: ResolvedPoiesisConfig,
-  current: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined },
+  current: { tracker?: { provider: string; project?: unknown } | undefined; delivery?: { mode?: unknown; preview?: unknown; staging?: unknown; production?: unknown } | undefined },
   poiesisConfigBytesMatch: boolean,
   openCodeBytesMatch: boolean,
 ): void {

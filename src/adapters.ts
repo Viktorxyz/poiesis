@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { mkdir, open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PoiesisConfig } from "./config.js";
+import type { DeliveryTargetConfig, PoiesisConfig } from "./config.js";
+import { trackerProjectOf } from "./config.js";
 import { PoiesisError, invariant } from "./errors.js";
 import { atomicWrite, exists, readUtf8 } from "./fs.js";
 import { run } from "./process.js";
@@ -20,16 +21,27 @@ import {
   type StagingEvidence,
 } from "./evidence.js";
 
-export type TrackerProvider = "github" | "gitlab" | "fixture";
+/**
+ * Spec #139 / ticket #140: tracker identity is independent from Git
+ * hosting. `linear` and `local` are configurable providers whose
+ * coordinates come from the Poiesis config, not from the Git remote.
+ */
+export type TrackerProvider = "github" | "gitlab" | "linear" | "local" | "fixture";
 export type TrackerItemKind = "spec" | "ticket";
 export type TrackerItemState = "open" | "closed" | "superseded";
 
 const SHA_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
-export interface TrackerConfig {
-  provider: TrackerProvider;
-  project: string;
-}
+/**
+ * The provider-specific tracker coordinates. Only the Git hosts and the
+ * test-only fixture carry a repository coordinate; `local` has none at
+ * all and `linear` carries a team (and optionally a project) instead.
+ */
+export type TrackerConfig =
+  | { provider: "github" | "gitlab"; project: string }
+  | { provider: "linear"; team: string; project?: string }
+  | { provider: "local" }
+  | { provider: "fixture"; project: string };
 
 export interface TrackerItem {
   id: string;
@@ -670,16 +682,34 @@ export function createTrackerAdapter(
   config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>,
   root = process.cwd(),
 ): TrackerAdapter {
-  const project = config.project ?? "";
-  requiredText(project, "tracker project");
   switch (config.provider) {
     case "github":
-      return new GitHubTrackerAdapter(project, root);
+      return new GitHubTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
     case "gitlab":
-      return new GitLabTrackerAdapter(project, root);
+      return new GitLabTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
     case "fixture":
-      return new FixtureTrackerAdapter(project, root);
+      return new FixtureTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
+    // Spec #139 / ticket #140: `linear` and `local` are configurable
+    // identities whose adapters arrive in later tickets. This seam fails
+    // closed with a typed error rather than constructing a fake adapter or
+    // routing Linear / local work through the Git host CLI.
+    case "linear":
+    case "local":
+      throw new PoiesisError(
+        "UNSUPPORTED_TRACKER_PROVIDER",
+        `The ${config.provider} tracker adapter is not implemented yet; Poiesis will not substitute a fake adapter`,
+        { provider: config.provider },
+      );
   }
+}
+
+/**
+ * Read the repository coordinate from any tracker config shape. Used only
+ * by the providers that actually carry one; `linear` and `local` never
+ * reach it because they fail closed above.
+ */
+function configProject(config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>): string {
+  return trackerProjectOf(config) ?? "";
 }
 
 export function createGitHubTrackerAdapter(project: string, cwd = process.cwd()): TrackerAdapter {
@@ -772,7 +802,14 @@ export interface FixtureDeliveryConfig {
 }
 
 export type DeliveryAdapterConfig = CommandDeliveryConfig | FixtureDeliveryConfig;
-export type ConfiguredDeliveryTarget = NonNullable<PoiesisConfig["delivery"]>[DeliveryTarget];
+/**
+ * Ticket #140: a configured delivery target is always a complete adapter
+ * object. The deferred state lives at the `delivery` block level and is
+ * resolved away (or refused) by `requireConfiguredDelivery` before an
+ * adapter is ever constructed, so no adapter can be built from a deferred
+ * or partial shape.
+ */
+export type ConfiguredDeliveryTarget = DeliveryTargetConfig;
 
 class CommandDeliveryAdapter implements DeliveryAdapter {
   readonly kind = "command" as const;

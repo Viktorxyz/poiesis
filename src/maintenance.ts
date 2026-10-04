@@ -4,12 +4,20 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
 import {
+  DEFERRED_DELIVERY_MODE,
+  isDeferredDelivery,
   loadConfig,
   parseJsonc,
+  requireConfiguredDelivery,
   serializeConfig,
+  trackerProjectOf,
   validateConfig,
+  type ConfiguredDeliveryConfig,
   type PoiesisConfig,
+  type ResolvedDeliveryConfig,
   type ResolvedPoiesisConfig,
+  type ResolvedTrackerConfig,
+  type TrackerProviderId,
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
@@ -86,6 +94,15 @@ import {
   templateMappings,
 } from "./templates.js";
 import { createDeliveryAdapter } from "./adapters.js";
+import type { PublishProvider } from "./evidence.js";
+
+/**
+ * Spec #139 / ticket #140 — the tracker providers that carry NO Git
+ * repository coordinate. Their identity is stated in the config, never
+ * inferred from the remote, and they can never stand in for a Git host
+ * when publishing.
+ */
+const TRACKER_PROVIDERS_WITHOUT_REPOSITORY: ReadonlySet<TrackerProviderId> = new Set(["linear", "local"]);
 
 export interface MaintenanceOptions {
   skipSkills?: boolean;
@@ -365,42 +382,46 @@ export async function autoResolveConfigDefaults(
   }
 
   let discoveredTracker = false;
-  let trackerProvider = config.tracker?.provider;
-  let trackerProject = config.tracker?.project ?? "";
-  // Spec #138: this block also runs when the provider is still unknown, which
-  // is the whole point - a fresh config has no `tracker` block at all, and the
-  // remote is what tells us the provider and the project.
-  if (
+  const configuredTracker = config.tracker;
+  let trackerProvider: TrackerProviderId | undefined = configuredTracker?.provider;
+  let trackerProject = (configuredTracker === undefined ? undefined : trackerProjectOf(configuredTracker)) ?? "";
+  let trackerTeam =
+    configuredTracker?.provider === "linear" &&
+    typeof (configuredTracker as { team?: unknown }).team === "string"
+      ? (configuredTracker as { team: string }).team
+      : "";
+  // Spec #138 / #139: a repository coordinate is inferred from the Git
+  // remote only for a provider that IS a Git host. `linear` and `local`
+  // are explicitly NOT inferred from the remote — that is the whole point
+  // of making tracker identity independent from Git hosting — so their
+  // coordinates come from the config alone.
+  const infersProjectFromRemote =
+    trackerProvider !== undefined &&
     trackerProvider !== "fixture" &&
-    (trackerProvider === undefined || trackerProject.trim().length === 0) &&
-    remote !== undefined
-  ) {
+    !TRACKER_PROVIDERS_WITHOUT_REPOSITORY.has(trackerProvider);
+  if (infersProjectFromRemote && trackerProject.trim().length === 0 && remote !== undefined) {
     const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
     const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
     if (url !== undefined) {
       const parsed = parseTrackerFromUrl(url);
-      if (parsed !== null) {
-        // Spec #138: infer BOTH the provider and the project from the remote.
-        // The previous condition only accepted a URL whose provider already
-        // matched the configured one, so a fresh config with no `tracker` block
-        // could never resolve either field - the Author was asked to supply,
-        // by hand, facts the Git remote already states.
-        if (trackerProvider === undefined) {
-          trackerProvider = parsed.provider;
-        }
-        if (parsed.provider === trackerProvider && trackerProject.trim().length === 0) {
-          trackerProject = parsed.project;
-          discoveredTracker = true;
-        }
+      if (parsed !== null && parsed.provider === trackerProvider) {
+        trackerProject = parsed.project;
+        discoveredTracker = true;
       }
     }
   }
-  if (trackerProject.trim().length === 0) {
-    throw new PoiesisError(
-      "INVALID_TRACKER_CONFIG",
-      "Cannot resolve tracker project; please set tracker.project in the config or configure a recognized Git remote",
-      { provider: trackerProvider },
-    );
+  // Spec #138: a config with NO `tracker` block still resolves both the
+  // provider and the project from the remote, so a fresh project does not
+  // have to hand-state facts Git already records.
+  if (trackerProvider === undefined && remote !== undefined) {
+    const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
+    const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+    const parsed = url === undefined ? null : parseTrackerFromUrl(url);
+    if (parsed !== null) {
+      trackerProvider = parsed.provider;
+      trackerProject = parsed.project;
+      discoveredTracker = true;
+    }
   }
 
   if (trackerProvider === undefined) {
@@ -410,17 +431,43 @@ export async function autoResolveConfigDefaults(
       {},
     );
   }
-  const resolvedTrackerProvider: ResolvedPoiesisConfig["tracker"]["provider"] = trackerProvider;
+  if (trackerProvider === "linear" && trackerTeam.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "A linear tracker requires a non-empty tracker.team; Linear credentials are read from the environment and must never be stored in the Poiesis config",
+      { provider: trackerProvider, field: "tracker.team" },
+    );
+  }
+  if (!TRACKER_PROVIDERS_WITHOUT_REPOSITORY.has(trackerProvider) && trackerProject.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "Cannot resolve tracker project; please set tracker.project in the config or configure a recognized Git remote",
+      { provider: trackerProvider },
+    );
+  }
+
+  const resolvedTracker: ResolvedTrackerConfig =
+    trackerProvider === "local"
+      ? { provider: "local" }
+      : trackerProvider === "linear"
+        ? {
+            provider: "linear",
+            team: trackerTeam,
+            ...(trackerProject.trim().length === 0 ? {} : { project: trackerProject }),
+          }
+        : { provider: trackerProvider, project: trackerProject };
 
   const resolved: ResolvedPoiesisConfig = {
     schema: 1,
     models: { reasoning: config.models.reasoning, execution: config.models.execution, ...(config.models.roles === undefined ? {} : { roles: config.models.roles }) },
     repository: { remote: remote!, integrationBranch: integrationBranch! },
-    tracker: { provider: resolvedTrackerProvider, project: trackerProject },
+    tracker: resolvedTracker,
     // Spec #138: a config with no `delivery` block is a normal fresh-project
     // config, not an error. init writes `scripts/poiesis-<target>.mjs` for the
     // targets that are missing, so the resolved config points at real, working
     // files. An Author who supplies their own delivery block keeps it.
+    // Spec #139: an explicitly deferred install resolves to the deferred
+    // mode, which never becomes a generated command target.
     delivery: resolveDelivery(config.delivery),
     verification: {
       commands: verificationCommands,
@@ -649,6 +696,17 @@ export async function validateOpenCodeConfigPayload(content: string): Promise<vo
 
 export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
+  // Spec #139 / ticket #140: `linear` and `local` are configurable
+  // identities with no adapter in this foundation. Failing closed with a
+  // typed, actionable error is the only honest outcome — a fake adapter,
+  // a synthesized issue, or a silent success claim is forbidden.
+  if (config.tracker.provider === "linear" || config.tracker.provider === "local") {
+    throw new PoiesisError(
+      "UNSUPPORTED_TRACKER_PROVIDER",
+      `The ${config.tracker.provider} tracker adapter is not implemented yet; Poiesis will not substitute a fake adapter`,
+      { provider: config.tracker.provider },
+    );
+  }
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
     await run("gh", ["repo", "view", config.tracker.project, "--json", "nameWithOwner"], { cwd: root });
@@ -659,13 +717,79 @@ export async function verifyTracker(root: string, config: ResolvedPoiesisConfig)
   return "verified";
 }
 
-export function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
+export function verifyDeliveryConfiguration(
+  root: string,
+  config: ResolvedPoiesisConfig,
+): "verified" | "fixture" | "deferred" {
+  if (isDeferredDelivery(config.delivery)) return "deferred";
+  const delivery = requireConfiguredDelivery(config.delivery, "delivery configuration");
   let fixture = false;
-  for (const target of ["preview", "staging", "production"] as const) {
-    const adapter = createDeliveryAdapter(config.delivery[target], root);
+  for (const target of DELIVERY_TARGETS) {
+    const adapter = createDeliveryAdapter(delivery[target], root);
     if (adapter.kind === "fixture") fixture = true;
   }
   return fixture ? "fixture" : "verified";
+}
+
+/**
+ * Spec #139 / ticket #140 — publishing coordinates.
+ *
+ * The provider and repository a change request is opened against are a
+ * property of the configured **Git remote**, never of the tracker. A
+ * project that keeps its work in Linear or in a clone-local store still
+ * publishes to the GitHub or GitLab repository its remote points at, so
+ * `provider: "linear"` / `"local"` can never leak into Publish evidence
+ * or into a publishing call.
+ *
+ * When the remote is not a recognized forge (a local path, a self-hosted
+ * host), the only coordinates that may be used are the configured
+ * tracker's — and only when that tracker is itself a publishing provider.
+ * A tracker-only provider with an unrecognized remote fails closed rather
+ * than inventing a repository.
+ */
+export interface PublishCoordinates {
+  provider: PublishProvider;
+  project: string;
+  source: "git-remote" | "tracker";
+}
+
+export async function resolvePublishCoordinates(
+  root: string,
+  config: ResolvedPoiesisConfig,
+): Promise<PublishCoordinates> {
+  const remotes = await run("git", ["remote", "get-url", "--all", config.repository.remote], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const remoteUrl = remotes.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (remoteUrl === undefined) {
+    throw new PoiesisError(
+      "GIT_REMOTE_UNAVAILABLE",
+      "Publishing coordinates are derived from the configured Git remote, which is unavailable",
+      { remote: config.repository.remote },
+    );
+  }
+  const fromRemote = parseTrackerFromUrl(remoteUrl);
+  if (fromRemote !== null) {
+    return { provider: fromRemote.provider, project: fromRemote.project, source: "git-remote" };
+  }
+  const trackerProvider = config.tracker.provider;
+  const trackerProject = trackerProjectOf(config.tracker);
+  if (
+    (trackerProvider === "github" || trackerProvider === "gitlab" || trackerProvider === "fixture") &&
+    trackerProject !== undefined &&
+    trackerProject.trim().length > 0
+  ) {
+    return { provider: trackerProvider, project: trackerProject, source: "tracker" };
+  }
+  throw new PoiesisError(
+    "PUBLISH_PROVIDER_UNRESOLVED",
+    "Publishing coordinates are derived from the configured Git remote, and this remote is not a recognized GitHub or GitLab host; point the remote at a recognized host or use a tracker that can host a change request",
+    { provider: trackerProvider, remote: config.repository.remote, remoteUrl },
+  );
 }
 
 async function assertInitDestinationsAbsent(root: string, files: Array<{ path: string }>): Promise<void> {
@@ -898,20 +1022,24 @@ export const DEFAULT_VERIFICATION_COMMAND = "git rev-parse --git-dir";
  * scripts. init creates `scripts/poiesis-<target>.mjs` for any target the
  * project lacks, so the default resolves to a file that will exist by the
  * time the transaction finishes.
+ *
+ * Spec #139 / ticket #140: an explicitly deferred install resolves to
+ * `{ mode: "deferred" }` and is NEVER completed with generated command
+ * targets. A complete block is returned unchanged, so an existing
+ * installation's serialized bytes are untouched.
  */
-function resolveDelivery(
-  delivery: PoiesisConfig["delivery"],
-): NonNullable<PoiesisConfig["delivery"]> {
-  const generated = {
+function resolveDelivery(delivery: PoiesisConfig["delivery"]): ResolvedDeliveryConfig {
+  if (isDeferredDelivery(delivery)) return { mode: DEFERRED_DELIVERY_MODE };
+  const generated: ConfiguredDeliveryConfig = {
     preview: defaultDeliveryAdapter("preview"),
     staging: defaultDeliveryAdapter("staging"),
     production: defaultDeliveryAdapter("production"),
   };
   if (delivery === undefined) return generated;
   return {
-    preview: delivery.preview ?? generated.preview,
-    staging: delivery.staging ?? generated.staging,
-    production: delivery.production ?? generated.production,
+    preview: delivery.preview,
+    staging: delivery.staging,
+    production: delivery.production,
   };
 }
 
@@ -1140,15 +1268,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     // Spec #138: write a working delivery script for every target the project
     // does not already have. Never overwrites - an existing script belongs to
     // the Author, which is what makes "edit it freely" a real promise.
-    for (const target of DELIVERY_TARGETS) {
-      const rel = deliveryScriptPath(target);
-      if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
-        continue;
+    // Spec #139 / ticket #140: a deferred install generates NOTHING. Writing
+    // a placeholder script would be exactly the fake adapter the Spec
+    // forbids.
+    if (deliveryMode !== "deferred") {
+      for (const target of DELIVERY_TARGETS) {
+        const rel = deliveryScriptPath(target);
+        if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
+          continue;
+        }
+        const abs = join(resolvedRoot, rel);
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
+        writtenDeliveryScripts.push(rel);
       }
-      const abs = join(resolvedRoot, rel);
-      await mkdir(dirname(abs), { recursive: true });
-      await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
-      writtenDeliveryScripts.push(rel);
     }
 
     const writtenPackageJson = await ensurePoiesisScriptRefusing(resolvedRoot, initialPackageJsonSnapshot);
@@ -1641,7 +1774,7 @@ export async function doctor(root: string): Promise<DoctorReport> {
         id: "tracker",
         status: mode === "fixture" ? "warn" : "pass",
         message: mode === "fixture" ? "Test-only fixture tracker is configured" : "Tracker authentication and project are available",
-        details: { provider: config.tracker.provider, project: config.tracker.project },
+        details: { provider: config.tracker.provider, project: trackerProjectOf(config.tracker) ?? null },
       });
     } catch (error) {
       checks.push({ id: "tracker", status: "fail", message: "Tracker authentication or project check failed", details: errorDetails(error) });
@@ -1650,13 +1783,24 @@ export async function doctor(root: string): Promise<DoctorReport> {
       const mode = verifyDeliveryConfiguration(resolvedRoot, config);
       checks.push({
         id: "delivery",
-        status: mode === "fixture" ? "warn" : "pass",
-        message: mode === "fixture" ? "Test-only fixture delivery is configured" : "Preview, staging, and production adapters are valid",
-        details: {
-          preview: config.delivery.preview.adapter,
-          staging: config.delivery.staging.adapter,
-          production: config.delivery.production.adapter,
-        },
+        // Spec #139: deferred delivery is an intentional operator choice,
+        // not a defect. It is reported as a nonblocking warning so the
+        // doctor gate keeps passing while the state stays visible.
+        status: mode === "fixture" || mode === "deferred" ? "warn" : "pass",
+        message:
+          mode === "fixture"
+            ? "Test-only fixture delivery is configured"
+            : mode === "deferred"
+              ? "Delivery is explicitly deferred; preview, staging, and production are not configured"
+              : "Preview, staging, and production adapters are valid",
+        details:
+          mode === "deferred"
+            ? { mode: DEFERRED_DELIVERY_MODE }
+            : {
+                preview: requireConfiguredDelivery(config.delivery, "doctor").preview.adapter,
+                staging: requireConfiguredDelivery(config.delivery, "doctor").staging.adapter,
+                production: requireConfiguredDelivery(config.delivery, "doctor").production.adapter,
+              },
       });
     } catch (error) {
       checks.push({ id: "delivery", status: "fail", message: "Delivery adapter configuration is invalid", details: errorDetails(error) });

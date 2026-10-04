@@ -38,7 +38,7 @@
  *   - Auth probe failures short-circuit BEFORE `init()` runs and include
  *     the exact auth login command in the error message.
  */
-import type { PoiesisConfig } from "./config.js";
+import { isDeferredDelivery, trackerProjectOf, type ConfiguredDeliveryConfig, type PoiesisConfig } from "./config.js";
 import { defaultDeliveryAdapter } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import {
@@ -146,8 +146,12 @@ export /**
  * needs a real value, because the config type requires all three. init writes
  * the corresponding generated script, so the generated adapter is the correct
  * answer rather than a placeholder.
+ *
+ * Spec #139 / ticket #140: the return type is the CONFIGURED branch of the
+ * delivery union, so a deferred draft is never completed with generated
+ * command targets by this helper.
  */
-function resolveDeliveryDefaults(): NonNullable<PoiesisConfig["delivery"]> {
+function resolveDeliveryDefaults(): ConfiguredDeliveryConfig {
   return {
     preview: defaultDeliveryAdapter("preview"),
     staging: defaultDeliveryAdapter("staging"),
@@ -417,11 +421,27 @@ async function resolveAuthorChoices(
         { provider: raw, supported: ["github", "gitlab"] },
       );
     }
-    next.tracker = { ...(next.tracker ?? {}), provider: raw as "github" | "gitlab" | "fixture" };
+    next.tracker = { ...(next.tracker ?? {}), provider: raw };
   }
   if (discovery.unresolved.includes("tracker.project")) {
     const project = await promptWithDefault(io, "Tracker project", "");
     next.tracker = { ...(next.tracker ?? ({} as NonNullable<PoiesisConfig["tracker"]>)), project };
+  }
+  // Spec #139 / ticket #140: a Linear tracker needs its non-secret team
+  // coordinate before `init()` can resolve it. The credential itself is
+  // environment-only and is never prompted into the config.
+  if (discovery.unresolved.includes("tracker.team")) {
+    const team = await promptWithDefault(io, "Linear team", "");
+    const provider = next.tracker?.provider;
+    if (provider !== "linear") {
+      throw new PoiesisError(
+        "INVALID_TRACKER_CONFIG",
+        "tracker.team is only meaningful for the linear tracker provider",
+        { provider: provider ?? null },
+      );
+    }
+    const project = next.tracker === undefined ? undefined : trackerProjectOf(next.tracker);
+    next.tracker = { provider: "linear", team, ...(project === undefined ? {} : { project }) };
   }
 
   // Delivery command argv: real command line containing `{sha}`. The
@@ -432,6 +452,10 @@ async function resolveAuthorChoices(
   // placeholders that the composer replaces with the detected script
   // hint. We always apply the composer's detected config when present
   // so the Author's draft placeholders never reach `init()`.
+  // Spec #139 / ticket #140: a deferred draft keeps its deferred state; no
+  // target is ever completed from a placeholder or a generated script, so
+  // the whole delivery question loop is skipped.
+  if (isDeferredDelivery(next.delivery)) return next;
   for (const { target } of DELIVERY_TARGET_PROMPTS) {
     const detection = discovery.detections.delivery[target];
     if (detection !== null) {
@@ -572,6 +596,12 @@ async function promptWithDefault(io: InteractiveInitIO, label: string, fallback:
 async function probeTrackerAuthBeforeInstall(io: InteractiveInitIO, config: PoiesisConfig): Promise<void> {
   const provider = config.tracker?.provider;
   if (provider === "fixture") return; // test-only path; init() handles authorization
+  // Spec #139 / ticket #140: the interactive auth probe exists only for the
+  // Git hosts, which authenticate through their CLI. `linear` and `local`
+  // have no CLI credential to probe here — Linear reads its credential from
+  // the environment and Local has none — so there is nothing to ask the
+  // Author. `init()` remains the single fail-closed authority for both.
+  if (provider === "linear" || provider === "local") return;
   // A provider is resolved before this point on every supported path; the guard
   // keeps the type honest rather than asserting a non-null.
   if (provider === undefined) return;

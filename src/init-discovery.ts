@@ -32,7 +32,8 @@
  */
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { PoiesisConfig, ResolvedPoiesisConfig } from "./config.js";
+import type { DeliveryTargetConfig, PoiesisConfig, ResolvedPoiesisConfig, TrackerProviderId } from "./config.js";
+import { isDeferredDelivery, requireConfiguredDelivery, trackerProjectOf } from "./config.js";
 import {
   parseTrackerFromUrl,
   autoResolveConfigDefaults,
@@ -75,13 +76,14 @@ export interface VerificationDetection {
 }
 
 export interface TrackerDetection {
-  provider?: "github" | "gitlab" | "fixture";
+  provider?: TrackerProviderId;
   project?: string;
+  team?: string;
   source: TrackerSource;
 }
 
 export interface DeliveryDetectionTarget {
-  config: ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]];
+  config: DeliveryTargetConfig;
   source: DeliverySource;
 }
 
@@ -165,14 +167,20 @@ export async function composeInitDiscovery(
   if (verificationDetection.source === "none") {
     unresolved.push("verification.commands");
   }
-  if (trackerDetection.source === "missing" || trackerDetection.project === undefined) {
+  // Spec #139 / ticket #140: a `local` tracker has no repository
+  // coordinate to resolve, so it never blocks the composer. A `linear`
+  // tracker needs a team; its repository-equivalent project is optional.
+  if (
+    detectionTrackerNeedsProject(trackerDetection) &&
+    (trackerDetection.source === "missing" || trackerDetection.project === undefined)
+  ) {
     unresolved.push("tracker.project");
   }
-  if (
-    draft?.tracker?.provider === undefined &&
-    trackerDetection.provider === undefined
-  ) {
+  if (draft?.tracker?.provider === undefined && trackerDetection.provider === undefined) {
     unresolved.push("tracker.provider");
+  }
+  if (draft?.tracker?.provider === "linear" && trackerDetection.team === undefined) {
+    unresolved.push("tracker.team");
   }
   if (draft?.models.reasoning === undefined || draft.models.reasoning.trim().length === 0) {
     unresolved.push("models.reasoning");
@@ -184,28 +192,45 @@ export async function composeInitDiscovery(
   // working `scripts/poiesis-<target>.mjs` when the target is absent, so the
   // composer resolves to the generated script instead of surfacing an
   // unresolved field. The Author can still replace the script afterwards.
-  for (const target of DELIVERY_TARGETS) {
-    if (deliveryDetection[target] !== null) continue;
-    if (await exists(join(root, deliveryScriptPath(target)))) continue;
-    unresolved.push(`delivery.${target}`);
+  // Spec #139 / ticket #140: an explicitly deferred draft is complete as
+  // stated, so no target question is raised for it.
+  if (!isDeferredDelivery(draft?.delivery)) {
+    for (const target of DELIVERY_TARGETS) {
+      if (deliveryDetection[target] !== null) continue;
+      if (await exists(join(root, deliveryScriptPath(target)))) continue;
+      unresolved.push(`delivery.${target}`);
+    }
   }
 
   if (unresolved.length === 0) {
     try {
       const resolved = await autoResolveConfigDefaults(root, draft as PoiesisConfig);
-      if (resolved.config.verification.commands.length > 0 && trackerDetection.project !== undefined) {
+      if (resolved.config.verification.commands.length > 0 && trackerResolved(trackerDetection)) {
         // Replace any delivery target that still carries a `<...>` placeholder
         // (e.g. the canonical config template) with the composer's prefilled
         // command adapter. The composer reuses `autoResolveConfigDefaults` for
         // every field it cannot reasonably recompute, but it owns the delivery
         // argv because the delivery script-hint rule is internal-only.
+        // Spec #139 / ticket #140: a deferred draft keeps its deferred state
+        // instead of being completed with discovered command targets.
         const finalConfig: ResolvedPoiesisConfig = {
           ...resolved.config,
-          delivery: {
-            preview: replaceTemplateDelivery(resolved.config.delivery.preview, deliveryDetection.preview),
-            staging: replaceTemplateDelivery(resolved.config.delivery.staging, deliveryDetection.staging),
-            production: replaceTemplateDelivery(resolved.config.delivery.production, deliveryDetection.production),
-          },
+          delivery: isDeferredDelivery(resolved.config.delivery)
+            ? resolved.config.delivery
+            : {
+                preview: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").preview,
+                  deliveryDetection.preview,
+                ),
+                staging: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").staging,
+                  deliveryDetection.staging,
+                ),
+                production: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").production,
+                  deliveryDetection.production,
+                ),
+              },
           verification: verificationDetection.source === "package-scripts"
             ? { commands: [...verificationDetection.commands] }
             : resolved.config.verification,
@@ -342,12 +367,44 @@ async function detectVerification(root: string, draft: PoiesisConfig | undefined
   return { commands: [], source: "none" };
 }
 
+/**
+ * Spec #139 / ticket #140: a `local` tracker is complete without a
+ * repository coordinate, and a `linear` tracker is complete with a team.
+ * Only the Git hosts and the test-only fixture need a project.
+ */
+function detectionTrackerNeedsProject(detection: TrackerDetection): boolean {
+  return detection.provider !== "local" && detection.provider !== "linear";
+}
+
+function trackerResolved(detection: TrackerDetection): boolean {
+  if (detection.provider === "local") return true;
+  if (detection.provider === "linear") return detection.team !== undefined;
+  return detection.project !== undefined;
+}
+
 async function detectTracker(
   draft: PoiesisConfig | undefined,
   remoteUrl: string | undefined,
 ): Promise<TrackerDetection> {
   const provider = draft?.tracker?.provider;
-  const explicitProject = draft?.tracker?.project;
+  const explicitProject = draft?.tracker === undefined ? undefined : trackerProjectOf(draft.tracker);
+  const explicitTeam =
+    draft?.tracker?.provider === "linear" &&
+    typeof (draft.tracker as { team?: unknown }).team === "string"
+      ? (draft.tracker as { team: string }).team
+      : undefined;
+  // Spec #139: an explicitly chosen non-forge tracker (`linear` / `local`)
+  // is never second-guessed against the Git remote. Tracker selection and
+  // Git hosting are independent choices.
+  if (provider === "local") return { provider, source: "explicit" };
+  if (provider === "linear") {
+    return {
+      provider,
+      ...(explicitTeam === undefined ? {} : { team: explicitTeam }),
+      ...(explicitProject === undefined ? {} : { project: explicitProject }),
+      source: "explicit",
+    };
+  }
   if (provider !== undefined && explicitProject !== undefined && explicitProject.trim().length > 0) {
     return { provider, project: explicitProject, source: "explicit" };
   }
@@ -411,8 +468,12 @@ async function detectDelivery(draft: PoiesisConfig | undefined, root: string): P
   }
 
   const detection: DeliveryDetection = { preview: null, staging: null, production: null };
+  // Spec #139 / ticket #140: an explicitly deferred draft states its own
+  // complete answer. There is no per-target detection to perform and no
+  // script hint may complete it.
+  if (isDeferredDelivery(draft?.delivery)) return detection;
   for (const target of DELIVERY_TARGETS) {
-    const explicitConfig = draft?.delivery?.[target];
+    const explicitConfig = draft?.delivery === undefined ? undefined : draft.delivery[target];
     if (explicitConfig !== undefined && !containsTemplatePlaceholder(explicitConfig)) {
       // Explicit non-template delivery wins over script hints.
       const source: DeliverySource = explicitConfig.adapter === "fixture"
@@ -451,9 +512,9 @@ function containsTemplatePlaceholder(value: unknown): boolean {
 }
 
 function replaceTemplateDelivery(
-  original: ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]],
+  original: DeliveryTargetConfig,
   detected: DeliveryDetectionTarget | null,
-): ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]] {
+): DeliveryTargetConfig {
   if (detected === null) return original;
   if (!containsTemplatePlaceholder(original)) return original;
   return detected.config;

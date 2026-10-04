@@ -611,6 +611,18 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateText(options.title, "title");
   validateText(options.body, "body");
   validateSha(options.candidateSha, "candidateSha");
+  // Spec #139 / ticket #140: publishing coordinates belong to the Git
+  // remote, never to tracker identity. A tracker-only identity that
+  // reaches this seam (from untyped input) is refused before any push,
+  // change request, or evidence construction rather than being routed
+  // through the generic command path.
+  const requestedProvider: string = options.provider;
+  invariant(
+    requestedProvider !== "linear" && requestedProvider !== "local",
+    "PUBLISH_PROVIDER_UNSUPPORTED",
+    "Publishing provider is derived from the configured Git remote, not from tracker identity",
+    { provider: options.provider },
+  );
   const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
   // Spec #104 / ticket #106: pre-mutation runtime identity guard.
   // Validates the running package equals the durable
