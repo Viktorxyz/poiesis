@@ -44,9 +44,16 @@ import type {
  *   3. EXCLUSIVITY ACROSS PROCESSES. Every read-modify-write runs under a
  *      cross-process lock (`store.lock` serialized by `store.lock.guard`).
  *      Release is token-checked, so a process can only ever remove ITS OWN
- *      lock, and stale recovery is bounded: a lock whose holder PID is dead is
- *      reclaimed within the caller's bounded wait, a LIVE foreign lock is
- *      never stolen, and a malformed lock is never reclaimed.
+ *      lock. The two artifacts recover on DIFFERENT terms, and collapsing them
+ *      would be a lie: a canonical `store.lock` whose holder PID is dead is
+ *      reclaimed within the caller's bounded wait, a LIVE foreign lock is never
+ *      stolen, and a malformed lock is never reclaimed — but the
+ *      `store.lock.guard` is NEVER reclaimed by the runtime at any age. A guard
+ *      only proves that some process was inside the read-decide-write critical
+ *      section, and a dead stamped PID cannot distinguish a crashed holder from
+ *      a live one this process is merely not permitted to signal, so clearing it
+ *      is an operator decision that `LOCAL_TRACKER_LOCK_TIMEOUT` states in full
+ *      (Spec #139 / ticket #148).
  *
  *   4. FAIL-CLOSED VALIDATION. The store document is validated strictly —
  *      unknown schema, forged identifier, non-monotonic counter, missing
@@ -298,6 +305,14 @@ function parseLockContent(raw: string): LocalTrackerLockContent | null {
   return { version: 1, token, pid, acquiredAt };
 }
 
+/**
+ * Read the canonical lock, collapsing BOTH "absent" and "malformed" to `null`.
+ *
+ * The collapse is deliberate and is why `tryAcquireUnderGuard` then attempts
+ * `wx`: a `null` snapshot is a hypothesis, not a fact, and the `wx` is what
+ * distinguishes the two. A malformed blob therefore surfaces as `EEXIST`
+ * contention and a bounded timeout rather than as a silent overwrite.
+ */
 async function readLockSnapshot(path: string): Promise<LocalTrackerLockContent | null> {
   try {
     return parseLockContent(await readFile(path, "utf8"));
@@ -333,6 +348,27 @@ async function writeLockExclusive(path: string, token: string): Promise<"written
   }
 }
 
+/**
+ * Acquire the guard with a bounded wait, or report that it is unavailable.
+ *
+ * The guard is a SHORT-LIVED serialization signal, not a resource with a
+ * lifetime this module may infer. `wx` succeeds for exactly one contender on a
+ * given filesystem, and the winner releases it in a `finally` on both the
+ * success and the failure path, so a guard that is still present when this
+ * function gives up was left there by a process that died inside the critical
+ * section.
+ *
+ * The runtime therefore NEVER auto-reclaims the guard, at any age, on any
+ * evidence. A dead PID stamped inside a guard is not proof of a crashed holder
+ * (`isPidAlive` returns `true` for any PID it cannot signal, and PID recycling
+ * is not observable from a stale envelope), and an automatic removal would let
+ * a second process enter the critical section while the real holder is still in
+ * it — exactly the double-entry the guard exists to prevent. The same refusal
+ * applies to a guard this process itself wrote earlier: removing it
+ * unconditionally would be indistinguishable from removing someone else's.
+ * Recovery is the operator's decision, and `lockTimeoutError` hands them the
+ * exact procedure rather than a guess.
+ */
 async function acquireGuard(path: string, token: string, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + Math.max(0, timeoutMs);
   for (;;) {
@@ -342,6 +378,12 @@ async function acquireGuard(path: string, token: string, timeoutMs: number): Pro
   }
 }
 
+/**
+ * Release a guard this process is holding. Only ever called from a `finally`
+ * that follows a successful `acquireGuard`, so it never runs against a guard
+ * this process does not own; the `.catch` keeps a vanished guard from turning a
+ * completed critical section into a failure.
+ */
 async function releaseGuard(path: string): Promise<void> {
   await unlink(path).catch(() => undefined);
 }
@@ -354,9 +396,13 @@ async function releaseGuard(path: string): Promise<void> {
  *   - present, live holder -> report contention WITHOUT mutating anything.
  *   - present, dead holder -> re-read and reclaim ONLY when the token and PID
  *     are still exactly the ones observed, so a replacement lock is never
- *     unlinked.
+ *     unlinked. This is the ONE case the runtime resolves on its own, which is
+ *     why an operator is never told to remove a stale `store.lock` by hand.
  *   - present, unreadable or malformed -> report contention. The blob is never
- *     unlinked; clearing it is the operator's decision.
+ *     unlinked: the runtime cannot tell unknown bytes apart from a foreign lock
+ *     it does not own, and guessing is the failure mode this protocol exists to
+ *     prevent. This is NOT the guard case and the guard recovery procedure does
+ *     not cover it; it is corruption, and clearing it is the operator's call.
  */
 async function tryAcquireUnderGuard(
   location: LocalTrackerStoreLocation,
@@ -386,7 +432,11 @@ async function releaseTokenChecked(location: LocalTrackerStoreLocation, token: s
     // A wedged guard means a crashed holder. Refuse to mutate the canonical
     // lock without the guard rather than risk unlinking a foreign lock; the
     // next acquirer observes the lock, reclaims it if its holder is gone, and
-    // proceeds. The guard itself is left for the operator.
+    // proceeds. The guard is NOT cleared here and is never cleared by any code
+    // path: the release closure holds no evidence that distinguishes its own
+    // wedged guard from one left by another process, so recovering it is the
+    // operator's decision, reported by `lockTimeoutError` on the next
+    // acquisition that meets the same guard.
     return;
   }
   try {
@@ -397,9 +447,60 @@ async function releaseTokenChecked(location: LocalTrackerStoreLocation, token: s
 }
 
 /**
+ * The bounded-wait refusal, carrying everything an operator needs to act.
+ *
+ * A timeout has two distinguishable causes and the guidance must not blur them:
+ *
+ *   - the canonical lock is held by a process that is still running, in which
+ *     case waiting is correct and nothing should be removed; or
+ *   - the guard is present because a process died inside the critical section,
+ *     in which case no amount of waiting helps, because the runtime will never
+ *     reclaim it.
+ *
+ * The report therefore names BOTH exact paths, and the recovery steps are scoped
+ * to the guard. The canonical `store.lock` is deliberately NOT a removal
+ * target: it already has the ordinary holder-PID and ownership-token check, so a
+ * stale one is reclaimed by the runtime inside the very bounded wait that just
+ * expired. Telling an operator to delete it by hand would bypass the identity
+ * check that makes the protocol safe — a hand-deleted live lock admits a second
+ * writer — to fix a problem the runtime does not have.
+ */
+function lockTimeoutError(location: LocalTrackerStoreLocation, timeoutMs: number): PoiesisError {
+  return new PoiesisError(
+    "LOCAL_TRACKER_LOCK_TIMEOUT",
+    "The local tracker store lock could not be acquired within the bounded wait",
+    {
+      // `path` is the canonical lock, kept for consumers that already read it;
+      // `lockPath` / `guardPath` / `storePath` are the unambiguous names.
+      path: location.lockPath,
+      lockPath: location.lockPath,
+      guardPath: location.guardPath,
+      storePath: location.storePath,
+      gitCommonDir: location.gitCommonDir,
+      timeoutMs,
+      guardRecovery: [
+        "First verify that no Poiesis process is accessing this clone: a guard present at " +
+          `${location.guardPath} is never reclaimed by the runtime, whatever its stamped holder PID says, ` +
+          "because a dead PID cannot distinguish a crashed holder from a live process this process may not signal.",
+        `Then remove only the exact guard artifact, and nothing else: rm ${location.guardPath}`,
+        "Then retry the operation; with the guard gone the next acquirer enters the critical section normally.",
+        `Never remove ${location.lockPath} to clear a stale holder: its holder PID and ownership token already ` +
+          "reclaim one within the bounded wait, and a hand-deleted live lock would admit a second writer and " +
+          "break the exclusivity this lock exists to provide.",
+      ],
+    },
+  );
+}
+
+/**
  * Acquire the store lock, waiting at most `timeoutMs`. Exported so the
  * contention, token-checked-release, and bounded-stale-recovery evidence can
  * drive the protocol directly; production callers go through the adapter.
+ *
+ * The bounded wait has two outcomes that are both normal and both refusals: a
+ * canonical lock held by a live process, and a guard left by a crashed holder.
+ * Only the second is operator-recoverable, and the loop below never tries to
+ * recover either one itself.
  */
 export async function acquireLocalTrackerLockWithTimeout(
   location: LocalTrackerStoreLocation,
@@ -414,11 +515,7 @@ export async function acquireLocalTrackerLockWithTimeout(
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      throw new PoiesisError(
-        "LOCAL_TRACKER_LOCK_TIMEOUT",
-        "The local tracker store lock could not be acquired within the bounded wait",
-        { path: location.lockPath, timeoutMs },
-      );
+      throw lockTimeoutError(location, timeoutMs);
     }
     const gotGuard = await acquireGuard(
       location.guardPath,

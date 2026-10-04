@@ -75,6 +75,24 @@ const LATER_CONFIGURATION_STATEMENT =
 const NO_EXISTING_WORKFLOW_STATEMENT =
   "Adopting a deferred install requires no change to any existing project workflow: nothing is pushed, no pull or merge request is opened, and nothing is deployed to any environment.";
 
+/**
+ * Spec #139 / ticket #148 — the crash-left `store.lock.guard` contract.
+ *
+ * The canonical `store.lock` has PID and ownership-token logic, so a stale one
+ * is reclaimed automatically inside the bounded wait. The guard deliberately has
+ * none and must never grow any, so the only thing the runtime can do with a
+ * guard a crashed process left behind is report it. These are the sentences an
+ * Author reads before touching anything in the store directory themselves.
+ */
+const GUARD_NEVER_RECLAIMED =
+  "Poiesis never reclaims a `store.lock.guard` left behind by a crash: the guard stays on disk, every later acquisition fails closed with `LOCAL_TRACKER_LOCK_TIMEOUT` naming both the canonical `store.lock` and the exact `store.lock.guard`, and clearing it is an operator decision.";
+
+const GUARD_RECOVERY_PROCEDURE =
+  "first verify that no Poiesis process is accessing the clone, then remove only the exact `store.lock.guard` artifact and retry";
+
+const CANONICAL_LOCK_NEVER_REMOVED =
+  "The canonical `store.lock` is never removed by hand, because its holder PID and ownership token already reclaim a stale one within the bounded wait.";
+
 describe("the canonical Method states one tracker / delivery contract", () => {
   const method = readRepoFile("POIESIS_METHOD.md");
 
@@ -121,6 +139,15 @@ describe("the canonical Method states one tracker / delivery contract", () => {
     // than promise a code it cannot always reach.
     expect(method).toContain("may refuse one step earlier with `PUBLISH_PROVIDER_UNRESOLVED`");
     expect(method).toContain("no push, no fetch, no remote revalidation, no change request, and no delivery evidence");
+  });
+
+  it("states that a crash-left store lock guard is never auto-reclaimed", () => {
+    expect(method).toContain(GUARD_NEVER_RECLAIMED);
+  });
+
+  it("states the ordered operator recovery and refuses a hand-removed canonical lock", () => {
+    expect(method).toContain(GUARD_RECOVERY_PROCEDURE);
+    expect(method).toContain(CANONICAL_LOCK_NEVER_REMOVED);
   });
 });
 
@@ -242,6 +269,20 @@ describe("COMPATIBILITY documents the providers", () => {
     expect(compatibility).toContain("DELIVERY_DEFERRED");
     expect(compatibility).toContain(PUBLISH_STATEMENT);
     expect(compatibility).toContain(FORK_STATEMENT);
+  });
+
+  it("documents the guard that serializes the canonical lock and is never auto-reclaimed", () => {
+    expect(compatibility).toContain("`store.lock.guard`");
+    expect(compatibility).toContain("the runtime never reclaims a guard");
+    expect(compatibility).toContain("LOCAL_TRACKER_LOCK_TIMEOUT");
+  });
+
+  it("documents the ordered operator recovery and the canonical lock it must not name as a removal", () => {
+    expect(compatibility).toContain("That error names both paths and the ordered procedure");
+    expect(compatibility).toContain(GUARD_RECOVERY_PROCEDURE);
+    expect(compatibility).toContain(
+      "the canonical `store.lock` is never a removal target, because the ordinary holder-PID and ownership-token check already reclaims a stale one within the bounded wait.",
+    );
   });
 });
 

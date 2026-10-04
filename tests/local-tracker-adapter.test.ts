@@ -772,6 +772,169 @@ describe("the local tracker serializes cross-process writers on a token-checked 
   });
 });
 
+/**
+ * Spec #139 / ticket #148 — a guard left behind by a crash is the ONE wedged
+ * artifact the runtime does not resolve on its own.
+ *
+ * The canonical `store.lock` has ordinary PID and ownership-token logic, so a
+ * stale one is reclaimed inside the caller's bounded wait. The guard has no
+ * such logic and must not grow any: a guard whose stamped holder PID is dead
+ * still proves that SOME process was inside the read-decide-write critical
+ * section, and the runtime cannot tell a crashed holder from a live one it is
+ * merely not allowed to signal. Deleting it automatically would let two
+ * processes believe they hold the critical section at once, which is exactly
+ * the identity violation the guard exists to prevent.
+ */
+describe("a crash-left store lock guard is never auto-reclaimed, only reported", () => {
+  it("times out within the bound on a pre-planted guard and leaves it byte-identical", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    await mkdir(location.directory, { recursive: true, mode: 0o700 });
+    // Planted as a VALID envelope naming a PID that is already gone: the
+    // strongest form of the claim, because the canonical-lock stale check would
+    // happily reclaim this bytes if the guard were treated the same way.
+    const guard = lockEnvelope("crashed-holder-token", await deadPid());
+    await writeFile(location.guardPath, guard, { mode: 0o600 });
+
+    const boundedMs = 400;
+    const startedAt = Date.now();
+    const error = await acquireLocalTrackerLockWithTimeout(location, boundedMs).then(
+      () => undefined,
+      (reason: unknown) => reason,
+    );
+    const elapsed = Date.now() - startedAt;
+
+    expect(error).toMatchObject({ code: "LOCAL_TRACKER_LOCK_TIMEOUT" });
+    // Bounded: the wait is a real bound, not a hang. A generous ceiling absorbs
+    // scheduler noise without hiding an unbounded wait.
+    expect(elapsed).toBeLessThan(5_000);
+    // Byte-identical: nothing rewrote, truncated, chmod-ed, or re-timestamped
+    // the guard, and the runtime never unlinked it.
+    expect(await readFile(location.guardPath, "utf8")).toBe(guard);
+    expect((await lstat(location.guardPath)).mode & 0o777).toBe(0o600);
+    // The canonical lock was never created: without the guard the runtime never
+    // reaches the read-decide-write critical section at all.
+    expect(await readFile(location.lockPath, "utf8").catch(() => "")).toBe("");
+    expect((await readdir(location.directory)).sort()).toEqual(["store.lock.guard"]);
+  });
+
+  it("does not reclaim a dead canonical lock while the guard is wedged", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    await mkdir(location.directory, { recursive: true, mode: 0o700 });
+    // Both artifacts wedged. The canonical lock is reclaimable on its own; the
+    // guard is not. A runtime that reclaimed the lock here would be mutating
+    // the canonical path without holding the guard that authorizes it.
+    const stale = lockEnvelope("stale-canonical-token", await deadPid());
+    const guard = lockEnvelope("crashed-holder-token", await deadPid());
+    await writeFile(location.lockPath, stale, { mode: 0o600 });
+    await writeFile(location.guardPath, guard, { mode: 0o600 });
+
+    await expect(acquireLocalTrackerLockWithTimeout(location, 400)).rejects.toMatchObject({
+      code: "LOCAL_TRACKER_LOCK_TIMEOUT",
+    });
+    expect(await readFile(location.lockPath, "utf8")).toBe(stale);
+    expect(await readFile(location.guardPath, "utf8")).toBe(guard);
+  });
+
+  it("resumes after the operator removes only the guard, reclaiming the dead canonical lock itself", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "T", body: "B" });
+
+    // Exactly the two artifacts a process that died inside the guarded critical
+    // section leaves behind, with a holder that is provably gone.
+    await writeFile(location.lockPath, lockEnvelope("crashed-canonical-token", await deadPid()), { mode: 0o600 });
+    await writeFile(location.guardPath, lockEnvelope("crashed-holder-token", await deadPid()), { mode: 0o600 });
+    await expect(acquireLocalTrackerLockWithTimeout(location, 400)).rejects.toMatchObject({
+      code: "LOCAL_TRACKER_LOCK_TIMEOUT",
+    });
+
+    // The operator's documented recovery is exactly one removal: the guard.
+    await rm(location.guardPath);
+    const release = await acquireLocalTrackerLockWithTimeout(location, 2_000);
+    await release();
+
+    // The canonical `store.lock` was never touched by hand and did not need to
+    // be: the ordinary holder-PID and ownership-token check reclaimed the dead
+    // one on its own. That is why the guidance must never point at it.
+    expect(await readFile(location.lockPath, "utf8").catch(() => "")).toBe("");
+    expect(await readFile(location.guardPath, "utf8").catch(() => "")).toBe("");
+    await tracker.commentSpec(spec.id, "after operator recovery");
+    // Recovery is lock plumbing, never a store repair: the wedged attempt wrote
+    // nothing, and the canonical document carries exactly the one comment that
+    // was actually committed.
+    const store = await readStoreJson(location.storePath);
+    const record = (store.items as Record<string, { comments: { body: string }[] }>)[spec.id]!;
+    expect(record.comments.map((comment) => comment.body)).toEqual(["after operator recovery"]);
+  });
+
+  it("never clears a guard it cannot take, even from its own release path", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const release = await acquireLocalTrackerLockWithTimeout(location, 2_000);
+    const owned = await readFile(location.lockPath, "utf8");
+    // The holder is THIS process and its own release closure, so the only thing
+    // standing between the release and an unconditional unlink is the refusal to
+    // touch a guard it does not hold. A release path that "cleaned up after
+    // itself" here would clear a guard another process is relying on.
+    const guard = lockEnvelope("wedged-by-a-crash", await deadPid());
+    await writeFile(location.guardPath, guard, { mode: 0o600 });
+
+    await release();
+    expect(await readFile(location.guardPath, "utf8")).toBe(guard);
+    // The canonical lock is left alone too: without the guard, mutating it is
+    // exactly the unlink a replacement lock could be destroyed by.
+    expect(await readFile(location.lockPath, "utf8")).toBe(owned);
+  }, 20_000);
+
+  it("names both paths and the ordered operator procedure on the timeout", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    await mkdir(location.directory, { recursive: true, mode: 0o700 });
+    await writeFile(location.guardPath, lockEnvelope("crashed-holder-token", await deadPid()), { mode: 0o600 });
+
+    const error = (await acquireLocalTrackerLockWithTimeout(location, 200).catch((reason: unknown) => reason)) as {
+      details: Record<string, unknown>;
+    };
+    const details = error.details;
+    // Both artifacts are named by their EXACT path. An operator who is told
+    // "the lock" cannot tell which of the two files in the directory is the one
+    // to look at.
+    expect(details.lockPath).toBe(location.lockPath);
+    expect(details.guardPath).toBe(location.guardPath);
+    expect(details.storePath).toBe(location.storePath);
+    expect(details.timeoutMs).toBe(200);
+
+    const steps = details.guardRecovery as string[];
+    expect(Array.isArray(steps)).toBe(true);
+    const text = steps.join("\n");
+
+    // Step one is the precondition, step two is the single permitted removal,
+    // step three is the retry. Order is the whole point of the guidance.
+    expect(steps[0]).toMatch(/first/i);
+    expect(steps[0]).toMatch(/no Poiesis process is accessing this clone/i);
+    expect(steps[1]).toContain(location.guardPath);
+    expect(steps[1]).toMatch(/rm /);
+    expect(steps[2]).toMatch(/retry/i);
+    // The canonical lock is explicitly OUT of scope, with the reason.
+    expect(steps.some((step) => step.includes(location.lockPath))).toBe(true);
+    expect(text).toMatch(/never remove/i);
+    expect(text).toMatch(/holder PID and ownership token/i);
+    // The guard is never auto-reclaimed, and the guidance says so instead of
+    // implying a self-healing runtime.
+    expect(text).toMatch(/never reclaimed by the runtime/i);
+
+    // Nothing in the guidance may hand the operator a command that removes the
+    // canonical lock: `store.lock.guard` must not be read as `store.lock`.
+    const removals = steps.filter((step) => /\brm\b/.test(step));
+    expect(removals).toHaveLength(1);
+    expect(removals[0]).toContain(location.guardPath);
+    expect(removals[0]).not.toMatch(/store\.lock(?![\w.])/);
+  });
+});
+
 describe("concurrent processes never lose a write or reuse an identifier", () => {
   let bundle: string | undefined;
 
