@@ -350,30 +350,31 @@ describe("composeInitDiscovery", () => {
     expect(result.unresolved).toContain("tracker.provider");
   });
 
-  it("discovers tracker provider+project from a github.com remote WITHOUT a draft (flagless init)", async () => {
+  it("discovers tracker provider+project from a github.com remote WITHOUT a draft, and reports it as a default rather than a decision (flagless init)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless.git"], { cwd: repository.root });
     // No draft at all — flagless invocation.
     const result = await composeInitDiscovery(repository.root);
-    // The composer must NOT mark `tracker.provider` unresolved when it has
-    // already discovered the provider from the remote URL.
-    expect(result.unresolved).not.toContain("tracker.provider");
+    // Spec #139 / ticket #144: the tracker choice belongs to the Author, so a
+    // provider inferred from the remote is a DEFAULT the TTY offers, not a
+    // recorded decision. The composer therefore still marks the provider
+    // unresolved for a github.com remote — but it keeps reporting the
+    // inference, which is what makes it a usable default.
+    expect(result.unresolved).toContain("tracker.provider");
     // The discovered detection carries both provider and project.
     expect(result.detections.tracker.provider).toBe("github");
     expect(result.detections.tracker.project).toBe("poiesis-test/flagless");
     expect(result.detections.tracker.source).toBe("remote-github");
   });
 
-  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft (flagless init)", async () => {
+  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft, and reports it as a default (flagless init)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await run("git", ["remote", "set-url", "origin", "https://gitlab.com/poiesis-test/flagless-gitlab.git"], { cwd: repository.root });
     // No draft at all — flagless invocation.
     const result = await composeInitDiscovery(repository.root);
-    // The composer must NOT mark `tracker.provider` unresolved when it has
-    // already discovered gitlab from the remote URL.
-    expect(result.unresolved).not.toContain("tracker.provider");
+    expect(result.unresolved).toContain("tracker.provider");
     // The discovered detection carries gitlab + the discovered project.
     expect(result.detections.tracker.provider).toBe("gitlab");
     expect(result.detections.tracker.project).toBe("poiesis-test/flagless-gitlab");
@@ -392,6 +393,34 @@ describe("composeInitDiscovery", () => {
     expect(result.unresolved).toContain("tracker.provider");
     expect(result.detections.tracker.provider).toBeUndefined();
     expect(result.detections.tracker.source).toBe("missing");
+  });
+
+  it("does not ask the tracker question again for a draft that already states the provider (ticket #144)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // A github.com remote, but the draft already records `local` — an
+    // explicit, unrelated choice. Detection must not second-guess it and the
+    // composer must not ask again.
+    await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless.git"], { cwd: repository.root });
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      tracker: { provider: "local" },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.unresolved).not.toContain("tracker.provider");
+    expect(result.unresolved).not.toContain("tracker.project");
+    expect(result.detections.tracker.source).toBe("explicit");
+  });
+
+  it("does not ask the delivery-readiness question for a draft that already states a state (ticket #144)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // `baseDraft()` states three configured targets; the omitted block is the
+    // only shape that must raise the readiness question.
+    expect((await composeInitDiscovery(repository.root, baseDraft())).unresolved).not.toContain("delivery.mode");
+    // An omitted delivery block must raise it, because only a human can answer.
+    const { delivery: _omitted, ...withoutDelivery } = baseDraft();
+    expect((await composeInitDiscovery(repository.root, withoutDelivery as PoiesisConfig)).unresolved).toContain("delivery.mode");
   });
 
   it("honors an explicit tracker.project and reports source=explicit", async () => {

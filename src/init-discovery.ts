@@ -176,7 +176,16 @@ export async function composeInitDiscovery(
   ) {
     unresolved.push("tracker.project");
   }
-  if (draft?.tracker?.provider === undefined && trackerDetection.provider === undefined) {
+  // Spec #139 / ticket #144: the tracker choice belongs to the Author, so a
+  // provider the composer INFERRED from the Git remote is a suggested
+  // default, never a recorded decision. `tracker.provider` is therefore
+  // unresolved for every draft that does not state one — including a
+  // github.com / gitlab.com remote, which previously removed the question
+  // entirely and silently coupled tracker identity to Git hosting. The
+  // inference stays available on `detections.tracker` as the default the
+  // TTY offers; a draft that states the provider keeps it, so every
+  // existing noninteractive config stays a recorded explicit choice.
+  if (draft?.tracker?.provider === undefined) {
     unresolved.push("tracker.provider");
   }
   if (draft?.tracker?.provider === "linear" && trackerDetection.team === undefined) {
@@ -194,6 +203,21 @@ export async function composeInitDiscovery(
   // unresolved field. The Author can still replace the script afterwards.
   // Spec #139 / ticket #140: an explicitly deferred draft is complete as
   // stated, so no target question is raised for it.
+  //
+  // Spec #139 / ticket #144: the two honest delivery states are so different
+  // from one another (three working targets versus an intentional pause) that
+  // picking one silently would record a readiness decision the Author never
+  // made. A draft that states no delivery block at all therefore raises
+  // `delivery.mode` exactly once, before any per-target question. The
+  // per-target questions are raised independently of it, so a draft that
+  // still has to be configured can ask for the three commands AFTER the
+  // Author answers `configured` — and is skipped entirely when the answer is
+  // `deferred`. A draft that states EITHER state already answers the mode
+  // question, so a `--config` install and an existing configuration are never
+  // asked twice.
+  if (!statesDeliveryMode(draft)) {
+    unresolved.push("delivery.mode");
+  }
   if (!isDeferredDelivery(draft?.delivery)) {
     for (const target of DELIVERY_TARGETS) {
       if (deliveryDetection[target] !== null) continue;
@@ -365,6 +389,19 @@ async function detectVerification(root: string, draft: PoiesisConfig | undefined
     return { commands: discovered, source: "package-scripts" };
   }
   return { commands: [], source: "none" };
+}
+
+/**
+ * Spec #139 / ticket #144 — does the draft already state a delivery state?
+ *
+ * A `{ mode: "deferred" }` block and a three-target block are both complete,
+ * explicit answers, so neither is asked again. An OMITTED block is not an
+ * answer: it is the legacy shape, and only a noninteractive `--config`
+ * install may rely on it. The interactive TTY must ask, because that is the
+ * only place an Author can be asked.
+ */
+function statesDeliveryMode(draft: PoiesisConfig | undefined): boolean {
+  return draft?.delivery !== undefined;
 }
 
 /**

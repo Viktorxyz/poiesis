@@ -38,7 +38,7 @@
  *   - Auth probe failures short-circuit BEFORE `init()` runs and include
  *     the exact auth login command in the error message.
  */
-import { isDeferredDelivery, trackerProjectOf, type ConfiguredDeliveryConfig, type PoiesisConfig } from "./config.js";
+import { isDeferredDelivery, trackerProjectOf, DEFERRED_DELIVERY_MODE, type ConfiguredDeliveryConfig, type PoiesisConfig } from "./config.js";
 import { defaultDeliveryAdapter } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import {
@@ -46,6 +46,12 @@ import {
   type InitDiscoveryResult,
   type RemoteDetection,
 } from "./init-discovery.js";
+import {
+  LINEAR_API_KEY_VARIABLE,
+  LINEAR_OAUTH_TOKEN_VARIABLE,
+  verifyLinearTrackerConfigured,
+} from "./linear-tracker.js";
+import { assertLocalTrackerStoreUsable, resolveLocalTrackerStoreLocation } from "./local-tracker.js";
 import {
   DEFAULT_RECOMMENDED_MODEL_IDS,
   runModelSelector,
@@ -58,7 +64,16 @@ import { init, parseOpenCodeModelInventory } from "./maintenance.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { run as runChildProcess } from "./process.js";
 
-export type TrackerProvider = "github" | "gitlab";
+/**
+ * Spec #139 / ticket #144 — the four tracker providers an interactive install
+ * may record. `fixture` is deliberately absent: it is a test-only path gated
+ * behind explicit authorization, and offering it in the human flow would make
+ * a fixture look like a supported product choice.
+ */
+export type TrackerProvider = "github" | "gitlab" | "linear" | "local";
+
+/** The provider names this flow offers, in prompt order. */
+const TRACKER_CHOICES: readonly TrackerProvider[] = ["github", "gitlab", "linear", "local"];
 
 export interface ModelSelection {
   readonly modelClass: ModelClass;
@@ -73,13 +88,25 @@ export interface TrackerAuthProbeResult {
   readonly hint?: string;
 }
 
+/**
+ * Spec #139 / ticket #144 — the coordinates the pre-install check needs.
+ *
+ * Only `linear` has a coordinate that is not a Git host repository, so only
+ * `linear` reads a field here. The credential is never part of this context:
+ * it stays in the environment, and a prompt must never carry it.
+ */
+export interface TrackerAuthProbeContext {
+  readonly team?: string;
+  readonly project?: string;
+}
+
 export interface InteractiveInitIO {
   readonly isTTY: boolean;
   writeStderr(line: string): void;
   promptLine(prompt: string): Promise<string>;
   listOpenCodeModels(): Promise<readonly string[]>;
   runModelSelector(selection: ModelSelection): Promise<string>;
-  probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult>;
+  probeTrackerAuth(provider: TrackerProvider, context?: TrackerAuthProbeContext): Promise<TrackerAuthProbeResult>;
   /**
    * Flow-scoped resource release (ticket #75). The interactive flow
    * invokes this exactly once from a `finally` block on every code
@@ -130,6 +157,29 @@ const FORBIDDEN_DELIVERY_ADAPTERS: ReadonlySet<string> = new Set([
   "github-actions",
   "pages",
 ]);
+
+/**
+ * Spec #139 / ticket #144 — the generated prompt strings this ticket owns.
+ * They are the Author-visible contract of the onboarding questions, so they
+ * live next to the flow that issues them.
+ */
+const LINEAR_TEAM_PROMPT = "Linear team (key or name)";
+const LINEAR_PROJECT_PROMPT = "Linear project (optional — leave blank to skip)";
+const DELIVERY_MODE_PROMPT = "Configure delivery now? (configured|deferred)";
+/**
+ * The Linear credential variables, and the one sentence that tells an
+ * operator what to do about them. The credential is environment-only by
+ * design, so the guidance deliberately contains no "paste", "enter your
+ * key", or any other wording that would invite a secret into the config.
+ */
+const LINEAR_CREDENTIAL_VARIABLES = [LINEAR_API_KEY_VARIABLE, LINEAR_OAUTH_TOKEN_VARIABLE] as const;
+const LINEAR_CREDENTIAL_GUIDANCE =
+  `Set exactly one of ${LINEAR_CREDENTIAL_VARIABLES.join(" or ")} in the environment and re-run \`poiesis init\`. ` +
+  "Poiesis never stores a Linear credential in the config, so do not put one there.";
+const LOCAL_STORE_LABEL = "poiesis-tracker-v1 (under the Git common directory)";
+const LOCAL_STORE_GUIDANCE =
+  `The Local tracker needs a writable, non-symlinked ${LOCAL_STORE_LABEL} beneath the Git common directory; ` +
+  "remove the obstruction and re-run `poiesis init`.";
 
 /**
  * Run the interactive init flow. Returns the installed Manifest on
@@ -248,8 +298,13 @@ function printDetections(io: InteractiveInitIO, discovery: InitDiscoveryResult):
     `  verification: ${discovery.detections.verification.commands.length === 0 ? "(none)" : discovery.detections.verification.commands.join("; ")}${formatSource(discovery.detections.verification.source)}`,
   );
   const tracker = discovery.detections.tracker;
+  // Spec #139 / ticket #144: the detected tracker is a SUGGESTED default. The
+  // wording says so, so a github.com remote never reads as a decision the
+  // Author already made.
   lines.push(
-    `  tracker: ${tracker.provider ?? "(unknown)"}${tracker.project ? ` / ${tracker.project}` : ""}${formatSource(tracker.source)}`,
+    tracker.provider === undefined
+      ? `  tracker: (unknown; a provider must be chosen)${formatSource(tracker.source)}`
+      : `  tracker: ${tracker.provider}${tracker.project ? ` / ${tracker.project}` : ""}${formatSource(tracker.source)} (suggested default — you choose)`,
   );
 
   for (const { target, label } of DELIVERY_TARGET_PROMPTS) {
@@ -281,8 +336,10 @@ function printDetections(io: InteractiveInitIO, discovery: InitDiscoveryResult):
       "repository.remote": "Git remote (multiple candidates)",
       "repository.integrationBranch": "integration branch",
       "verification.commands": "verification command",
-      "tracker.provider": "tracker provider",
+      "tracker.provider": "tracker provider (github, gitlab, linear, or local)",
       "tracker.project": "tracker project",
+      "tracker.team": "Linear team",
+      "delivery.mode": "delivery readiness (configured now, or deferred)",
       "delivery.preview": "how this project creates Preview",
       "delivery.staging": "how this project deploys to Staging",
       "delivery.production": "how this project releases to Production",
@@ -334,26 +391,19 @@ async function resolveAuthorChoices(
   // return a fully resolved config. Walk the unresolved paths in a
   // stable order.
   //
-  // The tracker block is seeded from the composer's discovery result
-  // when the remote URL uniquely identifies a supported provider
-  // (github.com or gitlab.com). The Author MUST NOT be prompted for a
-  // provider that the composer already knows — that would either push
-  // the Author toward a default that contradicts the remote (e.g.
-  // github for a gitlab.com host) or drop the discovered project.
-  // `tracker` is intentionally typed loosely here: when discovery did not
-  // fill the provider (unknown remote host), the provider field is omitted.
-  // The prompt below requires an explicit `github`|`gitlab` answer before
-  // `init()` runs, so the runtime config always carries a valid provider
-  // by the time it reaches the validation layer.
+  // Spec #139 / ticket #144: the tracker block is NOT seeded from the
+  // composer's remote inference. Detection still runs (it is the default the
+  // provider prompt offers), but the Author's answer decides the block, and a
+  // coordinate detected for one provider is never carried into another — a
+  // `owner/repo` learned from a github.com remote must not become a GitLab or
+  // Linear project. The runtime config therefore always carries a provider
+  // the Author chose, and coordinates that match that provider.
   const base: PoiesisConfig = (draft ?? {
     schema: 1,
     models: { reasoning: "", execution: "" },
     tracker: {
       ...(discovery.detections.tracker.provider !== undefined
         ? { provider: discovery.detections.tracker.provider }
-        : {}),
-      ...(discovery.detections.tracker.project !== undefined
-        ? { project: discovery.detections.tracker.project }
         : {}),
     },
     delivery: {
@@ -408,40 +458,79 @@ async function resolveAuthorChoices(
     next.verification = { ...(next.verification ?? {}), commands: [answer] };
   }
 
-  // Tracker: provider may be missing when the remote host is unknown.
-  // The Author MUST supply an explicit `github` or `gitlab` answer — empty
-  // Enter or any other value fails closed. The composer refuses to invent
-  // a host, mirroring the discovery layer's no-guess rule.
+  // Spec #139 / ticket #144 — ONE explicit tracker choice, then exactly the
+  // coordinates that provider needs. The provider the remote implied is
+  // offered as a visible default (empty Enter accepts it); an unrecognized
+  // remote host offers NO default, so the composer still cannot guess a
+  // tracker for a host it does not understand.
   if (discovery.unresolved.includes("tracker.provider")) {
-    const raw = (await io.promptLine("Tracker provider (github|gitlab)")).trim();
-    if (raw !== "github" && raw !== "gitlab") {
+    const inferred = discovery.detections.tracker.provider;
+    const answer = (await io.promptLine(trackerProviderPrompt(inferred))).trim();
+    const provider = answer.length === 0 && inferred !== undefined ? inferred : answer;
+    if (!isTrackerProvider(provider)) {
       throw new PoiesisError(
         "INVALID_TRACKER_PROVIDER",
-        "Unsupported tracker provider; only `github` or `gitlab` are accepted",
-        { provider: raw, supported: ["github", "gitlab"] },
+        `Unsupported tracker provider; choose one of: ${TRACKER_CHOICES.join(", ")}`,
+        { provider: answer, supported: [...TRACKER_CHOICES] },
       );
     }
-    next.tracker = { ...(next.tracker ?? {}), provider: raw };
+    next.tracker = { provider };
   }
-  if (discovery.unresolved.includes("tracker.project")) {
-    const project = await promptWithDefault(io, "Tracker project", "");
-    next.tracker = { ...(next.tracker ?? ({} as NonNullable<PoiesisConfig["tracker"]>)), project };
+
+  // Coordinates follow the CHOSEN provider, never the inferred one. Each
+  // branch drops every coordinate that belongs to a different provider, so a
+  // repository project discovered from the remote can never leak into a
+  // Linear or Local tracker block.
+  const chosen = next.tracker?.provider;
+  if (chosen === "local") {
+    // Spec #139: Local needs no remote coordinates at all. Its only state is
+    // the clone-local store the repository already owns.
+    next.tracker = { provider: "local" };
+  } else if (chosen === "linear") {
+    const team = declaredTeam(next.tracker) ?? (await promptRequired(io, LINEAR_TEAM_PROMPT));
+    // The Linear project is OPTIONAL, and a draft that already names one is
+    // the recorded answer. A draft that names only the team is asked, and a
+    // blank answer keeps the block project-free rather than inventing one.
+    const project = declaredProject(next.tracker) ?? (await promptOptional(io, LINEAR_PROJECT_PROMPT));
+    next.tracker = {
+      provider: "linear",
+      team,
+      ...(project.length === 0 ? {} : { project }),
+    };
+  } else if (chosen === "github" || chosen === "gitlab") {
+    // A detected project is only reusable when the REMOTE derived it for this
+    // same provider; an explicit draft project is the Author's own record.
+    const detected =
+      discovery.detections.tracker.provider === chosen &&
+      (discovery.detections.tracker.source === "remote-github" ||
+        discovery.detections.tracker.source === "remote-gitlab")
+        ? discovery.detections.tracker.project
+        : undefined;
+    const project =
+      declaredProject(next.tracker) ?? detected ?? (await promptRequired(io, "Tracker project"));
+    next.tracker = { provider: chosen, project };
   }
-  // Spec #139 / ticket #140: a Linear tracker needs its non-secret team
-  // coordinate before `init()` can resolve it. The credential itself is
-  // environment-only and is never prompted into the config.
-  if (discovery.unresolved.includes("tracker.team")) {
-    const team = await promptWithDefault(io, "Linear team", "");
-    const provider = next.tracker?.provider;
-    if (provider !== "linear") {
+
+  // Spec #139 / ticket #144 — delivery readiness is asked ONCE, before any
+  // per-target question. The two states are so different from one another
+  // (three working targets versus an intentional pause) that choosing one for
+  // the Author would record a readiness decision nobody made, and writing
+  // placeholder scripts for a deferred install is exactly the fake adapter
+  // the Spec forbids. There is no bracket default here on purpose.
+  if (discovery.unresolved.includes("delivery.mode")) {
+    const answer = (await io.promptLine(DELIVERY_MODE_PROMPT)).trim();
+    if (answer === "deferred") {
+      // Deferral skips the rest of this function: no target prompt, no target
+      // probe, and `init()` generates no script for any target.
+      return { ...next, delivery: { mode: DEFERRED_DELIVERY_MODE } };
+    }
+    if (answer !== "configured") {
       throw new PoiesisError(
-        "INVALID_TRACKER_CONFIG",
-        "tracker.team is only meaningful for the linear tracker provider",
-        { provider: provider ?? null },
+        "INVALID_DELIVERY_MODE",
+        `Unsupported delivery readiness; choose \`configured\` or \`deferred\``,
+        { answer, supported: ["configured", "deferred"] },
       );
     }
-    const project = next.tracker === undefined ? undefined : trackerProjectOf(next.tracker);
-    next.tracker = { provider: "linear", team, ...(project === undefined ? {} : { project }) };
   }
 
   // Delivery command argv: real command line containing `{sha}`. The
@@ -593,35 +682,129 @@ async function promptWithDefault(io: InteractiveInitIO, label: string, fallback:
   return answer.length === 0 ? fallback : answer;
 }
 
-async function probeTrackerAuthBeforeInstall(io: InteractiveInitIO, config: PoiesisConfig): Promise<void> {
+/**
+ * Spec #139 / ticket #144 — the tracker-provider prompt. Every supported
+ * provider is named in the prompt itself, so the Author can see that the
+ * choice is one of four before answering, and an inferred provider appears
+ * as a bracketed DEFAULT rather than a silent decision. An unrecognized
+ * remote host renders no default at all, so the discovery layer still cannot
+ * invent a tracker it cannot see.
+ */
+function trackerProviderPrompt(inferred: string | undefined): string {
+  const choices = TRACKER_CHOICES.join("|");
+  const provider = inferred !== undefined && isTrackerProvider(inferred) ? inferred : undefined;
+  return provider === undefined
+    ? `Tracker provider (${choices})`
+    : `Tracker provider (${choices}) [${provider}]`;
+}
+
+function isTrackerProvider(value: string): value is TrackerProvider {
+  return (TRACKER_CHOICES as readonly string[]).includes(value);
+}
+
+/** The declared repository/project coordinate of a possibly absent block. */
+function declaredProjectOf(tracker: PoiesisConfig["tracker"]): string | undefined {
+  return tracker === undefined ? undefined : trackerProjectOf(tracker);
+}
+
+/**
+ * A coordinate the draft already recorded, or `undefined` when it recorded
+ * nothing usable. An empty or whitespace-only value is treated as nothing
+ * said: carrying it forward would record a coordinate the Author never
+ * named, which is exactly the fabrication this ticket removes.
+ */
+function declaredProject(tracker: PoiesisConfig["tracker"]): string | undefined {
+  const value = declaredProjectOf(tracker);
+  return value === undefined || value.trim().length === 0 ? undefined : value;
+}
+
+/** The declared Linear team of a possibly absent block. */
+function declaredTeam(tracker: PoiesisConfig["tracker"]): string | undefined {
+  const value = tracker === undefined ? undefined : (tracker as { team?: unknown }).team;
+  return typeof value === "string" && value.trim().length > 0 ? value : undefined;
+}
+
+/** A coordinate with no safe default: an empty answer fails closed. */
+async function promptRequired(io: InteractiveInitIO, label: string): Promise<string> {
+  const answer = (await io.promptLine(label)).trim();
+  if (answer.length === 0) {
+    throw new PoiesisError("INVALID_TRACKER_CONFIG", `${label} must not be empty`, { field: label });
+  }
+  return answer;
+}
+
+/** An optional coordinate: an empty answer means "no such coordinate". */
+async function promptOptional(io: InteractiveInitIO, label: string): Promise<string> {
+  return (await io.promptLine(label)).trim();
+}
+
+async function probeTrackerAuthBeforeInstall(
+  io: InteractiveInitIO,
+  config: PoiesisConfig,
+): Promise<void> {
   const provider = config.tracker?.provider;
   if (provider === "fixture") return; // test-only path; init() handles authorization
-  // Spec #139 / ticket #140: the interactive auth probe exists only for the
-  // Git hosts, which authenticate through their CLI. `linear` and `local`
-  // have no CLI credential to probe here — Linear reads its credential from
-  // the environment and Local has none — so there is nothing to ask the
-  // Author. `init()` remains the single fail-closed authority for both.
-  if (provider === "linear" || provider === "local") return;
-  // A provider is resolved before this point on every supported path; the guard
-  // keeps the type honest rather than asserting a non-null.
   if (provider === undefined) return;
-  const result = await io.probeTrackerAuth(provider);
+  // Spec #139 / ticket #144: the check dispatches on the provider the Author
+  // actually chose, and receives whatever coordinates that provider needs.
+  // Linear carries a team (and an optional project); the Git hosts and Local
+  // need none, because their coordinates are either inferred or absent.
+  const tracker = config.tracker;
+  const team = provider === "linear" ? declaredTeam(tracker) : undefined;
+  const project = declaredProjectOf(tracker);
+  const result = await io.probeTrackerAuth(provider, {
+    ...(team === undefined ? {} : { team }),
+    ...(project === undefined ? {} : { project }),
+  });
   if (result.available) return;
-  const loginCommand = provider === "github" ? "gh auth login" : "glab auth login";
-  const detailLines: string[] = [];
-  if (result.stderr !== undefined) detailLines.push(result.stderr);
-  if (result.hint !== undefined) detailLines.push(result.hint);
-  detailLines.push(`Run \`${loginCommand}\` to authenticate, then re-run \`poiesis init\`.`);
+  const guidance = trackerAuthGuidance(provider);
   throw new PoiesisError(
     "TRACKER_AUTH_FAILED",
-    `${provider} tracker is not authenticated: ${loginCommand}`,
+    `${provider} tracker is not ready: ${guidance.summary}`,
     {
       provider,
-      loginCommand,
+      ...guidance.details,
       stderr: result.stderr,
-      hint: result.hint ?? `Run \`${loginCommand}\` to authenticate, then re-run \`poiesis init\`.`,
+      hint: result.hint ?? guidance.action ?? guidance.summary,
     },
   );
+}
+
+/**
+ * Spec #139 / ticket #144 — actionable guidance per provider.
+ *
+ * A Git host authenticates through its CLI, so the action is a login command.
+ * Linear's credential is environment-only, so the action names the two
+ * variables and explicitly refuses to invite the Author to write a secret
+ * anywhere. Local has no credential at all, so its action names the state that
+ * must be usable. `details` is spread into the error so a caller can act on
+ * the guidance programmatically.
+ */
+function trackerAuthGuidance(provider: TrackerProvider): {
+  summary: string;
+  action: string | undefined;
+  details: Record<string, unknown>;
+} {
+  if (provider === "github") {
+    const action = "Run `gh auth login` to authenticate, then re-run `poiesis init`.";
+    return { summary: "gh auth login", action, details: { loginCommand: "gh auth login" } };
+  }
+  if (provider === "gitlab") {
+    const action = "Run `glab auth login` to authenticate, then re-run `poiesis init`.";
+    return { summary: "glab auth login", action, details: { loginCommand: "glab auth login" } };
+  }
+  if (provider === "linear") {
+    return {
+      summary: `the configured Linear team is not reachable with the ${LINEAR_CREDENTIAL_VARIABLES.join(" / ")} credential in the environment`,
+      action: LINEAR_CREDENTIAL_GUIDANCE,
+      details: { credentialVariables: [...LINEAR_CREDENTIAL_VARIABLES] },
+    };
+  }
+  return {
+    summary: "the clone-local tracker store is not usable",
+    action: LOCAL_STORE_GUIDANCE,
+    details: { storeDirectory: LOCAL_STORE_LABEL },
+  };
 }
 
 function formatRestartNotice(): string {
@@ -759,7 +942,7 @@ export function createProductionInteractiveInitIO(root: string): InteractiveInit
         ),
       });
     },
-    async probeTrackerAuth(provider: TrackerProvider): Promise<TrackerAuthProbeResult> {
+    async probeTrackerAuth(provider: TrackerProvider, context?: TrackerAuthProbeContext): Promise<TrackerAuthProbeResult> {
       if (provider === "github") {
         // Run from the repo root so the auth probe sees the same Git
         // config (`gh` / `glab` honor the current repo's credentials
@@ -775,13 +958,46 @@ export function createProductionInteractiveInitIO(root: string): InteractiveInit
           hint: "Run `gh auth login` to authenticate, then re-run `poiesis init`",
         };
       }
-      const result = await runChildProcess("glab", ["auth", "status"], { cwd: root, allowFailure: true });
-      if (result.exitCode === 0) return { available: true };
-      return {
-        available: false,
-        stderr: result.stderr || result.stdout,
-        hint: "Run `glab auth login` to authenticate, then re-run `poiesis init`",
-      };
+      if (provider === "gitlab") {
+        const result = await runChildProcess("glab", ["auth", "status"], { cwd: root, allowFailure: true });
+        if (result.exitCode === 0) return { available: true };
+        return {
+          available: false,
+          stderr: result.stderr || result.stdout,
+          hint: "Run `glab auth login` to authenticate, then re-run `poiesis init`",
+        };
+      }
+      // Spec #139 / ticket #144: Linear and Local have no host CLI, so their
+      // check is the real capability the tracker depends on, not an
+      // `auth status` stand-in. Linear proves the environment credential AND
+      // that the configured team/project actually resolve, so a mistyped
+      // coordinate is refused here rather than at the first tracker mutation.
+      // Both paths fail closed with the provider's own typed error, which
+      // `trackerAuthGuidance` turns into Author-facing guidance.
+      if (provider === "linear") {
+        try {
+          await verifyLinearTrackerConfigured({
+            team: context?.team ?? "",
+            ...(context?.project === undefined ? {} : { project: context.project }),
+          });
+          return { available: true };
+        } catch (error) {
+          return { available: false, ...probeFailureDetails(error) };
+        }
+      }
+      try {
+        await assertLocalTrackerStoreUsable(await resolveLocalTrackerStoreLocation(root));
+        return { available: true };
+      } catch (error) {
+        return { available: false, ...probeFailureDetails(error) };
+      }
     },
   };
+}
+
+/** The typed code and message of a failed capability probe, with no secret. */
+function probeFailureDetails(error: unknown): { stderr?: string } {
+  if (error instanceof PoiesisError) return { stderr: `${error.code}: ${error.message}` };
+  if (error instanceof Error) return { stderr: `${error.name}: ${error.message}` };
+  return { stderr: String(error) };
 }

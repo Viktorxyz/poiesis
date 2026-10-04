@@ -28,12 +28,13 @@ import { rm } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTrackerAdapter } from "../src/adapters.js";
 import { PoiesisError } from "../src/errors.js";
-import { verifyTracker } from "../src/maintenance.js";
+import { setLinearTrackerSeamsForTest, verifyTracker } from "../src/maintenance.js";
 import { createTestRepository, type TestRepository } from "./helpers.js";
 import type { ResolvedPoiesisConfig } from "../src/config.js";
 import {
   createLinearTrackerAdapter,
   verifyLinearTrackerAuthorized,
+  verifyLinearTrackerConfigured,
   type LinearHttpRequest,
   type LinearHttpResponse,
   type LinearTransport,
@@ -1036,6 +1037,7 @@ describe("the Linear adapter is reachable from the shipped surfaces", () => {
   });
 
   afterEach(async () => {
+    setLinearTrackerSeamsForTest(null);
     if (previousKey === undefined) delete process.env.LINEAR_API_KEY;
     else process.env.LINEAR_API_KEY = previousKey;
     if (previousToken === undefined) delete process.env.LINEAR_OAUTH_TOKEN;
@@ -1092,5 +1094,91 @@ describe("the Linear adapter is reachable from the shipped surfaces", () => {
     };
 
     await expect(verifyTracker(repository.root, config)).rejects.toMatchObject({ code: "LINEAR_AUTH_MISSING" });
+  });
+
+  it("verifyTracker refuses a configured team that does not resolve", async () => {
+    // Break: a viewer-only probe reports a mistyped team as healthy, so the
+    // misconfiguration surfaces much later as an unexplained failure at the
+    // first tracker mutation, in a different command, with a different
+    // message. `doctor` is the operator's chance to catch it.
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const config: ResolvedPoiesisConfig = {
+      schema: 1,
+      models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+      repository: { remote: "origin", integrationBranch: "main" },
+      tracker: { provider: "linear", team: "TYPO" },
+      delivery: { mode: "deferred" },
+      verification: { commands: ["test -f README.md"] },
+    };
+    setLinearTrackerSeamsForTest({
+      env: { LINEAR_API_KEY: "lin_api_secret" },
+      transport: async (request) => {
+        const operation = /^(?:query|mutation)\s+(\w+)/.exec(JSON.parse(request.body).query as string)?.[1] ?? "";
+        const data =
+          operation === "PoiesisViewer"
+            ? { viewer: { id: "user-1" } }
+            : TEAM_PAGE([{ id: "team-eng", key: "ENG", name: "Engineering" }]);
+        return { status: 200, headers: {}, body: JSON.stringify({ data }) } satisfies LinearHttpResponse;
+      },
+    });
+
+    await expect(verifyTracker(repository.root, config)).rejects.toMatchObject({
+      code: "LINEAR_TEAM_NOT_FOUND",
+      details: expect.objectContaining({ team: "TYPO" }),
+    });
+  });
+
+  it("keeps the credential out of a failed coordinate verification", async () => {
+    // Break: the coordinate probe is a NEW network path that echoes upstream
+    // text, so it needs the same redaction guarantee as every other Linear
+    // call — an echoed secret in a `doctor` report or an init error would
+    // write the credential into operator-visible output. Both the refused-
+    // credential body and a GraphQL error message that quotes the credential
+    // are checked, because they reach the error by different routes.
+    const refused = new LinearScript({ kind: "http", status: 401, body: "rejected credential lin_api_secret" });
+    const quoted = new LinearScript({
+      kind: "graphql",
+      data: null,
+      errors: [{ message: "bad Authorization: lin_oauth_secret" }],
+    });
+
+    for (const [script, env, secret] of [
+      [refused, { LINEAR_API_KEY: "lin_api_secret" }, "lin_api_secret"],
+      [quoted, { LINEAR_OAUTH_TOKEN: "lin_oauth_secret" }, "lin_oauth_secret"],
+    ] as const) {
+      const error = await verifyLinearTrackerConfigured(
+        { team: "ENG" },
+        { env, transport: script.transport },
+      ).catch((caught: unknown) => caught);
+
+      expect(error).toBeInstanceOf(PoiesisError);
+      const serialized = JSON.stringify({
+        message: (error as Error).message,
+        details: (error as { details: unknown }).details,
+      });
+      expect(serialized).not.toContain(secret);
+      // The GraphQL path DOES echo the credential upstream, so the redactor is
+      // what removes it here — proving redaction rather than mere omission.
+      if (script === quoted) expect(serialized).toContain("[redacted]");
+    }
+  });
+
+  it("reports the team it resolved so a health check can name it", async () => {
+    const script = new LinearScript(
+      { kind: "graphql", data: { viewer: { id: "user-1" } } },
+      { kind: "graphql", data: TEAM_PAGE([teamNode({ key: "ENG", name: "Engineering" })]) },
+    );
+
+    const verified = await verifyLinearTrackerConfigured(
+      { team: "Engineering" },
+      { env: { LINEAR_API_KEY: "lin_api_secret" }, transport: script.transport },
+    );
+
+    // A team configured by display NAME resolves to the team's own key, so a
+    // report can show the operator the identity Poiesis will actually use.
+    expect(verified.team.key).toBe("ENG");
+    expect(verified.project).toBeUndefined();
+    expect(script.operations()).toEqual(["PoiesisViewer", "PoiesisTeams"]);
   });
 });

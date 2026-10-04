@@ -737,53 +737,20 @@ class LinearTracker implements TrackerAdapter {
    * arbitrary team.
    */
   private async resolveTeamId(): Promise<string> {
-    const wanted = this.team.toLowerCase();
-    const matches: LinearTeamNode[] = [];
-    for await (const nodes of this.paginate(TEAM_QUERY, "teams", {})) {
-      for (const node of nodes) {
-        const team = readTeamNode(node, "PoiesisTeams");
-        if (team.key.toLowerCase() === wanted || team.name.toLowerCase() === wanted) matches.push(team);
-      }
-    }
-    if (matches.length === 0) {
-      throw new PoiesisError(
-        "LINEAR_TEAM_NOT_FOUND",
-        `No Linear team matches the configured tracker.team; check the team key or name`,
-        { team: this.team },
-      );
-    }
-    if (matches.length > 1) {
-      throw new PoiesisError(
-        "LINEAR_TEAM_AMBIGUOUS",
-        `The configured tracker.team matches ${matches.length} Linear teams; Poiesis will not guess which team owns this work`,
-        { team: this.team, matches: matches.map((match) => `${match.key} (${match.id})`) },
-      );
-    }
-    return (matches[0] as LinearTeamNode).id;
+    return (await resolveLinearTeam(this.executeLinear.bind(this), this.team)).id;
   }
 
   private async resolveProjectId(): Promise<string | undefined> {
     if (this.linearProject === undefined) return undefined;
-    const name = this.linearProject;
-    const matches: LinearProjectNode[] = [];
-    for await (const nodes of this.paginate(PROJECT_QUERY, "projects", { name })) {
-      for (const node of nodes) matches.push(readProjectNode(node, "PoiesisProjects"));
-    }
-    if (matches.length === 0) {
-      throw new PoiesisError(
-        "LINEAR_PROJECT_NOT_FOUND",
-        `No Linear project matches the configured tracker.project`,
-        { project: name },
-      );
-    }
-    if (matches.length > 1) {
-      throw new PoiesisError(
-        "LINEAR_PROJECT_AMBIGUOUS",
-        `The configured tracker.project matches ${matches.length} Linear projects; Poiesis will not guess which project owns this work`,
-        { project: name, matches: matches.map((match) => match.id) },
-      );
-    }
-    return (matches[0] as LinearProjectNode).id;
+    return (await resolveLinearProject(this.executeLinear.bind(this), this.linearProject)).id;
+  }
+
+  private executeLinear(
+    document: string,
+    variables: Record<string, unknown>,
+    mode: LinearCallMode,
+  ): Promise<Record<string, unknown>> {
+    return this.execute(document, variables, mode);
   }
 
   /**
@@ -796,25 +763,108 @@ class LinearTracker implements TrackerAdapter {
     connection: string,
     extraVariables: Record<string, unknown>,
   ): AsyncGenerator<readonly unknown[]> {
-    let after: string | null = null;
-    for (let page = 0; page < LINEAR_MAX_PAGES; page += 1) {
-      const data = await this.execute(document, { first: LINEAR_PAGE_SIZE, after, ...extraVariables }, "read");
-      const value = data[connection];
-      invariant(isRecord(value), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} connection`, { connection });
-      const pageInfo = value.pageInfo;
-      invariant(isRecord(pageInfo), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} pageInfo`, { connection });
-      const nodes = value.nodes;
-      invariant(Array.isArray(nodes), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} nodes`, { connection });
-      yield nodes;
-      if (pageInfo.hasNextPage !== true) return;
-      after = typeof pageInfo.endCursor === "string" ? pageInfo.endCursor : null;
+    yield* paginateLinearConnection(this.executeLinear.bind(this), document, connection, extraVariables);
+  }
+}
+
+/**
+ * The narrow executor seam shared by the adapter and the verification probe.
+ * Both need the SAME bounded, redacted, retried call path, and both must
+ * resolve a team or a project through the SAME matching rules — otherwise a
+ * configuration that verification accepts is not the configuration the
+ * adapter will actually file work in.
+ */
+type LinearExecute = (
+  document: string,
+  variables: Record<string, unknown>,
+  mode: LinearCallMode,
+) => Promise<Record<string, unknown>>;
+
+/**
+ * Walk a Relay connection page by page, following `endCursor` until Linear
+ * says there is no next page. The page count is bounded, so a connection
+ * that never terminates fails closed instead of looping.
+ */
+async function* paginateLinearConnection(
+  execute: LinearExecute,
+  document: string,
+  connection: string,
+  extraVariables: Record<string, unknown>,
+): AsyncGenerator<readonly unknown[]> {
+  let after: string | null = null;
+  for (let page = 0; page < LINEAR_MAX_PAGES; page += 1) {
+    const data = await execute(document, { first: LINEAR_PAGE_SIZE, after, ...extraVariables }, "read");
+    const value = data[connection];
+    invariant(isRecord(value), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} connection`, { connection });
+    const pageInfo = value.pageInfo;
+    invariant(isRecord(pageInfo), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} pageInfo`, { connection });
+    const nodes = value.nodes;
+    invariant(Array.isArray(nodes), "LINEAR_GRAPHQL_ERROR", `Linear returned no ${connection} nodes`, { connection });
+    yield nodes;
+    if (pageInfo.hasNextPage !== true) return;
+    after = typeof pageInfo.endCursor === "string" ? pageInfo.endCursor : null;
+  }
+  throw new PoiesisError(
+    "LINEAR_PAGINATION_BOUND_REACHED",
+    `Linear ${connection} still had more pages after ${LINEAR_MAX_PAGES} pages; Poiesis will not keep scanning`,
+    { connection, maxPages: LINEAR_MAX_PAGES },
+  );
+}
+
+/**
+ * Resolve a configured team coordinate to exactly one Linear team. The
+ * coordinate may be a team key or a team display name. Zero matches and more
+ * than one match are both refusals: an ambiguous team would file every Spec
+ * under an arbitrary queue, and a missing one is a configuration error that
+ * must surface where the operator is looking.
+ */
+async function resolveLinearTeam(execute: LinearExecute, team: string): Promise<LinearTeamNode> {
+  const wanted = team.toLowerCase();
+  const matches: LinearTeamNode[] = [];
+  for await (const nodes of paginateLinearConnection(execute, TEAM_QUERY, "teams", {})) {
+    for (const node of nodes) {
+      const candidate = readTeamNode(node, "PoiesisTeams");
+      if (candidate.key.toLowerCase() === wanted || candidate.name.toLowerCase() === wanted) matches.push(candidate);
     }
+  }
+  if (matches.length === 0) {
     throw new PoiesisError(
-      "LINEAR_PAGINATION_BOUND_REACHED",
-      `Linear ${connection} still had more pages after ${LINEAR_MAX_PAGES} pages; Poiesis will not keep scanning`,
-      { connection, maxPages: LINEAR_MAX_PAGES },
+      "LINEAR_TEAM_NOT_FOUND",
+      `No Linear team matches the configured tracker.team; check the team key or name`,
+      { team },
     );
   }
+  if (matches.length > 1) {
+    throw new PoiesisError(
+      "LINEAR_TEAM_AMBIGUOUS",
+      `The configured tracker.team matches ${matches.length} Linear teams; Poiesis will not guess which team owns this work`,
+      { team, matches: matches.map((match) => `${match.key} (${match.id})`) },
+    );
+  }
+  return matches[0] as LinearTeamNode;
+}
+
+/** Resolve a configured Linear project name to exactly one project. */
+async function resolveLinearProject(execute: LinearExecute, project: string): Promise<LinearProjectNode> {
+  const matches: LinearProjectNode[] = [];
+  for await (const nodes of paginateLinearConnection(execute, PROJECT_QUERY, "projects", { name: project })) {
+    for (const node of nodes) matches.push(readProjectNode(node, "PoiesisProjects"));
+  }
+  if (matches.length === 0) {
+    throw new PoiesisError(
+      "LINEAR_PROJECT_NOT_FOUND",
+      `No Linear project matches the configured tracker.project`,
+      { project },
+    );
+  }
+  if (matches.length > 1) {
+    throw new PoiesisError(
+      "LINEAR_PROJECT_AMBIGUOUS",
+      `The configured tracker.project matches ${matches.length} Linear projects; Poiesis will not guess which project owns this work`,
+      { project, matches: matches.map((match) => match.id) },
+    );
+  }
+  return matches[0] as LinearProjectNode;
 }
 
 /**
@@ -975,6 +1025,49 @@ function requiredCoordinate(value: string, name: string): string {
 export async function verifyLinearTrackerAuthorized(seams: LinearTrackerSeams = {}): Promise<"verified"> {
   await executeWith(resolveSeams(seams), VIEWER_QUERY, {}, "read");
   return "verified";
+}
+
+/**
+ * Spec #139 / ticket #144 — the coordinates Linear verification actually has
+ * to prove. The returned identities are the resolved ones, so a health report
+ * can name what the workspace really resolves to rather than echoing the
+ * configuration back at the operator.
+ */
+export interface LinearTrackerVerification {
+  readonly team: { readonly id: string; readonly key: string; readonly name: string };
+  readonly project?: { readonly id: string; readonly name: string };
+}
+
+/**
+ * Ticket #144 — prove the CONFIGURED Linear coordinates, not merely that some
+ * credential authenticates.
+ *
+ * A viewer-only probe reports a mistyped `tracker.team` or
+ * `tracker.project` as a healthy tracker, so the misconfiguration surfaces
+ * much later as an unexplained failure at the first tracker mutation, in a
+ * different command, with a different message. This probe resolves the team
+ * (and the project when one is configured) through exactly the same
+ * pagination, ambiguity refusal, and typed error codes the adapter uses, so
+ * `poiesis doctor` fails closed next to the cause.
+ *
+ * The credential rules are unchanged and still environment-only: a missing or
+ * doubled credential fails here, before any request is made, and no secret
+ * reaches a request detail, a message, or `details`.
+ */
+export async function verifyLinearTrackerConfigured(
+  config: LinearTrackerConfig,
+  seams: LinearTrackerSeams = {},
+): Promise<LinearTrackerVerification> {
+  const resolved = resolveSeams(seams);
+  const execute: LinearExecute = (document, variables, mode) => executeWith(resolved, document, variables, mode);
+  // Prove the credential itself before spending requests on coordinates: a
+  // refused credential is a different problem from a mistyped team, and the
+  // operator needs the credential one first.
+  await execute(VIEWER_QUERY, {}, "read");
+  const team = await resolveLinearTeam(execute, requiredCoordinate(config.team, "tracker team"));
+  if (config.project === undefined) return { team };
+  const project = await resolveLinearProject(execute, requiredCoordinate(config.project, "tracker project"));
+  return { team, project };
 }
 
 const VIEWER_QUERY = `query PoiesisViewer {

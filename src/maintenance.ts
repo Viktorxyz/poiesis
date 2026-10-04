@@ -94,7 +94,7 @@ import {
   templateMappings,
 } from "./templates.js";
 import { createDeliveryAdapter } from "./adapters.js";
-import { verifyLinearTrackerAuthorized } from "./linear-tracker.js";
+import { verifyLinearTrackerConfigured } from "./linear-tracker.js";
 import { assertLocalTrackerStoreUsable, resolveLocalTrackerStoreLocation } from "./local-tracker.js";
 import type { PublishProvider } from "./evidence.js";
 
@@ -696,8 +696,47 @@ export async function validateOpenCodeConfigPayload(content: string): Promise<vo
 }
 
 
+/**
+ * Spec #139 / ticket #144 — the internal seam that lets the suite drive
+ * `verifyTracker`'s Linear branch against a fake transport instead of the
+ * live Linear API.
+ *
+ * It mirrors the existing `setRuntimePackageVersionOverrideForTest` precedent:
+ * module-scoped, deliberately NOT re-exported from `src/index.ts`, and reset
+ * to `null` by the caller. Production always passes `null`, so the real
+ * `process.env` credential and the real `fetch` transport are used.
+ */
+let linearTrackerSeamsForTest: Parameters<typeof verifyLinearTrackerConfigured>[1] | null = null;
+
+export function setLinearTrackerSeamsForTest(seams: Parameters<typeof verifyLinearTrackerConfigured>[1] | null): void {
+  linearTrackerSeamsForTest = seams;
+}
+
 export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
-  if (config.tracker.provider === "fixture") return "fixture";
+  return (await inspectTracker(root, config)).mode;
+}
+
+/**
+ * Spec #139 / ticket #144 — the outcome of a tracker check, including the
+ * identities a provider actually RESOLVED.
+ *
+ * `init` and `update` only need the mode, so `verifyTracker` stays the
+ * boolean-ish seam they use. Doctor additionally reports which team or
+ * project the workspace resolves to, because a health report that only
+ * echoes the configuration back tells an operator nothing they did not
+ * already type.
+ */
+export interface TrackerInspection {
+  readonly mode: "verified" | "fixture";
+  /**
+   * The identity the provider resolved for the configured coordinate, or
+   * `undefined` for a provider that has no separate resolution step.
+   */
+  readonly resolved?: { readonly team?: string; readonly project?: string };
+}
+
+export async function inspectTracker(root: string, config: ResolvedPoiesisConfig): Promise<TrackerInspection> {
+  if (config.tracker.provider === "fixture") return { mode: "fixture" };
   // Spec #139 / ticket #142: `local` is a first-class tracker whose only
   // credential is the Git common directory the repository already has. There
   // is no host CLI to authenticate against and no network to reach, so
@@ -706,24 +745,68 @@ export async function verifyTracker(root: string, config: ResolvedPoiesisConfig)
   // `poiesis init` does not materialize tracker state as a side effect.
   if (config.tracker.provider === "local") {
     await assertLocalTrackerStoreUsable(await resolveLocalTrackerStoreLocation(root));
-    return "verified";
+    return { mode: "verified" };
   }
   // Spec #139 / ticket #141: Linear authenticates with a credential from the
   // environment, not with a host CLI. Verification is therefore one real
-  // authenticated read against Linear: a missing, doubled, or refused
+  // authenticated read against Linear plus a resolution of the CONFIGURED
+  // team (and project when one is configured): a missing, doubled, or refused
   // credential fails closed here, next to its cause, instead of surfacing
-  // later as an unexplained 401 during the first tracker mutation.
+  // later as an unexplained 401 during the first tracker mutation — and a
+  // mistyped coordinate fails here too, instead of being reported as a
+  // healthy tracker and failing later at the first create.
   if (config.tracker.provider === "linear") {
-    return verifyLinearTrackerAuthorized();
+    const verified = await verifyLinearTrackerConfigured(
+      {
+        team: config.tracker.team,
+        ...(config.tracker.project === undefined ? {} : { project: config.tracker.project }),
+      },
+      linearTrackerSeamsForTest ?? {},
+    );
+    return {
+      mode: "verified",
+      resolved: {
+        team: verified.team.key,
+        ...(verified.project === undefined ? {} : { project: verified.project.name }),
+      },
+    };
   }
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
     await run("gh", ["repo", "view", config.tracker.project, "--json", "nameWithOwner"], { cwd: root });
-    return "verified";
+    return { mode: "verified" };
   }
   await run("glab", ["auth", "status"], { cwd: root });
   await run("glab", ["api", `projects/${encodeURIComponent(config.tracker.project)}`], { cwd: root });
-  return "verified";
+  return { mode: "verified" };
+}
+
+/**
+ * Spec #139 / ticket #144 — the coordinate detail of a tracker, reported per
+ * provider. A Git host has a repository project, Linear has a team plus an
+ * optional project, and Local has neither; collapsing all three into one
+ * `project` field is what let a mistyped Linear team read as healthy.
+ */
+function describeTrackerDetails(tracker: ResolvedPoiesisConfig["tracker"]): Record<string, unknown> {
+  if (tracker.provider === "local") return { provider: "local", coordinates: "none (clone-local store)" };
+  if (tracker.provider === "linear") {
+    return {
+      provider: "linear",
+      team: tracker.team,
+      ...(tracker.project === undefined ? {} : { project: tracker.project }),
+    };
+  }
+  return { provider: tracker.provider, project: tracker.project };
+}
+
+/** Provider-accurate one-line health summary, naming the configured coordinates. */
+function describeTrackerHealth(tracker: ResolvedPoiesisConfig["tracker"]): string {
+  if (tracker.provider === "local") return "Local clone-local tracker store is available";
+  if (tracker.provider === "linear") {
+    const project = tracker.project === undefined ? "" : ` and project ${tracker.project}`;
+    return `Linear team ${tracker.team}${project} is available`;
+  }
+  return "Tracker authentication and project are available";
 }
 
 export function verifyDeliveryConfiguration(
@@ -1778,15 +1861,28 @@ export async function doctor(root: string): Promise<DoctorReport> {
       checks.push({ id: "git-base", status: "fail", message: "Configured integration branch check failed", details: errorDetails(error) });
     }
     try {
-      const mode = await verifyTracker(resolvedRoot, config);
+      const inspection = await inspectTracker(resolvedRoot, config);
       checks.push({
         id: "tracker",
-        status: mode === "fixture" ? "warn" : "pass",
-        message: mode === "fixture" ? "Test-only fixture tracker is configured" : "Tracker authentication and project are available",
-        details: { provider: config.tracker.provider, project: trackerProjectOf(config.tracker) ?? null },
+        status: inspection.mode === "fixture" ? "warn" : "pass",
+        message: inspection.mode === "fixture" ? "Test-only fixture tracker is configured" : describeTrackerHealth(config.tracker),
+        details: {
+          ...describeTrackerDetails(config.tracker),
+          ...(inspection.resolved === undefined
+            ? {}
+            : {
+                ...(inspection.resolved.team === undefined ? {} : { resolvedTeamKey: inspection.resolved.team }),
+                ...(inspection.resolved.project === undefined ? {} : { resolvedProject: inspection.resolved.project }),
+              }),
+        },
       });
     } catch (error) {
-      checks.push({ id: "tracker", status: "fail", message: "Tracker authentication or project check failed", details: errorDetails(error) });
+      checks.push({
+        id: "tracker",
+        status: "fail",
+        message: `Tracker authentication or coordinate check failed for ${config.tracker.provider}`,
+        details: { provider: config.tracker.provider, ...describeTrackerDetails(config.tracker), ...errorDetails(error) },
+      });
     }
     try {
       const mode = verifyDeliveryConfiguration(resolvedRoot, config);
