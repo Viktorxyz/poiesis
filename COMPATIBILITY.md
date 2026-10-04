@@ -133,8 +133,41 @@ Production-capable tracker adapters:
 
 - GitHub through `gh`
 - GitLab through `glab`
+- Linear through its GraphQL API
+- Local, clone-local, with no external service
+
+The tracker choice and the delivery choice are independent: any production tracker can be combined with configured delivery or with `"delivery": { "mode": "deferred" }`.
+
+#### GitHub and GitLab
+
+`gh` and `glab` must be installed and authenticated for the target project. `tracker.project` is `<owner>/<repository>` for GitHub and the nested `group/subgroup/project` path for GitLab. A coordinate may be inferred from a recognized `github.com` or `gitlab.com` remote when the config does not state one.
+
+#### Linear
+
+Linear is a first-class tracker, reached over `https://api.linear.app/graphql`. Its coordinates are a required `tracker.team` (key or name) plus an optional `tracker.project`. Poiesis never invents a team: an empty `tracker.team` fails closed with `INVALID_TRACKER_CONFIG`.
+
+The credential is environment-only. Set exactly one of:
+
+- `LINEAR_API_KEY` — a personal API key, sent as the raw `Authorization` value.
+- `LINEAR_OAUTH_TOKEN` — an OAuth access token, sent as `Authorization: Bearer <token>`.
+
+Both set fails closed with `LINEAR_AUTH_AMBIGUOUS`; neither set fails closed with `LINEAR_AUTH_MISSING`. The credential is never stored in the Poiesis config, never placed in a tracker item, never logged, and never echoed into an error message or an error's `details` — every byte that could reach an error goes through the redactor first.
+
+#### Local
+
+`local` needs no CLI, no service, no network call, no credential, and no project coordinate. It is a production tracker, not a test fixture.
+
+State lives in `poiesis-tracker-v1` beneath the Git common directory (`git rev-parse --git-common-dir`), which keeps it outside every working tree and shared by every linked worktree of the clone. The store is created as a `0700` directory holding `0600` regular files. Items carry monotonic `LOCAL-<n>` identities. Validation is strict and fails closed: a non-JSON store, an unknown schema version or provider, a non-positive or colliding next id, a non-`LOCAL` identifier, a symlinked or world-readable file, or a symlinked store directory or lock path is refused rather than repaired. Cross-process writers serialize on a token-checked lock, so a live foreign lock is never stolen and a stale lock left by a dead process is reclaimed only within a bounded wait.
+
+#### fixture
 
 `fixture` is test-only, requires `--allow-fixtures` at `init` time, and writes outside the repository root.
+
+### Publishing coordinates
+
+Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host, otherwise the configured `tracker.project` when the tracker is itself a publishing provider, and otherwise fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. `linear` and `local` never supply coordinates and never appear as the `provider` of Publish evidence.
+
+A fork is a different repository, not a shortcut to its upstream. A remote naming a fork is a recognized host, so the change request is opened against that fork's own integration branch, and Publish fails closed if the resulting change request is owned by a different repository than the coordinates Poiesis resolved. A self-hosted host or a filesystem remote is not a recognized host and yields no coordinates.
 
 ### Delivery
 
@@ -143,6 +176,14 @@ Delivery uses an argv-only command adapter. The command consumes the exact candi
 Production authorization is JSON bound to the candidate SHA/tree, Staging artifact identity, integration SHA, explicit approval, and Author identity. Production fetches `repository.remote` / `repository.integrationBranch`, requires the integration SHA to be the exact remote head, and verifies its actual Git tree before invoking the delivery command.
 
 Fixture delivery is test-only, requires `--allow-fixtures`, and writes outside the repository root.
+
+### Deferred delivery
+
+`"delivery": { "mode": "deferred" }` is an explicit, healthy product state, not a defect. `poiesis doctor` reports it as a nonblocking `warn` on the `delivery` check and keeps `report.ok` true. `init` writes no `scripts/poiesis-{preview,staging,production}.mjs` for a deferred install.
+
+One central policy guard reads the installed config — with no auto-resolution, no subprocess, and no network — and every gated operation calls it before its first side effect. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with `DELIVERY_DEFERRED`, naming the blocked operation and its remediation, before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, or worktree removal. `poiesis preview` and `poiesis promote` refuse earlier still, at argument resolution, because no delivery adapter exists to construct. `poiesis publish` may refuse even earlier with `PUBLISH_PROVIDER_UNRESOLVED` when the configured remote is not a recognized forge; that is a separate, equally fail-closed condition and produces the same zero remote side effects.
+
+Delivery is configured later through `poiesis update --config`, never by hand-editing the managed config. The change is atomic and leaves the `tracker` block untouched.
 
 ## Repository Intelligence (v1.2)
 

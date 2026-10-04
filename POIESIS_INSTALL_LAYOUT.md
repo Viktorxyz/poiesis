@@ -8,6 +8,13 @@ The canonical design document is `POIESIS_FOUNDATION_v1.2.md` (kept in the GitHu
 
 The Repository Intelligence cache is owned Poiesis local state under `.poiesis/cache/repository-intelligence/`. The directory is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. Foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
 
+## Tracker and delivery shapes a supported install may add
+
+Two install shapes add state outside the table above, and neither is a manifest record:
+
+- A `local` tracker stores Spec and ticket state in `poiesis-tracker-v1` beneath the Git common directory (`git rev-parse --git-common-dir`), as a `0700` directory of `0600` files. It is outside every working tree, so it is never foreign work, is never a candidate for a commit, is shared by every linked worktree of the clone, and is preserved across `uninstall` and reinstall. It is created lazily by the first `poiesis tracker` mutation; `init` verifies the location is usable and creates nothing.
+- A **configured** delivery install generates `scripts/poiesis-{preview,staging,production}.mjs` for every target the project does not already have, never overwriting an existing script. A `deferred` install (`"delivery": { "mode": "deferred" }`) generates none of them, because there is no delivery command to run; the deferred state is recorded in `.poiesis/config.jsonc` and changed later only through `poiesis update --config`.
+
 ## Canonical Poiesis files
 
 These source files are projected into the consumer repo by the runtime (`src/templates.ts::templateMappings` and the `init`/`update`/`update --config` transactions). They are also included in the published `poiesis-cli` package per `package.json::files[]`.

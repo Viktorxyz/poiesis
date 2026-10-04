@@ -58,11 +58,24 @@ Required infrastructure includes:
 - Git repository;
 - configured remote;
 - supported tracker;
-- configured Preview, Staging, and Production targets;
+- configured Preview, Staging, and Production targets, or an explicit `"delivery": { "mode": "deferred" }` state;
 - supported harness;
 - configured reasoning and execution models.
 
 Never consume foreign uncommitted work as the implementation base.
+
+### Tracker choice
+
+The tracker choice and the delivery choice are independent. A project decides where its canonical Spec and its tickets live separately from whether a candidate can be published, previewed, and released today. Choosing one never silently changes the other, and neither choice promises that a change request, a Preview, or a release will happen.
+
+The supported tracker adapters are:
+
+- `github` and `gitlab` — the Spec and tickets live in the forge repository, addressed by `tracker.project`, operated through the authenticated `gh` or `glab` CLI.
+- `linear` — the Spec and tickets live in a Linear team, addressed by a required `tracker.team` and an optional `tracker.project`. Poiesis reads the Linear credential from the environment only: set exactly one of `LINEAR_API_KEY` (sent as the raw credential) or `LINEAR_OAUTH_TOKEN` (sent as a `Bearer` token). Poiesis never reads, stores, writes, or logs a Linear credential in the config, a tracker item, an error, or a log line. Setting both variables fails closed with `LINEAR_AUTH_AMBIGUOUS` rather than picking one silently; setting neither fails closed with `LINEAR_AUTH_MISSING`.
+- `local` — `local` persists Spec and ticket state in the clone itself under `poiesis-tracker-v1` beneath the Git common directory, outside every working tree, and makes no network call. It needs no CLI and no credential, its items carry monotonic `LOCAL-<n>` identities, and it is a first-class product tracker, not a test fixture. A `local` install still resolves the integration branch and any publishing destination from the Git repository itself.
+- `fixture` — test-only, requires `--allow-fixtures` at `init`, and writes outside the repository root. It is never offered as an Author choice.
+
+A `github` or `gitlab` coordinate may be inferred from a recognized `github.com` or `gitlab.com` Git remote when the config does not state one. `linear` and `local` coordinates are never inferred from a remote: `linear` needs an Author-supplied team, and `local` needs no coordinate at all. Poiesis never invents a coordinate the Author did not state and the remote did not record.
 
 ### Capability Check
 
@@ -263,13 +276,37 @@ Canonical Publish evidence fields (runtime-required, equality invariants shown a
 
 A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
+### Publishing coordinates
+
+Publishing coordinates are a property of the configured Git remote, never of the tracker. A project that keeps its Spec and tickets in Linear or in the clone still publishes to the repository its Git remote points at. Poiesis resolves them in exactly one order:
+
+1. the configured remote, when it is a recognized `github.com` or `gitlab.com` host;
+2. otherwise, the configured `tracker.project`, and only when the tracker is itself a publishing provider (`github`, `gitlab`, or the test-only `fixture`);
+3. otherwise nothing.
+
+`linear` and `local` can never supply publishing coordinates and can never appear as the `provider` of Publish evidence. When no coordinate resolves, Poiesis fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence.
+
+A fork is a different repository, not a shortcut to its upstream. A remote pointing at a fork is a recognized host, so Poiesis publishes to the fork that remote names and opens the change request against that fork's own configured integration branch. Nothing in a clone records the fork/upstream relationship, so Poiesis can never publish back to the upstream it was forked from and never pretends to: if the change request that comes back is owned by a repository other than the coordinates Poiesis resolved, Publish fails closed. A self-hosted host (`gitlab.example.com`) or a filesystem remote is not a recognized host at all, so it yields no coordinates of its own.
+
 ### Deferred delivery
 
 An installed project may state `"delivery": { "mode": "deferred" }`. That is an explicit, honest state, not a defect: the work stays local. Everything up to and including whole-change Proof therefore continues normally — Prepare, Realize, Checkpoint, accepted Review, and Verify for the exact candidate — and `poiesis doctor` reports the deferred state as a nonblocking warning.
 
 Deferral stops the lifecycle before anything leaves the project. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with a typed `DELIVERY_DEFERRED` error that names the blocked operation and the remediation, before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, worktree removal, or delivery evidence.
 
+The refusal is a property of the operation, not of the order the runtime happens to check things in. Publish may refuse one step earlier with `PUBLISH_PROVIDER_UNRESOLVED` (see **Publishing coordinates** above) when the configured remote is not a recognized forge, and Preview and promotion refuse before they even have an adapter to construct. Those are separate conditions with their own typed codes; the guarantee they share is the one that matters: no push, no fetch, no remote revalidation, no change request, and no delivery evidence.
+
 A deferred lifecycle pauses after exact-candidate Proof. Poiesis must not claim that Publish, Preview, Staging, Production, integration, Author validation, or completion happened, and must not ask the Author to validate a realization that was never delivered. Report the proven candidate and the blocked operations, and continue when the Author configures delivery.
+
+Deferral is a statement about delivery only; it never changes the tracker. Spec and ticket create, update, comment, close, and supersede keep working through the configured tracker, and a `local` tracker keeps persisting them in the clone. A deferred install also generates no delivery script, because there is no delivery command to run.
+
+Adopting a deferred install requires no change to any existing project workflow: nothing is pushed, no pull or merge request is opened, and nothing is deployed to any environment. A project that already ships through its own pipeline keeps shipping through that pipeline. Poiesis does not adopt, replace, reorder, or reconfigure an existing deployment workflow, and adopting Poiesis is not a deployment step.
+
+Configuring delivery later is the ordinary managed-configuration workflow, never a hand edit of `.poiesis/config.jsonc`: `poiesis update --config`. Supply the proposed complete config as the argument —
+
+    poiesis update --config ./poiesis-config.jsonc
+
+— replacing the `delivery` block with the complete Preview, Staging, and Production command targets and leaving the `tracker` block exactly as it is. The authenticated transaction writes the new config, the OpenCode projection, the manifest, and the ownership receipt atomically before `doctor` gates the result. Tracker and delivery stay independent through the change: a `local` tracker may keep its Spec and tickets in the clone while delivery becomes configured, and a deferred install on a forge tracker keeps its forge Spec and tickets.
 
 ## 12. Preview
 
@@ -400,6 +437,8 @@ Then:
 ## Operating rules
 
 - Keep Git, tracker, PR/MR, and delivery mechanics internal unless the Author asks for them.
+- The tracker choice and the delivery choice are independent; never let one imply the other, and never invent a tracker coordinate, a credential, or a publishing destination.
+- Report only what the deterministic operations actually produced; a paused, blocked, or unconfigured state is reported as itself, never as progress.
 - Use strong reasoning for consequential judgment and final semantic review.
 - Use execution-oriented models for exploration, implementation, routine review, debugging, and fact gathering.
 - Keep child returns bounded; do not forward transcripts, raw exploration, or large logs.
