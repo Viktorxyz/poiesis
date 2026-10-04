@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { PoiesisError } from "./errors.js";
+import { sanitizeSubprocessOutput } from "./url-userinfo.js";
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -108,8 +109,8 @@ export async function run(command: string, args: string[], options: RunOptions):
       command,
       args,
       exitCode,
-      stdout: stripTrailingWhitespace(captureText(stdout)),
-      stderr: stripTrailingWhitespace(captureText(stderr)),
+      stdout: sanitizedStream(stdout),
+      stderr: sanitizedStream(stderr),
       stdoutTruncated: stdout.truncated,
       stderrTruncated: stderr.truncated,
       timedOut,
@@ -562,6 +563,32 @@ function commandIoError(
 
 function stripTrailingWhitespace(value: string): string {
   return value.replace(/[\s\u0000]+$/, "");
+}
+
+/**
+ * Spec #139 / ticket #149 — the redaction seam for a captured stream.
+ *
+ * This runner is the ONE place subprocess output is captured, so the URL
+ * userinfo redaction is applied here rather than at each of the many
+ * call sites that report a command's output. Every settlement path reads
+ * `buildResult()` — the resolved result (including `allowFailure`), the
+ * `COMMAND_TIMEOUT` details, and the `COMMAND_FAILED` details — so a
+ * credential a child printed (`fatal: unable to access
+ * 'https://user:<token>@host/…'`) cannot reach any of them.
+ *
+ * Sanitizing happens AFTER the capture and BEFORE `bounded()` bounds the
+ * text for an error detail, so a later cut can only ever shorten a
+ * credential-free URL, never expose a credential that is still present.
+ *
+ * `truncated` is the capture's own flag: when the byte cap or an
+ * incomplete trailing code point cut the stream, the text's end is not a
+ * real boundary, and the sanitizer withholds a trailing authority it
+ * cannot prove is credential-free.
+ */
+function sanitizedStream(capture: Capture): string {
+  return sanitizeSubprocessOutput(stripTrailingWhitespace(captureText(capture)), {
+    truncated: capture.truncated,
+  });
 }
 
 function normalizeTimeout(value: number | undefined): number {

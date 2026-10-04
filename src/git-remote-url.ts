@@ -22,10 +22,14 @@
  * path, scheme, and the scp-like SSH form are preserved byte-for-byte. This
  * is a redaction, not a rewriter — `git@github.com:owner/repo.git` has no
  * userinfo section and stays exactly as the Author wrote it.
+ *
+ * Spec #139 / ticket #149: the rule itself now lives in
+ * `src/url-userinfo.ts`, next to the same rule applied to absolute URLs
+ * embedded in arbitrary subprocess output. A remote URL is a whole URL,
+ * so this function is that single rule with a whole-value shape — one rule,
+ * two shapes, no possibility of the two drifting apart.
  */
-
-/** `scheme://userinfo@rest`, where userinfo is the authority up to the LAST `@`. */
-const URL_WITH_USERINFO = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s/?#]*@)(.*)$/;
+import { stripUrlUserinfo } from "./url-userinfo.js";
 
 /**
  * Strip the userinfo section from a Git remote URL.
@@ -36,7 +40,5 @@ const URL_WITH_USERINFO = /^([A-Za-z][A-Za-z0-9+.-]*:\/\/)([^\s/?#]*@)(.*)$/;
  * credential-free URL.
  */
 export function sanitizeGitRemoteUrl(url: string): string {
-  const match = URL_WITH_USERINFO.exec(url.trim());
-  if (match === null) return url.trim();
-  return `${match[1] ?? ""}${match[3] ?? ""}`;
+  return stripUrlUserinfo(url);
 }
