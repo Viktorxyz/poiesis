@@ -371,6 +371,53 @@ describe("the local tracker implements the complete TrackerAdapter", () => {
     expect((await tracker.closeSpec(spec.id)).state).toBe("superseded");
   });
 
+  it("refuses a replacement identifier that is not a LOCAL id instead of writing a store its own validator refuses", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({
+      title: "T",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: "none",
+    });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const before = await readFile(location.storePath, "utf8");
+
+    // `supersededBy` is PERSISTED, and the strict store validator refuses any
+    // entry that is not a LOCAL identifier. Accepting an arbitrary value here
+    // commits a store this adapter can never read again — the failure is the
+    // caller's, and it is total, not a single bad read. Every non-LOCAL value
+    // is therefore rejected as invalid input BEFORE the mutation.
+    for (const replacementIds of [["ENG-123"], [spec.id, "#42"], ["local-3"], ["LOCAL-0"], [""]]) {
+      await expect(
+        tracker.supersedeTicket(ticket.id, { reason: "Replanned", replacementIds }),
+      ).rejects.toMatchObject({ code: "INVALID_ADAPTER_INPUT" });
+    }
+    // The rejection leaves the canonical bytes EXACTLY as they were, and the
+    // items that were readable before are still readable.
+    expect(await readFile(location.storePath, "utf8")).toBe(before);
+    expect((await tracker.getTicket(ticket.id)).state).toBe("open");
+    expect((await tracker.getSpec(spec.id)).title).toBe("Intent");
+
+    // A genuine LOCAL replacement is unchanged, including the empty list.
+    const replacement = await tracker.createTicket({
+      title: "Replacement",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: "none",
+    });
+    const superseded = await tracker.supersedeTicket(ticket.id, {
+      reason: "Replanned",
+      replacementIds: [replacement.id],
+    });
+    expect(superseded.state).toBe("superseded");
+    expect(superseded.supersededBy).toEqual([replacement.id]);
+    const reloaded = createLocalTrackerAdapter(repository.root);
+    expect((await reloaded.getTicket(ticket.id)).supersededBy).toEqual([replacement.id]);
+    expect((await reloaded.supersedeSpec(spec.id, { reason: "Also replanned" })).supersededBy).toEqual([]);
+  });
+
   it("mints a fresh comment id when a valid store carries a noncontiguous comment run", async () => {
     const repository = await newRepository();
     const tracker = createLocalTrackerAdapter(repository.root);

@@ -976,6 +976,22 @@ class LocalTrackerAdapter implements TrackerAdapter {
   private async supersede(id: string, kind: TrackerItemKind, input: SupersedeInput): Promise<TrackerItem> {
     const reason = requiredText(input.reason, "supersede reason");
     const replacementIds = [...(input.replacementIds ?? [])];
+    // `supersededBy` is PERSISTED, and the strict store validator refuses any
+    // entry that is not a LOCAL identifier. An unvalidated value would commit a
+    // store this adapter itself can never read again, so the same invariant is
+    // enforced HERE, on the caller's input, before the mutation. A replacement
+    // this tracker never issued is a caller mistake, not a store to repair:
+    // a cross-provider id (`ENG-123`) is precisely the shape the validator
+    // refuses, and accepting it would convert one bad argument into a
+    // permanently unreadable store.
+    for (const replacementId of replacementIds) {
+      invariant(
+        typeof replacementId === "string" && localIdNumber(replacementId) !== null,
+        "INVALID_ADAPTER_INPUT",
+        "A supersession replacement must be a LOCAL identifier issued by this tracker",
+        { name: "replacementIds", value: replacementId },
+      );
+    }
     return this.mutate((store) => {
       const record = localRecord(store, id, kind);
       const at = new Date().toISOString();
