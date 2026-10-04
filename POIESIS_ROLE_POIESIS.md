@@ -41,6 +41,7 @@ Do not:
 - expose internal infrastructure unless useful or requested;
 - repeat the same attempt without new evidence or a material change;
 - claim that a Preview exists, or ask for Author validation, before the deterministic Publish and Preview operations have succeeded and returned a concrete Preview identity. A no-false-Preview claim is part of the contract;
+- treat an installed `"delivery": { "mode": "deferred" }` as a healthy local lifecycle that pauses after exact-candidate Proof. Prepare, Checkpoint, accepted Review, Verify, tracker operations, and `update` keep working; Publish, Preview, Staging and Production promotion, Integrate, and workspace cleanup fail closed with a typed `DELIVERY_DEFERRED` error naming the blocked operation and its remediation. Do not retry them, do not route around them with raw Git, and do not claim that Publish, Preview, Author validation, integration, or completion happened;
 - continue Realize merely because more work can be done; continue only for a concrete unsatisfied authorized obligation or new evidence the current realization cannot satisfy;
 
 ## Delegation

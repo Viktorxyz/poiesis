@@ -450,43 +450,22 @@ describe("publish coordinates are derived from the Git remote", () => {
   });
 });
 
-describe("unimplemented tracker providers fail closed", () => {
-  it("createTrackerAdapter refuses linear and local without a fake adapter", () => {
-    for (const tracker of [
-      { provider: "linear", team: "ENG" },
-      { provider: "local" },
-    ] as const) {
-      try {
-        createTrackerAdapter(tracker, process.cwd());
-        throw new Error(`expected createTrackerAdapter to refuse ${tracker.provider}`);
-      } catch (error) {
-        expect(error).toBeInstanceOf(PoiesisError);
-        expect(error).toMatchObject({ code: "UNSUPPORTED_TRACKER_PROVIDER" });
-      }
-    }
-  });
-
-  it("verifyTracker refuses linear and local with an actionable typed error", async () => {
-    const repository = await createTestRepository();
-    try {
-      for (const tracker of [
-        { provider: "linear", team: "ENG" },
-        { provider: "local" },
-      ] as const) {
-        const { config } = await autoResolveConfigDefaults(repository.root, {
-          ...baseConfig(),
-          tracker,
-        });
-        await expect(verifyTracker(repository.root, config)).rejects.toMatchObject({
-          code: "UNSUPPORTED_TRACKER_PROVIDER",
-        });
-      }
-    } finally {
-      await rm(repository.parent, { recursive: true, force: true });
-    }
-  });
-});
-
+/**
+ * Ticket #142: `local` is no longer in this list. It is a first-class
+ * provider with a complete adapter, so the fail-closed contract now applies
+ * only to a provider whose adapter has not landed. `local`'s own factory,
+ * verification, and lifecycle evidence lives in
+ * `tests/local-tracker-adapter.test.ts`.
+ */
+/**
+ * Spec #139: the fail-closed factory seam. It originally covered `linear`
+ * and `local` as providers with no adapter. Both are now first-class
+ * providers behind a real `TrackerAdapter` — `linear` in ticket #141,
+ * `local` in ticket #142 — so that block has no remaining subject and is
+ * removed rather than left asserting an adapter that no longer exists. The
+ * property it protected is still covered above: an unknown or absent
+ * `tracker.provider` is refused with a typed, actionable error.
+ */
 describe("trackerProjectOf reads the repository coordinate across the union", () => {
   it("returns the project for forge and fixture trackers and undefined otherwise", () => {
     expect(trackerProjectOf({ provider: "github", project: "owner/repo" })).toBe("owner/repo");

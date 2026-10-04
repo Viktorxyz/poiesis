@@ -4,8 +4,29 @@ import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
 import type { DeliveryTargetConfig, PoiesisConfig } from "./config.js";
 import { trackerProjectOf } from "./config.js";
+// Spec #139 / ticket #141: the Poiesis metadata envelope, the body round
+// trip, and the tracker item / comment shapes are ONE implementation shared
+// by every adapter. A second copy of the envelope would let an item created
+// through one provider become unreadable through another.
+import {
+  assertKind,
+  decorateBody,
+  isRecord,
+  metadataFromItem,
+  requiredText,
+  trackerItem,
+  type TrackerComment,
+  type TrackerItem,
+  type TrackerItemKind,
+  type TrackerItemState,
+  type TrackerMetadata,
+} from "./tracker-item.js";
+export type { TrackerComment, TrackerItem, TrackerItemKind, TrackerItemState };
 import { PoiesisError, invariant } from "./errors.js";
 import { atomicWrite, exists, readUtf8 } from "./fs.js";
+import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
+import { createLinearTrackerAdapter, type LinearTrackerConfig } from "./linear-tracker.js";
+import { createLocalTrackerAdapter as buildLocalTrackerAdapter } from "./local-tracker.js";
 import { run } from "./process.js";
 import {
   validateIntegrationEvidence,
@@ -27,8 +48,6 @@ import {
  * coordinates come from the Poiesis config, not from the Git remote.
  */
 export type TrackerProvider = "github" | "gitlab" | "linear" | "local" | "fixture";
-export type TrackerItemKind = "spec" | "ticket";
-export type TrackerItemState = "open" | "closed" | "superseded";
 
 const SHA_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
@@ -42,27 +61,6 @@ export type TrackerConfig =
   | { provider: "linear"; team: string; project?: string }
   | { provider: "local" }
   | { provider: "fixture"; project: string };
-
-export interface TrackerItem {
-  id: string;
-  kind: TrackerItemKind;
-  title: string;
-  body: string;
-  state: TrackerItemState;
-  url: string;
-  parentSpecId?: string;
-  dependencyText?: string;
-  supersededBy?: string[];
-  supersededReason?: string;
-}
-
-export interface TrackerComment {
-  id: string;
-  itemId: string;
-  body: string;
-  url?: string;
-}
-
 export interface CreateSpecInput {
   title: string;
   body: string;
@@ -102,103 +100,6 @@ export interface TrackerAdapter {
   commentTicket(id: string, body: string): Promise<TrackerComment>;
   closeTicket(id: string): Promise<TrackerItem>;
   supersedeTicket(id: string, input: SupersedeInput): Promise<TrackerItem>;
-}
-
-interface TrackerMetadata {
-  kind: TrackerItemKind;
-  parentSpecId?: string;
-  dependencyText?: string;
-  supersededReason?: string;
-  supersededBy?: string[];
-}
-
-const METADATA_START = "<!-- poiesis:tracker\n";
-const METADATA_END = "\npoiesis:tracker -->\n\n";
-
-function requiredText(value: string, name: string): string {
-  invariant(value.trim().length > 0, "INVALID_ADAPTER_INPUT", `${name} must not be empty`, { name });
-  return value;
-}
-
-function decorateBody(body: string, metadata: TrackerMetadata): string {
-  return `${METADATA_START}${JSON.stringify(metadata)}${METADATA_END}${relationshipText(metadata)}${body}`;
-}
-
-function parseBody(value: string): { body: string; metadata: TrackerMetadata } {
-  if (!value.startsWith(METADATA_START)) {
-    throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item is not managed by Poiesis");
-  }
-  const end = value.indexOf(METADATA_END, METADATA_START.length);
-  if (end < 0) throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item metadata is incomplete");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value.slice(METADATA_START.length, end));
-  } catch (error) {
-    throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item metadata is invalid JSON", {
-      cause: error instanceof Error ? error.message : String(error),
-    });
-  }
-  invariant(isRecord(parsed), "INVALID_TRACKER_ITEM", "Tracker item metadata must be an object");
-  invariant(parsed.kind === "spec" || parsed.kind === "ticket", "INVALID_TRACKER_ITEM", "Unknown tracker item kind");
-  const metadata: TrackerMetadata = { kind: parsed.kind };
-  if (typeof parsed.parentSpecId === "string") metadata.parentSpecId = parsed.parentSpecId;
-  if (typeof parsed.dependencyText === "string") metadata.dependencyText = parsed.dependencyText;
-  if (typeof parsed.supersededReason === "string") metadata.supersededReason = parsed.supersededReason;
-  if (Array.isArray(parsed.supersededBy) && parsed.supersededBy.every((entry) => typeof entry === "string")) {
-    metadata.supersededBy = parsed.supersededBy;
-  }
-  const remainder = value.slice(end + METADATA_END.length);
-  const relationships = relationshipText(metadata);
-  invariant(remainder.startsWith(relationships), "INVALID_TRACKER_ITEM", "Tracker relationship text is incomplete");
-  return { body: remainder.slice(relationships.length), metadata };
-}
-
-function relationshipText(metadata: TrackerMetadata): string {
-  const lines = [`**Poiesis ${metadata.kind === "spec" ? "Spec" : "Ticket"}**`];
-  if (metadata.parentSpecId !== undefined) lines.push(`Parent Spec: ${metadata.parentSpecId}`);
-  if (metadata.dependencyText !== undefined) lines.push(`Dependencies:\n${metadata.dependencyText}`);
-  if (metadata.supersededReason !== undefined) lines.push(`Superseded: ${metadata.supersededReason}`);
-  if (metadata.supersededBy !== undefined && metadata.supersededBy.length > 0) {
-    lines.push(`Replaced by: ${metadata.supersededBy.join(", ")}`);
-  }
-  return `${lines.join("\n\n")}\n\n---\n\n`;
-}
-
-function trackerItem(
-  raw: { id: string; title: string; body: string; state: string; url: string },
-): TrackerItem {
-  const parsed = parseBody(raw.body);
-  const supersessionReason = parsed.metadata.supersededReason?.trim();
-  const superseded = supersessionReason !== undefined && supersessionReason.length > 0;
-  const normalizedState = raw.state.trim().toLowerCase();
-  const openStates = new Set(["open", "opened", "reopened"]);
-  return {
-    id: raw.id,
-    kind: parsed.metadata.kind,
-    title: raw.title,
-    body: parsed.body,
-    state: superseded ? "superseded" : openStates.has(normalizedState) ? "open" : "closed",
-    url: raw.url,
-    ...(parsed.metadata.parentSpecId === undefined ? {} : { parentSpecId: parsed.metadata.parentSpecId }),
-    ...(parsed.metadata.dependencyText === undefined ? {} : { dependencyText: parsed.metadata.dependencyText }),
-    ...(parsed.metadata.supersededBy === undefined ? {} : { supersededBy: [...parsed.metadata.supersededBy] }),
-    ...(supersessionReason === undefined || supersessionReason.length === 0
-      ? {}
-      : { supersededReason: supersessionReason }),
-  };
-}
-
-function assertKind(item: TrackerItem, kind: TrackerItemKind): TrackerItem {
-  invariant(item.kind === kind, "TRACKER_ITEM_KIND_MISMATCH", `Tracker item ${item.id} is not a ${kind}`, {
-    id: item.id,
-    expected: kind,
-    actual: item.kind,
-  });
-  return item;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function jsonObject(stdout: string, command: string): Record<string, unknown> {
@@ -315,16 +216,6 @@ abstract class CliTrackerAdapter implements TrackerAdapter {
     await this.updateIssue(current.id, current.title, decorateBody(current.body, metadata));
     return this.closeIssue(current.id);
   }
-}
-
-function metadataFromItem(item: TrackerItem): TrackerMetadata {
-  return {
-    kind: item.kind,
-    ...(item.parentSpecId === undefined ? {} : { parentSpecId: item.parentSpecId }),
-    ...(item.dependencyText === undefined ? {} : { dependencyText: item.dependencyText }),
-    ...(item.supersededReason === undefined ? {} : { supersededReason: item.supersededReason }),
-    ...(item.supersededBy === undefined ? {} : { supersededBy: [...item.supersededBy] }),
-  };
 }
 
 class GitHubTrackerAdapter extends CliTrackerAdapter {
@@ -689,17 +580,17 @@ export function createTrackerAdapter(
       return new GitLabTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
     case "fixture":
       return new FixtureTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
-    // Spec #139 / ticket #140: `linear` and `local` are configurable
-    // identities whose adapters arrive in later tickets. This seam fails
-    // closed with a typed error rather than constructing a fake adapter or
-    // routing Linear / local work through the Git host CLI.
-    case "linear":
+    // Spec #139 / ticket #142: `local` is a first-class provider with a
+    // complete adapter and its own durable store under the Git common
+    // directory. It is NOT routed through a Git host CLI and NOT served by
+    // the test-only fixture.
     case "local":
-      throw new PoiesisError(
-        "UNSUPPORTED_TRACKER_PROVIDER",
-        `The ${config.provider} tracker adapter is not implemented yet; Poiesis will not substitute a fake adapter`,
-        { provider: config.provider },
-      );
+      return buildLocalTrackerAdapter(root);
+    // Spec #139 / ticket #141: Linear is a first-class provider. It speaks
+    // the official GraphQL endpoint directly with a credential read only from
+    // the environment, and it is never routed through a Git host CLI.
+    case "linear":
+      return createLinearTrackerAdapter(linearConfigOf(config));
   }
 }
 
@@ -712,6 +603,27 @@ function configProject(config: TrackerConfig | NonNullable<PoiesisConfig["tracke
   return trackerProjectOf(config) ?? "";
 }
 
+/**
+ * The `linear` branch's non-secret coordinates. An empty team is refused
+ * rather than defaulted: filing a Spec in a team the Author never named
+ * would put their work somewhere they are not looking.
+ */
+function linearConfigOf(config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>): LinearTrackerConfig {
+  const team = (config as { team?: unknown }).team;
+  if (typeof team !== "string" || team.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "A linear tracker requires a non-empty tracker.team; Poiesis will not choose a Linear team for you",
+      { provider: "linear", field: "tracker.team" },
+    );
+  }
+  const project = trackerProjectOf(config);
+  return {
+    team: team.trim(),
+    ...(project === undefined || project.trim().length === 0 ? {} : { project: project.trim() }),
+  };
+}
+
 export function createGitHubTrackerAdapter(project: string, cwd = process.cwd()): TrackerAdapter {
   return new GitHubTrackerAdapter(requiredText(project, "tracker project"), cwd);
 }
@@ -722,6 +634,16 @@ export function createGitLabTrackerAdapter(project: string, cwd = process.cwd())
 
 export function createFixtureTrackerAdapter(projectPath: string, root = process.cwd()): TrackerAdapter {
   return new FixtureTrackerAdapter(requiredText(projectPath, "tracker project path"), root);
+}
+
+/**
+ * Spec #139 / ticket #142. The `local` adapter's store layout, lock envelope,
+ * and validation contract live in `src/local-tracker.ts` and stay module-
+ * internal; only the factory is public, so callers get a complete
+ * `TrackerAdapter` without the store shape freezing into the package root.
+ */
+export function createLocalTrackerAdapter(cwd: string = process.cwd()): TrackerAdapter {
+  return buildLocalTrackerAdapter(cwd);
 }
 
 export type DeliveryTarget = "preview" | "staging" | "production";
@@ -1280,6 +1202,11 @@ export async function previewDelivery(
   // graph acyclic (adapters.ts and maintenance.ts must not import each
   // other at module-load time).
   await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. The guard
+  // runs before the adapter is constructed, so a deferred install produces no
+  // remote revalidation, no delivery subprocess, no delivery artifact, and no
+  // Preview identity.
+  await assertDeliveryPolicyAllows(root, "poiesis preview");
   return createDeliveryAdapter(config, root).preview(input);
 }
 
@@ -1303,6 +1230,10 @@ export async function promoteDelivery(
   // guard mirrors `previewDelivery` so the surfaced error code is
   // uniform across delivery mutations.
   await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of
+  // adapter construction and of the canonical-integration revalidation and
+  // release subprocess that follow.
+  await assertDeliveryPolicyAllows(root, `poiesis promote --target ${input.target}`);
   const adapter = createDeliveryAdapter(config, root);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

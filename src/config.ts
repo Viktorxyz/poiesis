@@ -106,6 +106,30 @@ export function isDeferredDelivery(
 }
 
 /**
+ * Spec #139 / ticket #143 — the remediation every `DELIVERY_DEFERRED` failure
+ * names. One string, shared by the resolved-config access point and the
+ * lifecycle-policy guard, so an Author reads the same actionable instruction
+ * whichever seam refused.
+ */
+export const DELIVERY_DEFERRED_REMEDIATION =
+  "Replace the deferred mode with the three delivery targets in .poiesis/config.jsonc " +
+  "(delivery.preview, delivery.staging, delivery.production) and apply the change with " +
+  "`poiesis update --config <file>`; until then this operation stays blocked.";
+
+/**
+ * The one typed `DELIVERY_DEFERRED` error. Every blocked operation is
+ * reported by name together with its remediation, so a refusal is actionable
+ * without reading the source.
+ */
+export function deliveryDeferredError(operation: string): PoiesisError {
+  return new PoiesisError(
+    "DELIVERY_DEFERRED",
+    `Delivery is explicitly deferred; ${operation} cannot run until delivery is configured`,
+    { mode: DEFERRED_DELIVERY_MODE, operation, remediation: DELIVERY_DEFERRED_REMEDIATION },
+  );
+}
+
+/**
  * The single fail-closed access point for code that needs a real delivery
  * target. Throws a typed `DELIVERY_DEFERRED` error naming the blocked
  * operation, so a deferred install can never construct a fake target, a
@@ -119,15 +143,11 @@ export function requireConfiguredDelivery(
     throw new PoiesisError(
       "DELIVERY_DEFERRED",
       `Delivery is not configured; ${operation} cannot run until delivery is configured`,
-      { mode: null, operation },
+      { mode: null, operation, remediation: DELIVERY_DEFERRED_REMEDIATION },
     );
   }
   if (isDeferredDelivery(delivery)) {
-    throw new PoiesisError(
-      "DELIVERY_DEFERRED",
-      `Delivery is explicitly deferred; ${operation} cannot run until delivery is configured`,
-      { mode: DEFERRED_DELIVERY_MODE, operation },
-    );
+    throw deliveryDeferredError(operation);
   }
   return delivery;
 }

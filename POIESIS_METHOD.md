@@ -263,6 +263,14 @@ Canonical Publish evidence fields (runtime-required, equality invariants shown a
 
 A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
+### Deferred delivery
+
+An installed project may state `"delivery": { "mode": "deferred" }`. That is an explicit, honest state, not a defect: the work stays local. Everything up to and including whole-change Proof therefore continues normally — Prepare, Realize, Checkpoint, accepted Review, and Verify for the exact candidate — and `poiesis doctor` reports the deferred state as a nonblocking warning.
+
+Deferral stops the lifecycle before anything leaves the project. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with a typed `DELIVERY_DEFERRED` error that names the blocked operation and the remediation, before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, worktree removal, or delivery evidence.
+
+A deferred lifecycle pauses after exact-candidate Proof. Poiesis must not claim that Publish, Preview, Staging, Production, integration, Author validation, or completion happened, and must not ask the Author to validate a realization that was never delivered. Report the proven candidate and the blocked operations, and continue when the Author configures delivery.
+
 ## 12. Preview
 
 Preview only after Publish succeeds. Pass, to `poiesis preview`:

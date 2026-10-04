@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
+import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
 import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
 import {
@@ -630,6 +631,11 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   // effect. The receipt-authenticated manifest lives under the primary
   // checkout that owns this workspace.
   await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. Explicitly
+  // deferred delivery is a healthy local state, so it stops here — before
+  // the push, before the remote revalidation, before any change request, and
+  // before a single field of Publish evidence exists.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis publish");
   const branch = await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Publish remote does not match workspace ownership", {
     expected: owned.marker.remote,
@@ -746,6 +752,10 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   // `manifest.poiesisVersion` before any
   // commit-tree / fetch-base / push integration side effect.
   await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of the
+  // fetch-base / commit-tree / push integration side effects and before any
+  // Integration evidence is built.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis integrate");
   await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Integration remote does not match workspace ownership");
   invariant(
@@ -862,6 +872,12 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
   // package must equal the durable `manifest.poiesisVersion` before
   // any branch / marker / worktree teardown runs.
   await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. Cleanup
+  // proves a delivered tree and then deletes the remote change branch and the
+  // owned worktree, so a deferred install — which can never have delivered
+  // anything — is refused before the fetch, before the remote branch
+  // deletion, and before the worktree is removed.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis workspace cleanup");
   invariant(
     owned.marker.branch !== owned.marker.integrationBranch,
     "INTEGRATION_WORKSPACE_CLEANUP_FORBIDDEN",

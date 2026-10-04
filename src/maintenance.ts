@@ -94,6 +94,8 @@ import {
   templateMappings,
 } from "./templates.js";
 import { createDeliveryAdapter } from "./adapters.js";
+import { verifyLinearTrackerAuthorized } from "./linear-tracker.js";
+import { assertLocalTrackerStoreUsable, resolveLocalTrackerStoreLocation } from "./local-tracker.js";
 import type { PublishProvider } from "./evidence.js";
 
 /**
@@ -696,16 +698,23 @@ export async function validateOpenCodeConfigPayload(content: string): Promise<vo
 
 export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
   if (config.tracker.provider === "fixture") return "fixture";
-  // Spec #139 / ticket #140: `linear` and `local` are configurable
-  // identities with no adapter in this foundation. Failing closed with a
-  // typed, actionable error is the only honest outcome — a fake adapter,
-  // a synthesized issue, or a silent success claim is forbidden.
-  if (config.tracker.provider === "linear" || config.tracker.provider === "local") {
-    throw new PoiesisError(
-      "UNSUPPORTED_TRACKER_PROVIDER",
-      `The ${config.tracker.provider} tracker adapter is not implemented yet; Poiesis will not substitute a fake adapter`,
-      { provider: config.tracker.provider },
-    );
+  // Spec #139 / ticket #142: `local` is a first-class tracker whose only
+  // credential is the Git common directory the repository already has. There
+  // is no host CLI to authenticate against and no network to reach, so
+  // verification is a path-usability check: it fails closed on a symlinked,
+  // nonregular, or world-readable store and deliberately creates nothing, so
+  // `poiesis init` does not materialize tracker state as a side effect.
+  if (config.tracker.provider === "local") {
+    await assertLocalTrackerStoreUsable(await resolveLocalTrackerStoreLocation(root));
+    return "verified";
+  }
+  // Spec #139 / ticket #141: Linear authenticates with a credential from the
+  // environment, not with a host CLI. Verification is therefore one real
+  // authenticated read against Linear: a missing, doubled, or refused
+  // credential fails closed here, next to its cause, instead of surfacing
+  // later as an unexplained 401 during the first tracker mutation.
+  if (config.tracker.provider === "linear") {
+    return verifyLinearTrackerAuthorized();
   }
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });

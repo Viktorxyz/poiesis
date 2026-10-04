@@ -254,6 +254,56 @@ const forbiddenFunctions = [
   // the Specialist agent `permission.bash` strip) into a public
   // API before the v1.2 surface stabilizes.
   "predecessorProjectionV113V114",
+  // Spec #139 / ticket #142: the `local` tracker's store layout, lock
+  // protocol, and strict-validation contract live in `src/local-tracker.ts`
+  // and MUST NOT reach the package root. Only the `createLocalTrackerAdapter`
+  // factory is public (mirroring the forge / fixture factories), so a caller
+  // gets a complete `TrackerAdapter` without the on-disk store shape, the
+  // lock envelope, and the refusal codes freezing into a public surface.
+  "resolveLocalTrackerStoreLocation",
+  "resolveLocalTrackerStoreLocationSync",
+  "parseLocalTrackerStore",
+  "acquireLocalTrackerLock",
+  "acquireLocalTrackerLockWithTimeout",
+  "releaseLocalTrackerLock",
+  "assertLocalTrackerStoreUsable",
+  "LOCAL_TRACKER_STORE_DIRECTORY",
+  "LOCAL_TRACKER_STORE_SCHEMA",
+  "LOCAL_TRACKER_STORE_PROVIDER",
+  "LOCAL_TRACKER_LOCK_VERSION",
+  "LOCAL_TRACKER_LOCK_TIMEOUT_MS",
+  // Spec #139 / ticket #141: the Linear adapter lives in
+  // `src/linear-tracker.ts` and stays module-internal, and it is reached
+  // through the EXISTING public `createTrackerAdapter` factory rather than a
+  // second bespoke public entry point. The credential variable names, the
+  // official endpoint, the pagination / retry ceilings, the injected
+  // transport-clock-sleep-UUID seams, and the authorization probe are the
+  // implementation of one provider, not a contract downstream code should
+  // depend on.
+  "createLinearTrackerAdapter",
+  "verifyLinearTrackerAuthorized",
+  "LINEAR_GRAPHQL_ENDPOINT",
+  "LINEAR_API_KEY_VARIABLE",
+  "LINEAR_OAUTH_TOKEN_VARIABLE",
+  "LINEAR_PAGE_SIZE",
+  "LINEAR_MAX_PAGES",
+  "LINEAR_MAX_ATTEMPTS",
+  "LINEAR_MAX_RETRY_DELAY_MS",
+  "LINEAR_MAX_RETRY_WAIT_MS",
+  "LINEAR_DEFAULT_RETRY_DELAY_MS",
+  // Ticket #141: the Poiesis tracker metadata envelope and the tracker item
+  // helpers were extracted from `src/adapters.ts` into `src/tracker-item.ts`
+  // so every adapter — including Linear — shares ONE implementation of the
+  // persisted description format. The envelope helpers stay internal:
+  // promoting them would lock the on-the-wire format into a public API. The
+  // item and comment TYPES remain public and unchanged.
+  "decorateBody",
+  "parseBody",
+  "trackerItem",
+  "metadataFromItem",
+  "assertKind",
+  "isRecord",
+  "requiredText",
 ] as const;
 
 const forbiddenTypes = [
@@ -381,6 +431,19 @@ const forbiddenTypes = [
   "RefreshLockContent",
   "RefreshGuardContent",
   "REFRESH_LOCK_CONTENT_VERSION",
+  // Ticket #142: the `local` tracker store document, item / comment / history
+  // records, lock envelope, and store-location shape are module-internal for
+  // the same reason. Every currently-leaked name is enumerated so a future
+  // re-export regresses immediately.
+  "LocalTrackerStore",
+  "LocalTrackerStoreLocation",
+  "LocalTrackerItemRecord",
+  "LocalTrackerItemFile",
+  "LocalTrackerCommentRecord",
+  "LocalTrackerHistoryEntry",
+  "LocalTrackerLockContent",
+  "LocalTrackerState",
+  "LocalTrackerOperation",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

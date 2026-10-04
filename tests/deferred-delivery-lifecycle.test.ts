@@ -1,0 +1,704 @@
+/**
+ * Spec #139 / ticket #143 — explicit deferred delivery is a healthy LOCAL
+ * lifecycle up to exact-candidate Proof, and a hard block on every
+ * delivery-integrated operation.
+ *
+ * One central internal lifecycle-policy guard reads the authorized installed
+ * config — and nothing else, with no auto-resolution and no network — then
+ * every gated seam calls it before its first side effect. So a deferred
+ * install keeps preparing workspaces, accepting accepted-Review checkpoints,
+ * and proving exact candidates, while it can never produce a push, a fetch, a
+ * remote revalidation, a delivery subprocess, an integration commit, a remote
+ * branch deletion, a worktree removal, evidence, or a success envelope.
+ */
+import { existsSync, readFileSync } from "node:fs";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// Wrap `run` so the test can see exactly which subprocesses the runtime
+// reached. The wrapper calls the real runner, so real Git behavior is
+// preserved; only the call log is added. See tests/git-lifecycle.test.ts for
+// the same seam used for a different purpose.
+vi.mock("../src/process.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/process.js")>();
+  return { ...actual, run: vi.fn(actual.run) };
+});
+
+import {
+  DEFERRED_DELIVERY_MODE,
+  serializeConfig,
+  type PoiesisConfig,
+  type ResolvedPoiesisConfig,
+} from "../src/config.js";
+import {
+  createTrackerAdapter,
+  previewDelivery,
+  promoteDelivery,
+  type DeliveryIdentity,
+  type PreviewDeliveryResult,
+} from "../src/adapters.js";
+import {
+  checkpoint,
+  inspect,
+  integrate,
+  publish,
+  resolveTree,
+  verify,
+  workspaceCleanup,
+  workspacePrepare,
+  type WorkspaceIdentity,
+} from "../src/git.js";
+import { assertDeliveryPolicyAllows, DEFERRED_BLOCKED_OPERATIONS, type DeferredBlockedOperation } from "../src/lifecycle-policy.js";
+import { doctor, init, updateFromConfig } from "../src/maintenance.js";
+import { PoiesisError } from "../src/errors.js";
+import { run } from "../src/process.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+const REPO_ROOT = join(import.meta.dirname, "..");
+const BRANCH = "poiesis/spec-1";
+const PROBE = "poiesis-delivery-probe.mjs";
+
+/**
+ * Subprocess seams a deferred install must never reach. `ls-remote` is the
+ * remote revalidation used by Publish, Preview, and workspace cleanup;
+ * `worktree remove` and `update-ref -d` are the cleanup teardown; the probe
+ * script stands in for any delivery subprocess.
+ */
+const FORBIDDEN_GIT_SUBCOMMANDS = ["push", "fetch", "ls-remote", "commit-tree", "worktree", "update-ref"] as const;
+
+interface SubprocessCall {
+  executable: string;
+  args: string[];
+}
+
+function markSubprocesses(): number {
+  return (run as unknown as { mock: { calls: unknown[] } }).mock.calls.length;
+}
+
+function subprocessCallsSince(mark: number): SubprocessCall[] {
+  return (run as unknown as { mock: { calls: unknown[][] } }).mock.calls.slice(mark).map((call) => ({
+    executable: String(call[0]),
+    args: Array.isArray(call[1]) ? (call[1] as unknown[]).map(String) : [],
+  }));
+}
+
+function reachedSideEffects(calls: SubprocessCall[]): string[] {
+  const labels: string[] = [];
+  for (const call of calls) {
+    const subcommand = call.args[0];
+    if (call.executable === "git" && subcommand !== undefined && (FORBIDDEN_GIT_SUBCOMMANDS as readonly string[]).includes(subcommand)) {
+      labels.push(`git ${subcommand}`);
+    }
+    if (call.executable === "node" && call.args.some((argument) => argument.endsWith(PROBE))) {
+      labels.push(`delivery subprocess: node ${call.args.join(" ")}`);
+    }
+  }
+  return labels;
+}
+
+function deferredConfig(repository: TestRepository): PoiesisConfig {
+  return {
+    schema: 1,
+    models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+    repository: { remote: "origin", integrationBranch: "main" },
+    tracker: { provider: "fixture", project: join(repository.fixtures, "tracker") },
+    delivery: { mode: DEFERRED_DELIVERY_MODE },
+    verification: { commands: ["test -f feature.txt"] },
+  };
+}
+
+function probeScript(artifactRoot: string): string {
+  return `#!/usr/bin/env node
+import { spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+const [, , sha, target] = process.argv;
+const candidateTree = spawnSync("git", ["rev-parse", \`\${sha}^{tree}\`], { encoding: "utf8" }).stdout.trim();
+mkdirSync(${JSON.stringify(artifactRoot)}, { recursive: true });
+const artifactIdentity = \`artifact-\${target}\`;
+writeFileSync(resolve(${JSON.stringify(artifactRoot)}, "ran.json"), JSON.stringify({ sha, target }));
+process.stdout.write(\`\${JSON.stringify({ sha, candidateTree, target, verified: true, artifactIdentity, artifact: artifactIdentity })}\\n\`);
+`;
+}
+
+interface DeferredLocalProgress {
+  repository: TestRepository;
+  workspace: WorkspaceIdentity;
+  candidateSha: string;
+  candidateTree: string;
+  artifactPath: string;
+  probeCommand: { adapter: "command"; command: string[] };
+}
+
+async function deliveryProbeCommand(fixture: DeferredLocalProgress): Promise<{ adapter: "command"; command: string[] }> {
+  const script = join(fixture.repository.parent, PROBE);
+  await writeFile(script, probeScript(join(fixture.repository.parent, "delivery-artifacts")));
+  return { adapter: "command", command: ["node", script, "{sha}", "{target}"] };
+}
+
+function previewIdentity(fixture: DeferredLocalProgress): PreviewDeliveryResult {
+  const artifactIdentity = "artifact-preview";
+  return {
+    sha: fixture.candidateSha,
+    candidateSha: fixture.candidateSha,
+    candidateTree: fixture.candidateTree,
+    target: "preview",
+    verified: true,
+    status: "previewed",
+    artifactIdentity,
+    artifact: artifactIdentity,
+  };
+}
+
+function stagingEvidence(fixture: DeferredLocalProgress): {
+  candidateSha: string;
+  candidateTree: string;
+  target: "staging";
+  artifactIdentity: string;
+  verified: true;
+} {
+  return {
+    candidateSha: fixture.candidateSha,
+    candidateTree: fixture.candidateTree,
+    target: "staging",
+    artifactIdentity: "artifact-staging",
+    verified: true,
+  };
+}
+
+/**
+ * A deferred install that has completed all local work through exact-candidate
+ * Proof: an owned workspace, an accepted-Review checkpoint, and a passing
+ * Verify for that exact candidate. The harness (not the runtime) publishes the
+ * candidate so the delivery seams have a genuine precondition; a blocked seam
+ * must still refuse.
+ */
+async function deferredLocalProgress(repositories: TestRepository[]): Promise<DeferredLocalProgress> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, deferredConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
+  const workspace = await workspacePrepare({
+    cwd: repository.root,
+    remote: "origin",
+    integrationBranch: "main",
+    branch: BRANCH,
+    workspacePath: join(repository.parent, "workspace"),
+    specId: "1",
+  });
+  await writeFile(join(workspace.path, "feature.txt"), "deferred local work\n");
+  const accepted = await checkpoint({
+    cwd: workspace.path,
+    ownershipId: workspace.ownershipId,
+    paths: ["feature.txt"],
+    message: "ticket 143: local work",
+    review: { verdict: "PASS", reviewerIdentity: "final-review-143", evidence: "no findings" },
+  });
+  const candidateTree = await resolveTree(workspace.path, accepted.sha);
+  await verify({ cwd: workspace.path, candidateSha: accepted.sha, commands: ["test -f feature.txt"] });
+  await run("git", ["push", "--porcelain", "origin", `${accepted.sha}:refs/heads/${BRANCH}`], { cwd: workspace.path });
+  return {
+    repository,
+    workspace,
+    candidateSha: accepted.sha,
+    candidateTree,
+    artifactPath: join(repository.parent, "delivery-artifacts", "ran.json"),
+    probeCommand: { adapter: "command", command: ["node", "unused", "{sha}", "{target}"] },
+  };
+}
+
+async function remoteHeads(repository: TestRepository): Promise<string> {
+  return (await run("git", ["ls-remote", "--heads", "origin"], { cwd: repository.root })).stdout;
+}
+
+async function deliveryScripts(repository: TestRepository): Promise<string[]> {
+  const { readdir } = await import("node:fs/promises");
+  const scripts = join(repository.root, "scripts");
+  if (!existsSync(scripts)) return [];
+  return (await readdir(scripts)).filter((entry) => entry.startsWith("poiesis-")).sort();
+}
+
+/** A non-fixture (`github`) tracker needs an authenticated `gh` for doctor. */
+async function installFakeGh(): Promise<() => void> {
+  const parent = await mkdtemp(join(tmpdir(), "poiesis-deferred-gh-"));
+  const bin = join(parent, "bin");
+  await mkdir(bin);
+  const script = join(bin, "gh");
+  await writeFile(
+    script,
+    `#!/bin/sh
+case "$1" in
+  auth) exit 0 ;;
+  repo)
+    if [ "$2" = "view" ]; then
+      printf '{"nameWithOwner":"%s"}\\n' "$3"
+      exit 0
+    fi
+    exit 1
+    ;;
+esac
+exit 0
+`,
+  );
+  await chmod(script, 0o755);
+  const previousPath = process.env.PATH;
+  process.env.PATH = `${bin}:${previousPath ?? ""}`;
+  return () => {
+    process.env.PATH = previousPath;
+    void rm(parent, { recursive: true, force: true });
+  };
+}
+
+function expectedDeferredFailure(operation: string) {
+  return {
+    code: "DELIVERY_DEFERRED",
+    details: {
+      mode: DEFERRED_DELIVERY_MODE,
+      operation,
+      remediation: expect.stringContaining("delivery"),
+    },
+  };
+}
+
+/**
+ * The zero-side-effect matrix: every delivery-integrated operation, with
+ * inputs that are otherwise complete and valid, so a refusal can only come
+ * from the lifecycle policy.
+ */
+function blockedAttempts(
+  fixture: DeferredLocalProgress,
+  probeCommand: { adapter: "command"; command: string[] },
+): Array<{ operation: DeferredBlockedOperation; attempt: () => Promise<unknown> }> {
+  const proof = proofShell(fixture.candidateSha, fixture.candidateTree);
+  const ownership = { cwd: fixture.workspace.path, ownershipId: fixture.workspace.ownershipId };
+  const preview = previewIdentity(fixture);
+  const staging = { ...preview, target: "staging" as const, artifactIdentity: "artifact-staging", artifact: "artifact-staging" };
+  return [
+    {
+      operation: "poiesis publish",
+      attempt: () =>
+        publish({
+          ...ownership,
+          remote: "origin",
+          integrationBranch: "main",
+          candidateSha: fixture.candidateSha,
+          candidateTree: fixture.candidateTree,
+          provider: "fixture",
+          project: fixture.repository.fixtures,
+          title: "Spec 1",
+          body: "body",
+          proof,
+        }),
+    },
+    {
+      operation: "poiesis preview",
+      attempt: () =>
+        previewDelivery(
+          probeCommand,
+          {
+            sha: fixture.candidateSha,
+            candidateTree: fixture.candidateTree,
+            proof,
+            publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+            remote: "origin",
+          },
+          fixture.repository.root,
+        ),
+    },
+    {
+      operation: "poiesis promote --target staging",
+      attempt: () =>
+        promoteDelivery(
+          probeCommand,
+          { sha: fixture.candidateSha, target: "staging", candidateTree: fixture.candidateTree, identity: preview },
+          fixture.repository.root,
+        ),
+    },
+    {
+      operation: "poiesis promote --target production",
+      attempt: () =>
+        promoteDelivery(
+          probeCommand,
+          {
+            sha: fixture.candidateSha,
+            target: "production",
+            candidateTree: fixture.candidateTree,
+            identity: staging,
+            productionAuthorization: {
+              candidateSha: fixture.candidateSha,
+              candidateTree: fixture.candidateTree,
+              stagingArtifactIdentity: "artifact-staging",
+              integrationSha: fixture.candidateSha,
+              authorIdentity: "author",
+              approved: true,
+            },
+            integrationRemote: "origin",
+            integrationBranch: "main",
+            proof,
+            integration: {
+              candidateSha: fixture.candidateSha,
+              candidateTree: fixture.candidateTree,
+              integrationSha: fixture.candidateSha,
+              integrationTree: fixture.candidateTree,
+              contentMatchesCandidate: true,
+            },
+          },
+          fixture.repository.root,
+        ),
+    },
+    {
+      operation: "poiesis integrate",
+      attempt: () =>
+        integrate({
+          ...ownership,
+          remote: "origin",
+          integrationBranch: "main",
+          expectedBaseSha: fixture.workspace.baseSha,
+          candidateSha: fixture.candidateSha,
+          candidateTree: fixture.candidateTree,
+          message: "Spec 1: deferred local work",
+          proof,
+          staging: stagingEvidence(fixture),
+          authorAcceptance: "Yes, this is what I wanted.",
+        }),
+    },
+    {
+      operation: "poiesis workspace cleanup",
+      attempt: () => workspaceCleanup(ownership),
+    },
+  ];
+}
+
+describe("explicit deferred delivery keeps local work healthy through exact-candidate Proof", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let restoreGh: (() => void) | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    restoreGh?.();
+    restoreGh = undefined;
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("prepares a workspace, accepts an accepted-Review checkpoint, and proves the exact candidate", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    expect(fixture.workspace.branch).toBe(BRANCH);
+    expect(fixture.candidateSha).not.toBe(fixture.workspace.baseSha);
+    expect(fixture.candidateTree).toMatch(/^[0-9a-f]{40}$/);
+    await expect(
+      verify({ cwd: fixture.workspace.path, candidateSha: fixture.candidateSha, commands: ["test -f feature.txt"] }),
+    ).resolves.toMatchObject({ candidateSha: fixture.candidateSha, cleanBefore: true, cleanAfter: true });
+  }, 30_000);
+
+  it("does not gate inspect", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    await expect(inspect({ cwd: fixture.workspace.path, remote: "origin", integrationBranch: "main" })).resolves.toMatchObject({
+      root: expect.stringContaining("workspace"),
+    });
+  }, 30_000);
+
+  it("does not gate a tracker mutation", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    const adapter = createTrackerAdapter({ provider: "fixture", project: join(fixture.repository.fixtures, "tracker") }, fixture.repository.root);
+    const created = await adapter.createSpec({ title: "Deferred delivery", body: "local work only" });
+    expect(created.id).toBeTruthy();
+    await expect(adapter.getSpec(created.id)).resolves.toMatchObject({ title: "Deferred delivery" });
+  }, 30_000);
+
+  it("creates no delivery script or delivery adapter at init and reports only a nonblocking doctor warning", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    const installed = JSON.parse(await readFile(join(fixture.repository.root, ".poiesis", "config.jsonc"), "utf8")) as ResolvedPoiesisConfig;
+    expect(installed.delivery).toEqual({ mode: DEFERRED_DELIVERY_MODE });
+    for (const target of ["preview", "staging", "production"] as const) {
+      expect(existsSync(join(fixture.repository.root, "scripts", `poiesis-${target}.mjs`))).toBe(false);
+    }
+    const report = await doctor(fixture.repository.root);
+    expect(report.checks.find((check) => check.id === "delivery")).toMatchObject({ status: "warn" });
+    // A nonblocking warning: the deferred state never surfaces as a typed
+    // block error anywhere in the doctor report.
+    expect(JSON.stringify(report.checks)).not.toContain("DELIVERY_DEFERRED");
+  }, 60_000);
+
+  it("creates no delivery script when update switches an installation to deferred delivery", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...deferredConfig(repository),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery: {
+          preview: { adapter: "command", command: ["echo", "preview", "{sha}", "{target}"] },
+          staging: { adapter: "command", command: ["echo", "staging", "{sha}", "{target}"] },
+          production: { adapter: "command", command: ["echo", "production", "{sha}", "{target}"] },
+        },
+      },
+      { skipSkills: true },
+    );
+    const scriptsBefore = await deliveryScripts(repository);
+
+    const candidatePath = join(repository.parent, "deferred.jsonc");
+    await writeFile(
+      candidatePath,
+      serializeConfig({ ...deferredConfig(repository), tracker: { provider: "github", project: "owner/repo" } }),
+    );
+    const result = await updateFromConfig(repository.root, candidatePath);
+    expect(result.doctor.checks.find((check) => check.id === "delivery")).toMatchObject({ status: "warn" });
+    expect(await deliveryScripts(repository)).toEqual(scriptsBefore);
+    expect(JSON.parse(await readFile(join(repository.root, ".poiesis", "config.jsonc"), "utf8")).delivery).toEqual({
+      mode: DEFERRED_DELIVERY_MODE,
+    });
+  }, 90_000);
+});
+
+describe("explicit deferred delivery hard-blocks every delivery-integrated operation", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+  let probeCommand: { adapter: "command"; command: string[] };
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+    probeCommand = await deliveryProbeCommand(fixture);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("refuses Publish with a typed error naming the operation and the remediation", async () => {
+    const mark = markSubprocesses();
+    await expect(
+      publish({
+        cwd: fixture.workspace.path,
+        ownershipId: fixture.workspace.ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        candidateSha: fixture.candidateSha,
+        candidateTree: fixture.candidateTree,
+        provider: "fixture",
+        project: fixture.repository.fixtures,
+        title: "Spec 1",
+        body: "body",
+        proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      }),
+    ).rejects.toMatchObject(expectedDeferredFailure("poiesis publish"));
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+  }, 30_000);
+
+  it("refuses Preview before remote revalidation and before any delivery subprocess", async () => {
+    const mark = markSubprocesses();
+    await expect(
+      previewDelivery(
+        probeCommand,
+        {
+          sha: fixture.candidateSha,
+          candidateTree: fixture.candidateTree,
+          proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+          publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+          remote: "origin",
+        },
+        fixture.repository.root,
+      ),
+    ).rejects.toMatchObject(expectedDeferredFailure("poiesis preview"));
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 30_000);
+
+  it("refuses Staging and Production promotion before any delivery subprocess", async () => {
+    const stagingMark = markSubprocesses();
+    await expect(
+      promoteDelivery(
+        probeCommand,
+        { sha: fixture.candidateSha, target: "staging", candidateTree: fixture.candidateTree, identity: previewIdentity(fixture) },
+        fixture.repository.root,
+      ),
+    ).rejects.toMatchObject(expectedDeferredFailure("poiesis promote --target staging"));
+    expect(reachedSideEffects(subprocessCallsSince(stagingMark))).toEqual([]);
+
+    const productionMark = markSubprocesses();
+    await expect(
+      promoteDelivery(
+        probeCommand,
+        {
+          sha: fixture.candidateSha,
+          target: "production",
+          candidateTree: fixture.candidateTree,
+          identity: { ...previewIdentity(fixture), target: "staging", artifactIdentity: "artifact-staging", artifact: "artifact-staging" },
+          productionAuthorization: {
+            candidateSha: fixture.candidateSha,
+            candidateTree: fixture.candidateTree,
+            stagingArtifactIdentity: "artifact-staging",
+            integrationSha: fixture.candidateSha,
+            authorIdentity: "author",
+            approved: true,
+          },
+          integrationRemote: "origin",
+          integrationBranch: "main",
+          proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+          integration: {
+            candidateSha: fixture.candidateSha,
+            candidateTree: fixture.candidateTree,
+            integrationSha: fixture.candidateSha,
+            integrationTree: fixture.candidateTree,
+            contentMatchesCandidate: true,
+          },
+        },
+        fixture.repository.root,
+      ),
+    ).rejects.toMatchObject(expectedDeferredFailure("poiesis promote --target production"));
+    expect(reachedSideEffects(subprocessCallsSince(productionMark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 30_000);
+
+  it("refuses Integrate before fetch, commit-tree, and push", async () => {
+    const mark = markSubprocesses();
+    await expect(
+      integrate({
+        cwd: fixture.workspace.path,
+        ownershipId: fixture.workspace.ownershipId,
+        remote: "origin",
+        integrationBranch: "main",
+        expectedBaseSha: fixture.workspace.baseSha,
+        candidateSha: fixture.candidateSha,
+        candidateTree: fixture.candidateTree,
+        message: "Spec 1: deferred local work",
+        proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+        staging: stagingEvidence(fixture),
+        authorAcceptance: "Yes, this is what I wanted.",
+        postIntegrationCommands: ["test -f feature.txt"],
+      }),
+    ).rejects.toMatchObject(expectedDeferredFailure("poiesis integrate"));
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+  }, 30_000);
+
+  it("refuses workspace cleanup before remote branch deletion and worktree removal", async () => {
+    const mark = markSubprocesses();
+    await expect(workspaceCleanup({ cwd: fixture.workspace.path, ownershipId: fixture.workspace.ownershipId })).rejects.toMatchObject(
+      expectedDeferredFailure("poiesis workspace cleanup"),
+    );
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.workspace.path)).toBe(true);
+    expect(existsSync(fixture.workspace.markerPath)).toBe(true);
+  }, 30_000);
+
+  it("reports exactly the operations the policy declares as blocked", async () => {
+    const reported: string[] = [];
+    for (const { operation, attempt } of blockedAttempts(fixture, probeCommand)) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, `${operation} must be refused`).toMatchObject(expectedDeferredFailure(operation));
+      reported.push((error as PoiesisError).details.operation as string);
+    }
+    expect(reported.sort()).toEqual([...DEFERRED_BLOCKED_OPERATIONS].sort());
+  }, 30_000);
+
+  it("leaves the remote, the local candidate, and the delivered state untouched", async () => {
+    const headsBefore = await remoteHeads(fixture.repository);
+    for (const { attempt } of blockedAttempts(fixture, probeCommand)) {
+      await expect(attempt()).rejects.toMatchObject({ code: "DELIVERY_DEFERRED" });
+    }
+    expect(await remoteHeads(fixture.repository)).toBe(headsBefore);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+    expect((await resolveTree(fixture.workspace.path, fixture.candidateSha)).trim()).toBe(fixture.candidateTree);
+    expect(existsSync(fixture.workspace.path)).toBe(true);
+    expect(existsSync(fixture.workspace.markerPath)).toBe(true);
+    await expect(
+      verify({ cwd: fixture.workspace.path, candidateSha: fixture.candidateSha, commands: ["test -f feature.txt"] }),
+    ).resolves.toMatchObject({ candidateSha: fixture.candidateSha });
+  }, 30_000);
+});
+
+describe("the lifecycle-policy guard reads the installed config without auto-resolution or network", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("blocks a deferred install without running a single subprocess", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    const mark = markSubprocesses();
+    await expect(assertDeliveryPolicyAllows(fixture.repository.root, "poiesis publish")).rejects.toMatchObject(
+      expectedDeferredFailure("poiesis publish"),
+    );
+    expect(subprocessCallsSince(mark)).toEqual([]);
+  }, 30_000);
+
+  it("allows a configured install without running a single subprocess", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
+    const mark = markSubprocesses();
+    await expect(assertDeliveryPolicyAllows(repository.root, "poiesis publish")).resolves.toBeUndefined();
+    expect(subprocessCallsSince(mark)).toEqual([]);
+  }, 60_000);
+
+  it("fails closed on a malformed installed delivery block instead of allowing the operation", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    await writeFile(
+      join(fixture.repository.root, ".poiesis", "config.jsonc"),
+      JSON.stringify({
+        ...deferredConfig(fixture.repository),
+        delivery: { preview: { adapter: "command", command: ["echo", "{sha}"] } },
+      }),
+    );
+    await expect(assertDeliveryPolicyAllows(fixture.repository.root, "poiesis publish")).rejects.toMatchObject({
+      code: "INVALID_DELIVERY_CONFIG",
+    });
+  }, 30_000);
+
+  it("allows a project with no installed config so the runtime identity guard owns the uninstalled failure", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await expect(assertDeliveryPolicyAllows(repository.root, "poiesis publish")).resolves.toBeUndefined();
+  }, 30_000);
+});
+
+describe("deferred-delivery guidance", () => {
+  const GUIDED_STATEMENTS: readonly string[] = [
+    '"delivery": { "mode": "deferred" }',
+    "pauses after exact-candidate Proof",
+    "DELIVERY_DEFERRED",
+    "must not claim",
+  ];
+
+  it("POIESIS_METHOD.md states that explicit deferred delivery pauses after Proof and forbids a completion or Preview claim", () => {
+    const method = readFileSync(join(REPO_ROOT, "POIESIS_METHOD.md"), "utf8");
+    for (const statement of GUIDED_STATEMENTS) {
+      expect(method, "POIESIS_METHOD.md must state: " + statement).toContain(statement);
+    }
+  });
+
+  it("POIESIS_ROLE_POIESIS.md states the same paused-after-Proof rule", () => {
+    const role = readFileSync(join(REPO_ROOT, "POIESIS_ROLE_POIESIS.md"), "utf8");
+    for (const statement of GUIDED_STATEMENTS) {
+      expect(role, "POIESIS_ROLE_POIESIS.md must state: " + statement).toContain(statement);
+    }
+  });
+
+  it("OPENCODE_AGENT_POIESIS.md projects the same paused-after-Proof rule to the installed agent", () => {
+    const agent = readFileSync(join(REPO_ROOT, "OPENCODE_AGENT_POIESIS.md"), "utf8");
+    for (const statement of GUIDED_STATEMENTS) {
+      expect(agent, "OPENCODE_AGENT_POIESIS.md must state: " + statement).toContain(statement);
+    }
+  });
+});
