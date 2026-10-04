@@ -40,6 +40,7 @@ import {
 } from "./maintenance.js";
 import { exists } from "./fs.js";
 import { PoiesisError } from "./errors.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { run as runChildProcess } from "./process.js";
 
 export type RemoteSource = "explicit" | "git-origin" | "git-singleton" | "ambiguous" | "none";
@@ -622,7 +623,10 @@ async function readRemoteUrls(root: string, remoteNames: string[]): Promise<Map<
         { cwd: root, allowFailure: true },
       );
       const first = result.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
-      if (first !== undefined) map.set(name, first);
+      // Spec #139 / ticket #146: the detected URL is rendered in the init
+      // summary the Author reads, so it is sanitized at the one seam rather
+      // than at each render site.
+      if (first !== undefined) map.set(name, sanitizeGitRemoteUrl(first));
     } catch {
       // skip — leave absent
     }

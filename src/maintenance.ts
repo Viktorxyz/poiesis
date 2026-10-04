@@ -21,6 +21,7 @@ import {
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { runUpdateConfigTransaction } from "./update-config-internal.js";
 import {
   runUpdateTransaction,
@@ -510,8 +511,15 @@ async function discoverVerificationCommands(root: string): Promise<string[]> {
   return out;
 }
 
+/**
+ * Spec #139 / ticket #146 — the forge parsers sanitize the remote URL before
+ * they match it, so a supported HTTPS remote that carries userinfo still
+ * resolves to its repository coordinate while the credential is never
+ * retained. Sanitizing first (rather than matching userinfo and dropping it
+ * later) means there is exactly one place that understands a Git remote URL.
+ */
 export function parseGitHubProject(url: string): string | null {
-  const trimmed = url.trim();
+  const trimmed = sanitizeGitRemoteUrl(url);
   const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
   if (sshMatch !== null && sshMatch[1] !== undefined && sshMatch[2] !== undefined) {
     return `${sshMatch[1]}/${sshMatch[2]}`;
@@ -524,7 +532,7 @@ export function parseGitHubProject(url: string): string | null {
 }
 
 export function parseGitLabProject(url: string): string | null {
-  const trimmed = url.trim();
+  const trimmed = sanitizeGitRemoteUrl(url);
   // SSH: `git@gitlab.com:<group-path>` (with optional `.git` suffix).
   // Group path may contain nested groups separated by `/`, and must
   // contain at least two non-empty segments (group + project).
@@ -833,16 +841,24 @@ export function verifyDeliveryConfiguration(
  * `provider: "linear"` / `"local"` can never leak into Publish evidence
  * or into a publishing call.
  *
- * When the remote is not a recognized forge (a local path, a self-hosted
- * host), the only coordinates that may be used are the configured
- * tracker's — and only when that tracker is itself a publishing provider.
- * A tracker-only provider with an unrecognized remote fails closed rather
- * than inventing a repository.
+ * Spec #139 / ticket #146 — that independence is total. A `github` or
+ * `gitlab` tracker used to supply the coordinates when the remote was not
+ * a recognized forge, which quietly re-coupled publishing to tracker
+ * identity: the tracker block became a second, invisible source of truth
+ * for where a change request is opened. The only surviving fallback is the
+ * test-only `fixture` tracker, and it can only ever yield `provider:
+ * "fixture"` coordinates. For every other tracker an unrecognized remote
+ * (a local path, a self-hosted host) fails closed rather than inventing a
+ * repository.
+ *
+ * The reported `remoteUrl` is the sanitized one, so a credential embedded
+ * in the remote never reaches an error envelope, a log line, or a CI
+ * transcript.
  */
 export interface PublishCoordinates {
   provider: PublishProvider;
   project: string;
-  source: "git-remote" | "tracker";
+  source: "git-remote" | "fixture-tracker";
 }
 
 export async function resolvePublishCoordinates(
@@ -870,17 +886,13 @@ export async function resolvePublishCoordinates(
   }
   const trackerProvider = config.tracker.provider;
   const trackerProject = trackerProjectOf(config.tracker);
-  if (
-    (trackerProvider === "github" || trackerProvider === "gitlab" || trackerProvider === "fixture") &&
-    trackerProject !== undefined &&
-    trackerProject.trim().length > 0
-  ) {
-    return { provider: trackerProvider, project: trackerProject, source: "tracker" };
+  if (trackerProvider === "fixture" && trackerProject !== undefined && trackerProject.trim().length > 0) {
+    return { provider: "fixture", project: trackerProject, source: "fixture-tracker" };
   }
   throw new PoiesisError(
     "PUBLISH_PROVIDER_UNRESOLVED",
-    "Publishing coordinates are derived from the configured Git remote, and this remote is not a recognized GitHub or GitLab host; point the remote at a recognized host or use a tracker that can host a change request",
-    { provider: trackerProvider, remote: config.repository.remote, remoteUrl },
+    "Publishing coordinates are derived from the configured Git remote, and this remote is not a recognized GitHub or GitLab host; point the remote at a recognized host — tracker identity never supplies publishing coordinates",
+    { provider: trackerProvider, remote: config.repository.remote, remoteUrl: sanitizeGitRemoteUrl(remoteUrl) },
   );
 }
 
@@ -1850,7 +1862,10 @@ export async function doctor(root: string): Promise<DoctorReport> {
     try {
       const remote = await run("git", ["remote", "get-url", config.repository.remote], { cwd: resolvedRoot, allowFailure: true });
       if (remote.exitCode !== 0 || remote.stdout.length === 0) throw new PoiesisError("GIT_REMOTE_UNAVAILABLE", "Configured remote is unavailable");
-      checks.push({ id: "git-remote", status: "pass", message: "Configured Git remote is available", details: { name: config.repository.remote, url: remote.stdout } });
+      // Spec #139 / ticket #146: the reported URL is the sanitized one, so a
+      // credential embedded in the remote never reaches the doctor report an
+      // Author pastes into an issue.
+      checks.push({ id: "git-remote", status: "pass", message: "Configured Git remote is available", details: { name: config.repository.remote, url: sanitizeGitRemoteUrl(remote.stdout) } });
     } catch (error) {
       checks.push({ id: "git-remote", status: "fail", message: "Configured Git remote check failed", details: errorDetails(error) });
     }

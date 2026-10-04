@@ -281,8 +281,10 @@ A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists 
 Publishing coordinates are a property of the configured Git remote, never of the tracker. A project that keeps its Spec and tickets in Linear or in the clone still publishes to the repository its Git remote points at. Poiesis resolves them in exactly one order:
 
 1. the configured remote, when it is a recognized `github.com` or `gitlab.com` host;
-2. otherwise, the configured `tracker.project`, and only when the tracker is itself a publishing provider (`github`, `gitlab`, or the test-only `fixture`);
+2. otherwise, the configured `tracker.project`, and only when the tracker is the test-only `fixture`;
 3. otherwise nothing.
+
+A remote URL that carries userinfo (`https://user:token@github.com/owner/repo.git`) is still a recognized remote, and Poiesis keeps the credential out of every coordinate, report, error detail, log line, and evidence file it produces.
 
 `linear` and `local` can never supply publishing coordinates and can never appear as the `provider` of Publish evidence. When no coordinate resolves, Poiesis fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence.
 

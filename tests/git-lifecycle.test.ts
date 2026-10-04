@@ -941,4 +941,47 @@ describe("GitHub provider headRepository handling", () => {
     });
     expect(third.action).toBe("updated");
   }, 30_000);
+
+  // Spec #139 / ticket #146 — a change-request URL reported by the
+  // provider is still a URL that reaches Publish evidence and the CLI
+  // JSON envelope, so it passes the same redaction seam as a remote URL.
+  // A forge API does not normally return userinfo; the point is that the
+  // credential cannot ride along when one does.
+  it("keeps a credential out of the change-request URL in Publish evidence and its result", async () => {
+    const repository = await installedTestRepository(repositories);
+    const project = "owner/repo";
+    const { workspacePath, ownershipId, sha, tree } = await createWorkspaceWithCheckpoint(repository, "gh-credential-url");
+    const credential = "ghp_POIESIS_SENTINEL_4f3a9c2b7e1d";
+
+    ghResponseQueue.push(
+      ghListEmpty(),
+      ghPrCreateResponse(),
+      ghResult(
+        JSON.stringify([
+          {
+            number: 7,
+            url: `https://build-bot:${credential}@github.com/owner/repo/pull/7`,
+            headRefOid: sha,
+            headRepository: { nameWithOwner: project },
+          },
+        ]),
+      ),
+    );
+    const first = await publish({
+      cwd: workspacePath,
+      ownershipId,
+      remote: "origin",
+      integrationBranch: "main",
+      candidateSha: sha,
+      candidateTree: tree,
+      provider: "github",
+      project,
+      title: "Spec",
+      body: "body",
+      proof: proofShell(sha, tree),
+    });
+    expect(first.requestUrl).toBe("https://github.com/owner/repo/pull/7");
+    expect(first.evidence.changeRequest.url).toBe("https://github.com/owner/repo/pull/7");
+    expect(JSON.stringify(first)).not.toContain(credential);
+  }, 30_000);
 });

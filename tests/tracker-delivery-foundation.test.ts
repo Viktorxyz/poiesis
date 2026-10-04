@@ -417,7 +417,12 @@ describe("publish coordinates are derived from the Git remote", () => {
     }
   });
 
-  it("keeps legacy tracker coordinates for an unrecognized remote", async () => {
+  // Spec #139 / ticket #146: this was "keeps legacy tracker coordinates for
+  // an unrecognized remote" and also accepted a `github` / `gitlab` tracker,
+  // which re-coupled publishing to tracker identity. The only surviving
+  // fallback is the test-only `fixture` tracker, and it is labelled as such
+  // in `source` so it can never be read as "tracker coordinates" again.
+  it("keeps the test-only fixture coordinates for an unrecognized remote", async () => {
     const repository = await createTestRepository();
     try {
       const config = {
@@ -426,7 +431,23 @@ describe("publish coordinates are derived from the Git remote", () => {
       expect(await resolvePublishCoordinates(repository.root, config)).toEqual({
         provider: "fixture",
         project: join(repository.fixtures, "tracker"),
-        source: "tracker",
+        source: "fixture-tracker",
+      });
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed rather than inventing coordinates for a forge tracker on an unrecognized remote", async () => {
+    const repository = await createTestRepository();
+    try {
+      const { config } = await autoResolveConfigDefaults(repository.root, {
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+      });
+      await expect(resolvePublishCoordinates(repository.root, config)).rejects.toMatchObject({
+        code: "PUBLISH_PROVIDER_UNRESOLVED",
+        details: { provider: "github" },
       });
     } finally {
       await rm(repository.parent, { recursive: true, force: true });

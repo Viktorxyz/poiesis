@@ -295,7 +295,9 @@ That transaction is atomic — config, OpenCode projection, manifest, receipt �
 
 ## Publishing coordinates and forks
 
-Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host; otherwise it uses the configured `tracker.project` when the tracker is itself a publishing provider; otherwise there are no coordinates. A `linear` or `local` tracker never supplies them and never appears as the `provider` of Publish evidence — a project whose Specs live in Linear or in the clone still publishes to the repository its remote points at.
+Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host; otherwise the only coordinates it may use are the test-only `fixture` tracker's; otherwise there are none. A `github` or `gitlab` tracker never supplies them either — tracker identity is not a second source of truth for where a change request is opened — and a `linear` or `local` tracker never appears as the `provider` of Publish evidence, so a project whose Specs live in Linear or in the clone still publishes to the repository its remote points at.
+
+A remote URL may carry a credential (`https://user:token@github.com/owner/repo.git`). Poiesis reads such a URL as the recognized remote it is, and strips the userinfo before the URL reaches a coordinate, a `doctor` report, an error detail, a CLI JSON envelope, a log line, or published evidence.
 
 When nothing resolves, `poiesis publish` fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. That is what a project with a filesystem or self-hosted remote gets; Poiesis does not invent a repository to publish into.
 

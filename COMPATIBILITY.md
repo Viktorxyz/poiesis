@@ -165,7 +165,7 @@ State lives in `poiesis-tracker-v1` beneath the Git common directory (`git rev-p
 
 ### Publishing coordinates
 
-Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host, otherwise the configured `tracker.project` when the tracker is itself a publishing provider, and otherwise fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. `linear` and `local` never supply coordinates and never appear as the `provider` of Publish evidence.
+Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host, otherwise the test-only `fixture` tracker's `tracker.project`, and otherwise fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. A `github` or `gitlab` tracker never supplies coordinates, and `linear` and `local` never appear as the `provider` of Publish evidence. A remote URL that carries userinfo is parsed as the remote it is, with the credential stripped from every coordinate, report, error detail, and log line Poiesis emits.
 
 A fork is a different repository, not a shortcut to its upstream. A remote naming a fork is a recognized host, so the change request is opened against that fork's own integration branch, and Publish fails closed if the resulting change request is owned by a different repository than the coordinates Poiesis resolved. A self-hosted host or a filesystem remote is not a recognized host and yields no coordinates.
 

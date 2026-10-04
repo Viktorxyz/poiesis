@@ -3,6 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
 import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { resolveGitRoot } from "./paths.js";
@@ -254,10 +255,13 @@ export async function inspect(options: InspectOptions): Promise<InspectResult> {
   for (const name of nonemptyLines(remoteList.stdout)) {
     const fetchUrls = await run("git", ["remote", "get-url", "--all", name], { cwd: root });
     const pushUrls = await run("git", ["remote", "get-url", "--push", "--all", name], { cwd: root });
+    // Spec #139 / ticket #146: an inspection is printed as JSON by
+    // `poiesis inspect`, so the URLs are sanitized here — one seam, and the
+    // credential stays out of the report and any log that records it.
     remotes.push({
       name,
-      fetchUrls: nonemptyLines(fetchUrls.stdout),
-      pushUrls: nonemptyLines(pushUrls.stdout),
+      fetchUrls: nonemptyLines(fetchUrls.stdout).map(sanitizeGitRemoteUrl),
+      pushUrls: nonemptyLines(pushUrls.stdout).map(sanitizeGitRemoteUrl),
     });
   }
 
@@ -704,6 +708,14 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     );
   }
 
+  // Spec #139 / ticket #146 — the change-request URL is the last URL that
+  // leaves this operation, and it leaves twice: in the evidence an Author
+  // pastes into Preview, and in the CLI JSON result. It therefore passes the
+  // same redaction seam as a remote URL. A forge API does not normally
+  // return userinfo; the guarantee is that a credential cannot ride along
+  // when one does.
+  const requestUrl = providerCompletion.requestUrl === null ? null : sanitizeGitRemoteUrl(providerCompletion.requestUrl);
+
   const evidence: PublishEvidence = {
     candidateSha,
     candidateTree,
@@ -715,7 +727,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     action: providerCompletion.action,
     changeRequest: {
       id: providerCompletion.requestId,
-      url: providerCompletion.requestUrl,
+      url: requestUrl,
     },
   };
   validatePublishEvidence(evidence, candidateSha, candidateTree, branch, remoteRef);
@@ -730,7 +742,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     remoteRef,
     publishedHeadSha: publishedSha,
     requestId: providerCompletion.requestId,
-    requestUrl: providerCompletion.requestUrl,
+    requestUrl,
     action: providerCompletion.action,
   };
 }
