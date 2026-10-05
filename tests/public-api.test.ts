@@ -312,9 +312,23 @@ const forbiddenFunctions = [
   "assertKind",
   "isRecord",
   "requiredText",
+  // Spec #139 / ticket #162: the generated delivery runtime is Poiesis-owned
+  // DERIVED state whose exact layout, ignore rule, and destructive removal
+  // contract live in `src/delivery-runtime.ts`. None of it may reach the
+  // package root: promoting the paths would lock the on-disk layout into a
+  // public API, and promoting the removal seam would make a
+  // recursive-delete entry point callable by a library consumer. It is
+  // reached only through the generated delivery target, the init / update /
+  // bootstrap ignore transaction, and `poiesis uninstall`.
+  "DELIVERY_RUNTIME_CONTAINER",
+  "DELIVERY_RUNTIME_OWNED_ENTRY",
+  "DELIVERY_RUNTIME_RELATIVE",
+  "DELIVERY_RUNTIME_IGNORE_RULE",
+  "removeValidatedDeliveryRuntime",
 ] as const;
 
 const forbiddenTypes = [
+  "DeliveryRuntimeRemovalResult",
   "UpdateWriterHooks",
   "UpdateTransactionHooks",
   "UpdateBootstrapTransactionHooks",

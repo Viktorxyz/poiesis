@@ -451,3 +451,4 @@ Then:
 - Do not repeat work without new evidence or a meaningful change in approach.
 - Prefer focused Repository Intelligence queries over broad mechanical rediscovery when the index can answer the question economically.
 - Repository Intelligence is a rebuildable, non-canonical local state, not durable project truth; an unavailable or stale cache falls back to ordinary source exploration without blocking the Method. The fallback is not a new lifecycle phase and does not create new durable state.
+- The generated delivery runtime is owned rebuildable, non-canonical local state at exactly `.poiesis/runtime/delivery/`; the container around it and every other sibling in it belong to the Author. Keep it ignored so a delivery run never shows up as project dirtiness, and remove only the owned subtree, never a link Poiesis has not validated.

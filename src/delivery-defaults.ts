@@ -30,7 +30,13 @@ export const deliveryScriptPath = (target: DeliveryTarget): string =>
  * `.poiesis/runtime/delivery/`. A real project replaces these with its own
  * deploy; the point is that a fresh install is complete and inspectable
  * rather than unfinished.
+ *
+ * Spec #139 / ticket #162: the artifact path is owned state, not a literal
+ * repeated here. `src/delivery-runtime.ts` states the exact subtree, the
+ * exact ignore rule, and the removal contract, and the generated script
+ * derives its path from that single owner.
  */
+import { DELIVERY_RUNTIME_RELATIVE } from "./delivery-runtime.js";
 const SCRIPT_BODY = `#!/usr/bin/env node
 /**
  * Poiesis delivery target: __TARGET__.
@@ -69,8 +75,11 @@ if (tree.status !== 0) {
 const candidateTree = tree.stdout.trim();
 
 // The delivery artifact always exists on disk, so the target is inspectable
-// even when the remote-facing step below cannot run.
-const artifactRoot = resolve(process.cwd(), ".poiesis/runtime/delivery", target, sha);
+// even when the remote-facing step below cannot run. The path is the
+// Poiesis-owned runtime subtree: ignored by the init/update transaction,
+// never a manifest record, and removed only by the validated owned-subtree
+// removal on uninstall.
+const artifactRoot = resolve(process.cwd(), ${JSON.stringify(DELIVERY_RUNTIME_RELATIVE)}, target, sha);
 mkdirSync(artifactRoot, { recursive: true });
 
 let commitMessage = "";

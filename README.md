@@ -195,6 +195,8 @@ before any side effect.
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
 ```
 
+That includes Poiesis-owned derived state: the Repository Intelligence cache under `.poiesis/cache/repository-intelligence/`, and the generated delivery runtime under `.poiesis/runtime/delivery/`. Ownership of each is exact — Poiesis owns the `repository-intelligence/` entry under `.poiesis/cache/`, and the `delivery/` entry under `.poiesis/runtime/` — and every other sibling in those containers is yours. `uninstall` removes only the owned entry, `rmdir`s the container only when it is empty, and reports anything it preserved. A symlinked container, a symlinked owned entry, or a symlink anywhere inside one is never traversed or deleted: the removal is refused, reported as `preserved`, and the rest of the uninstall proceeds.
+
 ## What `init` produces
 
 `init` cannot run from nothing because every project makes a real choice that only the Author owns. The interactive flow discovers everything it can and asks only for the Author-owned decisions. The successful install writes a resolved `.poiesis/config.jsonc` shaped like:
@@ -272,6 +274,8 @@ Note that `local` is a **tracker** choice, not a delivery choice. It does not st
 `"delivery"` is either complete or explicitly deferred. There is no partial state, and mixing a mode with individual targets fails closed.
 
 **Configured** delivery is the three command targets above. On the interactive path it is an explicit choice, never a silent default: `init` asks `Configure delivery now? (configured|deferred)` once, offers no bracketed default, and fails closed with `INVALID_DELIVERY_MODE` on any other answer. When a config carries no `delivery` block at all — a non-interactive `--config` file, for example — Poiesis resolves the three generated command targets instead, because an adapter that actually runs is a better answer than a placeholder. Either way `init` writes a real `scripts/poiesis-{preview,staging,production}.mjs` for any target the project does not already have, and never overwrites a script you wrote yourself.
+
+A generated target records what it produced at `.poiesis/runtime/delivery/<target>/<sha>/delivery.json`, in the workspace it ran in. That path is Poiesis-owned derived state, and the ownership is exact: `init`, `update`, and `update --bootstrap-legacy-ownership` each reconcile the single ignore rule `.poiesis/runtime/delivery/` — never the whole `.poiesis/runtime/` container — transactionally, and a failed transaction restores your `.gitignore` byte-for-byte. The runtime is never a manifest file and never a tracked path, so running a target leaves `git status` exactly as it was, in the primary checkout and in a linked workspace alike; `workspace cleanup` is never blocked by delivery residue. `uninstall` removes the owned `delivery/` subtree and the `.poiesis/runtime/` parent when nothing else is there, and leaves any other sibling under `.poiesis/runtime/` byte-for-byte. Write your own artifact path anywhere you like by editing the generated script — Poiesis stops touching it at your first edit.
 
 **Deferred** delivery is an explicit, healthy state:
 

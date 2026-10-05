@@ -36,6 +36,11 @@ import {
   renderDefaultDeliveryScript,
 } from "./delivery-defaults.js";
 import {
+  DELIVERY_RUNTIME_CONTAINER,
+  DELIVERY_RUNTIME_RELATIVE,
+  removeValidatedDeliveryRuntime,
+} from "./delivery-runtime.js";
+import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
   nextAdapterFiles,
@@ -2232,6 +2237,15 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   // for cache directories the runtime owns.
   known.add(".poiesis/cache");
   known.add(".poiesis/cache/repository-intelligence");
+  // Spec #139 / ticket #162: the generated delivery runtime is the
+  // Poiesis-owned `.poiesis/runtime/delivery/` subtree. It is non-canonical
+  // derived local state (never recorded in the manifest), but the uninstall
+  // walker still considers the container and its owned entry known so an
+  // operator does not see "unknown content under .poiesis" for derived
+  // artifacts the runtime owns. Removal is owned by
+  // `removeValidatedDeliveryRuntime`, which preserves foreign siblings.
+  known.add(DELIVERY_RUNTIME_CONTAINER);
+  known.add(DELIVERY_RUNTIME_RELATIVE);
   for (const file of manifest.files) {
     if (!file.path.startsWith(".poiesis/")) continue;
     known.add(file.path);
@@ -2668,6 +2682,13 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     // which preserves foreign siblings and reports them via
     // `foreignPreserved` with the canonical "foreign content" reason.
     if (path === ".poiesis/cache" || path.startsWith(".poiesis/cache/")) continue;
+    // Spec #139 / ticket #162: the Poiesis-owned generated delivery runtime
+    // (`.poiesis/runtime/delivery/`) is derived local state, so the walker
+    // must not report it (or a foreign sibling of it) as "unknown content
+    // under .poiesis". Owned removal is owned by
+    // `removeValidatedDeliveryRuntime` below, which preserves foreign
+    // siblings and reports them with the canonical "foreign content" reason.
+    if (path === DELIVERY_RUNTIME_CONTAINER || path.startsWith(`${DELIVERY_RUNTIME_CONTAINER}/`)) continue;
     if (!known.has(path)) result.preserved.push({ path, reason: "unknown content under .poiesis" });
   }
 
@@ -2751,6 +2772,32 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     // the canonical manifest paths.
     const message = error instanceof PoiesisError ? error.message : String(error);
     result.preserved.push({ path: ".poiesis/cache/", reason: `cache validation refused removal: ${message}` });
+  }
+
+  // Spec #139 / ticket #162: generated delivery runtime cleanup. The
+  // helper validates the owned `.poiesis/runtime/delivery/` subtree
+  // before it removes anything and refuses a symlinked container, a
+  // symlinked delivery root, or a symlink at any depth inside it, so no
+  // traversal and no recursive removal can follow a link out of the
+  // project. Foreign `.poiesis/runtime/` siblings survive byte-for-byte
+  // and are reported as preserved, which keeps uninstall incomplete with
+  // the ownership receipt retained.
+  try {
+    const runtimeRemoval = await removeValidatedDeliveryRuntime(resolvedRoot);
+    if (runtimeRemoval.removed) result.removed.push(DELIVERY_RUNTIME_RELATIVE);
+    for (const entry of runtimeRemoval.foreignPreserved) {
+      result.preserved.push({
+        path: `${DELIVERY_RUNTIME_CONTAINER}/${entry}`,
+        reason:
+          "foreign content under the Poiesis-owned runtime container; uninstall only removes the owned delivery subtree",
+      });
+    }
+  } catch (error) {
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({
+      path: `${DELIVERY_RUNTIME_CONTAINER}/`,
+      reason: `delivery runtime validation refused removal: ${message}`,
+    });
   }
 
   if (result.preserved.length === 0) {

@@ -238,6 +238,16 @@ The runtime owns the pin; moving the pin in a future Poiesis release is an `upda
 
 The derived cache lives under `.poiesis/cache/` (Poiesis-owned local state). It is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. The directory is owned by Poiesis only at `.poiesis/cache/repository-intelligence/`; foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
 
+### Generated delivery runtime
+
+A delivery target records its artifact under `.poiesis/runtime/delivery/<target>/<sha>/delivery.json` (Poiesis-owned derived state). The ownership is exact and one-directional:
+
+- The `.gitignore` rule is `.poiesis/runtime/delivery/`. `poiesis init`, the receipt-authenticated `poiesis update`, and the explicit `poiesis update --bootstrap-legacy-ownership` each reconcile that one rule, transactionally with a byte-exact rollback; `poiesis update --config` intentionally does not touch `.gitignore`. The rule is the owned subtree, never the whole `.poiesis/runtime/` container, so state Poiesis does not own stays visible.
+- The runtime is never a manifest file and never a durable (tracked) path, so nothing under it is hash-gated managed state.
+- A generated target run therefore leaves `git status` byte-identical to its pre-run value, including in a linked worktree, so `poiesis workspace cleanup` is never blocked by delivery residue (`DIRTY_WORKSPACE_CLEANUP_FORBIDDEN`).
+- `poiesis uninstall` removes the complete owned `.poiesis/runtime/delivery/` subtree and the `.poiesis/runtime/` parent when nothing else remains. A foreign sibling under `.poiesis/runtime/` survives byte-for-byte, is reported as `preserved`, and keeps the uninstall incomplete with the ownership receipt retained.
+- A symlinked runtime container, a symlinked `delivery` root, or a symlink at any depth inside the owned subtree is never traversed or deleted: the removal is refused with `DELIVERY_RUNTIME_UNSAFE` (or `DELIVERY_RUNTIME_UNOWNED` for a non-directory target), reported as `preserved`, and the installation stays intact.
+
 ## Process execution
 
 All external command execution is bounded:
