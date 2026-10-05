@@ -23,6 +23,7 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 
 - Node.js `>=22.20.0`
 - Git
+- **A POSIX host with `/bin/sh` at that exact path.** `poiesis verify` and the post-integration verification `poiesis integrate` runs execute every configured verification command as `/bin/sh -c <command>`, with the working directory set to the canonical Git root of the exact candidate being proven. A host with no `/bin/sh` — Windows, or a container image without a POSIX shell — cannot run verification, so this is a stated requirement rather than a `package.json` `os` restriction, and there is no PowerShell, `cmd.exe`, or `sh`-on-`PATH` fallback.
 - OpenCode `1.18.29`, `1.18.30`, or `1.18.31` (see [COMPATIBILITY.md](./COMPATIBILITY.md) for the verified adapter-v1 contract)
 - **Repository Intelligence standard requirement (Poiesis v1.2):** `uv` (https://docs.astral.sh/uv/) on PATH. `uv` is the exact-version runtime that launches the pinned default engine behind the deterministic `poiesis repository` surface; it is invoked via `uvx --python 3.12 --from graphifyy==<pin> graphify ...`. A missing `uv` makes `poiesis init` and `poiesis update` fail closed before any canonical mutation with the typed `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` error; `poiesis doctor` reports the same condition as a hard `fail`. Poiesis does not install `uv`, does not vendor Python, does not offer a fallback flag, and does not ask the Author a question about it.
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository

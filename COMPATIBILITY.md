@@ -260,3 +260,7 @@ All external command execution is bounded:
 - `COMMAND_FAILED` on ordinary non-zero exit;
 - `stdoutTruncated`/`stderrTruncated` flags recorded when bound is hit;
 - safe SIGTERM then SIGKILL termination on timeout.
+
+### Verification command execution
+
+`verification.commands` and `verification.postIntegrationCommands` are shell command strings, not argument vectors, and both run through the same interpreter: Poiesis executes each one as `/bin/sh -c <command>`, with the working directory set to the canonical Git root of the exact candidate it is proving — the repository root for `poiesis verify`, and the temporary detached worktree Poiesis creates for the integrated commit for post-integration verification. The interpreter is that exact path: there is no PowerShell, `cmd.exe`, or `sh`-on-`PATH` route, so a host without `/bin/sh` cannot run verification and the requirement is documented in the README rather than declared as a `package.json` `os` restriction. Nothing else about the execution is host-dependent: the per-command timeout, the bounded stdout/stderr evidence, the exact-SHA clean assertions before and after, and the merged environment are identical on every host.

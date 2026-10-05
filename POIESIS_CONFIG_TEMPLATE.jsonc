@@ -68,6 +68,13 @@
   // Commands receive POIESIS_CANDIDATE_TREE and, during promotion,
   // POIESIS_DELIVERY_IDENTITY. They must return exact sha, candidateTree,
   // target, verified: true, and an artifactIdentity matching id/url/artifact.
+  //
+  // Every string in this `verification` block is one POSIX-sh command line,
+  // not an argument vector: Poiesis executes it as `/bin/sh -c` with the
+  // working directory set to the canonical Git root of the exact candidate. So
+  // the strings configured here and the package-script strings `init`
+  // discovers from package.json must both be POSIX-sh compatible; the same
+  // rule covers `postIntegrationCommands` if you add that block.
   "verification": {
     "commands": ["<authoritative-project-check-command>"]
   }
