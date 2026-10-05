@@ -34,6 +34,7 @@ import {
   LOCAL_TRACKER_LOCK_VERSION,
   LOCAL_TRACKER_STORE_DIRECTORY,
   acquireLocalTrackerLockWithTimeout,
+  assertLocalTrackerStoreUsable,
   createLocalTrackerAdapter,
   releaseLocalTrackerLock,
   resolveLocalTrackerStoreLocation,
@@ -826,6 +827,268 @@ describe("the local tracker store is validated strictly and fails closed", () =>
     expect((await readdir(location.directory)).sort()).toEqual(["store.json"]);
   });
 });
+
+/**
+ * Spec #139 / ticket #155 — a permission refusal is a VALUE, never a command.
+ *
+ * The store lives inside a Git common directory whose name Poiesis did not
+ * choose, and its three artifacts are addressed by full path. A diagnostic that
+ * assembles `chmod 600 <path>` therefore hands a command to whatever the path
+ * contains: a renamed clone, a checkout under a hostile parent directory, a
+ * space, a quote, a newline, a `;`, a `$()`. An operator who trusts an error
+ * message is exactly the person who runs it, so the refusal carries the exact
+ * path and BOTH modes as structured VALUES, and states the repair as PROSE that
+ * names no executable and interpolates nothing.
+ *
+ * The properties that make that claim checkable, and that a plausible
+ * implementation gets wrong, are all asserted below: the modes must be
+ * separate fields an operator can compare, the prose must survive a hostile
+ * path byte-for-byte, the WHOLE serialized error must contain no shell syntax
+ * outside the path value, and none of it may weaken the fail-closed refusal
+ * that makes the permission check worth having in the first place.
+ */
+describe.skipIf(process.platform === "win32")(
+  "the local tracker permission refusal reports values and prose, never a command",
+  () => {
+    /**
+     * One hostile path per way a path can break a pasted command. A space
+     * splits an argument, a quote ends one, a newline starts a second line, a
+     * `;` starts a second command, and `$(...)` / backticks / `|` all
+     * substitute or redirect. Each is written to disk first so the refusal is
+     * provoked by a real artifact rather than by a synthetic path.
+     */
+    const HOSTILE_SEGMENTS: readonly string[] = [
+      "store with space.json",
+      "store'single'quote.json",
+      'store"double"quote.json',
+      "store\nnewline.json",
+      "store;semicolon.json",
+      "store$(id).json",
+      "store`id`.json",
+      "store|tee|pwned.json",
+      "store 600.json & curl evil",
+    ];
+
+    /**
+     * The whole point of prose remediation, stated as assertions. A step is
+     * acceptable only if it names no executable, carries no character a shell
+     * would act on, and contains no path at all.
+     */
+    function expectNoExecutableProse(step: string, path: string): void {
+      expect(step, "prose must name no executable").not.toMatch(
+        /\b(chmod|chown|chgrp|rm|rmdir|unlink|sudo|doas|sh|bash|zsh|fish|pwsh|powershell|cmd|icacls|attrib|takeown|setfacl|install|run)\b/i,
+      );
+      expect(step, "prose must carry no shell syntax").not.toMatch(/[;&|`$><*?~\\]/);
+      expect(step, "prose must interpolate no path").not.toContain(path);
+    }
+
+    /** The exact shape the CLI writes to stderr, built the way `writeFailure` builds it. */
+    function serializeFailure(error: PoiesisError): string {
+      return JSON.stringify({
+        ok: false,
+        error: { code: error.code, message: error.message, details: error.details },
+      });
+    }
+
+    it("reports the exact path, both modes, and an ordered procedure with no command in it", async () => {
+      // Break: `repair: "chmod 600 <path>"` looks like the most helpful field
+      // on the error and is the one field that turns a hostile directory name
+      // into something a shell executes. The modes are the actionable part and
+      // they are values, so the repair can be stated without being runnable.
+      const repository = await newRepository();
+      const location = await resolveLocalTrackerStoreLocation(repository.root);
+      const tracker = createLocalTrackerAdapter(repository.root);
+      await tracker.createSpec({ title: "Intent", body: "B" });
+      await chmod(location.storePath, 0o644);
+
+      const error = (await assertLocalTrackerStoreUsable(location).catch(
+        (reason: unknown) => reason,
+      )) as PoiesisError;
+      expect(error).toBeInstanceOf(PoiesisError);
+      expect(error.code).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+      const details = error.details;
+
+      // The EXACT path, as a value. An operator (or Poiesis) can act on it.
+      expect(details.path).toBe(location.storePath);
+      expect(details.kind).toBe("permissions");
+      // Both modes as separate comparable octal digit strings. The refusal is
+      // useless without the pair: one says what is wrong, the other says what
+      // is required.
+      expect(details.currentMode).toBe("644");
+      expect(details.expectedMode).toBe("600");
+      // The command that used to live here is gone, not renamed.
+      expect(details).not.toHaveProperty("repair");
+      // The message is built from a fixed label and the observed mode only, so
+      // no path byte can reach a sentence that a human reads as instruction.
+      expect(error.message).toMatch(/readable beyond its owner/);
+      expect(error.message).not.toContain(location.storePath);
+
+      const steps = details.permissionRecovery as string[];
+      expect(Array.isArray(steps)).toBe(true);
+      expect(steps.length).toBeGreaterThanOrEqual(4);
+      for (const step of steps) expectNoExecutableProse(step, location.storePath);
+      // The order is the whole point of guidance: what the mode means, what to
+      // change, where the two mode values are, how to apply it, that it is
+      // permanent, and what is not the repair.
+      expect(steps[0]).toMatch(/owner/i);
+      expect(steps[1]).toMatch(/group/i);
+      expect(steps[1]).toMatch(/other/i);
+      expect(steps[2]).toMatch(/currentMode/);
+      expect(steps[2]).toMatch(/expectedMode/);
+      expect(steps[3]).toMatch(/path value on this error/);
+      expect(steps[4]).toMatch(/retry/i);
+      expect(steps[5]).toMatch(/widen|copy/i);
+      // Poiesis re-establishes the mode on every write, so the refusal is not a
+      // recurring chore, and the guidance says so rather than implying the
+      // operator must maintain it forever.
+      expect(steps[4]).toMatch(/every write/i);
+      // Widening, copying, or relocating the file is NOT the repair, and the
+      // guidance says why.
+      expect(steps.join("\n")).toMatch(/widen|copy/i);
+    });
+
+    it.each(HOSTILE_SEGMENTS)(
+      "keeps a hostile store path an inert value in every field of the serialized error: %j",
+      async (segment) => {
+        // Break: guidance or a detail built by concatenation turns a path Poiesis
+        // did not choose into an argument, a substitution, or a second command.
+        // The path must survive byte-for-byte AS A VALUE and reach nothing else.
+        const repository = await newRepository();
+        const real = await resolveLocalTrackerStoreLocation(repository.root);
+        await mkdir(real.directory, { recursive: true, mode: 0o700 });
+        const hostile = join(real.directory, segment);
+        await writeFile(hostile, "{}\n", { mode: 0o600 });
+        // `writeFile`'s mode is masked by the ambient umask, so the mode the
+        // refusal observes is set explicitly rather than inherited.
+        await chmod(hostile, 0o644);
+        const planted = await readFile(hostile, "utf8");
+
+        const error = (await assertLocalTrackerStoreUsable({ ...real, storePath: hostile }).catch(
+          (reason: unknown) => reason,
+        )) as PoiesisError;
+        expect(error.code).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+        // Preserved exactly, in the one field a reader or Poiesis can act on.
+        expect(error.details.path).toBe(hostile);
+        expect(error.details.currentMode).toBe("644");
+
+        const steps = error.details.permissionRecovery as string[];
+        expect(Array.isArray(steps)).toBe(true);
+        for (const step of steps) {
+          expectNoExecutableProse(step, hostile);
+          // Not one attacker-controlled byte reached the prose at all.
+          expect(step, "prose must not carry any of the path's own bytes").not.toContain(segment);
+        }
+
+        // The FULL serialized error: exactly the bytes the CLI writes to stderr,
+        // asserted as a whole rather than field by field. Removing every
+        // occurrence of the path as a VALUE must leave nothing a shell could act
+        // on and no executable named anywhere.
+        const serialized = serializeFailure(error);
+        const escapedPath = JSON.stringify(hostile).slice(1, -1);
+        expect(serialized, "the path must travel as a value").toContain(escapedPath);
+        const withoutPath = serialized.split(escapedPath).join("");
+        expect(withoutPath, "the serialized error must carry no shell syntax").not.toMatch(/[;&|`$><]/);
+        expect(withoutPath, "the serialized error must name no executable").not.toMatch(
+          /\b(chmod|rm|unlink|sudo|sh|bash)\b/i,
+        );
+        // And nothing the path could have said happened: no planted file, no
+        // rewritten bytes, no sibling artifact.
+        expect(await readFile(hostile, "utf8")).toBe(planted);
+        expect(await readdir(real.directory)).toEqual([segment]);
+      },
+    );
+
+    it("still fails closed on every mode beyond the owner and re-establishes 0600 on the next write", async () => {
+      // Break: softening the check to "warn and continue" would let a world
+      // readable store be read and then rewritten, compounding a leak that has
+      // already happened. Every mode with a group or other bit stays refused, the
+      // refused bytes are untouched, and tightening by hand resumes the store.
+      const repository = await newRepository();
+      const location = await resolveLocalTrackerStoreLocation(repository.root);
+      const tracker = createLocalTrackerAdapter(repository.root);
+      const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+      const before = await readFile(location.storePath, "utf8");
+
+      for (const mode of [0o644, 0o640, 0o604, 0o660, 0o666, 0o777]) {
+        await chmod(location.storePath, mode);
+        const error = (await tracker.getSpec(spec.id).catch((reason: unknown) => reason)) as PoiesisError;
+        expect(error.code, `mode ${mode.toString(8)} must be refused`).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+        expect(error.details.currentMode).toBe(mode.toString(8));
+        expect(error.details.expectedMode).toBe("600");
+        // A read that is refused writes nothing.
+        expect(await readFile(location.storePath, "utf8")).toBe(before);
+      }
+
+      // The operator narrows it, and the store works again: the failure mode
+      // was the mode, not the document.
+      await chmod(location.storePath, 0o600);
+      await tracker.commentSpec(spec.id, "resumed");
+      expect((await lstat(location.storePath)).mode & 0o777).toBe(0o600);
+      // The directory mode is still the 0700 Poiesis creates, so the fix is not
+      // a one-off file edit that the next write undoes.
+      expect((await lstat(location.directory)).mode & 0o777).toBe(0o700);
+    });
+
+    it("reports the same permission refusal for the lock artifact, before any waiting", async () => {
+      // One helper, three artifacts. The lock is a store artifact too, so its
+      // permission refusal must carry the same values and prose — and must be
+      // reported as the permission problem it is, not as lock contention.
+      const repository = await newRepository();
+      const location = await resolveLocalTrackerStoreLocation(repository.root);
+      await mkdir(location.directory, { recursive: true, mode: 0o700 });
+      await writeFile(location.lockPath, lockEnvelope("live-holder", process.pid), { mode: 0o600 });
+      await chmod(location.lockPath, 0o666);
+
+      const error = (await acquireLocalTrackerLockWithTimeout(location, 200).catch(
+        (reason: unknown) => reason,
+      )) as PoiesisError;
+      expect(error.code).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+      expect(error.details.path).toBe(location.lockPath);
+      expect(error.details.kind).toBe("permissions");
+      expect(error.details.currentMode).toBe("666");
+      expect(error.details.expectedMode).toBe("600");
+      for (const step of error.details.permissionRecovery as string[]) expectNoExecutableProse(step, location.lockPath);
+      // The bounded-wait report is a different refusal with a different
+      // procedure, and mixing them would send an operator to the wrong fix.
+      expect(error.details).not.toHaveProperty("guardRecovery");
+      expect(error.details).not.toHaveProperty("timeoutMs");
+    });
+
+    it("leaves the symlink and nonregular refusals free of permission fields", async () => {
+      // Scope: only the PERMISSION diagnostic changes shape. A symlink or a
+      // directory is a different refusal, and reporting a mode for it would be a
+      // category error: there is no mode to change on something that is not the
+      // file the store owns.
+      const repository = await newRepository();
+      const location = await resolveLocalTrackerStoreLocation(repository.root);
+      await mkdir(location.directory, { recursive: true, mode: 0o700 });
+      const outside = join(repository.parent, "outside-permission-scope.json");
+      await writeFile(outside, "keep\n", { mode: 0o600 });
+      await symlink(outside, location.storePath);
+
+      const symlinked = (await assertLocalTrackerStoreUsable(location).catch(
+        (reason: unknown) => reason,
+      )) as PoiesisError;
+      expect(symlinked.code).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+      expect(symlinked.details.kind).toBe("symlink");
+      expect(symlinked.details).not.toHaveProperty("permissionRecovery");
+      expect(symlinked.details).not.toHaveProperty("expectedMode");
+      expect(symlinked.details).not.toHaveProperty("currentMode");
+      expect(symlinked.details).not.toHaveProperty("repair");
+
+      await rm(location.storePath, { force: true });
+      await mkdir(location.storePath);
+      const nonregular = (await assertLocalTrackerStoreUsable(location).catch(
+        (reason: unknown) => reason,
+      )) as PoiesisError;
+      expect(nonregular.code).toBe("LOCAL_TRACKER_STORE_UNSAFE");
+      expect(nonregular.details.kind).toBe("non-regular");
+      expect(nonregular.details).not.toHaveProperty("permissionRecovery");
+      expect(nonregular.details).not.toHaveProperty("expectedMode");
+      expect(await readFile(outside, "utf8")).toBe("keep\n");
+    });
+  },
+);
 
 describe("the local tracker serializes cross-process writers on a token-checked lock", () => {
   it("refuses to steal a live foreign lock and preserves it byte-for-byte", async () => {

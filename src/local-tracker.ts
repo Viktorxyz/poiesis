@@ -60,7 +60,11 @@ import type {
  *      dependency text, dangling comment — is a typed refusal that leaves the
  *      bytes on disk untouched. A store, lock, or store directory that is a
  *      symlink or a nonregular file is refused before it is read or written,
- *      and every store file is 0600.
+ *      and every store file is 0600. Every operator-facing refusal carries the
+ *      EXACT paths and the exact numbers as structured VALUES and states its
+ *      procedure as PROSE, because a path is not a command and this store lives
+ *      inside a Git common directory whose name Poiesis did not choose
+ *      (Spec #139 / ticket #148, #155).
  *
  * This module is intentionally NOT re-exported by `src/index.ts`: the store
  * layout, the lock envelope, and the validation contract stay free to evolve
@@ -259,12 +263,48 @@ async function assertSafeRegularFile(path: string, label: string): Promise<"abse
   const mode = stats.mode & 0o777;
   // The store carries the Author's Spec and Ticket text and the dependency
   // evidence attached to them. A file another user can read has already
-  // leaked, and silently continuing would compound it; the refusal names the
-  // exact repair instead.
+  // leaked, and silently continuing would compound it; the refusal states the
+  // procedure in prose and carries the path and both modes as values.
   if (!IS_WINDOWS && (mode & 0o077) !== 0) {
-    throw unsafe(path, `the ${label} is readable beyond its owner (mode ${mode.toString(8)})`, {
-      mode: mode.toString(8),
-      repair: `chmod 600 ${path}`,
+    // The EXACT path and BOTH modes travel as VALUES, and the repair is PROSE
+    // that names no executable. Concatenating `chmod 600 <path>` here would look
+    // like the most helpful field on the error and would be the one field that
+    // hands a command to whatever the path contains: this store lives inside a
+    // Git common directory whose name Poiesis did not choose, so a clone
+    // renamed by a human, a checkout under a hostile parent directory, or a path
+    // with a space, a quote, a newline, a `;`, or a `$(...)` in it all produce a
+    // string that is perfectly safe to READ and dangerous to paste. An operator
+    // who trusts an error message is exactly the person who runs it, so the path
+    // is a field to act on and the procedure says what to do without ever being
+    // executable. The modes are the actionable part and they are plain values, so
+    // nothing has to be built to state the repair.
+    const currentMode = mode.toString(8);
+    const expectedMode = LOCAL_TRACKER_FILE_MODE.toString(8);
+    throw unsafe(path, `the ${label} is readable beyond its owner (mode ${currentMode})`, {
+      kind: "permissions",
+      expectedMode,
+      currentMode,
+      permissionRecovery: [
+        "A local tracker store file carries the Spec and Ticket text of this project together with the dependency " +
+          "evidence attached to them, and it is meant to be readable by its owner alone. This refusal is not a " +
+          "warning: Poiesis will not read the file, and it will not change the file either, until its permissions " +
+          "are narrowed.",
+        "Narrow this one file so that only its owner may read it and write it: clear every group permission bit and " +
+          "every other-user permission bit, and leave the owner's read bit and write bit in place.",
+        "Both numbers you need are on this error rather than in this text. The currentMode value is what the file " +
+          "has now, and the expectedMode value is what Poiesis requires, each written as three octal digits for the " +
+          "owner, the group, and other users in that order. Clear the last two digits of the first and keep the last " +
+          "two digits of the second at zero.",
+        "Apply the change with whatever permission facility your platform and your administrator already provide, " +
+          "naming the file yourself from the path value on this error. This guidance deliberately describes the " +
+          "procedure instead of printing it, so that nothing a path Poiesis did not choose can become an argument, " +
+          "a substitution, or a second instruction when you act on it.",
+        "Then retry the operation. Poiesis re-establishes the owner-only permissions on every write it makes, so the " +
+          "refusal does not come back and this is not a chore to repeat.",
+        "Do not widen the file, do not copy it elsewhere, and do not open access to the containing directory " +
+          "instead: those changes leave the readable bytes in place rather than removing them, and a store file " +
+          "another account can already read has leaked the text it carried.",
+      ],
     });
   }
   return "present";
