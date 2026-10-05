@@ -133,6 +133,76 @@ const STORE_BOUNDED_MUTATION_STATEMENT =
 const STORE_NO_AUTOMATIC_REPAIR_STATEMENT =
   "Nothing is pruned to fit and nothing is repaired automatically: an over-ceiling store is left byte-for-byte as it is, and reducing it is the operator's decision about their own work.";
 
+/**
+ * Spec #139 / ticket #163 — the refusal precedence, stated honestly.
+ *
+ * The shipped guidance claimed that a project with no
+ * `.poiesis/config.jsonc` "reports `CONFIG_NOT_INSTALLED` for all six" from
+ * "the primary checkout or in a Poiesis workspace". That is a promise the
+ * runtime cannot keep for `poiesis workspace cleanup`, and the reason is not a
+ * gap in the guard but the guard's own design:
+ *
+ *   - The five preflighted operations (`publish`, `preview`, `promote`
+ *     staging, `promote` production, `integrate`) decide the installed state
+ *     from the PRIMARY installation authority before they read anything else,
+ *     so they report the same code from any directory of the clone.
+ *   - `poiesis workspace cleanup` has no such preflight, because it must know
+ *     what it would DELETE before it can judge anything else. It resolves
+ *     workspace ownership first, so a cleanup invoked outside a workspace
+ *     Poiesis can prove it owns never reaches the installed-state decision at
+ *     all — and the code it reports is not the one the old sentence promised.
+ *
+ * That asymmetry is the SIXTH operation's alone. `poiesis publish` and
+ * `poiesis integrate` also resolve ownership inside their own seams, but their
+ * COMMANDS run the shared preflight first, so from an unowned working
+ * directory they report the installed-state code the preflight decided and
+ * never reach the ownership check. See `CLEANUP_OWNERSHIP_FIRST_SCOPE`.
+ *
+ * The four sentences below are the contract: ownership first for cleanup and
+ * only for cleanup, the unchanged ordered precedence inside an owned workspace,
+ * and the guarantee that every one of those refusals lands before the first
+ * lifecycle side effect. They are asserted literally against the canon, the
+ * compatibility matrix, and the README, so a projection that drifts from the
+ * runtime fails here.
+ */
+const CLEANUP_OWNERSHIP_FIRST =
+  "Workspace ownership comes first for cleanup: `poiesis workspace cleanup` proves it owns the workspace before it reads any installation, so a cleanup invoked outside a workspace Poiesis can prove it owns is refused with `WORKSPACE_OWNERSHIP_UNKNOWN` and never reaches the installed-state decision.";
+
+const CLEANUP_OWNED_PRECEDENCE =
+  "Inside an owned workspace the precedence is unchanged and strictly ordered: `RUNTIME_VERSION_MISMATCH` when the installed version does not match, then `CONFIG_NOT_INSTALLED` naming the PRIMARY checkout's `.poiesis/config.jsonc` when that installed config is missing, then `DELIVERY_DEFERRED` when it states the deferred mode.";
+
+/**
+ * The scope of the ownership-first rule, stated so it cannot be read as
+ * covering all three workspace operations. Only `workspace cleanup` reaches
+ * ownership before the installed state; the two commands that also own a
+ * workspace are judged by the preflight first, which is why an integrator
+ * wiring an error handler must not expect `WORKSPACE_OWNERSHIP_UNKNOWN` from
+ * `poiesis publish` or `poiesis integrate` launched in an unowned directory.
+ */
+const CLEANUP_OWNERSHIP_FIRST_SCOPE =
+  "`poiesis publish` and `poiesis integrate` reach workspace ownership only after the shared preflight has accepted the installed state, so their commands invoked from an unowned working directory report the installed-state code the preflight decided, never `WORKSPACE_OWNERSHIP_UNKNOWN`.";
+
+/**
+ * The refusals are decided before the first lifecycle SIDE EFFECT, and the
+ * distinction is load-bearing: the read-only `git rev-parse` calls that locate
+ * a root, read a common directory, and read markers all complete before the
+ * refusal is raised, so a literal "before any subprocess" would be false. What
+ * is guaranteed is that no subprocess that mutates anything has run.
+ */
+const REFUSAL_PRECEDES_SIDE_EFFECTS =
+  "Every one of those refusals is decided before the first lifecycle side effect: before any side-effecting subprocess, before any remote branch deletion, before any worktree removal, before any local ref deletion, and before any change to the immutable workspace ownership marker.";
+
+/**
+ * The carve-out that makes the first sentence honest rather than a loophole.
+ * A deferred install is the ordinary case in which the primary installation is
+ * present, correct, and deferred, so it is the one project state in which a
+ * config-first cleanup would produce a *confidently wrong* answer: it would
+ * report a delivery refusal for a workspace that does not exist. Pinned
+ * literally in all three files so the correction cannot be half-applied.
+ */
+const CLEANUP_OUTSIDE_OWNED_WORKSPACE =
+  "`poiesis workspace cleanup` invoked outside a workspace Poiesis can prove it owns never reports a delivery code at all: on a fully installed deferred project it reports `WORKSPACE_OWNERSHIP_UNKNOWN` rather than `DELIVERY_DEFERRED`.";
+
 describe("the canonical Method states one tracker / delivery contract", () => {
   const method = readRepoFile("POIESIS_METHOD.md");
 
@@ -183,6 +253,26 @@ describe("the canonical Method states one tracker / delivery contract", () => {
     expect(method).toContain("`CONFIG_NOT_INSTALLED`");
     expect(method).toContain("may refuse with `PUBLISH_PROVIDER_UNRESOLVED`");
     expect(method).toContain("no push, no fetch, no remote revalidation, no change request, and no delivery evidence");
+  });
+
+  it("states that workspace ownership outranks the installed state, and the ordered precedence inside an owned workspace", () => {
+    // Ticket #163. The canon must not promise `CONFIG_NOT_INSTALLED` for all
+    // six operations from every cwd: for `workspace cleanup` the ownership
+    // decision is the first one, and it can refuse with a different code.
+    expect(method).toContain(CLEANUP_OWNERSHIP_FIRST);
+    expect(method).toContain(CLEANUP_OUTSIDE_OWNED_WORKSPACE);
+    expect(method).toContain(CLEANUP_OWNED_PRECEDENCE);
+    expect(method).toContain(REFUSAL_PRECEDES_SIDE_EFFECTS);
+  });
+
+  it("scopes ownership-first to workspace cleanup and never to publish or integrate", () => {
+    // Ticket #163 review F1. The canon must not read as though all three
+    // workspace-owning operations decide ownership before the installed
+    // state: only `workspace cleanup` has no preflight ahead of it.
+    expect(method).toContain(CLEANUP_OWNERSHIP_FIRST_SCOPE);
+    expect(method).not.toContain(
+      "Workspace ownership outranks all of it for the operations that own a workspace.",
+    );
   });
 
   it("states that a crash-left store lock guard is never auto-reclaimed", () => {
@@ -273,12 +363,30 @@ describe("README documents the whole product contract", () => {
     // The deferred section must not promise a code the CLI cannot always
     // reach. Ticket #152: the CLI preflight decides the installed state and
     // the deferred state from the installed config BEFORE reading it for
-    // anything else, so all six operations report the same code wherever
-    // they run; coordinate resolution is the separate CONFIGURED-install
-    // condition the same paragraph names.
+    // anything else, so the five preflighted operations report the same code
+    // wherever they run; coordinate resolution is the separate
+    // CONFIGURED-install condition the same paragraph names.
     expect(readme).toContain("run one shared preflight before they read your config");
-    expect(readme).toContain("`CONFIG_NOT_INSTALLED` for all six");
     expect(readme).toContain("refuses with `PUBLISH_PROVIDER_UNRESOLVED` instead");
+  });
+
+  it("no longer promises CONFIG_NOT_INSTALLED unconditionally for all six operations", () => {
+    // Ticket #163. This sentence was the defect: it promised the
+    // installed-state code for `poiesis workspace cleanup` from any cwd, but
+    // cleanup proves ownership FIRST and refuses with
+    // `WORKSPACE_OWNERSHIP_UNKNOWN` when it cannot.
+    expect(readme).not.toContain("`CONFIG_NOT_INSTALLED` for all six");
+    expect(readme).toContain("`CONFIG_NOT_INSTALLED` for them too");
+  });
+
+  it("documents the ownership-first cleanup precedence and the unchanged precedence inside an owned workspace", () => {
+    expect(readme).toContain(CLEANUP_OWNERSHIP_FIRST);
+    expect(readme).toContain(CLEANUP_OUTSIDE_OWNED_WORKSPACE);
+    expect(readme).toContain(CLEANUP_OWNED_PRECEDENCE);
+    expect(readme).toContain(REFUSAL_PRECEDES_SIDE_EFFECTS);
+    // The primary checkout is the worked example of a directory that owns no
+    // workspace, because it is the one an Author runs commands from.
+    expect(readme).toContain("the primary checkout");
   });
 
   it("documents recognized-remote publishing coordinates including the fork implication", () => {
@@ -323,6 +431,36 @@ describe("COMPATIBILITY documents the providers", () => {
     expect(compatibility).toContain("DELIVERY_DEFERRED");
     expect(compatibility).toContain(PUBLISH_STATEMENT);
     expect(compatibility).toContain(FORK_STATEMENT);
+  });
+
+  it("documents the ownership-first cleanup precedence instead of six unconditional installed-state failures", () => {
+    // Ticket #163. The compatibility matrix is the reference an integrator
+    // reads when wiring an error handler, so it must name the code each
+    // operation can actually report and in which order.
+    expect(compatibility).not.toContain("the same six operations fail closed with `CONFIG_NOT_INSTALLED`");
+    expect(compatibility).toContain(CLEANUP_OWNERSHIP_FIRST);
+    expect(compatibility).toContain(CLEANUP_OUTSIDE_OWNED_WORKSPACE);
+    expect(compatibility).toContain(CLEANUP_OWNED_PRECEDENCE);
+    expect(compatibility).toContain(REFUSAL_PRECEDES_SIDE_EFFECTS);
+    expect(compatibility).toContain("WORKSPACE_OWNERSHIP_UNKNOWN");
+  });
+
+  it("scopes ownership-first to workspace cleanup and never to publish or integrate", () => {
+    // Ticket #163 review F1. The previous sentence here claimed all three
+    // workspace-owning operations resolve ownership before they read an
+    // installation. That is false for the two commands: `poiesis publish` and
+    // `poiesis integrate` run the shared preflight (runtime identity, then the
+    // installed state) BEFORE their own ownership check, so from an unowned
+    // working directory they report the preflight's installed-state code. An
+    // integrator reading the matrix must be able to tell those apart.
+    expect(compatibility).not.toContain(
+      "`poiesis publish`, `poiesis integrate`, and `poiesis workspace cleanup` each resolve workspace ownership before they read any installation",
+    );
+    expect(compatibility).toContain(CLEANUP_OWNERSHIP_FIRST_SCOPE);
+    // The scope has to be stated once, on the operation it actually describes.
+    expect(compatibility).toContain(
+      "Only `poiesis workspace cleanup` resolves workspace ownership before it reads an installation",
+    );
   });
 
   it("documents the guard that serializes the canonical lock and is never auto-reclaimed", () => {

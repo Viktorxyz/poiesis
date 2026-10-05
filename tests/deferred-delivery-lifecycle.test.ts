@@ -863,6 +863,288 @@ describe("an installed project with no installed config fails closed at the inst
 });
 
 /**
+ * Spec #139 / ticket #163 — workspace cleanup decides OWNERSHIP first.
+ *
+ * Ticket #152's guidance promised `CONFIG_NOT_INSTALLED` for all six
+ * operations from every cwd. That promise is false for the sixth, and the
+ * reason is structural rather than a gap in the guard: the five preflighted
+ * operations are judged by the PRIMARY installation authority, but
+ * `workspaceCleanup` has to know what it would delete before it can judge
+ * anything else, so it resolves workspace ownership first. The three cwds an
+ * Author actually runs commands from — the primary checkout, a linked worktree
+ * Poiesis never prepared, and a directory outside the clone — are all outside
+ * an owned workspace, and a cleanup there must refuse with
+ * `WORKSPACE_OWNERSHIP_UNKNOWN` without ever reaching the installed-state
+ * decision. The linked-worktree case is the discriminating one: the primary
+ * there IS a fully installed deferred project, so an order that consulted the
+ * config first would answer `DELIVERY_DEFERRED` and be wrong about what it was
+ * about to delete.
+ *
+ * Inside an owned workspace the precedence is unchanged and strictly ordered
+ * — runtime identity, then the missing installed config named by the PRIMARY
+ * path, then the deferred state — and every refusal lands before the first
+ * side effect: no subprocess, no remote branch deletion, no worktree removal,
+ * no local ref deletion, no ownership-marker change.
+ */
+describe("workspace cleanup proves ownership before it judges the installed state", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+
+  /** A linked worktree of the same clone that Poiesis never prepared. */
+  async function unpreparedWorktree(): Promise<string> {
+    const path = join(fixture.repository.parent, "unprepared-worktree");
+    await run("git", ["worktree", "add", "--detach", path, "main"], { cwd: fixture.repository.root });
+    return path;
+  }
+
+  /**
+   * Everything a refused cleanup must leave byte-for-byte: the remote, the
+   * published change branch, the local change ref, the worktree directory, and
+   * the immutable ownership marker that proves the worktree was ever owned.
+   */
+  async function assertNothingWasTouched(before: { heads: string; marker: string; branch: string; tree: string }): Promise<void> {
+    expect(await remoteHeads(fixture.repository)).toBe(before.heads);
+    expect(readFileSync(fixture.workspace.markerPath, "utf8")).toBe(before.marker);
+    expect(existsSync(fixture.workspace.path)).toBe(true);
+    expect((await run("git", ["rev-parse", `refs/heads/${BRANCH}`], { cwd: fixture.repository.root })).stdout).toBe(before.branch);
+    expect((await resolveTree(fixture.workspace.path, fixture.candidateSha)).trim()).toBe(before.tree);
+  }
+
+  async function snapshot(): Promise<{ heads: string; marker: string; branch: string; tree: string }> {
+    return {
+      heads: await remoteHeads(fixture.repository),
+      marker: readFileSync(fixture.workspace.markerPath, "utf8"),
+      branch: (await run("git", ["rev-parse", `refs/heads/${BRANCH}`], { cwd: fixture.repository.root })).stdout,
+      tree: (await resolveTree(fixture.workspace.path, fixture.candidateSha)).trim(),
+    };
+  }
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("refuses from the primary checkout with WORKSPACE_OWNERSHIP_UNKNOWN, not an installed-state code", async () => {
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: fixture.repository.root }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    // The primary checkout is a complete, correctly versioned, DEFERRED
+    // installation, so any code other than the ownership failure here would be
+    // the guard reporting on a delivery state it was not asked about.
+    expect(error).toMatchObject({
+      code: "WORKSPACE_OWNERSHIP_UNKNOWN",
+      details: { path: fixture.repository.root, matches: 0 },
+    });
+    expect((error as PoiesisError).details).not.toHaveProperty("operation");
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("refuses from a linked worktree Poiesis never prepared with WORKSPACE_OWNERSHIP_UNKNOWN, not DELIVERY_DEFERRED", async () => {
+    // This is the case the old guidance got wrong: the primary installation is
+    // intact and deferred, so only an ownership-first order can refuse with
+    // the right code here.
+    const unprepared = await unpreparedWorktree();
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: unprepared }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({
+      code: "WORKSPACE_OWNERSHIP_UNKNOWN",
+      details: { path: unprepared, matches: 0 },
+    });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("refuses from a directory that is not in a Git repository at all with NOT_GIT_REPOSITORY", async () => {
+    // The boundary of the ownership-first claim: a cwd outside any repository
+    // never reaches the ownership decision, so the documentation must not fold
+    // it into the WORKSPACE_OWNERSHIP_UNKNOWN case.
+    const outside = join(fixture.repository.parent, "not-a-repository");
+    await mkdir(outside, { recursive: true });
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: outside }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({ code: "NOT_GIT_REPOSITORY", details: { cwd: outside } });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("keeps the preflight ahead of ownership for the publish and integrate commands from an unowned cwd", async () => {
+    // Ticket #163 review F1. `workspace cleanup` is the ONLY operation whose
+    // ownership decision comes first: `poiesis publish` and `poiesis integrate`
+    // each run the shared preflight (runtime identity, then the installed
+    // state) before their own `resolveOwnedWorkspace`. So the same unowned cwd
+    // yields the preflight's code through the command and the ownership code
+    // through the library seam, and the compatibility matrix has to say so
+    // rather than imply one order for all three operations.
+    const unowned = fixture.repository.root;
+    const before = await snapshot();
+    const mark = markSubprocesses();
+
+    // The command surface: the deferred installed state is decided first.
+    for (const { operation, attempt } of [
+      {
+        operation: "poiesis publish" as const,
+        attempt: () =>
+          commandPublish([
+            "--sha",
+            fixture.candidateSha,
+            "--candidate-tree",
+            fixture.candidateTree,
+            "--proof",
+            JSON.stringify(proofShell(fixture.candidateSha, fixture.candidateTree)),
+            "--title",
+            "Spec 1",
+            "--body",
+            "body",
+            "--cwd",
+            unowned,
+          ]),
+      },
+      {
+        operation: "poiesis integrate" as const,
+        attempt: () =>
+          commandIntegrate([
+            "--sha",
+            fixture.candidateSha,
+            "--candidate-tree",
+            fixture.candidateTree,
+            "--base",
+            fixture.workspace.baseSha,
+            "--message",
+            "Spec 1: deferred local work",
+            "--proof",
+            JSON.stringify(proofShell(fixture.candidateSha, fixture.candidateTree)),
+            "--staging",
+            JSON.stringify(stagingEvidence(fixture)),
+            "--acceptance",
+            "Yes, this is what I wanted.",
+            "--cwd",
+            unowned,
+          ]),
+      },
+    ]) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, "the preflight decides before ownership").toMatchObject(expectedDeferredFailure(operation));
+    }
+
+    // The library seam from the same cwd: ownership is the first decision.
+    for (const attempt of [
+      () =>
+        publish({
+          cwd: unowned,
+          remote: "origin",
+          integrationBranch: "main",
+          candidateSha: fixture.candidateSha,
+          candidateTree: fixture.candidateTree,
+          provider: "fixture",
+          project: fixture.repository.fixtures,
+          title: "Spec 1",
+          body: "body",
+          proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+        }),
+      () =>
+        integrate({
+          cwd: unowned,
+          remote: "origin",
+          integrationBranch: "main",
+          expectedBaseSha: fixture.workspace.baseSha,
+          candidateSha: fixture.candidateSha,
+          candidateTree: fixture.candidateTree,
+          message: "Spec 1: deferred local work",
+          proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+          staging: stagingEvidence(fixture),
+          authorAcceptance: "Yes, this is what I wanted.",
+        }),
+    ]) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, "the library seam resolves ownership first").toMatchObject({
+        code: "WORKSPACE_OWNERSHIP_UNKNOWN",
+      });
+    }
+
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("reports CONFIG_NOT_INSTALLED from the primary installation authority inside an owned workspace", async () => {
+    const installedConfig = join(fixture.repository.root, ".poiesis", "config.jsonc");
+    await rm(installedConfig);
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: fixture.workspace.path, ownershipId: fixture.workspace.ownershipId }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({
+      code: "CONFIG_NOT_INSTALLED",
+      details: {
+        operation: "poiesis workspace cleanup",
+        // The PRIMARY path, never the workspace the cleanup was invoked from:
+        // the authority is the installation, not the invocation root.
+        path: installedConfig,
+        remediation: expect.stringContaining("poiesis init"),
+      },
+    });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("keeps runtime-mismatch precedence ahead of the missing installed config inside an owned workspace", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "config.jsonc"));
+    const manifestPath = join(fixture.repository.root, ".poiesis", "manifest.json");
+    const manifest = JSON.parse(readFileSync(manifestPath, "utf8")) as { poiesisVersion: string };
+    await writeFile(manifestPath, `${JSON.stringify({ ...manifest, poiesisVersion: "0.0.0-other" }, null, 2)}\n`);
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: fixture.workspace.path, ownershipId: fixture.workspace.ownershipId }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({
+      code: "RUNTIME_VERSION_MISMATCH",
+      details: { project: "0.0.0-other" },
+    });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+
+  it("keeps the deferred refusal unchanged inside an owned workspace", async () => {
+    const before = await snapshot();
+    const mark = markSubprocesses();
+    const error = await workspaceCleanup({ cwd: fixture.workspace.path, ownershipId: fixture.workspace.ownershipId }).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject(expectedDeferredFailure("poiesis workspace cleanup"));
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    await assertNothingWasTouched(before);
+  }, 60_000);
+});
+
+/**
  * Spec #139 / ticket #152 (Review correction) — the CLI operator surface.
  *
  * The four delivery-integrated command wrappers each run ONE shared preflight
