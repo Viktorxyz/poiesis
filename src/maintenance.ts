@@ -1141,8 +1141,13 @@ const RESERVED_DELIVERY_KEYS: ReadonlySet<string> = new Set<string>(["mode", ...
  * that `init` / `update --config` serialize must still hold it, because a
  * runtime that cannot act on a key must not delete it from the Author's
  * managed config.
+ *
+ * Spec #139 / ticket #154: the partition is the ONE definition of which outer
+ * key is an extension, so the init-discovery final overlay reuses it instead of
+ * re-deriving the reserved set. Exported for that internal caller only —
+ * `src/index.ts` does NOT re-export it, so it stays out of `dist/index.d.ts`.
  */
-function deliveryExtensionKeys(delivery: PoiesisConfig["delivery"]): Record<string, unknown> {
+export function deliveryExtensionKeys(delivery: PoiesisConfig["delivery"]): Record<string, unknown> {
   const extensions: Record<string, unknown> = {};
   if (delivery === undefined) return extensions;
   for (const [key, value] of Object.entries(delivery as Record<string, unknown>)) {

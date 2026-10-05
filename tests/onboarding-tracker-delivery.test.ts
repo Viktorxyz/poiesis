@@ -44,7 +44,13 @@ import {
   type ModelSelection,
 } from "../src/init-interactive.js";
 import { doctor, init, setLinearTrackerSeamsForTest, updateFromConfig } from "../src/maintenance.js";
-import { DEFERRED_DELIVERY_MODE, serializeConfig, type PoiesisConfig } from "../src/config.js";
+import {
+  DEFERRED_DELIVERY_MODE,
+  isDeferredDelivery,
+  serializeConfig,
+  type DeliveryTargetConfig,
+  type PoiesisConfig,
+} from "../src/config.js";
 import { run } from "../src/process.js";
 import { resolveLocalTrackerStoreLocation } from "../src/local-tracker.js";
 import type { LinearHttpRequest, LinearHttpResponse, LinearTransport } from "../src/linear-tracker.js";
@@ -1072,4 +1078,216 @@ describe("noninteractive onboarding and ordinary updates change no recorded choi
     const store = join(repository.root, commonDir, "poiesis-tracker-v1");
     await expect(readFile(join(store, "store.json"), "utf8")).rejects.toThrow();
   }, 60_000);
+});
+
+// =========================================================================
+// 8. Ticket #154 — unknown outer delivery keys survive the init-discovery
+//    final overlay and the managed config it is written into.
+//
+//    The composer's final overlay rebuilds `delivery` so the managed
+//    Preview / Staging / Production targets replace a `<...>` placeholder
+//    with the detected script hint. It rebuilt the block from those three
+//    targets alone, so an extension key that the schema accepted (ticket
+//    #152) and that `resolveDelivery` carried (ticket #153) was deleted by
+//    the one seam that runs after both. The overlay is where the extension
+//    disappeared, so the overlay is where it must be preserved.
+// =========================================================================
+
+/** The composer-owned literal a detected `scripts/poiesis-<target>` hint produces. */
+function hintedDeliveryTarget(target: "preview" | "staging" | "production"): DeliveryTargetConfig {
+  return { adapter: "command", command: [`scripts/poiesis-${target}`, "{sha}"] };
+}
+
+async function writeDeliveryHints(root: string): Promise<void> {
+  await mkdir(join(root, "scripts"), { recursive: true });
+  for (const target of ["preview", "staging", "production"] as const) {
+    const path = join(root, "scripts", `poiesis-${target}`);
+    await writeFile(path, "#!/bin/sh\nexit 0\n");
+    await chmod(path, 0o755);
+  }
+}
+
+/** A complete draft whose targets are still the canonical template placeholders. */
+function templateDraft(delivery: PoiesisConfig["delivery"]): PoiesisConfig {
+  return {
+    schema: 1,
+    models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
+    tracker: { provider: "github", project: "owner/repo" },
+    delivery,
+    verification: { commands: ["test -f README.md"] },
+  };
+}
+
+type ManagedTarget = "preview" | "staging" | "production";
+
+function placeholderTargets(): Record<ManagedTarget, DeliveryTargetConfig> {
+  return {
+    preview: { adapter: "command", command: ["<delivery-executable>", "preview", "{sha}"] },
+    staging: { adapter: "command", command: ["<delivery-executable>", "staging", "{sha}"] },
+    production: { adapter: "command", command: ["<delivery-executable>", "production", "{sha}"] },
+  };
+}
+
+describe("unknown outer delivery keys survive the init-discovery final overlay", () => {
+  it("keeps every extension key while the detected script hints replace the placeholder targets", async () => {
+    // Break: the overlay rebuilt `delivery` from the three targets alone, so a
+    // key the config accepted was deleted from the very config this install
+    // then writes — a runtime that cannot act on a key must not remove it.
+    const repository = await newRepository();
+    await writeDeliveryHints(repository.root);
+    const result = await composeInitDiscovery(
+      repository.root,
+      templateDraft({
+        ...placeholderTargets(),
+        experimental: { note: "kept", retries: 2 },
+        "author-note": "kept",
+      } as PoiesisConfig["delivery"]),
+    );
+    expect(result.unresolved).toEqual([]);
+    expect(result.config).toBeDefined();
+    // The three managed targets are the overlay's values, and the two
+    // extension keys are still present, unexamined, beside them.
+    expect(result.config!.delivery).toEqual({
+      experimental: { note: "kept", retries: 2 },
+      "author-note": "kept",
+      preview: hintedDeliveryTarget("preview"),
+      staging: hintedDeliveryTarget("staging"),
+      production: hintedDeliveryTarget("production"),
+    });
+    // The overlay invents no `mode` and drops nothing: the recorded block is
+    // exactly the five keys the draft carried plus the three it wrote.
+    expect(Object.keys(result.config!.delivery).sort()).toEqual([
+      "author-note",
+      "experimental",
+      "preview",
+      "production",
+      "staging",
+    ]);
+  });
+
+  it("keeps the extension keys for a complete configured draft that needs no overlay", async () => {
+    // Break: a draft whose targets are already concrete takes the OTHER branch
+    // of `replaceTemplateDelivery` (the original is kept, not a script hint).
+    // The rebuild is unconditional, so a fix that only guarded the hint
+    // substitution would still delete the key here.
+    const repository = await newRepository();
+    const concrete: Record<ManagedTarget, DeliveryTargetConfig> = {
+      preview: { adapter: "command", command: ["./deploy", "preview", "{sha}"] },
+      staging: { adapter: "command", command: ["./deploy", "staging", "{sha}"] },
+      production: { adapter: "command", command: ["./deploy", "production", "{sha}"] },
+    };
+    const result = await composeInitDiscovery(
+      repository.root,
+      templateDraft({
+        ...concrete,
+        // A target-shaped and mode-shaped extension: neither may introduce,
+        // replace, or complete a field Poiesis owns, and neither may reach
+        // the outer block as one.
+        experimental: { preview: { adapter: "fixture" }, mode: "deferred" },
+      } as PoiesisConfig["delivery"]),
+    );
+    expect(result.unresolved).toEqual([]);
+    expect(result.config).toBeDefined();
+    expect(result.config!.delivery).toEqual({
+      experimental: { preview: { adapter: "fixture" }, mode: "deferred" },
+      preview: concrete.preview,
+      staging: concrete.staging,
+      production: concrete.production,
+    });
+    // The extension's `mode` never became the block's mode, so the result is
+    // still the configured branch and not a silent deferral.
+    expect(isDeferredDelivery(result.config!.delivery)).toBe(false);
+    expect("mode" in result.config!.delivery).toBe(false);
+  });
+
+  it("never lets the overlay carry a reserved `mode` marker into a configured block", async () => {
+    // Break: the overlay is a SECOND seam that rebuilds the block, so the
+    // reserved-name rule has to hold here too. A partition that filtered only
+    // the three targets would carry `mode` through and hand init() a block
+    // whose deferred/configured state is ambiguous.
+    const repository = await newRepository();
+    await writeDeliveryHints(repository.root);
+    const result = await composeInitDiscovery(
+      repository.root,
+      templateDraft({
+        ...placeholderTargets(),
+        mode: "later",
+        experimental: { note: "kept" },
+      } as unknown as PoiesisConfig["delivery"]),
+    );
+    expect(result.unresolved).toEqual([]);
+    expect(result.config).toBeDefined();
+    // `mode` is a reserved NAME, so it is not an extension; the extension key
+    // beside it is, and the three targets resolve to the detected hints.
+    expect(result.config!.delivery).toEqual({
+      experimental: { note: "kept" },
+      preview: hintedDeliveryTarget("preview"),
+      staging: hintedDeliveryTarget("staging"),
+      production: hintedDeliveryTarget("production"),
+    });
+    expect(isDeferredDelivery(result.config!.delivery)).toBe(false);
+  });
+
+  it("adds no target to a deferred draft and keeps its extension keys", async () => {
+    // The deferred branch is the one the overlay must not touch. Deferral is
+    // an honest answer to the readiness question, so the composer neither
+    // completes it with a generated target nor rewrites its extension keys.
+    const repository = await newRepository();
+    await writeDeliveryHints(repository.root);
+    const result = await composeInitDiscovery(
+      repository.root,
+      templateDraft({
+        mode: DEFERRED_DELIVERY_MODE,
+        experimental: { note: "kept" },
+      } as PoiesisConfig["delivery"]),
+    );
+    expect(result.unresolved).toEqual([]);
+    expect(result.config).toBeDefined();
+    expect(isDeferredDelivery(result.config!.delivery)).toBe(true);
+    expect(result.config!.delivery).toEqual({
+      experimental: { note: "kept" },
+      mode: DEFERRED_DELIVERY_MODE,
+    });
+  });
+
+  it("never reaches the overlay for a draft that states no delivery block at all", async () => {
+    // Break: the omitted block is legacy, not an answered readiness question.
+    // If the overlay ran for it, the installed config would record a delivery
+    // decision that only the Author can make, and with three detected hints
+    // present every per-target question would silently disappear too.
+    const repository = await newRepository();
+    await writeDeliveryHints(repository.root);
+    const draft = templateDraft(undefined);
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.unresolved).toEqual(["delivery.mode"]);
+    expect(result.config).toBeUndefined();
+  });
+});
+
+describe("a configured-draft extension key reaches the managed init config", () => {
+  it("persists the extension beside the overlaid script adapters through interactive init", async () => {
+    // The composer's final config is what `init()` writes, so a key dropped by
+    // the overlay is a key deleted from the Author's managed config. This is
+    // the end-to-end shape of the break: the install succeeds and the
+    // extension is gone.
+    restoreForge = await installFakeForge();
+    const repository = await newRepository();
+    await writeDeliveryHints(repository.root);
+    const io = new ScriptedIO({ inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"] });
+    await runInteractiveInit({
+      root: repository.root,
+      io,
+      draft: templateDraft({
+        ...placeholderTargets(),
+        experimental: { note: "kept", retries: 2 },
+      } as PoiesisConfig["delivery"]),
+    });
+    const installed = await readInstalledConfig(repository.root);
+    expect(installed.delivery).toEqual({
+      experimental: { note: "kept", retries: 2 },
+      preview: hintedDeliveryTarget("preview"),
+      staging: hintedDeliveryTarget("staging"),
+      production: hintedDeliveryTarget("production"),
+    });
+  }, 90_000);
 });

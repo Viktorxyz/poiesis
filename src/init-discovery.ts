@@ -37,6 +37,7 @@ import { isDeferredDelivery, requireConfiguredDelivery, trackerProjectOf } from 
 import {
   parseTrackerFromUrl,
   autoResolveConfigDefaults,
+  deliveryExtensionKeys,
 } from "./maintenance.js";
 import { exists } from "./fs.js";
 import { PoiesisError } from "./errors.js";
@@ -238,11 +239,20 @@ export async function composeInitDiscovery(
         // argv because the delivery script-hint rule is internal-only.
         // Spec #139 / ticket #140: a deferred draft keeps its deferred state
         // instead of being completed with discovered command targets.
+        // Spec #139 / ticket #154: the overlay is the LAST seam to rewrite
+        // `delivery`, so it must carry the block's extension keys too — the
+        // schema accepted them (#152) and `resolveDelivery` preserved them
+        // (#153), and this rebuild used to delete what both had kept. The keys
+        // come from the shared `deliveryExtensionKeys` partition and the three
+        // known targets are written LAST, so the managed targets stay
+        // authoritative and an extension still cannot introduce or complete
+        // one.
         const finalConfig: ResolvedPoiesisConfig = {
           ...resolved.config,
           delivery: isDeferredDelivery(resolved.config.delivery)
             ? resolved.config.delivery
             : {
+                ...deliveryExtensionKeys(resolved.config.delivery),
                 preview: replaceTemplateDelivery(
                   requireConfiguredDelivery(resolved.config.delivery, "init discovery").preview,
                   deliveryDetection.preview,
