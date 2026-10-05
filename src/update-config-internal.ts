@@ -83,6 +83,65 @@ type JsonObject = Record<string, unknown>;
 const POIESIS_CONFIG_RELATIVE_PATH = ".poiesis/config.jsonc";
 
 /**
+ * Spec #139 / ticket #166 — the operation name this module reports. The
+ * refusal below is CONTEXTUAL, so the Author has to be told which command
+ * applies the rule: `init --config` and `update --config` read the same
+ * schema and answer the same question differently.
+ */
+const UPDATE_CONFIG_OPERATION = "update --config";
+
+/**
+ * Ticket #166 — an omitted `delivery` block is a FRESH-INSTALL default, never
+ * an UPDATE default.
+ *
+ * `init --config` may complete a project that states no delivery at all: the
+ * block resolves to the three generated command targets and `init` writes the
+ * matching `scripts/poiesis-<target>.mjs`. That is the legacy behavior an
+ * existing noninteractive installation was created under, so it stays exactly
+ * as it is.
+ *
+ * `update --config` is handed a proposed document for an installation that
+ * ALREADY recorded a delivery decision, and delivery is the one default that
+ * must not be invented there. Resolving the omission to the generated targets
+ * would replace a recorded `deferred` state — or the Author's three real
+ * commands — with three script names this transaction never writes, and
+ * `update --config` writes only the four managed artifacts. The document
+ * therefore has to state the decision, and an omission is refused.
+ *
+ * Why the check is HERE, and not in the schema:
+ *
+ *   - It is contextual. `delivery` stays optional in `configSchema` so
+ *     `init --config` keeps its legacy default, so this module — never the
+ *     shared parser — is where the operation's own rule belongs.
+ *   - It runs at step 1, immediately after the document is parsed, and
+ *     therefore BEFORE `autoResolveConfigDefaults` (the resolution that would
+ *     otherwise invent the three generated targets), before the capability
+ *     probes (`verifyModels`, `verifyTracker`, `verifyDeliveryConfiguration`,
+ *     the OpenCode schema call), before the journal is captured, and before
+ *     any write. A document that does not answer the question must not reach
+ *     the code that would answer it for it.
+ *   - It is `INVALID_DELIVERY_CONFIG`, the code `assertDeliveryShape` already
+ *     reports for a partial block, an unknown `mode`, and a deferred block
+ *     that also carries a target, so one rule, one code, and one place to read
+ *     about delivery shapes. `details.field` and `details.operation` are what
+ *     distinguish the omitted block from the partial one: an omitted block is
+ *     not an incomplete answer, it is no answer.
+ *
+ * A stated `delivery: null` is NOT absent — it is a malformed value, and it
+ * keeps the schema's own `INVALID_CONFIG` verdict.
+ */
+function assertUpdateConfigStatesDeliveryDecision(config: PoiesisConfig): void {
+  if (config.delivery !== undefined) return;
+  throw new PoiesisError(
+    "INVALID_DELIVERY_CONFIG",
+    `${UPDATE_CONFIG_OPERATION} configures an existing installation, so it requires a delivery decision: ` +
+      `add either the three delivery targets or { "mode": "deferred" } to the proposed config. ` +
+      `An omitted delivery block is only defaulted by \`poiesis init --config\`, which is the one operation that completes a fresh project.`,
+    { field: "delivery", operation: UPDATE_CONFIG_OPERATION },
+  );
+}
+
+/**
  * Test-only deterministic fault-injection hooks used by `runUpdateConfigTransaction`.
  * Each callback fires immediately BEFORE the corresponding write step (or
  * immediately AFTER for `postManifestWrite` / `postReceiptReplace`). Throwing
@@ -385,7 +444,11 @@ function assertUpdateConfigNoFixtureIntroduceOrAlter(
  * `replaceOwnershipReceipt` paths run).
  *
  * Step layout:
- *   1. parse + validate + assertResolvedConfig       (no I/O writes)
+ *   1. parse + validate + assertResolvedConfig + state the delivery decision
+ *      (no I/O writes; the contextual `INVALID_DELIVERY_CONFIG` refusal for an
+ *      omitted `delivery` block is ticket #166 and lands here, before step 3's
+ *      default resolution, before every probe, before the journal, and before
+ *      any write)
  *   2. ownership / auth / git / opencode-version      (no I/O writes)
  *   3. auto-discover defaults                         (no I/O writes)
  *   4. env validation: git / models / tracker / ...  (no I/O writes)
@@ -440,6 +503,12 @@ async function runLockedUpdateConfigTransaction(
   const proposedConfigRaw = await readUtf8(resolvedConfigPath);
   const proposedConfig = validateConfig(parseJsonc<unknown>(proposedConfigRaw, resolvedConfigPath), resolvedConfigPath);
   assertResolvedConfig(proposedConfig);
+  // Spec #139 / ticket #166: the proposed document must STATE its delivery
+  // decision. This runs before `autoResolveConfigDefaults` below — the step
+  // that would otherwise resolve an omitted block to the three generated
+  // command targets — and therefore before every capability probe, before the
+  // journal is captured, and before the first write.
+  assertUpdateConfigStatesDeliveryDecision(proposedConfig);
 
   // 2. Authenticate the trusted receipt FIRST, before any other ownership check
   //    consumes manifest records. This locks in the receipt's claim about the

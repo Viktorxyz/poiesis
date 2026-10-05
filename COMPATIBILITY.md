@@ -195,6 +195,8 @@ Both `delivery` branches are forward compatible: unknown outer extension keys on
 
 Delivery is configured later through `poiesis update --config`, never by hand-editing the managed config. The change is atomic and leaves the `tracker` block untouched.
 
+An omitted `delivery` block is a fresh-install default, never an update default: `poiesis init --config` resolves it to the three generated command targets, and `poiesis update --config` refuses it. `poiesis update --config` refuses a proposed config that omits `delivery` with `INVALID_DELIVERY_CONFIG` and details `{ field: "delivery", operation: "update --config" }`, before any default resolution, probe, journal, or write, so an installation's recorded delivery decision is never replaced by a default its Author did not choose. The `field` and `operation` details are what separate this refusal from the partial-block rejection above: an omitted block is not an incomplete answer, it is no answer. The rule is contextual and does not tighten the schema — `delivery` remains optional, so `init --config` keeps its legacy generated default and a stated `"delivery": null` keeps the schema's own `INVALID_CONFIG` verdict. `poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands.
+
 ### Installation authority and linked worktrees
 
 Poiesis installs into the PRIMARY checkout of a clone, and that installation is the authority for every guarded operation in every linked worktree of the same clone. A linked worktree carries none of the primary's managed Poiesis state, so an operation launched from one is judged by the install that governs the clone, not by the worktree's silence.

@@ -77,6 +77,44 @@ const NO_EXISTING_WORKFLOW_STATEMENT =
   "Adopting a deferred install requires no change to any existing project workflow: nothing is pushed, no pull or merge request is opened, and nothing is deployed to any environment.";
 
 /**
+ * Ticket #166 — the init-vs-update distinction, in three exact sentences.
+ *
+ * An omitted `delivery` block means two different things to two different
+ * commands, and both halves have to be stated wherever an Author learns what
+ * `update --config` is for. The first sentence is the distinction itself; the
+ * second is the refusal an update document gets, with the code, the two
+ * details that identify it, and the point in the transaction where it is
+ * decided; the third is the consequence that matters most to an Author
+ * planning to configure delivery later — nothing is generated for them, so
+ * the three commands are theirs to write.
+ *
+ * The timing clause in the second sentence is load-bearing. A refusal decided
+ * after default resolution would already have resolved the omission, which is
+ * the whole defect, so "before any default resolution" is not a flourish: it
+ * is the only placement that makes the code honest.
+ */
+const INIT_UPDATE_DELIVERY_DISTINCTION =
+  "An omitted `delivery` block is a fresh-install default, never an update default: `poiesis init --config` resolves it to the three generated command targets, and `poiesis update --config` refuses it.";
+
+const UPDATE_CONFIG_DELIVERY_REFUSAL =
+  "`poiesis update --config` refuses a proposed config that omits `delivery` with `INVALID_DELIVERY_CONFIG` and details `{ field: \"delivery\", operation: \"update --config\" }`, before any default resolution, probe, journal, or write, so an installation's recorded delivery decision is never replaced by a default its Author did not choose.";
+
+const UPDATE_CONFIG_GENERATES_NO_SCRIPT =
+  "`poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands.";
+
+/**
+ * The projection form of the same rule, for the role and the installed agent.
+ *
+ * Those two surfaces are what actually author and run the `update --config`
+ * document, so the sentence they need is the operational one: state the
+ * decision or be refused, and carry the installed one through any other
+ * change. It is deliberately NOT the README's long explanation — an agent
+ * reading a role file needs the rule and the refusal, not the rationale.
+ */
+const UPDATE_CONFIG_DELIVERY_REQUIREMENT =
+  "A `poiesis update --config` document must state its `delivery` decision: an omitted `delivery` block is refused with `INVALID_DELIVERY_CONFIG` naming `field: \"delivery\"` and `operation: \"update --config\"`, because an update configures an existing installation and never invents the delivery it already recorded.";
+
+/**
  * Spec #139 / ticket #148 — the crash-left `store.lock.guard` contract.
  *
  * The canonical `store.lock` has PID and ownership-token logic, so a stale one
@@ -313,6 +351,16 @@ describe("the Poiesis role carries the same contract", () => {
     expect(role).toContain("DELIVERY_DEFERRED");
     expect(role).toContain("must not claim");
   });
+
+  it("states the init-vs-update distinction, because the role is what runs update --config", () => {
+    // Ticket #166. The role already tells the agent to route a delivery change
+    // through `poiesis update --config`; without the new rule the same role
+    // would hand that command a document that omits `delivery` and be refused
+    // by the very transaction it was told to use. The sentence an agent needs
+    // is the one that says the document must state the decision.
+    expect(role).toContain(UPDATE_CONFIG_DELIVERY_REQUIREMENT);
+    expect(role).toContain(UPDATE_CONFIG_GENERATES_NO_SCRIPT);
+  });
 });
 
 describe("the projected primary agent carries the same contract", () => {
@@ -334,6 +382,14 @@ describe("the projected primary agent carries the same contract", () => {
     expect(agent).toContain("pauses after exact-candidate Proof");
     expect(agent).toContain("DELIVERY_DEFERRED");
     expect(agent).toContain("must not claim");
+  });
+
+  it("projects the init-vs-update distinction for an omitted delivery block", () => {
+    // Ticket #166. The installed agent is the surface that actually authors and
+    // runs the `update --config` document, so the rule has to travel with the
+    // deferred contract rather than living only in the operator-facing docs.
+    expect(agent).toContain(UPDATE_CONFIG_DELIVERY_REQUIREMENT);
+    expect(agent).toContain(UPDATE_CONFIG_GENERATES_NO_SCRIPT);
   });
 });
 
@@ -404,6 +460,28 @@ describe("README documents the whole product contract", () => {
     // The old bullet made configured Preview/Staging/Production targets a hard
     // install requirement, which is false for an explicitly deferred install.
     expect(readme).toContain("A configured Preview, Staging, and Production delivery target, or an explicit deferred state");
+  });
+
+  it("documents the init-vs-update distinction for an omitted delivery block", () => {
+    // Ticket #166. The README already promised that one config shape feeds
+    // both `init --config` and `update --config`; the distinction is what
+    // keeps that promise true, and the refusal is what an Author meets the
+    // first time they edit a copy of that same file and drop a block.
+    expect(readme).toContain(INIT_UPDATE_DELIVERY_DISTINCTION);
+    expect(readme).toContain(UPDATE_CONFIG_DELIVERY_REFUSAL);
+    expect(readme).toContain(UPDATE_CONFIG_GENERATES_NO_SCRIPT);
+  });
+
+  it("no longer presents one config shape as identical input to init and update", () => {
+    // The old sentence claimed the same document is the accepted input to both
+    // commands. For `delivery` that is now false in one direction, so the
+    // sentence has to carry the exception where the reader meets it.
+    expect(readme).not.toContain(
+      "The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init).",
+    );
+    expect(readme).toContain(
+      "an `update --config` document must also state its `delivery` decision",
+    );
   });
 });
 
@@ -491,6 +569,37 @@ describe("COMPATIBILITY documents the providers", () => {
     expect(compatibility).toContain(STORE_BOUNDED_READ_STATEMENT);
     expect(compatibility).toContain(STORE_BOUNDED_MUTATION_STATEMENT);
     expect(compatibility).toContain(STORE_NO_AUTOMATIC_REPAIR_STATEMENT);
+  });
+
+  it("documents the init-vs-update distinction for an omitted delivery block", () => {
+    // Ticket #166. The matrix is where an integrator reads which code a given
+    // document can get, so the distinction and the exact code that enforces it
+    // belong next to the other `delivery` rejection rules rather than only in
+    // the README's walkthrough.
+    expect(compatibility).toContain(INIT_UPDATE_DELIVERY_DISTINCTION);
+    expect(compatibility).toContain(UPDATE_CONFIG_DELIVERY_REFUSAL);
+    expect(compatibility).toContain(UPDATE_CONFIG_GENERATES_NO_SCRIPT);
+  });
+});
+
+describe("the canonical Method states the init-vs-update delivery distinction", () => {
+  const method = readRepoFile("POIESIS_METHOD.md");
+
+  it("states the distinction, the refusal, and the absence of a generated script", () => {
+    // The canon is what the role and the projected agent are written from, so
+    // the rule has to live here first. The `update --config` paragraph is the
+    // one an Author reads when configuring delivery later, which is exactly
+    // where a reader most needs to know the document must state `delivery`.
+    expect(method).toContain(INIT_UPDATE_DELIVERY_DISTINCTION);
+    expect(method).toContain(UPDATE_CONFIG_DELIVERY_REFUSAL);
+    expect(method).toContain(UPDATE_CONFIG_GENERATES_NO_SCRIPT);
+  });
+
+  it("keeps the schema itself un-tightened, so the rule stays contextual", () => {
+    // The refusal is CONTEXTUAL. If the canon implied the config schema now
+    // requires `delivery`, a reader would expect `init --config` to refuse an
+    // omission too — which is the legacy behavior that must survive.
+    expect(method).toContain("`delivery` is optional in the config schema");
   });
 });
 
