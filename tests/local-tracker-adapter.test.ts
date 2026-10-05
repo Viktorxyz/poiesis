@@ -29,6 +29,7 @@ import { realpath } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createTrackerAdapter } from "../src/adapters.js";
+import { PoiesisError } from "../src/errors.js";
 import {
   LOCAL_TRACKER_LOCK_VERSION,
   LOCAL_TRACKER_STORE_DIRECTORY,
@@ -418,6 +419,38 @@ describe("the local tracker implements the complete TrackerAdapter", () => {
     expect((await reloaded.supersedeSpec(spec.id, { reason: "Also replanned" })).supersededBy).toEqual([]);
   });
 
+  it("records a replacement this store never issued instead of refusing the supersession", async () => {
+    // Break: requiring the replacement to EXIST would make supersession depend
+    // on a resolution the tracker never promised. A Replan names the ticket that
+    // will replace this one, and that ticket is routinely created after the
+    // supersession is recorded. Every provider stores the reference without
+    // resolving it, so the Local tracker must not be the one that invents a
+    // stricter rule. The IDENTITY is still validated — a non-LOCAL value is
+    // refused above, because it would commit a store this adapter can never
+    // read again — while EXISTENCE is not invented.
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({
+      title: "T",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: "none",
+    });
+
+    const superseded = await tracker.supersedeTicket(ticket.id, {
+      reason: "Replanned",
+      replacementIds: ["LOCAL-99"],
+    });
+
+    expect(superseded).toMatchObject({ state: "superseded", supersededBy: ["LOCAL-99"] });
+    // Persisted, and still a store this adapter's own strict validator reads.
+    const reloaded = createLocalTrackerAdapter(repository.root);
+    expect((await reloaded.getTicket(ticket.id)).supersededBy).toEqual(["LOCAL-99"]);
+    // The never-issued identifier is not an item, and nothing invents one.
+    await expect(reloaded.getTicket("LOCAL-99")).rejects.toMatchObject({ code: "TRACKER_ITEM_NOT_FOUND" });
+  });
+
   it("mints a fresh comment id when a valid store carries a noncontiguous comment run", async () => {
     const repository = await newRepository();
     const tracker = createLocalTrackerAdapter(repository.root);
@@ -525,6 +558,105 @@ describe("the local tracker implements the complete TrackerAdapter", () => {
 
     const location = await resolveLocalTrackerStoreLocation(worktree);
     expect(location).toEqual(await resolveLocalTrackerStoreLocation(repository.root));
+  });
+});
+
+/**
+ * Spec #139 / ticket #150 — an identifier that names a JavaScript prototype
+ * member is not a tracker item.
+ *
+ * `store.items` is a plain object, so a bracket lookup of `__proto__`,
+ * `constructor`, or `toString` returns something REAL — an inherited object or
+ * function — where the caller asked for a Poiesis item. A lookup that treats
+ * an inherited value as "found" therefore does not report a missing item at
+ * all: it either throws a bare `TypeError` from inside the adapter, with no
+ * code an operator can branch on, or (for a key that reaches a field read)
+ * surfaces inherited content as if the tracker had recorded it. Membership is
+ * therefore OWN-property membership, and every such identifier gets exactly
+ * the typed refusal an unknown identifier has always gotten, with the store
+ * left byte-for-byte untouched.
+ */
+describe("the local store resolves an identifier by own property, never through the prototype chain", () => {
+  const INHERITED_KEYS = ["__proto__", "constructor", "toString", "hasOwnProperty", "valueOf"] as const;
+
+  it("reports an inherited prototype member as a missing item on every read", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    await tracker.createSpec({ title: "Intent", body: "B" });
+
+    for (const key of INHERITED_KEYS) {
+      for (const call of [
+        () => tracker.getSpec(key),
+        () => tracker.getTicket(key),
+      ]) {
+        const error = await call().then(
+          () => undefined,
+          (reason: unknown) => reason,
+        );
+        // The typed refusal, not a `TypeError` raised while reading a field off
+        // `Object.prototype`.
+        expect(error, `${key} must be an unknown item`).toBeInstanceOf(PoiesisError);
+        expect(error, `${key} must be an unknown item`).toMatchObject({
+          code: "TRACKER_ITEM_NOT_FOUND",
+          details: { id: key },
+        });
+      }
+    }
+  });
+
+  it("reports it on every mutation and leaves the canonical store byte-identical", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({
+      title: "T",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: "none",
+    });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const before = await readFile(location.storePath, "utf8");
+
+    for (const key of INHERITED_KEYS) {
+      for (const call of [
+        () => tracker.updateSpec(key, { title: "Renamed" }),
+        () => tracker.updateTicket(key, { body: "Rewritten" }),
+        () => tracker.commentSpec(key, "note"),
+        () => tracker.commentTicket(key, "note"),
+        () => tracker.closeSpec(key),
+        () => tracker.closeTicket(key),
+        () => tracker.supersedeSpec(key, { reason: "Replanned" }),
+        () => tracker.supersedeTicket(key, { reason: "Replanned" }),
+      ]) {
+        await expect(call(), `${key} must be an unknown item`).rejects.toMatchObject({
+          code: "TRACKER_ITEM_NOT_FOUND",
+        });
+      }
+    }
+
+    // Every rejection happened inside the guarded read-modify-write, so the
+    // proof is that none of them reached the durable write at all.
+    expect(await readFile(location.storePath, "utf8")).toBe(before);
+    expect((await tracker.getSpec(spec.id)).title).toBe("Intent");
+    expect((await tracker.getTicket(ticket.id)).body).toBe("B");
+  });
+
+  it("refuses a ticket whose parent identifier is an inherited prototype member", async () => {
+    // Break: the parent check runs inside the mutation, so a lookup that
+    // resolved `constructor` to an inherited function would create the ticket
+    // against something the store never issued.
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const before = await readFile(location.storePath, "utf8").catch(() => "");
+
+    for (const key of INHERITED_KEYS) {
+      await expect(
+        tracker.createTicket({ title: "Orphan", body: "B", parentSpecId: key, dependencyText: "none" }),
+        `${key} must be an unknown parent`).rejects.toMatchObject({ code: "TRACKER_ITEM_NOT_FOUND" });
+    }
+
+    expect(await readFile(location.storePath, "utf8").catch(() => "")).toBe(before);
   });
 });
 
@@ -915,23 +1047,62 @@ describe("a crash-left store lock guard is never auto-reclaimed, only reported",
     // step three is the retry. Order is the whole point of the guidance.
     expect(steps[0]).toMatch(/first/i);
     expect(steps[0]).toMatch(/no Poiesis process is accessing this clone/i);
-    expect(steps[1]).toContain(location.guardPath);
-    expect(steps[1]).toMatch(/rm /);
+    expect(steps[1]).toMatch(/remove only the exact store\.lock\.guard artifact/i);
     expect(steps[2]).toMatch(/retry/i);
     // The canonical lock is explicitly OUT of scope, with the reason.
-    expect(steps.some((step) => step.includes(location.lockPath))).toBe(true);
-    expect(text).toMatch(/never remove/i);
+    expect(text).toMatch(/never remove the canonical store\.lock/i);
     expect(text).toMatch(/holder PID and ownership token/i);
     // The guard is never auto-reclaimed, and the guidance says so instead of
     // implying a self-healing runtime.
     expect(text).toMatch(/never reclaimed by the runtime/i);
 
-    // Nothing in the guidance may hand the operator a command that removes the
-    // canonical lock: `store.lock.guard` must not be read as `store.lock`.
-    const removals = steps.filter((step) => /\brm\b/.test(step));
-    expect(removals).toHaveLength(1);
-    expect(removals[0]).toContain(location.guardPath);
-    expect(removals[0]).not.toMatch(/store\.lock(?![\w.])/);
+    // The report hands over the EXACT paths as structured data (asserted above)
+    // and describes the operation in prose, so nothing in the prose is a
+    // command an operator could run and nothing in it is built by
+    // concatenating a path.
+    for (const step of steps) {
+      expect(step, "the guidance must carry no command").not.toMatch(/\brm\b/i);
+      expect(step, "the guidance must carry no command").not.toMatch(/\b(unlink|chmod|rmdir|sudo|sh|bash)\b/i);
+      expect(step, "the guidance must carry no shell syntax").not.toMatch(/[;&|`$><]/);
+      expect(step, "the guidance must carry no interpolated path").not.toContain(location.guardPath);
+      expect(step, "the guidance must carry no interpolated path").not.toContain(location.lockPath);
+    }
+  });
+
+  it("states the procedure in prose even when the guard path is hostile", async () => {
+    // Break: guidance built by concatenation turns a hostile path into a
+    // command. An operator who pastes `rm <path>` from an error message is
+    // running whatever the path contains — a second argument, a substitution,
+    // a pipe — and a path Poiesis did not choose is exactly what a rename or a
+    // hostile clone can supply. The report therefore names the artifact, not a
+    // command, and carries the exact path as a field an operator (or Poiesis)
+    // can act on without ever being executed.
+    const repository = await newRepository();
+    const real = await resolveLocalTrackerStoreLocation(repository.root);
+    await mkdir(real.directory, { recursive: true, mode: 0o700 });
+    const hostile = join(real.directory, 'store.lock.guard"; rm -rf ~ $(id) `id` | tee pwned #');
+    const planted = lockEnvelope("crashed-holder-token", await deadPid());
+    await writeFile(hostile, planted, { mode: 0o600 });
+
+    const error = (await acquireLocalTrackerLockWithTimeout({ ...real, guardPath: hostile }, 200).catch(
+      (reason: unknown) => reason,
+    )) as { details: Record<string, unknown> };
+    const details = error.details;
+
+    // The exact path IS available — structurally, as a value.
+    expect(details.guardPath).toBe(hostile);
+    const steps = details.guardRecovery as string[];
+    expect(steps.length).toBeGreaterThanOrEqual(4);
+    for (const step of steps) {
+      expect(step, "no command may be constructed from a path").not.toMatch(/\brm\b/i);
+      expect(step, "no command may be constructed from a path").not.toMatch(/[;&|`$><]/);
+      // The prose names the two fixed artifacts, so no attacker-controlled byte
+      // reaches it at all.
+      expect(step, "the prose must not interpolate the path").not.toContain(hostile);
+    }
+    // The refusal still happened, and it still changed nothing on disk.
+    expect(await readFile(hostile, "utf8")).toBe(planted);
+    expect((await readdir(real.directory)).sort()).toEqual([hostile.split("/").pop() as string]);
   });
 });
 

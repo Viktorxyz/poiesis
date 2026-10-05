@@ -457,12 +457,24 @@ async function releaseTokenChecked(location: LocalTrackerStoreLocation, token: s
  *     in which case no amount of waiting helps, because the runtime will never
  *     reclaim it.
  *
- * The report therefore names BOTH exact paths, and the recovery steps are scoped
- * to the guard. The canonical `store.lock` is deliberately NOT a removal
- * target: it already has the ordinary holder-PID and ownership-token check, so a
- * stale one is reclaimed by the runtime inside the very bounded wait that just
- * expired. Telling an operator to delete it by hand would bypass the identity
- * check that makes the protocol safe — a hand-deleted live lock admits a second
+ * The report therefore carries BOTH exact paths as STRUCTURED fields and states
+ * the procedure as PROSE that names the two artifacts by their fixed names.
+ * It never builds a command. A path is not a command, and this store lives
+ * inside a Git common directory whose name Poiesis did not choose: a clone
+ * renamed by a human, a checkout under a hostile parent directory, or a path
+ * with a space in it all produce a string that is perfectly safe to READ and
+ * dangerous to paste into a shell. Concatenating `rm <path>` into operator
+ * guidance therefore hands a command to whatever the path contains — a second
+ * argument, a command substitution, a pipe — and an operator who trusts an
+ * error message is exactly the person who will run it. So the exact paths
+ * travel as `lockPath` / `guardPath` / `storePath` values a reader or Poiesis
+ * can act on, and the prose says what to do without ever being executable.
+ *
+ * The canonical `store.lock` is deliberately NOT a removal target: it already
+ * has the ordinary holder-PID and ownership-token check, so a stale one is
+ * reclaimed by the runtime inside the very bounded wait that just expired.
+ * Telling an operator to delete it by hand would bypass the identity check
+ * that makes the protocol safe — a hand-deleted live lock admits a second
  * writer — to fix a problem the runtime does not have.
  */
 function lockTimeoutError(location: LocalTrackerStoreLocation, timeoutMs: number): PoiesisError {
@@ -470,23 +482,28 @@ function lockTimeoutError(location: LocalTrackerStoreLocation, timeoutMs: number
     "LOCAL_TRACKER_LOCK_TIMEOUT",
     "The local tracker store lock could not be acquired within the bounded wait",
     {
-      // `path` is the canonical lock, kept for consumers that already read it;
-      // `lockPath` / `guardPath` / `storePath` are the unambiguous names.
+      // The EXACT paths, as values. `path` is the canonical lock, kept for
+      // consumers that already read it; `lockPath` / `guardPath` / `storePath`
+      // are the unambiguous names.
       path: location.lockPath,
       lockPath: location.lockPath,
       guardPath: location.guardPath,
       storePath: location.storePath,
       gitCommonDir: location.gitCommonDir,
       timeoutMs,
+      // Prose only. Not one character in these steps has a meaning to a shell,
+      // and no step interpolates a path, so no step can become a command.
       guardRecovery: [
-        "First verify that no Poiesis process is accessing this clone: a guard present at " +
-          `${location.guardPath} is never reclaimed by the runtime, whatever its stamped holder PID says, ` +
-          "because a dead PID cannot distinguish a crashed holder from a live process this process may not signal.",
-        `Then remove only the exact guard artifact, and nothing else: rm ${location.guardPath}`,
-        "Then retry the operation; with the guard gone the next acquirer enters the critical section normally.",
-        `Never remove ${location.lockPath} to clear a stale holder: its holder PID and ownership token already ` +
-          "reclaim one within the bounded wait, and a hand-deleted live lock would admit a second writer and " +
-          "break the exclusivity this lock exists to provide.",
+        "First verify that no Poiesis process is accessing this clone: a store.lock.guard is never reclaimed by " +
+          "the runtime, whatever its stamped holder PID says, because a dead PID cannot distinguish a crashed holder " +
+          "from a live process this process may not signal.",
+        "Then remove only the exact store.lock.guard artifact, and nothing else. The exact path is the guardPath " +
+          "value on this error, and this guidance names the artifact instead of printing a command for it, so " +
+          "nothing here is meant to be run as written.",
+        "Then retry the operation, and with the guard gone the next acquirer enters the critical section normally.",
+        "Never remove the canonical store.lock to clear a stale holder: its holder PID and ownership token already " +
+          "reclaim one within the bounded wait, and a hand-deleted live lock would admit a second writer and break " +
+          "the exclusivity this lock exists to provide.",
       ],
     },
   );
@@ -803,14 +820,30 @@ function assertLocalKind(item: LocalTrackerItemRecord, expected: TrackerItemKind
   return item;
 }
 
+/**
+ * Resolve one item from the store.
+ *
+ * Membership is checked with `Object.hasOwn`, never with a bare bracket read
+ * whose result is compared to `undefined`. `store.items` is a plain object, so
+ * `items["__proto__"]`, `items["constructor"]`, and `items["toString"]` all
+ * return something real — an inherited object or function — where the caller
+ * asked for a tracker item. Testing the value would turn every one of those
+ * identifiers into a `TypeError` raised while reading a field off
+ * `Object.prototype`, with no code for an operator to branch on, and would
+ * leave an inherited value one refactor away from being read as Poiesis
+ * content. Own-property membership asks the only question that matters — is
+ * this key an item THIS store issued — so an identifier that merely names a
+ * prototype member is an unknown identifier and gets the ordinary typed
+ * refusal.
+ */
 function localRecord(store: LocalTrackerStore, id: string, kind?: TrackerItemKind): LocalTrackerItemFile {
   const normalized = requiredText(id, "id");
-  const record = store.items[normalized];
-  if (record === undefined) {
+  if (!Object.hasOwn(store.items, normalized)) {
     throw new PoiesisError("TRACKER_ITEM_NOT_FOUND", `Local tracker item ${normalized} was not found`, {
       id: normalized,
     });
   }
+  const record = store.items[normalized] as LocalTrackerItemFile;
   if (kind !== undefined) assertLocalKind(record.item, kind);
   return record;
 }

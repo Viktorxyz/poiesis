@@ -47,6 +47,17 @@ import type {
  * config, never placed in a `TrackerItem`, never logged, and never copied
  * into an error message or an error's `details`; every echoed byte that
  * reaches an error goes through the redactor first.
+ *
+ * BOUNDED (ticket #150). Every attempt carries its own `AbortSignal` and
+ * ends at a fixed attempt deadline, and every operation — all its attempts,
+ * all its waits, and the idempotency probe — is refused at a fixed total
+ * budget. Without those two ceilings a Linear answer that simply never
+ * arrives hangs the caller forever: no error, no receipt, no bound. What
+ * Poiesis does with a timeout depends only on what the mode can safely do
+ * next, which is why the same deadline produces three different outcomes: a
+ * read is retried, an idempotent create re-probes the identity it already
+ * used, and a non-idempotent mutation is reported as the ambiguity it is
+ * rather than replayed.
  */
 
 /** The official Linear GraphQL endpoint. Never proxied, never overridden by config. */
@@ -62,6 +73,13 @@ export interface LinearHttpRequest {
   readonly method: "POST";
   readonly headers: Readonly<Record<string, string>>;
   readonly body: string;
+  /**
+   * Ticket #150 — the deadline for THIS attempt, and it is never absent. A
+   * transport that receives no signal cannot be stopped, so an attempt without
+   * one is an unbounded wait: a Linear answer that never arrives would hang the
+   * caller with no error and no bound.
+   */
+  readonly signal: AbortSignal;
 }
 
 export interface LinearHttpResponse {
@@ -71,6 +89,14 @@ export interface LinearHttpResponse {
 }
 
 export type LinearTransport = (request: LinearHttpRequest) => Promise<LinearHttpResponse>;
+
+/** A scheduled deadline Poiesis can take back before it fires. */
+export interface LinearTimerHandle {
+  readonly cancel: () => void;
+}
+
+/** Ticket #150 — the timer seam, so a deadline is testable without wall clock. */
+export type LinearTimer = (ms: number, onElapsed: () => void) => LinearTimerHandle;
 
 /**
  * Ticket #141 — every source of nondeterminism is injected so the adapter
@@ -88,6 +114,14 @@ export interface LinearTrackerSeams {
   readonly sleep?: (ms: number) => Promise<void>;
   /** Injected UUID source, so an idempotent create reuses one identity. */
   readonly uuid?: () => string;
+  /**
+   * Ticket #150 — the timer that ends an attempt. The clock above measures
+   * time; this one ADVANCES it, and it is the only thing that may abort a
+   * request. Injecting it is what makes the deadline provable: a test fires a
+   * deadline deliberately instead of waiting for it, so "Poiesis bounded this"
+   * is distinguishable from "the machine was quick".
+   */
+  readonly timer?: LinearTimer;
 }
 
 export interface LinearTrackerConfig {
@@ -101,6 +135,7 @@ interface ResolvedSeams {
   readonly clock: () => number;
   readonly sleep: (ms: number) => Promise<void>;
   readonly uuid: () => string;
+  readonly timer: LinearTimer;
   readonly authorization: string;
 }
 
@@ -146,15 +181,34 @@ function resolveSeams(seams: LinearTrackerSeams): ResolvedSeams {
     clock: seams.clock ?? (() => Date.now()),
     sleep: seams.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
     uuid: seams.uuid ?? (() => randomUUID()),
+    timer: seams.timer ?? defaultTimer,
     authorization: resolveAuthorization(env),
   };
 }
+
+/**
+ * The real deadline. The handle is deliberately NOT unref'd: a pending
+ * attempt timeout is the only thing that can end a request Poiesis has already
+ * sent, so the process must stay alive until it fires or is cancelled.
+ */
+const defaultTimer: LinearTimer = (ms, onElapsed) => {
+  const handle = setTimeout(onElapsed, Math.max(0, ms));
+  return {
+    cancel: () => {
+      clearTimeout(handle);
+    },
+  };
+};
 
 const defaultTransport: LinearTransport = async (request) => {
   const response = await fetch(request.url, {
     method: request.method,
     headers: { ...request.headers },
     body: request.body,
+    // The attempt's own deadline reaches the socket. Without this the timer
+    // would classify an abort Poiesis never sends, and a stalled connection
+    // would wait forever.
+    signal: request.signal,
   });
   const headers: Record<string, string> = {};
   response.headers.forEach((value, key) => {
@@ -180,19 +234,64 @@ function operationOf(document: string): string {
  */
 type LinearCallMode = "read" | "idempotent" | "mutation";
 
+/**
+ * Ticket #150 — the budget a nested call inherits from the operation that owns
+ * it.
+ *
+ * A nested call that starts a FRESH budget is not bounded by its parent, it
+ * doubles the parent: an idempotent create would wait up to two operation
+ * deadlines for one Poiesis item, and the probe — which is only ever asked
+ * whether one identity exists — would be entitled to its own full retry budget
+ * inside a budget that was already spent. So the enclosing operation passes its
+ * ABSOLUTE deadline down, and the nested call clamps to it. The remaining time
+ * is deliberately not passed as a second number: one deadline is the single
+ * source of truth, and a snapshot of "what was left" would go stale inside the
+ * very call it bounds.
+ */
+export interface LinearProbeBudget {
+  /** Absolute clock time, from the injected clock, the whole operation must finish by. */
+  readonly deadlineAt: number;
+  /**
+   * The nested call asks ONE question, so it makes ONE attempt. A probe that
+   * cannot answer on its first try will not answer on its third: Linear is not
+   * becoming reachable inside the milliseconds that are left.
+   */
+  readonly singleAttempt: true;
+}
+
 type LinearAttempt =
   | { readonly kind: "data"; readonly data: Record<string, unknown> }
   | { readonly kind: "rate-limited"; readonly status: number; readonly retryAfterMs: number }
   | { readonly kind: "server-error"; readonly status: number; readonly body: string }
   | { readonly kind: "transport"; readonly cause: string; readonly message: string }
+  | { readonly kind: "timeout"; readonly timeoutMs: number }
+  | { readonly kind: "probe-failed"; readonly cause: string }
   | { readonly kind: "rejected"; readonly error: PoiesisError };
 
 /**
  * Send one request and classify the outcome, never throwing for a
  * condition the caller may be allowed to retry.
+ *
+ * `attemptTimeoutMs` is the deadline for THIS attempt, and it is enforced by
+ * aborting the request's own signal rather than by racing the promise. Racing
+ * would leave the socket open and the transport running; aborting ends the
+ * work. The flag — not the shape of the error the transport threw — decides
+ * whether the attempt timed out, because Poiesis owns the only signal it ever
+ * passes, so an abort can only be the deadline it armed.
  */
-async function attemptOnce(seams: ResolvedSeams, document: string, variables: Record<string, unknown>): Promise<LinearAttempt> {
+async function attemptOnce(
+  seams: ResolvedSeams,
+  document: string,
+  variables: Record<string, unknown>,
+  attemptTimeoutMs: number,
+): Promise<LinearAttempt> {
   const operation = operationOf(document);
+  const controller = new AbortController();
+  let deadlineElapsed = false;
+  const deadline = seams.timer(attemptTimeoutMs, () => {
+    deadlineElapsed = true;
+    controller.abort();
+  });
   const request: LinearHttpRequest = {
     url: LINEAR_GRAPHQL_ENDPOINT,
     method: "POST",
@@ -202,16 +301,29 @@ async function attemptOnce(seams: ResolvedSeams, document: string, variables: Re
       authorization: seams.authorization,
     },
     body: JSON.stringify({ query: document, variables }),
+    signal: controller.signal,
   };
   let response: LinearHttpResponse;
   try {
     response = await seams.transport(request);
   } catch (error) {
+    if (deadlineElapsed) return { kind: "timeout", timeoutMs: attemptTimeoutMs };
     return {
       kind: "transport",
       cause: error instanceof Error ? error.name : "unknown",
       message: redact(seams, error instanceof Error ? error.message : String(error)),
     };
+  } finally {
+    // The deadline is taken back the moment the attempt is over, so a settled
+    // attempt can never abort a later one.
+    deadline.cancel();
+  }
+  if (deadlineElapsed) {
+    // An answer that arrived after the attempt's deadline is not used. A late
+    // answer is still an answer about a request Poiesis already gave up on,
+    // and for a mutation acting on it would be acting on evidence the deadline
+    // said no longer existed.
+    return { kind: "timeout", timeoutMs: attemptTimeoutMs };
   }
   if (response.status === 401 || response.status === 403) {
     // A refused credential will not fix itself; retrying only spends the
@@ -293,36 +405,97 @@ async function attemptOnce(seams: ResolvedSeams, document: string, variables: Re
 }
 
 /**
- * Run an operation within the retry bound.
+ * Run an operation within the retry bound AND the operation deadline.
  *
  * `beforeRetry` is the idempotency anchor: an `idempotent` create passes a
  * probe that re-reads the identity it already used, so a lost response
  * resolves to the issue the first attempt created instead of a second one.
+ * That probe is also the only evidence that can tell "nothing was created"
+ * from "the create landed and its answer was lost", so a probe that FAILS
+ * resolves nothing — the create's outcome is unknown, and the operation
+ * reports it as uncertain rather than letting the probe's own error escape and
+ * invite a caller to retry the create under a new identity.
+ *
+ * The probe runs INSIDE this operation's deadline and as a single attempt
+ * (`LinearProbeBudget`), so the create's total is one budget rather than one
+ * budget per nested call, and a probe that cannot answer ends the flow instead
+ * of spending a second budget failing to.
  */
 async function executeWith(
   seams: ResolvedSeams,
   document: string,
   variables: Record<string, unknown>,
   mode: LinearCallMode,
-  beforeRetry?: (attempt: number) => Promise<Record<string, unknown> | null>,
+  beforeRetry?: (attempt: number, budget: LinearProbeBudget) => Promise<Record<string, unknown> | null>,
+  enclosing?: LinearProbeBudget,
 ): Promise<Record<string, unknown>> {
   const operation = operationOf(document);
   const retryable = mode !== "mutation";
   const startedAt = seams.clock();
+  // The enclosing deadline WINS over a fresh one: a nested call is bounded by
+  // the operation that owns it, never by a second full allowance.
+  const deadlineAt =
+    enclosing === undefined ? startedAt + LINEAR_OPERATION_DEADLINE_MS : Math.min(startedAt + LINEAR_OPERATION_DEADLINE_MS, enclosing.deadlineAt);
+  const maxAttempts = enclosing?.singleAttempt === true ? 1 : LINEAR_MAX_ATTEMPTS;
+  // Whether this operation reached Linear at all, and whether Linear ever
+  // answered. Together they decide what an exhausted budget MEANS: nothing was
+  // sent, so asking again is free; something was sent and never confirmed, so
+  // the outcome is genuinely unknown.
+  let dispatched = false;
   for (let attempt = 1; ; attempt += 1) {
+    // No attempt and no probe ever starts without budget left for it, so the
+    // operation's total is bounded by its deadline and not only by its cap.
+    if (seams.clock() >= deadlineAt) {
+      throw operationDeadline(operation, mode, attempt - 1, ambiguous(mode, dispatched));
+    }
     if (attempt > 1 && beforeRetry !== undefined) {
-      const existing = await beforeRetry(attempt);
+      let existing: Record<string, unknown> | null;
+      try {
+        existing = await beforeRetry(attempt, { deadlineAt, singleAttempt: true });
+      } catch (error) {
+        throw uncertainMutation(operation, {
+          kind: "probe-failed",
+          // A code from Poiesis's own vocabulary, never the probe's message:
+          // the probe's failure came from Linear, so its text is upstream.
+          cause: error instanceof PoiesisError ? error.code : error instanceof Error ? error.name : "unknown",
+        });
+      }
       if (existing !== null) return existing;
     }
-    const outcome = await attemptOnce(seams, document, variables);
+    // The attempt may never outlive the operation it belongs to.
+    const budget = Math.min(LINEAR_ATTEMPT_TIMEOUT_MS, deadlineAt - seams.clock());
+    if (budget <= 0) throw operationDeadline(operation, mode, attempt - 1, ambiguous(mode, dispatched));
+    dispatched = true;
+    const outcome = await attemptOnce(seams, document, variables, budget);
     if (outcome.kind === "data") return outcome.data;
     if (outcome.kind === "rejected") throw outcome.error;
     if (!retryable) throw uncertainMutation(operation, outcome);
-    if (attempt >= LINEAR_MAX_ATTEMPTS) throw exhausted(operation, outcome, attempt);
+    // A timed-out attempt is retried like any other transient failure, but not
+    // once the operation itself is out of time: the deadline is the outer
+    // guarantee, and reporting it beats spending the retry-wait budget to
+    // arrive at the same refusal with a less precise cause.
+    if (outcome.kind === "timeout" && seams.clock() >= deadlineAt) {
+      throw operationDeadline(operation, mode, attempt, ambiguous(mode, dispatched));
+    }
+    if (attempt >= maxAttempts) throw exhausted(operation, outcome, attempt, ambiguous(mode, dispatched));
     const delay = boundedDelay(outcome, seams.clock() - startedAt, attempt);
-    if (delay === null) throw exhausted(operation, outcome, attempt);
+    if (delay === null) throw exhausted(operation, outcome, attempt, ambiguous(mode, dispatched));
     await seams.sleep(delay);
   }
+}
+
+/**
+ * Whether an operation that has run out of budget left an outcome that is
+ * genuinely unknown, rather than one that simply did not happen.
+ *
+ * A `mutation` has no identity anchor at all. An `idempotent` create has one,
+ * which is exactly why its answer matters: once an attempt has REACHED Linear
+ * and nothing came back, the issue may exist, and a caller told "timed out,
+ * nothing happened" would create it a second time. A `read` changed nothing, so
+ * it keeps the plain timeout — the ordinary classification, unchanged.
+ */
+function ambiguous(mode: LinearCallMode, dispatched: boolean): boolean {
+  return mode === "mutation" || (mode === "idempotent" && dispatched);
 }
 
 /** The delay before the next attempt, or null when the budget is spent. */
@@ -366,11 +539,17 @@ function uncertainMutation(operation: string, outcome: LinearAttempt): PoiesisEr
       operation,
       reason: outcome.kind,
       ...(status === null ? {} : { status }),
+      ...(outcome.kind === "probe-failed" ? { probeFailure: outcome.cause } : {}),
     },
   );
 }
 
-function exhausted(operation: string, outcome: LinearAttempt, attempts: number): PoiesisError {
+function exhausted(
+  operation: string,
+  outcome: LinearAttempt,
+  attempts: number,
+  ambiguousOutcome = false,
+): PoiesisError {
   if (outcome.kind === "rate-limited") {
     return new PoiesisError(
       "LINEAR_RATE_LIMITED",
@@ -386,12 +565,65 @@ function exhausted(operation: string, outcome: LinearAttempt, attempts: number):
       body: outcome.body,
     });
   }
+  if (outcome.kind === "timeout") {
+    // A create that reached Linear and was never answered is NOT here: it is
+    // reported as the ambiguity it is, because a plain timeout tells the caller
+    // the create did not happen, and that is exactly what Poiesis cannot know.
+    if (ambiguousOutcome) {
+      return uncertainMutation(operation, outcome);
+    }
+    // Reads and un-dispatched operations land here: nothing half-done was left
+    // behind, and the caller may simply ask again.
+    return new PoiesisError(
+      "LINEAR_REQUEST_TIMEOUT",
+      `Linear request ${operation} did not answer within its bound after ${attempts} attempts`,
+      {
+        operation,
+        attempts,
+        reason: "attempt-timeout",
+        timeoutMs: outcome.timeoutMs,
+        attemptTimeoutMs: LINEAR_ATTEMPT_TIMEOUT_MS,
+        deadlineMs: LINEAR_OPERATION_DEADLINE_MS,
+      },
+    );
+  }
   return new PoiesisError("LINEAR_TRANSPORT_ERROR", `Linear request ${operation} could not be completed`, {
     operation,
     attempts,
     cause: outcome.kind === "transport" ? outcome.cause : "unknown",
     causeMessage: outcome.kind === "transport" ? outcome.message : undefined,
   });
+}
+
+/**
+ * The whole operation spent its budget. What that MEANS depends on what the
+ * operation left behind: a read left nothing, so a plain timeout is accurate
+ * and retryable. A create that reached Linear left a real possibility that the
+ * issue exists, so it is reported as the ambiguity it is — with the
+ * inspect-before-retry instruction — instead of a retryable timeout a caller
+ * would answer by creating the same Poiesis item twice.
+ */
+function operationDeadline(
+  operation: string,
+  mode: LinearCallMode,
+  attempts: number,
+  ambiguousOutcome: boolean,
+): PoiesisError {
+  if (ambiguousOutcome) {
+    return uncertainMutation(operation, { kind: "timeout", timeoutMs: LINEAR_OPERATION_DEADLINE_MS });
+  }
+  return new PoiesisError(
+    "LINEAR_REQUEST_TIMEOUT",
+    `Linear request ${operation} did not complete within the operation budget`,
+    {
+      operation,
+      attempts,
+      reason: "operation-deadline",
+      timeoutMs: LINEAR_OPERATION_DEADLINE_MS,
+      attemptTimeoutMs: LINEAR_ATTEMPT_TIMEOUT_MS,
+      deadlineMs: LINEAR_OPERATION_DEADLINE_MS,
+    },
+  );
 }
 
 function randomUUID(): string {
@@ -604,9 +836,17 @@ class LinearTracker implements TrackerAdapter {
   /**
    * The idempotency probe for a create: if a previous attempt already
    * created the issue under this UUID, return it instead of creating again.
+   *
+   * The budget is the CREATE's, handed down by the executor: the probe is part
+   * of that create, so it may not start its own operation, may not outlive the
+   * deadline the create already has, and may not retry — the milliseconds left
+   * are not enough for a second attempt and one question deserves one answer.
    */
-  private async probeCreatedIssue(uuid: string): Promise<Record<string, unknown> | null> {
-    const node = await this.readIssueDirect(uuid);
+  private async probeCreatedIssue(
+    uuid: string,
+    budget: LinearProbeBudget,
+  ): Promise<Record<string, unknown> | null> {
+    const node = await this.readIssueDirect(uuid, budget);
     if (node === null) return null;
     return { issueCreate: { success: true, issue: node } };
   }
@@ -632,7 +872,7 @@ class LinearTracker implements TrackerAdapter {
         title,
         description,
       },
-    }, "idempotent", () => this.probeCreatedIssue(uuid));
+    }, "idempotent", (_attempt, budget) => this.probeCreatedIssue(uuid, budget));
     return readCreatedIssue(data, "issueCreate");
   }
 
@@ -696,9 +936,10 @@ class LinearTracker implements TrackerAdapter {
     document: string,
     variables: Record<string, unknown>,
     mode: LinearCallMode,
-    beforeRetry?: (attempt: number) => Promise<Record<string, unknown> | null>,
+    beforeRetry?: (attempt: number, budget: LinearProbeBudget) => Promise<Record<string, unknown> | null>,
+    enclosing?: LinearProbeBudget,
   ): Promise<Record<string, unknown>> {
-    return executeWith(this.#seams, document, variables, mode, beforeRetry);
+    return executeWith(this.#seams, document, variables, mode, beforeRetry, enclosing);
   }
 
   private redact(value: string): string {
@@ -706,8 +947,8 @@ class LinearTracker implements TrackerAdapter {
   }
 
   /** One direct `issue(id:)` lookup, with no identifier scan behind it. */
-  private async readIssueDirect(id: string): Promise<LinearIssueNode | null> {
-    const data = await this.execute(ISSUE_QUERY, { id }, "read");
+  private async readIssueDirect(id: string, budget?: LinearProbeBudget): Promise<LinearIssueNode | null> {
+    const data = await this.execute(ISSUE_QUERY, { id }, "read", undefined, budget);
     return isRecord(data.issue) ? readIssueNode(data.issue, "PoiesisIssue") : null;
   }
 
@@ -886,6 +1127,29 @@ export const LINEAR_MAX_ATTEMPTS = 3;
 export const LINEAR_MAX_RETRY_DELAY_MS = 10_000;
 export const LINEAR_MAX_RETRY_WAIT_MS = 15_000;
 export const LINEAR_DEFAULT_RETRY_DELAY_MS = 500;
+
+/**
+ * Ticket #150 — the two deadlines that make every Linear call finite.
+ *
+ * `LINEAR_ATTEMPT_TIMEOUT_MS` bounds ONE HTTP attempt. It exists because the
+ * numbers above bound attempts and waits, not a request: a transport that
+ * accepts a request and never answers it leaves the promise pending forever,
+ * so `poiesis init`, `poiesis doctor`, and every tracker mutation could hang
+ * with no error and no bound at all. The attempt is ended by aborting its own
+ * signal, which stops the socket rather than abandoning a socket that is still
+ * open.
+ *
+ * `LINEAR_OPERATION_DEADLINE_MS` bounds the operation as a WHOLE — every
+ * attempt, every wait, and the idempotency probe. It is the outer guarantee,
+ * and it is deliberately larger than the inner bounds can reach
+ * (3 attempts x 10s plus at most 15s of cumulative wait), so it never changes
+ * which refusal an ordinary rate limit or outage produces. What it closes is
+ * the case the inner bounds cannot see: a machine that spends the whole budget
+ * on a single stuck attempt. No attempt and no probe is ever started without
+ * budget left for it, so a Linear operation is finite in every case.
+ */
+export const LINEAR_ATTEMPT_TIMEOUT_MS = 10_000;
+export const LINEAR_OPERATION_DEADLINE_MS = 45_000;
 
 const ISSUE_FIELDS = "id identifier title description url state { type } team { id }";
 

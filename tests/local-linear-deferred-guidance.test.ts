@@ -93,6 +93,19 @@ const GUARD_RECOVERY_PROCEDURE =
 const CANONICAL_LOCK_NEVER_REMOVED =
   "The canonical `store.lock` is never removed by hand, because its holder PID and ownership token already reclaim a stale one within the bounded wait.";
 
+/**
+ * Ticket #150 — the procedure is prose, never a command.
+ *
+ * The exact guard path travels on the error as a FIELD (`guardPath`). The
+ * guidance names the two artifacts by their fixed names instead of printing a
+ * command built from that path, so a clone Poiesis did not choose — a hostile
+ * directory name, a path with a space, anything that could survive a rename —
+ * can never become an argument, a substitution, or a pipe in a command an
+ * operator pastes from an error message.
+ */
+const GUARD_RECOVERY_IS_PROSE =
+  "The exact guard path travels as a field on that error, and the procedure is stated in prose that names the two artifacts rather than printing a command to run.";
+
 describe("the canonical Method states one tracker / delivery contract", () => {
   const method = readRepoFile("POIESIS_METHOD.md");
 
@@ -148,6 +161,10 @@ describe("the canonical Method states one tracker / delivery contract", () => {
   it("states the ordered operator recovery and refuses a hand-removed canonical lock", () => {
     expect(method).toContain(GUARD_RECOVERY_PROCEDURE);
     expect(method).toContain(CANONICAL_LOCK_NEVER_REMOVED);
+  });
+
+  it("states the recovery as prose on a path field, never as a command to run", () => {
+    expect(method).toContain(GUARD_RECOVERY_IS_PROSE);
   });
 });
 
@@ -283,6 +300,10 @@ describe("COMPATIBILITY documents the providers", () => {
     expect(compatibility).toContain(
       "the canonical `store.lock` is never a removal target, because the ordinary holder-PID and ownership-token check already reclaims a stale one within the bounded wait.",
     );
+  });
+
+  it("documents the recovery as prose on a path field, never as a command to run", () => {
+    expect(compatibility).toContain(GUARD_RECOVERY_IS_PROSE);
   });
 });
 

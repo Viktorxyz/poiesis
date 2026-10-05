@@ -37,6 +37,7 @@ import {
   verifyLinearTrackerConfigured,
   type LinearHttpRequest,
   type LinearHttpResponse,
+  type LinearTimer,
   type LinearTransport,
   type LinearTrackerSeams,
 } from "../src/linear-tracker.js";
@@ -183,7 +184,17 @@ const TEAM_STATES = { team: { states: { nodes: [{ id: "state-done", type: "compl
 type LinearReply =
   | { readonly kind: "graphql"; readonly data?: unknown; readonly errors?: readonly { message: string; extensions?: Record<string, unknown> }[] }
   | { readonly kind: "http"; readonly status: number; readonly headers?: Record<string, string>; readonly body: string }
-  | { readonly kind: "network" };
+  | { readonly kind: "network" }
+  /**
+   * Spec #139 / ticket #150 — a request that never answers.
+   *
+   * The only thing that can end this promise is Poiesis's own abort deadline,
+   * which is exactly the production shape: a socket that stops reading, a
+   * proxy that holds the connection open, a Linear response that never starts
+   * arriving. A transport that cannot be aborted has no deadline at all, so
+   * this reply is also the assertion that every attempt carries a signal.
+   */
+  | { readonly kind: "hang" };
 
 class LinearScript {
   readonly requests: LinearHttpRequest[] = [];
@@ -202,6 +213,19 @@ class LinearScript {
       throw new Error(`unscripted Linear request: ${operationNameOf(request)}`);
     }
     if (reply.kind === "network") throw new Error("socket hang up");
+    if (reply.kind === "hang") {
+      const signal = request.signal as AbortSignal | undefined;
+      if (typeof signal?.addEventListener !== "function") {
+        throw new Error("a Linear attempt was sent with no abort signal");
+      }
+      return await new Promise<LinearHttpResponse>((_resolve, rejectOnAbort) => {
+        signal.addEventListener("abort", () => {
+          const aborted = new Error("The operation was aborted");
+          aborted.name = "AbortError";
+          rejectOnAbort(aborted);
+        });
+      });
+    }
     if (reply.kind === "http") {
       return {
         status: reply.status,
@@ -234,22 +258,51 @@ function operationNameOf(request: LinearHttpRequest): string {
 }
 
 /**
- * Deterministic clock / sleep / UUID seams. `sleep` advances the injected
- * clock by exactly the requested delay, so a test can assert the backoff
- * Poiesis asked for without waiting for it.
+ * Deterministic clock / sleep / UUID / TIMER seams.
+ *
+ * Ticket #150: the timer that fires an attempt's abort is virtual here too.
+ * A timeout test that waits on a real `setTimeout` is either slow or flaky,
+ * and a test that reaches into real time cannot tell "Poiesis bounded this"
+ * from "the machine was quick". `sleep` advances the injected clock by exactly
+ * the delay, `timer` records the deadline Poiesis asked for and fires it only
+ * when the test moves virtual time forward, and `advance` fires due callbacks
+ * in a fixed order (earliest deadline first, then scheduling order). So a
+ * deadline test asserts a SEQUENCE, never a race.
  */
 function deterministicSeams(): ObservableSeams {
   const sleeps: number[] = [];
   const uuids: string[] = [];
+  const attemptTimeouts: number[] = [];
   let now = 0;
   let sequence = 0;
+  let nextTimer = 0;
+  const pending: { id: number; at: number; fire: () => void }[] = [];
+
+  const advance = (ms: number): void => {
+    const target = now + Math.max(0, ms);
+    for (;;) {
+      const due = pending
+        .filter((entry) => entry.at <= target)
+        .sort((left, right) => left.at - right.at || left.id - right.id)[0];
+      if (due === undefined) break;
+      pending.splice(pending.indexOf(due), 1);
+      // Monotonic: time never moves backwards, even if a fired callback moved
+      // it forward itself.
+      now = Math.max(now, due.at);
+      due.fire();
+    }
+    now = Math.max(now, target);
+  };
+
   return {
     sleeps,
     uuids,
+    attemptTimeouts,
+    advance,
     clock: () => now,
     sleep: async (ms: number) => {
       sleeps.push(ms);
-      now += ms;
+      advance(ms);
     },
     uuid: () => {
       sequence += 1;
@@ -257,15 +310,59 @@ function deterministicSeams(): ObservableSeams {
       uuids.push(uuid);
       return uuid;
     },
+    timer: (ms: number, onElapsed: () => void) => {
+      const entry = { id: (nextTimer += 1), at: now + Math.max(0, ms), fire: onElapsed };
+      pending.push(entry);
+      attemptTimeouts.push(ms);
+      return {
+        cancel: () => {
+          const index = pending.indexOf(entry);
+          if (index >= 0) pending.splice(index, 1);
+        },
+      };
+    },
   };
 }
 
 /**
  * The seams plus the observation channels, so a test can assert the delays
- * Poiesis asked for and the identities it generated without waiting or
- * depending on a real random source.
+ * Poiesis asked for, the deadlines it scheduled, and the identities it
+ * generated without waiting or depending on a real random source. Declared
+ * explicitly rather than as an intersection with `LinearTrackerSeams` so the
+ * injected clock, sleep, UUID, and timer stay REQUIRED here: a test that
+ * passed an optional member through would silently fall back to a real clock.
  */
-type ObservableSeams = LinearTrackerSeams & { readonly sleeps: number[]; readonly uuids: string[] };
+type ObservableSeams = {
+  readonly env?: Record<string, string | undefined>;
+  readonly transport?: LinearTransport;
+  readonly clock: () => number;
+  readonly sleep: (ms: number) => Promise<void>;
+  readonly uuid: () => string;
+  readonly timer: LinearTimer;
+  readonly sleeps: number[];
+  readonly uuids: string[];
+  /** The attempt deadline Poiesis scheduled, in scheduling order. */
+  readonly attemptTimeouts: number[];
+  /** Move virtual time forward, firing every due deadline in a fixed order. */
+  readonly advance: (ms: number) => void;
+};
+
+/**
+ * Let every pending microtask run. The virtual timer only fires on an explicit
+ * `advance`, so this is deterministic: it drains the promise chain up to its
+ * next suspension, which is the next request awaiting its deadline.
+ */
+function drain(): Promise<void> {
+  return new Promise<void>((resolveDrain) => setImmediate(resolveDrain));
+}
+
+/** Observe a pending operation without ever leaving a rejection unhandled. */
+async function settled<T>(pending: Promise<T>): Promise<{ ok: T; error?: undefined } | { ok?: undefined; error: unknown }> {
+  return await pending.then(
+    (value) => ({ ok: value }),
+    (error: unknown) => ({ error }),
+  );
+}
 
 function seamsFor(script: LinearScript, env: Record<string, string | undefined>): ObservableSeams {
   return { env, transport: script.transport, ...deterministicSeams() };
@@ -898,6 +995,357 @@ describe("an uncertain mutation is reported, never replayed", () => {
   });
 });
 
+// -- Cycle 6: the deadline on every Linear call (ticket #150) ----------------
+
+/**
+ * Spec #139 / ticket #150 — no Linear call can wait forever.
+ *
+ * The retry bound that already existed bounds ATTEMPTS and WAITS. It never
+ * bounded a single attempt: a transport that accepts a request and then never
+ * answers leaves the promise pending forever, so `poiesis update`, `poiesis
+ * init`, and every tracker mutation hang with no error, no receipt, and no
+ * bound at all. Two ceilings close that: every attempt is aborted through its
+ * OWN `AbortSignal` after a fixed attempt deadline, and the operation as a
+ * whole is refused once it has spent a fixed total budget.
+ *
+ * The classification follows what each mode can safely do next:
+ *
+ *   - a read changed nothing, so a timeout is retried like any other
+ *     transient failure, and exhausting its budget is a typed refusal;
+ *   - an idempotent create re-probes the identity it already used before any
+ *     replay, so a lost answer resolves to the issue the first attempt made;
+ *   - a non-idempotent mutation (a comment, an update, a close) is attempted
+ *     exactly once and reported `LINEAR_MUTATION_UNCERTAIN`, because whether
+ *     it landed is not observable from here and replaying it could double it.
+ *
+ * Every number below is asserted as a literal on purpose: the ceilings are the
+ * guarantee, so a test that reads them out of the module would agree with any
+ * value the module chose.
+ */
+describe("every Linear attempt is bounded by an abort signal and the whole operation is bounded", () => {
+  const ATTEMPT_TIMEOUT_MS = 10_000;
+  const OPERATION_DEADLINE_MS = 45_000;
+  const CREDENTIAL = { LINEAR_API_KEY: "lin_api_secret" };
+
+  it("gives every attempt its own abort signal and a scheduled attempt deadline", async () => {
+    // Break: an attempt with no signal cannot be bounded at all, so a Linear
+    // response that never arrives is an unbounded wait rather than a refusal.
+    const script = new LinearScript({ kind: "graphql", data: { issue: issueNode() } });
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    await adapter.getSpec("ENG-1");
+
+    const signal = script.requests[0]?.signal;
+    expect(signal).toBeInstanceOf(AbortSignal);
+    // An answer that arrived inside the deadline is used, not discarded: the
+    // signal is only a deadline, never a reason to fail a request that worked.
+    expect(signal?.aborted).toBe(false);
+    // A ceiling, not a hope: the attempt was scheduled to end in 10s.
+    expect(seams.attemptTimeouts).toEqual([ATTEMPT_TIMEOUT_MS]);
+  });
+
+  it("aborts an attempt that never answers, retries the read, and refuses with a typed timeout", async () => {
+    // Break: a read that hangs forever hangs the caller forever. Two hangs and
+    // the retry-wait budget is spent, so the operation must fail as a typed
+    // refusal rather than wait for an answer that is not coming.
+    const script = new LinearScript(
+      { kind: "hang" },
+      { kind: "hang" },
+      { kind: "hang" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = settled(adapter.getSpec("ENG-1"));
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+
+    const result = await pending;
+    expect(result.error).toMatchObject({
+      code: "LINEAR_REQUEST_TIMEOUT",
+      details: { attempts: 2, timeoutMs: ATTEMPT_TIMEOUT_MS },
+    });
+    // The third attempt never started, and the answer that was scripted for it
+    // was never used: a timeout exhausts the budget, it does not buy more tries.
+    expect(script.operations()).toEqual(["PoiesisIssue", "PoiesisIssue"]);
+    // Each attempt was aborted through its own signal, and no signal was reused.
+    const signals = script.requests.map((request) => request.signal);
+    expect(new Set(signals).size).toBe(2);
+    for (const signal of signals) expect(signal?.aborted).toBe(true);
+    // A timed-out attempt backs off exactly like any other transient failure.
+    expect(seams.sleeps).toEqual([500]);
+  });
+
+  it("recovers a read whose first attempt timed out", async () => {
+    // Break: treating a timeout as fatal turns a slow Linear into a hard
+    // failure even though the operation changed nothing and the next attempt
+    // answers normally.
+    const script = new LinearScript(
+      { kind: "hang" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = adapter.getSpec("ENG-1");
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+
+    expect(await pending).toMatchObject({ id: "ENG-1" });
+    expect(seams.sleeps).toEqual([500]);
+    expect(script.requests[0]?.signal.aborted).toBe(true);
+    expect(script.requests[1]?.signal.aborted).toBe(false);
+  });
+
+  it("refuses the whole operation when it has spent its total budget", async () => {
+    // Break: the attempt ceiling bounds ONE attempt, not the operation. If the
+    // first attempt consumed the entire budget — a stuck socket on a machine
+    // that then spent the rest of it — starting attempt two anyway would make
+    // the total unbounded in exactly the case it matters most.
+    const script = new LinearScript(
+      { kind: "hang" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = settled(adapter.getSpec("ENG-1"));
+    await drain();
+    // The attempt deadline fires, and the machine then spends the remainder of
+    // the operation budget before Poiesis gets to decide what to do next.
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+    seams.advance(OPERATION_DEADLINE_MS);
+
+    const result = await pending;
+    expect(result.error).toMatchObject({
+      code: "LINEAR_REQUEST_TIMEOUT",
+      details: { reason: "operation-deadline", deadlineMs: OPERATION_DEADLINE_MS },
+    });
+    // One request only: the budget was gone, so no second attempt was started.
+    expect(script.requests).toHaveLength(1);
+  });
+
+  it("gives a non-idempotent mutation exactly one attempt and reports it uncertain", async () => {
+    // Break: a comment whose answer never arrives may or may not have been
+    // posted. Replaying it would double a supersede notice, and treating it as
+    // a plain timeout would invite the caller to retry with a fresh identity —
+    // so the mutation's own ambiguity is the thing reported.
+    const script = new LinearScript(
+      { kind: "graphql", data: { issue: issueNode() } },
+      { kind: "hang" },
+      { kind: "graphql", data: { commentCreate: { success: true, comment: { id: "c-2" } } } },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = settled(adapter.commentSpec("ENG-1", "Superseded: replan"));
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+
+    const result = await pending;
+    expect(result.error).toMatchObject({
+      code: "LINEAR_MUTATION_UNCERTAIN",
+      details: { operation: "PoiesisCommentCreate", reason: "timeout" },
+    });
+    // Exactly one attempt: no retry, and the scripted third reply is untouched.
+    expect(script.operations()).toEqual(["PoiesisIssue", "PoiesisCommentCreate"]);
+  });
+
+  it("re-probes the identity it already used before replaying a create that timed out", async () => {
+    // Break: a create whose answer was lost is the one case where a replay is
+    // safe, and it is safe ONLY because the identity is fixed. Replaying with
+    // a fresh UUID files the same Poiesis Spec twice; replaying without the
+    // probe would too, whenever the first attempt actually landed.
+    const created = issueNode({ identifier: "ENG-1" });
+    const script = new LinearScript(
+      { kind: "graphql", data: TEAM_PAGE([teamNode()], false) },
+      { kind: "hang" },
+      { kind: "graphql", data: { issue: created } },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = adapter.createSpec({ title: "Canonical intent", body: "Canonical decisions" });
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+
+    // The probe answered, so the issue the timed-out attempt created is
+    // returned instead of a second one.
+    expect(await pending).toMatchObject({ id: "ENG-1" });
+    expect(script.operations()).toEqual(["PoiesisTeams", "PoiesisIssueCreate", "PoiesisIssue"]);
+    expect(seams.uuids).toHaveLength(1);
+    expect(seams.uuids[0]).toBe((script.variablesOf(1).input as { id: string }).id);
+    expect(script.variablesOf(2).id).toBe(seams.uuids[0]);
+    // The create's own attempt really did time out — its signal was aborted —
+    // and the probe that replaced the replay was itself a bounded read. Every
+    // request in the flow carries a deadline, the team lookup included.
+    expect(script.requests[1]?.signal.aborted).toBe(true);
+    expect(script.requests[2]?.signal.aborted).toBe(false);
+    expect(seams.attemptTimeouts).toEqual([ATTEMPT_TIMEOUT_MS, ATTEMPT_TIMEOUT_MS, ATTEMPT_TIMEOUT_MS]);
+  });
+
+  it("reports a create uncertain when the probe that must resolve it cannot answer", async () => {
+    // Break: the probe is the only evidence that can distinguish "nothing was
+    // created" from "the create landed and its answer was lost". If the probe
+    // itself fails, the outcome is unknown, and letting the probe's own error
+    // escape invites a caller to retry the create with a NEW identity — a
+    // duplicate, filed on the strength of an unrelated read failure.
+    const script = new LinearScript(
+      { kind: "graphql", data: TEAM_PAGE([teamNode()], false) },
+      { kind: "network" },
+      { kind: "http", status: 400, body: "bad request" },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const error = await adapter.createSpec({ title: "Canonical intent", body: "Canonical decisions" }).catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toMatchObject({
+      code: "LINEAR_MUTATION_UNCERTAIN",
+      // The refusal names WHY the ambiguity is unresolved, as a typed code from
+      // Poiesis's own vocabulary — never the probe's echoed upstream text.
+      details: { operation: "PoiesisIssueCreate", reason: "probe-failed", probeFailure: "LINEAR_HTTP_ERROR" },
+    });
+    // The create was attempted once and never replayed, under one identity.
+    expect(script.operations()).toEqual(["PoiesisTeams", "PoiesisIssueCreate", "PoiesisIssue"]);
+    expect(seams.uuids).toHaveLength(1);
+  });
+
+  it("bounds the create AND its idempotency probe by one operation budget", async () => {
+    // Break: the probe is a nested operation, and a nested operation with a
+    // FRESH budget makes a create's total twice its own deadline — 90s of
+    // waiting for one Poiesis item — and a probe that RETRIES spends more
+    // still. The probe asks exactly one question ("does this identity
+    // exist?") inside the budget the create already has, and when it cannot
+    // answer, the create's outcome is unknown: uncertain, never a plain
+    // retryable timeout.
+    //
+    // The two spare hangs exist so a probe that retries shows up as EXTRA
+    // requests, which the assertions below count, rather than as a script that
+    // ran out of replies. A correct probe never reaches them.
+    const script = new LinearScript(
+      { kind: "graphql", data: TEAM_PAGE([teamNode()], false) },
+      { kind: "hang" },
+      { kind: "hang" },
+      { kind: "hang" },
+      { kind: "hang" },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = settled(adapter.createSpec({ title: "Canonical intent", body: "Canonical decisions" }));
+    await drain();
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+    await drain();
+    // The probe gets ONE bounded lookup, so a single further deadline is all
+    // the create can be waiting on.
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+    await drain();
+
+    // Three deadlines total: the team lookup, the create's attempt, and the
+    // probe's single lookup. A fourth is a probe that started retrying inside a
+    // budget that was already spent.
+    expect(seams.attemptTimeouts).toEqual([ATTEMPT_TIMEOUT_MS, ATTEMPT_TIMEOUT_MS, ATTEMPT_TIMEOUT_MS]);
+    // The create was sent once. The probe READ the identity back; it never
+    // issued a second create, under this identity or any other.
+    expect(script.operations()).toEqual(["PoiesisTeams", "PoiesisIssueCreate", "PoiesisIssue"]);
+    expect(seams.uuids).toHaveLength(1);
+
+    const result = await pending;
+    expect(result.error).toMatchObject({
+      code: "LINEAR_MUTATION_UNCERTAIN",
+      details: { operation: "PoiesisIssueCreate", reason: "probe-failed" },
+    });
+    // Never a plain retryable timeout: the create may have landed, and a
+    // caller reading LINEAR_REQUEST_TIMEOUT would answer by creating again.
+    expect((result.error as { code: string }).code).not.toBe("LINEAR_REQUEST_TIMEOUT");
+    expect((result.error as Error).message).toContain("inspect the issue in Linear before retrying");
+    // The whole flow stayed inside the ONE operation budget, not two.
+    expect(seams.clock()).toBeLessThanOrEqual(OPERATION_DEADLINE_MS);
+  });
+
+  it("reports a create uncertain when the budget is gone after it was sent unconfirmed", async () => {
+    // Break: the create reached Linear and no answer came back, so Poiesis does
+    // not know whether the issue exists. A plain timeout tells the caller the
+    // opposite — that nothing happened, so try again — and a caller that acts
+    // on that files the same Poiesis Spec twice under a second identity. No
+    // probe and no replay may start either: the budget is gone.
+    const script = new LinearScript(
+      { kind: "graphql", data: TEAM_PAGE([teamNode()], false) },
+      { kind: "hang" },
+      { kind: "hang" },
+      { kind: "hang" },
+    );
+    const seams = seamsFor(script, CREDENTIAL);
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    const pending = settled(adapter.createSpec({ title: "Canonical intent", body: "Canonical decisions" }));
+    await drain();
+    // The attempt deadline fires while the operation is still parked on that
+    // request, and the machine then spends the rest of the operation budget
+    // before Poiesis gets to decide what happens next.
+    seams.advance(ATTEMPT_TIMEOUT_MS);
+    seams.advance(OPERATION_DEADLINE_MS);
+
+    const result = await pending;
+    expect(result.error).toMatchObject({
+      code: "LINEAR_MUTATION_UNCERTAIN",
+      details: { operation: "PoiesisIssueCreate" },
+    });
+    expect((result.error as { code: string }).code).not.toBe("LINEAR_REQUEST_TIMEOUT");
+    // No probe, no replay, one identity: the budget was gone, so nothing else
+    // was started.
+    expect(script.operations()).toEqual(["PoiesisTeams", "PoiesisIssueCreate"]);
+    expect(seams.attemptTimeouts).toEqual([ATTEMPT_TIMEOUT_MS, ATTEMPT_TIMEOUT_MS]);
+    expect(seams.uuids).toHaveLength(1);
+  });
+
+  it("bounds the production transport: fetch receives the attempt signal", async () => {
+    // Break: the deadline is only real if it reaches the socket. A timer that
+    // classifies an abort Poiesis never sends to `fetch` bounds nothing, and
+    // this is the only test that exercises the transport Poiesis actually
+    // ships rather than an injected one.
+    const realFetch = globalThis.fetch;
+    const seen: { signal: AbortSignal | undefined }[] = [];
+    globalThis.fetch = ((_url: string, init?: RequestInit) => {
+      const signal = init?.signal ?? undefined;
+      seen.push({ signal });
+      return new Promise<Response>((_resolve, rejectOnAbort) => {
+        signal?.addEventListener("abort", () => rejectOnAbort(new Error("aborted")));
+      });
+    }) as typeof globalThis.fetch;
+    try {
+      const virtual = deterministicSeams();
+      const pending = settled(
+        verifyLinearTrackerAuthorized({
+          env: CREDENTIAL,
+          clock: virtual.clock,
+          sleep: virtual.sleep,
+          uuid: virtual.uuid,
+          timer: virtual.timer,
+        }),
+      );
+      await drain();
+      virtual.advance(ATTEMPT_TIMEOUT_MS);
+      virtual.advance(OPERATION_DEADLINE_MS);
+
+      const result = await pending;
+      expect(result.error).toMatchObject({ code: "LINEAR_REQUEST_TIMEOUT" });
+      expect(seen).toHaveLength(1);
+      expect(seen[0]?.signal).toBeInstanceOf(AbortSignal);
+      expect(seen[0]?.signal?.aborted).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
+
 // -- Cycle 5: supersede, close, and the reachable surfaces ------------------
 
 describe("closing moves a Linear issue to the team's completed state", () => {
@@ -1001,6 +1449,56 @@ describe("supersede uses Poiesis metadata, a comment, and a close", () => {
       supersededReason: "Design evidence changed",
       supersededBy: ["ENG-3"],
     });
+  });
+
+  it("records a replacement it never resolved instead of requiring it to exist", async () => {
+    // Break: resolving the replacement would make supersession fail on a
+    // Replan that names a ticket which does not exist yet, and would add a
+    // read whose own failure is indistinguishable from the mutation's. Poiesis
+    // records the reference exactly as the Author declared it, on every
+    // provider, and the Local tracker keeps the same rule for a LOCAL id.
+    const ticket = issueNode({ identifier: "ENG-2", description: ticketDescription("ENG-1", "none", "Acceptance") });
+    const script = new LinearScript(
+      { kind: "graphql", data: { issue: ticket } },
+      { kind: "graphql", data: { commentCreate: { success: true, comment: { id: "c-1" } } } },
+      { kind: "graphql", data: { issueUpdate: { success: true, issue: ticket } } },
+      { kind: "graphql", data: TEAM_STATES },
+      {
+        kind: "graphql",
+        data: {
+          issueUpdate: {
+            success: true,
+            issue: issueNode({
+              identifier: "ENG-2",
+              description: supersededTicketDescription("ENG-1", "none", "Acceptance", "Design evidence changed", [
+                "ENG-404",
+              ]),
+              state: { type: "completed" },
+            }),
+          },
+        },
+      },
+    );
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }));
+
+    const superseded = await adapter.supersedeTicket("ENG-2", {
+      reason: "Design evidence changed",
+      replacementIds: ["ENG-404"],
+    });
+
+    expect(superseded).toMatchObject({ state: "superseded", supersededBy: ["ENG-404"] });
+    // No request ever looked the replacement up: a supersession costs exactly
+    // the same five operations whether or not the replacement resolves.
+    expect(script.operations()).toEqual([
+      "PoiesisIssue",
+      "PoiesisCommentCreate",
+      "PoiesisIssueUpdate",
+      "PoiesisTeamStates",
+      "PoiesisIssueUpdate",
+    ]);
+    expect((script.variablesOf(2).input as { description: string }).description).toContain(
+      '"supersededBy":["ENG-404"]',
+    );
   });
 
   it("never fabricates a native Linear relation to express supersession", async () => {
