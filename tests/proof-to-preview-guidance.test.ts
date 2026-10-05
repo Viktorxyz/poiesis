@@ -32,6 +32,23 @@ const PROOF_SHAPE_PHRASINGS: readonly string[] = [
   "standardsReview",
 ];
 
+/**
+ * Spec #168 / ticket #171: the verification receipt reference is MANDATORY in
+ * the proof and in the Publish evidence Publish emits. It is listed separately
+ * from the historical proof shape so dropping it from any one of the four
+ * package surfaces regresses immediately instead of silently teaching an agent
+ * to build a legacy proof that Publish refuses.
+ */
+const RECEIPT_REFERENCE_PHRASINGS: readonly string[] = [
+  "verification",
+  "receiptId",
+  "receiptDigest",
+  "verificationPlanDigest",
+];
+
+/** The mandatory Publish-evidence list entry, in the canonical METHOD list. */
+const METHOD_PUBLISH_EVIDENCE_RECEIPT_LISTING = /^- `verification` —/m;
+
 const ORDERING_PHRASING = "Preview only after Publish succeeds";
 const PROOF_ORDERING_PHRASING = "Publish only after Verify, Spec Review, and Standards Review pass";
 const FAIL_CLOSED_PHRASING = "concrete Preview identity";
@@ -204,6 +221,44 @@ describe("proof-to-preview package guidance", () => {
     const previewIdx = help.indexOf("poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>");
     expect(publishIdx).toBeGreaterThanOrEqual(0);
     expect(previewIdx).toBeGreaterThan(publishIdx);
+  });
+
+  it("CLI HELP requires the verification receipt reference in the proof", async () => {
+    const help = await packageHelp();
+    for (const field of RECEIPT_REFERENCE_PHRASINGS) {
+      expect(help, "CLI HELP must name the receipt reference field: " + field).toContain(field);
+    }
+  });
+
+  it("CLI HELP requires the resolved receipt reference in the canonical Publish evidence Preview consumes", async () => {
+    const help = await packageHelp();
+    // The canonical Publish-evidence field enumeration lives on the line that
+    // documents `changeRequest`; the receipt reference must be part of it.
+    const evidenceLine = help.split("\n").find((line) => line.includes("changeRequest"));
+    expect(evidenceLine, "CLI HELP must enumerate the canonical Publish evidence fields").toBeDefined();
+    for (const field of RECEIPT_REFERENCE_PHRASINGS) {
+      expect(evidenceLine, "the canonical Publish evidence line must name: " + field).toContain(field);
+    }
+  });
+
+  it("POIESIS_METHOD.md names the verification receipt reference as a mandatory Publish-evidence field", async () => {
+    const method = await readRepoFile("POIESIS_METHOD.md");
+    for (const field of RECEIPT_REFERENCE_PHRASINGS) {
+      expect(method, "POIESIS_METHOD.md must name the receipt reference field: " + field).toContain(field);
+    }
+    expect(
+      method.match(METHOD_PUBLISH_EVIDENCE_RECEIPT_LISTING),
+      "the canonical Publish-evidence field list must include the `verification` entry",
+    ).not.toBeNull();
+  });
+
+  it("POIESIS_ROLE_POIESIS.md and OPENCODE_AGENT_POIESIS.md require the receipt reference in the proof and in Publish evidence", async () => {
+    for (const relativePath of ["POIESIS_ROLE_POIESIS.md", "OPENCODE_AGENT_POIESIS.md"]) {
+      const document = await readRepoFile(relativePath);
+      for (const field of RECEIPT_REFERENCE_PHRASINGS) {
+        expect(document, relativePath + " must name the receipt reference field: " + field).toContain(field);
+      }
+    }
   });
 
   it("OPENCODE_AGENT_POIESIS.md and the ROLE doc both teach the agent not to invent a Preview without a concrete identity", async () => {

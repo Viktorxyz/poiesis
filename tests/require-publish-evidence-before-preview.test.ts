@@ -10,7 +10,14 @@ import { validatePreviewPublishEvidence, type PublishEvidence } from "../src/evi
 import { init } from "../src/maintenance.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import {
+  createTestRepository,
+  proofShell,
+  publishEvidence,
+  testConfig,
+  verificationReference,
+  type TestRepository,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
@@ -272,6 +279,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
           candidateTree: "2".repeat(40),
           verified: false as unknown as true,
           branch: "poiesis/validator",
+          verification: verificationReference("1".repeat(40), "2".repeat(40)),
           remoteRef: "refs/heads/poiesis/validator",
           publishedHeadSha: "1".repeat(40),
           provider: "fixture",
@@ -292,6 +300,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
           candidateTree: "2".repeat(40),
           verified: true,
           branch: "poiesis/validator",
+          verification: verificationReference("1".repeat(40), "2".repeat(40)),
           remoteRef: "refs/heads/some-other-branch",
           publishedHeadSha: "1".repeat(40),
           provider: "fixture",
@@ -313,6 +322,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
           verified: true,
           branch: "poiesis/validator",
           remoteRef: "refs/heads/poiesis/validator",
+          verification: verificationReference("1".repeat(40), "2".repeat(40)),
           publishedHeadSha: "9".repeat(40),
           provider: "fixture",
           action: "pushed",
@@ -331,6 +341,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
           candidateSha: "1".repeat(40),
           candidateTree: "2".repeat(40),
           verified: true,
+          verification: verificationReference("1".repeat(40), "2".repeat(40)),
           branch: "   ",
           remoteRef: "refs/heads/   ",
           publishedHeadSha: "1".repeat(40),
@@ -472,6 +483,7 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
           publishedHeadSha: "1".repeat(40),
           provider: "fixture",
           action: "pushed",
+          verification: verificationReference("1".repeat(40), "2".repeat(40)),
           changeRequest: { id: 42 as unknown as string, url: null },
         },
         "1".repeat(40),

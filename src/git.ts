@@ -9,6 +9,15 @@ import { poiesisPath, resolveGitRoot } from "./paths.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { assertOwnershipReceipt, type OwnershipReceipt } from "./receipt.js";
 import {
+  createVerificationReceipt,
+  resolveLiveVerificationPlan,
+  resolveVerificationReceipt,
+  verificationEvidenceFrom,
+  type VerificationCommandClassification,
+  type VerificationCommandEvidenceV1,
+  type VerificationEvidence,
+} from "./verification-receipt.js";
+import {
   validateProofEvidence,
   validatePublishEvidence,
   validateStagingEvidence,
@@ -143,6 +152,17 @@ export interface VerifyResult {
   cleanBefore: true;
   cleanAfter: true;
   commands: VerifyCommandResult[];
+  /**
+   * Spec #168 / ticket #171 — the runtime-owned whole-change Verify evidence.
+   *
+   * A proof-scope Verify persists an immutable `VerificationReceiptV1` under
+   * the repository's shared Git common directory and returns the reference a
+   * caller forwards in `--proof`. `null` ONLY on the non-project-bound
+   * compatibility surface (a repository that never installed Poiesis), where
+   * there is no runtime / installation identity to bind a receipt to and no
+   * Publish can follow.
+   */
+  verification: VerificationEvidence | null;
 }
 
 export interface PublishOptions {
@@ -574,8 +594,64 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   // the PRIMARY receipt-authenticated installation, so a stale or
   // candidate-tracked generated config can never be lifecycle authority.
   // The commands themselves still execute in the exact candidate workspace.
-  await resolveVerifyAuthority(options.cwd, options.ownershipId);
-  return runVerification(options, options.cwd, options.ownershipId ?? null);
+  const authority = await resolveVerifyAuthority(options.cwd, options.ownershipId);
+  const outcome = await runVerification(options, options.cwd, options.ownershipId ?? null);
+  // Spec #168 / ticket #171: proof-scope Verify issues the runtime-owned
+  // receipt that Publish later resolves. A failed run still records its real
+  // evidence (outcome `failed`, per-command classification), because a receipt
+  // that could only ever say "verified" would be a constant, not evidence.
+  // The compatibility surface — a repository that never installed Poiesis —
+  // has no installation identity to bind and therefore issues no receipt.
+  let verification: VerificationEvidence | null = null;
+  let receiptFailure: unknown = null;
+  if (authority !== null) {
+    try {
+      verification = verificationEvidenceFrom(
+        await createVerificationReceipt({
+          authority,
+          ...outcome.execution,
+        }),
+      );
+    } catch (error) {
+      receiptFailure = error;
+    }
+  }
+  // The verification failure is the operator's actionable error and is never
+  // masked by a secondary receipt-storage failure. When a receipt WAS issued
+  // for the failed run, its reference rides along in the error details so the
+  // operator (and a later Publish attempt) can see the real evidence instead of
+  // a bare exit code.
+  if (outcome.failure !== null) {
+    if (verification !== null && outcome.failure instanceof PoiesisError) {
+      outcome.failure.details.verification = verification;
+    }
+    throw outcome.failure;
+  }
+  if (receiptFailure !== null) throw receiptFailure;
+  return { ...outcome.result, verification };
+}
+
+/**
+ * Spec #168 / ticket #171 — one completed Verify execution: the public result
+ * plus the complete, receipt-bound evidence the issuer records.
+ */
+interface VerificationOutcome {
+  result: VerifyResult;
+  execution: {
+    candidateSha: string;
+    candidateTree: string;
+    plan: string[];
+    timeoutMs: number;
+    outputLimit: number;
+    startedAt: string;
+    endedAt: string;
+    durationMs: number;
+    commands: VerificationCommandEvidenceV1[];
+    cleanAfter: boolean;
+    outcome: "verified" | "failed";
+  };
+  /** The deterministic failure of a completed run, or `null` when it passed. */
+  failure: unknown | null;
 }
 
 /**
@@ -588,17 +664,25 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
  * module-private (instead of a public `VerifyOptions` field) means no
  * external caller can hand `verify` a forged authority and skip the
  * ownership / receipt / runtime identity boundary.
+ *
+ * Spec #168 / ticket #171: the body returns its full per-command evidence and
+ * the deterministic failure instead of throwing mid-loop, so the caller can
+ * persist a faithful receipt for a run that FAILED. Pre-flight failures
+ * (unresolvable candidate, dirty before) still throw: they never reached a
+ * deterministic execution and no receipt exists for them.
  */
 async function runVerification(
   options: VerifyOptions,
   cwd: string,
   workspaceOwnershipId: string | null,
-): Promise<VerifyResult> {
+): Promise<VerificationOutcome> {
   const root = await canonicalGitRoot(cwd);
   const candidateSha = await resolveExpectedCommit(root, options.candidateSha, "candidateSha");
   await assertExactClean(root, candidateSha);
   const outputLimit = normalizeOutputLimit(options.outputLimit);
+  const startedAtMs = Date.now();
   const results: VerifyCommandResult[] = [];
+  const commands: VerificationCommandEvidenceV1[] = [];
   let failed: VerifyCommandResult | null = null;
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
@@ -608,6 +692,7 @@ async function runVerification(
   // check below can run unconditionally.
   let runError: unknown = null;
   for (const command of options.commands) {
+    const commandStartedAtMs = Date.now();
     let result: RunResult;
     try {
       result = await run("/bin/sh", ["-c", command], {
@@ -626,6 +711,10 @@ async function runVerification(
       });
     } catch (error) {
       runError = error;
+      // Spec #168 / ticket #171: the timed-out / unspawnable command is still
+      // recorded, with the classification the runner actually reported, so a
+      // receipt never silently drops the command that ended the run.
+      commands.push(failedCommandEvidence(command, error, commandStartedAtMs, timeoutMs, outputLimit));
       break;
     }
     const evidence = {
@@ -635,6 +724,25 @@ async function runVerification(
       stderr: bounded(result.stderr, outputLimit),
     };
     results.push(evidence);
+    const stdoutTruncated = result.stdoutTruncated || evidence.stdout !== result.stdout;
+    const stderrTruncated = result.stderrTruncated || evidence.stderr !== result.stderr;
+    commands.push({
+      command,
+      status: result.exitCode === 0 ? "passed" : "failed",
+      classification: result.exitCode === 0 ? "passed" : "command-failed",
+      exitCode: result.exitCode,
+      signal: result.signal,
+      startedAt: new Date(commandStartedAtMs).toISOString(),
+      endedAt: new Date(commandStartedAtMs + result.durationMs).toISOString(),
+      durationMs: result.durationMs,
+      timeoutMs,
+      timedOut: result.timedOut,
+      stdout: evidence.stdout,
+      stderr: evidence.stderr,
+      stdoutTruncated,
+      stderrTruncated,
+      outputTruncated: stdoutTruncated || stderrTruncated,
+    });
     if (result.exitCode !== 0) {
       failed = evidence;
       break;
@@ -658,9 +766,26 @@ async function runVerification(
       throw cleanError;
     }
   }
+  const endedAtMs = Date.now();
+  const cleanAfter = dirtyStatus === null;
+  const verified = cleanAfter && runError === null && failed === null;
+  const execution: VerificationOutcome["execution"] = {
+    candidateSha,
+    candidateTree: await resolveTree(root, candidateSha),
+    plan: [...options.commands],
+    timeoutMs,
+    outputLimit,
+    startedAt: new Date(startedAtMs).toISOString(),
+    endedAt: new Date(endedAtMs).toISOString(),
+    durationMs: Math.max(0, endedAtMs - startedAtMs),
+    commands,
+    cleanAfter,
+    outcome: verified ? "verified" : "failed",
+  };
 
+  let failure: unknown | null = null;
   if (dirtyStatus !== null) {
-    throw new PoiesisError(
+    failure = new PoiesisError(
       "DIRTY_CANDIDATE",
       "Verify invocation left the exact candidate workspace dirty",
       {
@@ -670,17 +795,61 @@ async function runVerification(
         status: dirtyStatus.map(statusEntryForEvidence),
       },
     );
-  }
-
-  if (runError !== null) throw runError;
-  if (failed !== null) {
-    throw new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
+  } else if (runError !== null) {
+    failure = runError;
+  } else if (failed !== null) {
+    failure = new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
       candidateSha,
       failed,
       commands: results,
     });
   }
-  return { candidateSha, cleanBefore: true, cleanAfter: true, commands: results };
+  return {
+    result: { candidateSha, cleanBefore: true, cleanAfter: true, commands: results, verification: null },
+    execution,
+    failure,
+  };
+}
+
+/**
+ * Spec #168 / ticket #171 — the per-command record for a command whose runner
+ * never produced a settled `RunResult`. The typed `COMMAND_TIMEOUT` /
+ * `COMMAND_CANCELLED` errors carry the executor's own duration and truncation
+ * fidelity, so a timed-out command is recorded as a timeout rather than being
+ * dropped from the receipt.
+ */
+function failedCommandEvidence(
+  command: string,
+  error: unknown,
+  startedAtMs: number,
+  timeoutMs: number,
+  outputLimit: number,
+): VerificationCommandEvidenceV1 {
+  const details = error instanceof PoiesisError ? error.details : {};
+  const timedOut = error instanceof PoiesisError && error.code === "COMMAND_TIMEOUT";
+  // A timeout is its own classification; every other rejection means the runner
+  // never produced a settled result for this command.
+  const classification: VerificationCommandClassification = timedOut ? "timeout" : "spawn-error";
+  const durationMs = typeof details.durationMs === "number" ? details.durationMs : Math.max(0, Date.now() - startedAtMs);
+  const stdout = typeof details.stdout === "string" ? bounded(details.stdout, outputLimit) : "";
+  const stderr = typeof details.stderr === "string" ? bounded(details.stderr, outputLimit) : "";
+  return {
+    command,
+    status: "failed",
+    classification,
+    exitCode: typeof details.exitCode === "number" ? details.exitCode : null,
+    signal: typeof details.signal === "string" ? details.signal : null,
+    startedAt: new Date(startedAtMs).toISOString(),
+    endedAt: new Date(startedAtMs + durationMs).toISOString(),
+    durationMs,
+    timeoutMs,
+    timedOut,
+    stdout,
+    stderr,
+    stdoutTruncated: details.stdoutTruncated === true,
+    stderrTruncated: details.stderrTruncated === true,
+    outputTruncated: details.stdoutTruncated === true || details.stderrTruncated === true,
+  };
 }
 
 export async function publish(options: PublishOptions): Promise<PublishResult> {
@@ -714,6 +883,18 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     provided: options.candidateTree,
   });
   validateProofEvidence(options.proof, candidateSha, candidateTree);
+  // Spec #168 / ticket #171: resolve the runtime-owned verification receipt.
+  // `proof.verified` is a claim; the stored receipt is the evidence. Publish
+  // reads the receipt the caller named and revalidates EVERY binding against
+  // live authority, the live verification plan of the PRIMARY installation,
+  // and the live candidate BEFORE any push happens.
+  const receipt = await resolveVerificationReceipt({
+    authority: owned,
+    reference: options.proof.verification,
+    candidateSha,
+    candidateTree,
+    plan: await resolveLiveVerificationPlan(owned.primaryRoot),
+  });
 
   const remoteRef = `refs/heads/${branch}`;
   const expectedRemote = await lsRemoteHead(owned.candidateRoot, options.remote, branch);
@@ -774,6 +955,10 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       id: providerCompletion.requestId,
       url: providerCompletion.requestUrl,
     },
+    // The receipt identity is re-derived from the STORED document Publish just
+    // resolved, so the evidence a caller forwards to Preview names exactly
+    // what this process proved.
+    verification: verificationEvidenceFrom(receipt),
   };
   validatePublishEvidence(evidence, candidateSha, candidateTree, branch, remoteRef);
 
@@ -1395,7 +1580,7 @@ async function verifyIntegratedCommit(
     path,
   });
   await run("git", ["worktree", "add", "--detach", path, integratedSha], { cwd: repositoryRoot });
-  let result: VerifyResult | null = null;
+  let outcome: VerificationOutcome | null = null;
   let failure: unknown;
   try {
     // Spec #168 / ticket #169: the temporary detached worktree is not a
@@ -1403,10 +1588,15 @@ async function verifyIntegratedCommit(
     // own. `integrate` already resolved and authenticated the candidate's
     // authority before the integration side effects ran; the commands
     // still execute in the temporary worktree.
+    //
+    // Spec #168 / ticket #171: post-integration verification is NOT
+    // proof scope — it proves the integrated revision inside a throwaway
+    // worktree, not the candidate — so it issues no verification receipt.
     const verifyOptions: VerifyOptions = { cwd: path, candidateSha: integratedSha, commands };
     if (outputLimit !== undefined) verifyOptions.outputLimit = outputLimit;
     if (env !== undefined) verifyOptions.env = env;
-    result = await runVerification(verifyOptions, path, owned.marker.ownershipId);
+    outcome = await runVerification(verifyOptions, path, owned.marker.ownershipId);
+    failure = outcome.failure;
   } catch (error) {
     failure = error;
   }
@@ -1420,9 +1610,9 @@ async function verifyIntegratedCommit(
     );
   }
   await run("git", ["worktree", "remove", path], { cwd: repositoryRoot });
-  if (failure !== undefined) throw failure;
-  invariant(result !== null, "POST_INTEGRATION_VERIFY_FAILED", "Post-integration verification returned no result");
-  return result;
+  if (failure !== undefined && failure !== null) throw failure;
+  invariant(outcome !== null, "POST_INTEGRATION_VERIFY_FAILED", "Post-integration verification returned no result");
+  return outcome.result;
 }
 
 async function canonicalGitRoot(cwd: string): Promise<string> {

@@ -40,7 +40,7 @@ import { serializeConfig } from "../src/config.js";
 import { loadManifest } from "../src/manifest.js";
 import { manifestDigest, removeOwnershipReceipt } from "../src/receipt.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 const repositories: TestRepository[] = [];
@@ -138,7 +138,7 @@ async function publishCandidate(
     project: repository.fixtures,
     title: "Candidate",
     body: "body",
-    proof: proofShell(candidate.sha, candidate.tree),
+    proof: await verifiedProof({ cwd: candidate.path, ownershipId: candidate.ownershipId, candidateSha: candidate.sha, candidateTree: candidate.tree }),
   });
 }
 

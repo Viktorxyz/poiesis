@@ -20,7 +20,7 @@ import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, 
 import { init } from "../src/maintenance.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run, type RunResult } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
@@ -105,7 +105,7 @@ describe("deterministic Git lifecycle", () => {
       project: repository.fixtures,
       title: "Spec 1",
       body: "body",
-      proof: proofShell(accepted.sha, treeA),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: accepted.sha, candidateTree: treeA }),
     });
     await expect(
       publish({
@@ -119,7 +119,7 @@ describe("deterministic Git lifecycle", () => {
         project: repository.fixtures,
         title: "Spec 1 rerun",
         body: "body",
-        proof: proofShell(accepted.sha, treeA),
+        proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: accepted.sha, candidateTree: treeA }),
       }),
     ).resolves.toMatchObject({ action: "updated" });
 
@@ -199,6 +199,14 @@ describe("deterministic Git lifecycle", () => {
     await run("git", ["commit", "--quiet", "--allow-empty", "-m", "unreviewed same-tree candidate"], { cwd: workspace.path });
     const newerSha = (await run("git", ["rev-parse", "HEAD"], { cwd: workspace.path })).stdout;
 
+    // The receipt is real and bound to the candidate being published; only the
+    // proof's identity is back-dated to the older same-tree commit.
+    const proof = await verifiedProof({
+      cwd: workspace.path,
+      ownershipId: workspace.ownershipId,
+      candidateSha: newerSha,
+      candidateTree: tree,
+    });
     await expect(
       publish({
         cwd: workspace.path,
@@ -211,7 +219,7 @@ describe("deterministic Git lifecycle", () => {
         project: repository.fixtures,
         title: "stale proof",
         body: "body",
-        proof: proofShell(accepted.sha, tree),
+        proof: { ...proof, candidateSha: accepted.sha },
       }),
     ).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
     expect((await run("git", ["ls-remote", "--heads", "origin", "refs/heads/poiesis/proof-binding"], { cwd: workspace.path })).stdout).toBe("");
@@ -274,7 +282,7 @@ describe("deterministic Git lifecycle", () => {
       project: repository.fixtures,
       title: "stale",
       body: "stale",
-      proof: proofShell(candidate.sha, treeB),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: candidate.sha, candidateTree: treeB }),
     });
 
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
@@ -331,7 +339,7 @@ describe("deterministic Git lifecycle", () => {
       project: repository.fixtures,
       title: "Spec 2 v1",
       body: "body",
-      proof: proofShell(acceptedV1.sha, treeV1),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: acceptedV1.sha, candidateTree: treeV1 }),
     });
     expect(first.action).toBe("pushed");
 
@@ -354,7 +362,7 @@ describe("deterministic Git lifecycle", () => {
       project: repository.fixtures,
       title: "Spec 2 v2",
       body: "body",
-      proof: proofShell(acceptedV2.sha, treeV2),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: acceptedV2.sha, candidateTree: treeV2 }),
     });
     expect(fastForward.action).toBe("updated");
 
@@ -388,7 +396,7 @@ describe("deterministic Git lifecycle", () => {
         project: repository.fixtures,
         title: "Spec 2 rerun",
         body: "body",
-        proof: proofShell(acceptedV2.sha, treeV2),
+        proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: acceptedV2.sha, candidateTree: treeV2 }),
       }),
     ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
   }, 30_000);
@@ -476,7 +484,7 @@ it("accepts a default-path workspace on a normal branch (poiesis/greeting-comman
       project: repository.fixtures,
       title: "Greeting command",
       body: "body",
-      proof: proofShell(accepted.sha, tree),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: accepted.sha, candidateTree: tree }),
     });
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree), publish: publishEvidence(accepted.sha, tree, "poiesis/greeting-command"), remote: "origin" });
@@ -660,7 +668,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(first.action).toBe("created");
 
@@ -683,7 +691,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec v2",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(second.action).toBe("updated");
   }, 30_000);
@@ -709,7 +717,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
 
     // Second publish: headRepository field absent entirely.
@@ -729,7 +737,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec v2",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(second.action).toBe("updated");
   }, 30_000);
@@ -755,7 +763,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
 
     // Second publish: gh returns a PR that points at a fork. Still mismatch.
@@ -772,7 +780,7 @@ describe("GitHub provider headRepository handling", () => {
         project,
         title: "Spec v2",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
   }, 30_000);
@@ -809,7 +817,7 @@ describe("GitHub provider headRepository handling", () => {
         project,
         title: "Spec",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
   }, 30_000);
@@ -841,7 +849,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
 
     // Second publish: initial list matches a same-repo PR, gh pr edit
@@ -865,7 +873,7 @@ describe("GitHub provider headRepository handling", () => {
         project,
         title: "Spec v2",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "CHANGE_REQUEST_OWNERSHIP_MISMATCH" });
   }, 30_000);
@@ -896,7 +904,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
 
     // Edit path, empty nameWithOwner on the final verify.
@@ -916,7 +924,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec v2",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(second.action).toBe("updated");
 
@@ -937,7 +945,7 @@ describe("GitHub provider headRepository handling", () => {
       project,
       title: "Spec v3",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(third.action).toBe("updated");
   }, 30_000);

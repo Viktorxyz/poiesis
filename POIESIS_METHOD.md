@@ -240,7 +240,7 @@ After a mutation:
 
 ## 11. Publish
 
-Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
+Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
 
 - push the Poiesis change branch;
 - create or update one PR/MR targeting the canonical integration branch;
@@ -260,6 +260,7 @@ Canonical Publish evidence fields (runtime-required, equality invariants shown a
 - `action` — one of `"created" | "updated" | "pushed"`.
 - `changeRequest.id` — string-or-null (provider change-request id, if any).
 - `changeRequest.url` — string-or-null (provider change-request URL, if any).
+- `verification` — the runtime-owned verification receipt reference Publish itself resolved for this exact candidate: `receiptId`, `receiptDigest`, `runtime`, `candidateSha`, `candidateTree`, `verificationPlanDigest`. An asserted `verified: true` is a claim; this reference is the evidence, and Preview requires it in the forwarded evidence.
 
 A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
@@ -267,7 +268,7 @@ A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists 
 
 Preview only after Publish succeeds. Pass, to `poiesis preview`:
 
-- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`);
+- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }`);
 - the same exact dynamic `--candidate-tree` that Publish just produced;
 - the exact successful canonical candidate-bound Publish evidence as `--publish` (the precise object returned by `poiesis publish`, carrying every field listed in §11 above).
 

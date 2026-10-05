@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { publish, resolveTree, workspacePrepare, checkpoint } from "../src/git.js";
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
@@ -255,7 +255,7 @@ describe("publish fail-closed invariants", () => {
       project: repository.fixtures,
       title: "ticket",
       body: "body",
-      proof: proofShell(accepted.sha, tree),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: accepted.sha, candidateTree: tree }),
     });
     expect(result.candidateSha).toBe(accepted.sha);
     expect(result.action).toBe("pushed");

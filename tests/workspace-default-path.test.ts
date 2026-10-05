@@ -5,7 +5,7 @@ import { checkpoint, integrate, publish, resolveTree, workspaceCleanup, workspac
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
@@ -260,7 +260,7 @@ describe("workspace prepare default path", () => {
       project: repository.fixtures,
       title: "Default path",
       body: "body",
-      proof: proofShell(accepted.sha, tree),
+      proof: await verifiedProof({ cwd: workspace.path, ownershipId: workspace.ownershipId, candidateSha: accepted.sha, candidateTree: tree }),
     });
     const delivery = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const preview = await delivery.preview({ sha: accepted.sha, candidateTree: tree, proof: proofShell(accepted.sha, tree), publish: publishEvidence(accepted.sha, tree, "poiesis/default-path-lifecycle"), remote: "origin" });
