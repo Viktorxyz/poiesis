@@ -71,6 +71,7 @@ import {
   validateOpenCodeConfig,
 } from "./opencode.js";
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
+import { hostPathFlavor, type PathFlavor } from "./path-flavor.js";
 import {
   assertPoiesisScriptAvailable,
   ensurePoiesisScriptRefusing,
@@ -1696,11 +1697,77 @@ export async function resolveConfigRoot(cwd: string): Promise<string> {
   const resolvedCommonDir = commonDirResult.exitCode === 0
     ? resolve(isAbsolute(commonDirResult.stdout) ? commonDirResult.stdout : resolve(cwd, commonDirResult.stdout))
     : resolve(cwd);
-  const parent = resolvedCommonDir.replace(/\/$/, "").replace(/\/[^/]+$/, "");
-  if (parent === "" || parent === resolvedCommonDir) return resolve(cwd);
+  const parent = primaryCheckoutOfCommonDir(resolvedCommonDir);
+  if (parent === null) return resolve(cwd);
   const configPath = join(parent, ".poiesis", "config.jsonc");
   if (await exists(configPath)) return parent;
   return resolve(cwd);
+}
+
+/**
+ * Spec #139 / ticket #156 — the primary checkout that OWNS a Git common
+ * directory, derived with the platform's own `dirname`.
+ *
+ * The common directory of a primary checkout IS that checkout's `.git`
+ * directory, so the checkout is the directory above it. This used to be spelled
+ * `replace(/\/$/, "").replace(/\/[^/]+$/, "")`, which is correct on POSIX and
+ * silently inert on Windows: `C:\primary\.git` contains no `/`, nothing was
+ * stripped, the result equalled its input, and a linked worktree on a Windows
+ * host therefore resolved the INSTALLATION ROOT to itself — after which the
+ * runtime-identity and lifecycle-policy guards read the worktree's config
+ * instead of the primary's. The authority this function protects is the whole
+ * reason it cannot be spelled with a POSIX-only regex.
+ *
+ * `dirname` also handles the trailing separator (`/a/.git/` and `/a/` both
+ * answer `/a`) and the filesystem root (`dirname("/") === "/"`, so a root
+ * common directory reports no parent rather than an empty string).
+ *
+ * Returns `null` — never a guess — when there is no parent to name: a root
+ * common directory, or a report that is not absolute for this flavor. Callers
+ * fall back to their invocation root.
+ */
+export function primaryCheckoutOfCommonDir(
+  commonDir: string,
+  flavor: PathFlavor = hostPathFlavor(),
+): string | null {
+  const normalized = flavor.normalize(commonDir);
+  if (!flavor.isAbsolute(normalized)) return null;
+  const parent = flavor.dirname(normalized);
+  return parent.length === 0 || parent === normalized ? null : parent;
+}
+
+/**
+ * Spec #139 / ticket #156 — the installation-root derivation, split from the
+ * subprocess so the PATH question is answerable on any host.
+ *
+ * `git rev-parse --absolute-git-dir --git-common-dir` prints the two paths in
+ * one call. In a primary checkout they are the same path and the checkout owns
+ * the installation; in a linked worktree they differ, and the common directory
+ * is the PRIMARY checkout's `.git`. The reconciliation is therefore one
+ * side-effect-free subprocess, and this pure function is what it reconciles
+ * into: a caller (and a test) can drive the answer for a Windows report from a
+ * Linux host by passing the Windows flavor.
+ */
+export function deriveInstallationRoot(
+  repoRoot: string,
+  reported: readonly string[],
+  flavor: PathFlavor = hostPathFlavor(),
+): string {
+  const root = flavor.resolve(repoRoot);
+  const [gitDirLine, commonDirLine] = reported;
+  if (gitDirLine === undefined || commonDirLine === undefined) return root;
+  // The FLAVOR decides what "absolute" means, not the host. Reading these two
+  // lines with the host's own `isAbsolute` is the same POSIX-only mistake one
+  // layer down: on a Linux host asked about `C:\primary\.git` the host reports
+  // it as RELATIVE and the derivation anchors it under the Linux root, so a
+  // Windows answer could never be reached even with the Windows flavor in hand.
+  const absolute = (line: string): string => flavor.resolve(flavor.isAbsolute(line) ? line : flavor.resolve(root, line));
+  // Git reports the same path twice in a primary checkout. That equality IS
+  // the primary/worktree discriminator, so a report that cannot produce two
+  // absolute paths, or that reports them as equal, keeps the invocation root
+  // rather than being derived into something.
+  if (absolute(gitDirLine) === absolute(commonDirLine)) return root;
+  return primaryCheckoutOfCommonDir(absolute(commonDirLine), flavor) ?? root;
 }
 
 /**
@@ -1727,19 +1794,12 @@ export async function resolveInstallationRoot(repoRoot: string): Promise<string>
     cwd: repoRoot,
     allowFailure: true,
   });
-  const [gitDir, commonDir] = result.stdout
+  if (result.exitCode !== 0) return resolve(repoRoot);
+  const reported = result.stdout
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => resolve(isAbsolute(line) ? line : resolve(repoRoot, line)));
-  if (result.exitCode !== 0 || gitDir === undefined || commonDir === undefined || gitDir === commonDir) {
-    return resolve(repoRoot);
-  }
-  // A linked worktree: the primary checkout that owns the installation is the
-  // parent of the shared common directory (the primary checkout's `.git`).
-  const primary = commonDir.replace(/\/$/, "").replace(/\/[^/]+$/, "");
-  if (primary === "" || primary === commonDir) return resolve(repoRoot);
-  return primary;
+    .filter((line) => line.length > 0);
+  return deriveInstallationRoot(repoRoot, reported);
 }
 
 export async function doctor(root: string): Promise<DoctorReport> {

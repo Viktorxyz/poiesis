@@ -1,10 +1,10 @@
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PoiesisError, invariant } from "./errors.js";
+import { discoverGitCommonDir } from "./git-common-dir.js";
 import type {
   CreateSpecInput,
   CreateTicketInput,
@@ -190,39 +190,19 @@ function buildLocation(gitCommonDir: string): LocalTrackerStoreLocation {
  * ever makes: the store is located, never fetched, and no working tree is
  * read or written.
  *
+ * The query itself lives in `src/git-common-dir.ts` (Spec #139 / ticket #156),
+ * which owns the explicit timeout, the max-output bound, and the five stable
+ * typed refusals. This function adds exactly one thing on top: the
+ * canonicalization `realpath` gives, so a repository reached through a
+ * symlinked parent still produces ONE store location rather than two.
+ *
  * The resolution is synchronous because `TrackerAdapter.project` is a
  * synchronous readonly property and `createTrackerAdapter` returns one
  * synchronously. The exported async form is the same single implementation,
  * so no caller can observe two different locations.
  */
 export function resolveLocalTrackerStoreLocationSync(cwd: string): LocalTrackerStoreLocation {
-  const root = resolve(cwd);
-  let stdout: string;
-  try {
-    stdout = execFileSync("git", ["rev-parse", "--git-common-dir"], {
-      cwd: root,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (error) {
-    throw new PoiesisError(
-      "LOCAL_TRACKER_GIT_UNAVAILABLE",
-      "The local tracker requires a Git repository with a resolvable common directory",
-      { cwd: root, cause: error instanceof Error ? error.message : String(error) },
-    );
-  }
-  const reported = stdout.trim();
-  if (reported.length === 0) {
-    throw new PoiesisError(
-      "LOCAL_TRACKER_GIT_UNAVAILABLE",
-      "Git reported an empty common directory for the local tracker",
-      { cwd: root },
-    );
-  }
-  // `git rev-parse --git-common-dir` prints a path relative to the working
-  // directory in the primary checkout and an absolute path in a linked
-  // worktree; `resolve` accepts both.
-  return buildLocation(realpathSync(resolve(root, reported)));
+  return buildLocation(realpathSync(discoverGitCommonDir(cwd)));
 }
 
 export async function resolveLocalTrackerStoreLocation(cwd: string): Promise<LocalTrackerStoreLocation> {
