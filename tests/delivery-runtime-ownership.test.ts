@@ -49,6 +49,7 @@ import {
 } from "../src/delivery-runtime.js";
 import { loadManifest } from "../src/manifest.js";
 import { readOwnershipReceipt, manifestDigest, ownershipReceiptExists } from "../src/receipt.js";
+import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
 import { parseJsonc } from "../src/config.js";
 import { readUtf8 } from "../src/fs.js";
@@ -176,19 +177,52 @@ async function installedTargetCommand(root: string, target: string): Promise<str
 /**
  * Run one delivery target exactly as the command adapter does: the installed
  * argv with `{sha}` / `{target}` substituted, executed with the workspace as
- * its working directory.
+ * its working directory and the runtime's candidate environment.
+ *
+ * Spec #139 / ticket #165 made `POIESIS_DELIVERY_IDENTITY` REQUIRED for a
+ * promotion: `staging` extends a Preview receipt and `production` extends a
+ * Staging one, and either refuses to write a record it cannot bind to a real
+ * artifact. The source identity is therefore passed in rather than assumed,
+ * exactly as `CommandDeliveryAdapter.execute` supplies it.
  */
 async function runInstalledTarget(
   root: string,
   target: string,
   sha: string,
+  sourceIdentity?: unknown,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   const command = await installedTargetCommand(root, target);
   const argv = command.map((argument) =>
     argument === "{sha}" ? sha : argument === "{target}" ? target : argument,
   );
-  const result = await run(argv[0]!, argv.slice(1), { cwd: root });
+  const result = await run(argv[0]!, argv.slice(1), {
+    cwd: root,
+    env: {
+      POIESIS_CANDIDATE_SHA: sha,
+      POIESIS_CANDIDATE_TREE: await resolveTree(root, sha),
+      POIESIS_DELIVERY_TARGET: target,
+      ...(sourceIdentity === undefined ? {} : { POIESIS_DELIVERY_IDENTITY: JSON.stringify(sourceIdentity) }),
+    },
+    allowFailure: true,
+  });
   return { exitCode: result.exitCode, stdout: result.stdout, stderr: result.stderr };
+}
+
+/**
+ * Run the installed default for all three targets as the real chain does, each
+ * one extending the receipt the target before it produced, and return those
+ * receipts. Every target must succeed, so a refusal fails the caller here
+ * rather than silently leaving an uninspected residue behind.
+ */
+async function runInstalledTargets(root: string, sha: string): Promise<Record<string, Record<string, unknown>>> {
+  const receipts: Record<string, Record<string, unknown>> = {};
+  for (const target of ["preview", "staging", "production"]) {
+    const source = target === "staging" ? receipts.preview : target === "production" ? receipts.staging : undefined;
+    const outcome = await runInstalledTarget(root, target, sha, source);
+    expect(outcome.exitCode, `${target} target refused: ${outcome.stderr}`).toBe(0);
+    receipts[target] = JSON.parse(outcome.stdout) as Record<string, unknown>;
+  }
+  return receipts;
 }
 
 async function gitStatusPorcelain(cwd: string): Promise<string> {
@@ -281,10 +315,7 @@ describe("generated delivery runtime ownership", () => {
     foreignBins.push(await installForeignBinStubs());
     await installWithGeneratedTargets(repository);
 
-    for (const target of ["preview", "staging", "production"]) {
-      const outcome = await runInstalledTarget(repository.root, target, repository.baseSha);
-      expect(outcome.exitCode, outcome.stderr).toBe(0);
-    }
+    await runInstalledTargets(repository.root, repository.baseSha);
 
     const manifest = await loadManifest(repository.root);
     const recorded = manifest.files.map((file) => file.path);
@@ -306,10 +337,12 @@ describe("generated delivery runtime ownership", () => {
     await installWithGeneratedTargets(repository);
     const before = await gitStatusPorcelain(repository.root);
 
+    // The whole installed chain, so every target's residue is on disk before
+    // `git status` is compared with its pre-run value.
+    const receipts = await runInstalledTargets(repository.root, repository.baseSha);
+
     for (const target of ["preview", "staging", "production"]) {
-      const outcome = await runInstalledTarget(repository.root, target, repository.baseSha);
-      expect(outcome.exitCode, outcome.stderr).toBe(0);
-      expect(JSON.parse(outcome.stdout)).toMatchObject({ target, candidateSha: repository.baseSha });
+      expect(receipts[target]).toMatchObject({ target, candidateSha: repository.baseSha });
       await expect(
         readFile(join(repository.root, EXPECTED_RUNTIME_RELATIVE, target, repository.baseSha, "delivery.json"), "utf8"),
       ).resolves.toContain(`"candidateSha": "${repository.baseSha}"`);
