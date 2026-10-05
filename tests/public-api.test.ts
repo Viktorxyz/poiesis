@@ -272,6 +272,14 @@ const forbiddenFunctions = [
   "LOCAL_TRACKER_STORE_PROVIDER",
   "LOCAL_TRACKER_LOCK_VERSION",
   "LOCAL_TRACKER_LOCK_TIMEOUT_MS",
+  // Spec #139 / ticket #159: the total serialized-store ceiling is a bound on
+  // ONE internal store layout, not a contract a caller tunes. Promoting it
+  // through `src/index.ts` would freeze the number, the trailing newline it
+  // counts, and the `LOCAL_TRACKER_STORE_TOO_LARGE` refusal's inert
+  // `path` / `sizeBytes` / `maxBytes` details into a public API, and would let
+  // a caller raise a bound that exists precisely because Poiesis does not read
+  // an unbounded document on its behalf.
+  "LOCAL_TRACKER_STORE_MAX_BYTES",
   // Spec #139 / ticket #141: the Linear adapter lives in
   // `src/linear-tracker.ts` and stays module-internal, and it is reached
   // through the EXISTING public `createTrackerAdapter` factory rather than a

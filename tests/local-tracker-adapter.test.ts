@@ -21,9 +21,10 @@
  *      leaves the bytes on disk untouched.
  */
 import { spawn, spawnSync } from "node:child_process";
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { appendFile, chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { realpath } from "node:fs/promises";
 import { join, relative, resolve, sep } from "node:path";
@@ -33,6 +34,8 @@ import { PoiesisError } from "../src/errors.js";
 import {
   LOCAL_TRACKER_LOCK_VERSION,
   LOCAL_TRACKER_STORE_DIRECTORY,
+  LOCAL_TRACKER_STORE_MAX_BYTES,
+  type LocalTrackerStoreLocation,
   acquireLocalTrackerLockWithTimeout,
   assertLocalTrackerStoreUsable,
   createLocalTrackerAdapter,
@@ -1844,6 +1847,359 @@ describe("a LOCAL identifier is canonical or it is nothing", () => {
     expect((await reloaded.getTicket("LOCAL-13")).state).toBe("superseded");
     expect((await reloaded.createSpec({ title: "After", body: "B" })).id).toBe("LOCAL-14");
   });
+});
+
+/**
+ * Spec #139 / ticket #159 — the COMPLETE serialized store is BOUNDED.
+ *
+ * The local document is a complete snapshot: every Spec, Ticket, comment, and
+ * history entry the tracker has ever committed lives in that one file, so the
+ * file only ever grows and no read of it can be free. A ceiling is the only
+ * honest answer to that — but a ceiling is only real if it is enforced on BOTH
+ * sides of the write, and enforced by ONE mechanism, because two bounds that
+ * can disagree produce exactly the two failures this ticket exists to prevent:
+ * a store that was committed over the ceiling and can no longer be read, and a
+ * store that is silently trimmed to fit.
+ *
+ * What is asserted here, and what breaks each assertion:
+ *
+ *   1. EXACTLY AT THE LIMIT IS ACCEPTED, ONE BYTE OVER IS REFUSED. The bound
+ *      is a total byte count INCLUDING the trailing newline, so an off-by-one
+ *      in either direction is visible at this boundary and nowhere else. The
+ *      refusal also happens BEFORE parsing: an oversized document whose bytes
+ *      are not JSON at all still reports the SIZE, which a parse-then-check
+ *      implementation cannot do.
+ *   2. READS ARE LOCK-FREE, SO A LIVE FOREIGN LOCK CHANGES NOTHING. The size
+ *      is a fact about the bytes. If the refusal needed the lock, an
+ *      oversize store would be reported as a lock timeout and the two would be
+ *      indistinguishable.
+ *   3. A GROWING FILE STAYS BOUNDED. The reported count is what Poiesis
+ *      actually consumed, so it is `max + 1` no matter how large the file
+ *      became; a read sized from `stat` reports a number that moves.
+ *   4. A MUTATION THAT CROSSES THE CEILING IS REFUSED BEFORE THE DURABLE
+ *      REPLACE. The canonical bytes are byte-for-byte unchanged, no temporary,
+ *      lock, or guard artifact is left behind, and a later FITTING mutation
+ *      still commits — a refusal that wedged the protocol would be a denial of
+ *      service the operator cannot clear.
+ *   5. NOTHING IS PRUNED TO FIT. A truncated history is indistinguishable from
+ *      a history that was never recorded, so the retained comments and history
+ *      entries are asserted individually, not merely left byte-identical.
+ *   6. TWO WRITERS THAT BOTH CROSS IT are serialized by the same lock and both
+ *      refused the same way, and the protocol is still healthy afterwards.
+ *   7. The USABILITY check `verifyTracker` / `doctor` runs on the same bound, so
+ *      an oversize store is reported as a failing tracker rather than a healthy
+ *      one whose every later operation will be refused.
+ */
+describe("the complete serialized store is bounded and never pruned to fit", () => {
+  const BOUNDARY_AT = "2026-01-01T00:00:00.000Z";
+  /** Headroom left below the ceiling, and the history already committed in it. */
+  const NEAR_SLACK_BYTES = 4_096;
+  const RETAINED_COMMENTS = ["kept", "kept verbatim with  spacing", "unicode: αβγ — ✓"];
+
+  function boundaryItem(id: string): Record<string, unknown> {
+    return {
+      id,
+      kind: "spec",
+      title: `Intent ${id}`,
+      body: "B",
+      state: "open",
+      createdAt: BOUNDARY_AT,
+      updatedAt: BOUNDARY_AT,
+    };
+  }
+
+  /**
+   * A strictly valid document whose total size on disk, trailing newline
+   * included, is exact arithmetic rather than a search: the bulk is a comment
+   * body, and a comment body adds exactly one byte per character. The bulk
+   * sits on `LOCAL-2` so `LOCAL-1` stays small, which is what lets ONE fixture
+   * serve the read boundary, the mutation boundary, and the history boundary.
+   */
+  function boundaryStoreDocument(fillerLength: number, firstSpecComments: readonly string[] = []): string {
+    const store = {
+      schema: 1,
+      provider: "poiesis-local",
+      nextId: 3,
+      items: {
+        "LOCAL-1": {
+          item: boundaryItem("LOCAL-1"),
+          comments: firstSpecComments.map((body, index) => ({
+            id: `LOCAL-1-C${index + 1}`,
+            itemId: "LOCAL-1",
+            body,
+            createdAt: BOUNDARY_AT,
+          })),
+          history: [{ operation: "create", at: BOUNDARY_AT, snapshot: boundaryItem("LOCAL-1") }],
+        },
+        "LOCAL-2": {
+          item: boundaryItem("LOCAL-2"),
+          comments: [
+            { id: "LOCAL-2-C1", itemId: "LOCAL-2", body: "z".repeat(fillerLength), createdAt: BOUNDARY_AT },
+          ],
+          history: [{ operation: "create", at: BOUNDARY_AT, snapshot: boundaryItem("LOCAL-2") }],
+        },
+      },
+    };
+    return `${JSON.stringify(store, null, 2)}\n`;
+  }
+
+  function boundaryStoreAt(totalBytes: number, firstSpecComments: readonly string[] = []): string {
+    const base = Buffer.byteLength(boundaryStoreDocument(0, firstSpecComments), "utf8");
+    return boundaryStoreDocument(totalBytes - base, firstSpecComments);
+  }
+
+  /**
+   * ONE built document per distinct size, shared by the whole block. Each is a
+   * 16 MiB string, and a suite that rebuilt one per test would spend its memory
+   * budget on fixtures instead of on evidence. The documents are immutable and
+   * a test plants one in the store and then mutates the FILE, so sharing one can
+   * never let one test's mutation reach another's fixture.
+   */
+  const fixtures = new Map<string, string>();
+  function fixture(key: string, build: () => string): string {
+    const cached = fixtures.get(key);
+    if (cached !== undefined) return cached;
+    const built = build();
+    fixtures.set(key, built);
+    return built;
+  }
+  /** A well-formed document of exactly the ceiling, trailing newline included. */
+  const atCeiling = (): string => fixture("at-ceiling", () => boundaryStoreAt(LOCAL_TRACKER_STORE_MAX_BYTES));
+  /** The same document one byte larger, so it is one byte OVER. */
+  const overCeiling = (): string => fixture("over-ceiling", () => boundaryStoreAt(LOCAL_TRACKER_STORE_MAX_BYTES + 1));
+  /** One byte over the ceiling AND not valid JSON, which orders the size check first. */
+  const unparseableOverCeiling = (): string =>
+    fixture("unparseable-over-ceiling", () => `${atCeiling().slice(0, LOCAL_TRACKER_STORE_MAX_BYTES)}{`);
+  /** A well-formed document just below the ceiling, with history already in it. */
+  const nearCeiling = (): string =>
+    fixture("near-ceiling", () => boundaryStoreAt(LOCAL_TRACKER_STORE_MAX_BYTES - NEAR_SLACK_BYTES, RETAINED_COMMENTS));
+
+  async function writeStoreDocument(location: LocalTrackerStoreLocation, document: string): Promise<void> {
+    await mkdir(location.directory, { recursive: true, mode: 0o700 });
+    await writeFile(location.storePath, document, { mode: 0o600 });
+  }
+
+  function caught(reason: unknown): PoiesisError {
+    return reason as PoiesisError;
+  }
+
+  /**
+   * The refusal is INERT: the exact path and two exact numbers, and nothing
+   * else. A procedure interpolated into that path would hand a command to
+   * whatever the Git common directory Poiesis did not choose contains, and
+   * there is nothing procedural to say that the two numbers do not.
+   */
+  function expectInertSizeRefusal(error: PoiesisError, path: string, sizeBytes: number): void {
+    expect(error.code).toBe("LOCAL_TRACKER_STORE_TOO_LARGE");
+    expect(Object.keys(error.details).sort()).toEqual(["maxBytes", "path", "sizeBytes"]);
+    expect(error.details).toEqual({ path, sizeBytes, maxBytes: LOCAL_TRACKER_STORE_MAX_BYTES });
+    for (const value of Object.values(error.details)) {
+      expect(typeof value === "string" || typeof value === "number").toBe(true);
+    }
+  }
+
+  it("accepts a store of exactly the ceiling and refuses one byte over, before it parses", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+
+    const exact = atCeiling();
+    expect(Buffer.byteLength(exact, "utf8")).toBe(LOCAL_TRACKER_STORE_MAX_BYTES);
+    await writeStoreDocument(location, exact);
+    // EXACTLY at the ceiling is inside it: the whole document, trailing newline
+    // included, is served through the ordinary lock-free read path.
+    expect((await tracker.getSpec("LOCAL-1")).id).toBe("LOCAL-1");
+    expect((await tracker.getSpec("LOCAL-2")).id).toBe("LOCAL-2");
+
+    const over = overCeiling();
+    expect(Buffer.byteLength(over, "utf8")).toBe(LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+    await writeStoreDocument(location, over);
+    expectInertSizeRefusal(
+      caught(await tracker.getSpec("LOCAL-1").then(() => undefined, (reason: unknown) => reason)),
+      location.storePath,
+      LOCAL_TRACKER_STORE_MAX_BYTES + 1,
+    );
+
+    // BEFORE PARSING, and not as a parse failure: the same oversized byte count
+    // carrying bytes that are not JSON at all still reports the SIZE. A
+    // parse-then-check implementation reports INVALID_LOCAL_TRACKER_STORE here.
+    const unparseable = unparseableOverCeiling();
+    await writeStoreDocument(location, unparseable);
+    expectInertSizeRefusal(
+      caught(await tracker.getSpec("LOCAL-1").then(() => undefined, (reason: unknown) => reason)),
+      location.storePath,
+      LOCAL_TRACKER_STORE_MAX_BYTES + 1,
+    );
+    // The refused store is left byte-for-byte alone, exactly like a corrupt one.
+    const refused = await readFile(location.storePath);
+    expect(refused.byteLength).toBe(LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+    expect(refused.subarray(refused.byteLength - 1).toString("utf8")).toBe("{");
+  }, 120_000);
+
+  it("refuses an oversize read while a live foreign lock is held, because reads are lock-free", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+
+    await writeStoreDocument(location, atCeiling());
+    const foreign = lockEnvelope("foreign-token", process.pid);
+    await writeFile(location.lockPath, foreign, { mode: 0o600 });
+    // A live foreign lock blocks WRITERS. It has never blocked a reader, and a
+    // size fact about the bytes cannot depend on winning the lock either.
+    expect((await tracker.getSpec("LOCAL-1")).id).toBe("LOCAL-1");
+
+    await writeStoreDocument(location, overCeiling());
+    const error = caught(await tracker.getSpec("LOCAL-1").then(() => undefined, (reason: unknown) => reason));
+    // The size refusal, NOT `LOCAL_TRACKER_LOCK_TIMEOUT`: collapsing the two
+    // would report a permanent property of the store as a transient condition
+    // of a lock, and the recovery for each is different.
+    expectInertSizeRefusal(error, location.storePath, LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+    // The foreign lock was neither stolen nor rewritten.
+    expect(await readFile(location.lockPath, "utf8")).toBe(foreign);
+  }, 120_000);
+
+  it("consumes at most one byte over the ceiling while the file keeps growing", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+    await writeStoreDocument(location, overCeiling());
+
+    const growth = "y".repeat(4 * 1024 * 1024);
+    for (let round = 0; round < 2; round += 1) {
+      // The file is already over the ceiling, so the refusal is deterministic,
+      // and a concurrent appender keeps making it larger across the read: the
+      // size the reader observes and the size the file ends at must not be the
+      // same number.
+      const appending = appendFile(location.storePath, growth, { mode: 0o600 });
+      const error = caught(await tracker.getSpec("LOCAL-1").then(() => undefined, (reason: unknown) => reason));
+      await appending;
+      // The reported count is what Poiesis ACTUALLY consumed. A read sized from
+      // `stat` reports a number that moves as the file grows, and a read that
+      // counted the rest of the file would read megabytes more to produce it.
+      expectInertSizeRefusal(error, location.storePath, LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+    }
+    // The file really did grow well past what either refusal reported.
+    expect((await lstat(location.storePath)).size).toBeGreaterThan(LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+  }, 120_000);
+
+  it("refuses a mutation that would cross the ceiling before the durable replace, and still accepts a fitting one", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+
+    // `NEAR_SLACK_BYTES` of headroom: a small comment fits inside it, a comment
+    // whose body alone is that large does not. A store already AT the ceiling
+    // could not prove that a FITTING mutation still succeeds, because every
+    // mutation appends at least a history entry.
+    await writeStoreDocument(location, nearCeiling());
+    const before = await readFile(location.storePath);
+
+    const error = caught(
+      await tracker
+        .commentSpec("LOCAL-1", "z".repeat(NEAR_SLACK_BYTES))
+        .then(() => undefined, (reason: unknown) => reason),
+    );
+    // The CANDIDATE was over the ceiling while the canonical bytes are not, so
+    // the reported size is the candidate's, not the store's.
+    expect(error.code).toBe("LOCAL_TRACKER_STORE_TOO_LARGE");
+    expect(Object.keys(error.details).sort()).toEqual(["maxBytes", "path", "sizeBytes"]);
+    expect(error.details.path).toBe(location.storePath);
+    expect(error.details.maxBytes).toBe(LOCAL_TRACKER_STORE_MAX_BYTES);
+    expect(error.details.sizeBytes).toBeGreaterThan(LOCAL_TRACKER_STORE_MAX_BYTES);
+    expect(error.details.sizeBytes).toBeLessThan(LOCAL_TRACKER_STORE_MAX_BYTES + 8 * 1024);
+
+    // Nothing was replaced: the canonical bytes are byte-for-byte the old ones,
+    // so no partial write, no lost mode, and no skipped fsync is even possible.
+    expect((await readFile(location.storePath)).equals(before)).toBe(true);
+    // No temporary, no lock, and no guard survived the refusal.
+    expect((await readdir(location.directory)).sort()).toEqual(["store.json"]);
+
+    // The store is not wedged: a mutation that FITS still commits.
+    expect((await tracker.commentSpec("LOCAL-1", "fits")).body).toBe("fits");
+    expect((await readdir(location.directory)).sort()).toEqual(["store.json"]);
+  }, 120_000);
+
+  it("never prunes a comment or a history entry to make a near-limit mutation fit", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const tracker = createLocalTrackerAdapter(repository.root);
+
+    await writeStoreDocument(location, nearCeiling());
+    const before = await readFile(location.storePath);
+
+    const error = caught(
+      await tracker.commentSpec("LOCAL-1", "z".repeat(6_000)).then(() => undefined, (reason: unknown) => reason),
+    );
+    expect(error.code).toBe("LOCAL_TRACKER_STORE_TOO_LARGE");
+    expect((await readFile(location.storePath)).equals(before)).toBe(true);
+
+    // A pruned history is indistinguishable from a history that was never
+    // recorded, so each retained entry is checked by VALUE, byte-for-byte.
+    const recordOf = (document: Buffer): { comments: { body: string }[]; history: { operation: string }[] } =>
+      (JSON.parse(document.toString("utf8")) as {
+        items: Record<string, { comments: { body: string }[]; history: { operation: string }[] }>;
+      }).items["LOCAL-1"]!;
+    const record = recordOf(before);
+    expect(record.comments.map((comment) => comment.body)).toEqual(RETAINED_COMMENTS);
+    expect(record.history.map((entry) => entry.operation)).toEqual(["create"]);
+
+    // The near-limit store is still fully usable, and the entries that were
+    // retained are still first in the sequence that follows them.
+    expect((await tracker.getSpec("LOCAL-1")).id).toBe("LOCAL-1");
+    expect((await tracker.commentSpec("LOCAL-1", "still fits")).body).toBe("still fits");
+    const grown = recordOf(await readFile(location.storePath));
+    expect(grown.comments.map((comment) => comment.body)).toEqual([...RETAINED_COMMENTS, "still fits"]);
+    expect(grown.history.map((entry) => entry.operation)).toEqual(["create", "comment"]);
+  }, 120_000);
+
+  it("serializes two crossing writers on the same lock, refuses both, and leaves the protocol healthy", async () => {
+    const repository = await newRepository();
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    // Two adapter instances, so two independent in-process queues: the only
+    // thing serializing them is the cross-process store lock, which is exactly
+    // the contention a real second process creates.
+    const first = createLocalTrackerAdapter(repository.root);
+    const second = createLocalTrackerAdapter(repository.root);
+
+    await writeStoreDocument(location, nearCeiling());
+    const before = await readFile(location.storePath);
+
+    const settled = await Promise.allSettled([
+      first.commentSpec("LOCAL-1", "z".repeat(NEAR_SLACK_BYTES)),
+      second.commentSpec("LOCAL-1", "y".repeat(NEAR_SLACK_BYTES)),
+    ]);
+    expect(settled.map((entry) => entry.status)).toEqual(["rejected", "rejected"]);
+    for (const entry of settled) {
+      expect(caught((entry as PromiseRejectedResult).reason).code).toBe("LOCAL_TRACKER_STORE_TOO_LARGE");
+    }
+    // Neither refusal raced the other into a write, and neither leaked an
+    // artifact on its way out of the critical section.
+    expect((await readFile(location.storePath)).equals(before)).toBe(true);
+    expect((await readdir(location.directory)).sort()).toEqual(["store.json"]);
+
+    // The lock protocol is untouched by the refusal: the next writer commits.
+    expect((await second.commentSpec("LOCAL-1", "fits")).body).toBe("fits");
+  }, 120_000);
+
+  it("fails the tracker usability check closed on an oversize store", async () => {
+    const repository = await newRepository();
+    const { config } = await autoResolveConfigDefaults(repository.root, {
+      ...baseConfig(),
+      tracker: { provider: "local" },
+    });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    await writeStoreDocument(location, atCeiling());
+    expect(await verifyTracker(repository.root, config)).toBe("verified");
+
+    await writeStoreDocument(location, overCeiling());
+    const error = caught(await verifyTracker(repository.root, config).then(() => undefined, (reason: unknown) => reason));
+    // `doctor` runs this same check, so an oversize store is reported as a
+    // FAILING tracker rather than a healthy one whose every later mutation
+    // will be refused.
+    expectInertSizeRefusal(error, location.storePath, LOCAL_TRACKER_STORE_MAX_BYTES + 1);
+    // The check still creates and mutates nothing.
+    expect((await readdir(location.directory)).sort()).toEqual(["store.json"]);
+  }, 120_000);
 });
 
 interface FakeUvEnvironment {

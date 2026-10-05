@@ -107,6 +107,32 @@ const CANONICAL_LOCK_NEVER_REMOVED =
 const GUARD_RECOVERY_IS_PROSE =
   "The exact guard path travels as a field on that error, and the procedure is stated in prose that names the two artifacts rather than printing a command to run.";
 
+/**
+ * Spec #139 / ticket #159 — the bounded-store contract.
+ *
+ * The store is a COMPLETE snapshot that only ever grows, so it needs a ceiling,
+ * and a ceiling has to be honest about what it counts and about what the runtime
+ * refuses to do on the operator's behalf. Each of these five sentences exists
+ * because the plausible alternative is silently wrong: counting the document
+ * without its trailing newline, sizing a read from `stat`, measuring a
+ * candidate with a second serialization, or trimming history to make a write
+ * fit.
+ */
+const STORE_CEILING_STATEMENT =
+  "The canonical document is one complete snapshot of every Spec, Ticket, comment, and history entry, and that snapshot is bounded: the total serialized store, including its trailing newline, may not exceed 16,777,216 UTF-8 bytes.";
+
+const STORE_COMPLETE_SNAPSHOT_STATEMENT =
+  "History is retained in full, so the file only ever grows and an operator reaches the ceiling by recording more work rather than by losing any.";
+
+const STORE_BOUNDED_READ_STATEMENT =
+  "A read consumes at most one byte more than that ceiling and refuses with `LOCAL_TRACKER_STORE_TOO_LARGE` before it parses anything, so a file that keeps growing under a reader stays a bounded read.";
+
+const STORE_BOUNDED_MUTATION_STATEMENT =
+  "A mutation serializes its candidate once, measures those bytes, and refuses before the durable replace, so a refused write leaves the canonical bytes, the history, the lock, and the file mode exactly as they were.";
+
+const STORE_NO_AUTOMATIC_REPAIR_STATEMENT =
+  "Nothing is pruned to fit and nothing is repaired automatically: an over-ceiling store is left byte-for-byte as it is, and reducing it is the operator's decision about their own work.";
+
 describe("the canonical Method states one tracker / delivery contract", () => {
   const method = readRepoFile("POIESIS_METHOD.md");
 
@@ -315,6 +341,18 @@ describe("COMPATIBILITY documents the providers", () => {
 
   it("documents the recovery as prose on a path field, never as a command to run", () => {
     expect(compatibility).toContain(GUARD_RECOVERY_IS_PROSE);
+  });
+
+  it("documents the total serialized-store ceiling, the complete snapshot, and the absence of any automatic repair", () => {
+    // Spec #139 / ticket #159. These are the sentences an Author reads after
+    // `LOCAL_TRACKER_STORE_TOO_LARGE` has refused their store, so they have to
+    // say what the ceiling counts, what is refused, and — most importantly —
+    // that nothing was pruned and nothing will be repaired for them.
+    expect(compatibility).toContain(STORE_CEILING_STATEMENT);
+    expect(compatibility).toContain(STORE_COMPLETE_SNAPSHOT_STATEMENT);
+    expect(compatibility).toContain(STORE_BOUNDED_READ_STATEMENT);
+    expect(compatibility).toContain(STORE_BOUNDED_MUTATION_STATEMENT);
+    expect(compatibility).toContain(STORE_NO_AUTOMATIC_REPAIR_STATEMENT);
   });
 });
 

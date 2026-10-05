@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { Buffer } from "node:buffer";
 import { realpathSync } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -66,9 +67,24 @@ import type {
  *      inside a Git common directory whose name Poiesis did not choose
  *      (Spec #139 / ticket #148, #155).
  *
+ *   5. A BOUNDED COMPLETE SNAPSHOT. The document is the WHOLE history, so it
+ *      only ever grows, which makes an unbounded read of it a memory cost
+ *      charged to a caller who asked to read one item and an unbounded write a
+ *      way to commit a store nothing can read back. ONE ceiling bounds the
+ *      total serialized bytes, and ONE bounded loader serves all three
+ *      consumers of the canonical bytes — the lock-free read, the mutation, and
+ *      the usability check `verifyTracker` / `doctor` runs — so a bound cannot
+ *      exist in one path and be missing from another. Reads consume at most one
+ *      byte over the ceiling (so a file growing under a reader cannot become an
+ *      unbounded read), mutations measure their serialized candidate once and
+ *      refuse BEFORE the durable replace, and NOTHING is ever pruned or
+ *      repaired: a trimmed history is indistinguishable from a history that
+ *      was never recorded (Spec #139 / ticket #159).
+ *
  * This module is intentionally NOT re-exported by `src/index.ts`: the store
- * layout, the lock envelope, and the validation contract stay free to evolve
- * behind `TrackerAdapter` until the v1.x surface stabilizes.
+ * layout, the lock envelope, the store ceiling, and the validation contract
+ * stay free to evolve behind `TrackerAdapter` until the v1.x surface
+ * stabilizes.
  */
 
 export const LOCAL_TRACKER_STORE_DIRECTORY = "poiesis-tracker-v1";
@@ -78,6 +94,31 @@ export const LOCAL_TRACKER_STORE_PROVIDER = "poiesis-local";
 export const LOCAL_TRACKER_LOCK_VERSION = 1;
 /** Bounded production wait for the cross-process store lock. */
 export const LOCAL_TRACKER_LOCK_TIMEOUT_MS = 30_000;
+
+/**
+ * Spec #139 / ticket #159 — the ONE total ceiling on the serialized store.
+ *
+ * It is a TOTAL size, not a per-item one, because the store is one document:
+ * a ceiling that applied to each item separately would bound nothing once a
+ * project recorded a few hundred of them. It COUNTS the trailing newline the
+ * durable write appends, because the ceiling is on the bytes that exist on
+ * disk — the only place this store actually is. A reader that counted the JSON
+ * without that newline would accept a store the durable write had already
+ * produced over the ceiling, and the very next read of it would have to refuse
+ * a document the previous write claimed to have committed.
+ *
+ * The number is a memory and latency budget, not a policy about how much work
+ * a project may record: an operator reaches it by recording more history, and
+ * nothing in the runtime prunes, compacts, or repairs anything to keep a write
+ * inside it.
+ *
+ * Module-internal on purpose, like the rest of this module. It bounds ONE
+ * store layout; promoting it through `src/index.ts` would freeze the number,
+ * the trailing newline it counts, and the `LOCAL_TRACKER_STORE_TOO_LARGE`
+ * details into a public API, and would let a caller raise a bound that exists
+ * precisely because Poiesis does not read an unbounded document for them.
+ */
+export const LOCAL_TRACKER_STORE_MAX_BYTES = 16_777_216;
 
 const LOCAL_TRACKER_STORE_FILENAME = "store.json";
 const LOCAL_TRACKER_LOCK_FILENAME = "store.lock";
@@ -169,6 +210,36 @@ function unsafe(path: string, message: string, details: Record<string, unknown> 
 
 function invalidStore(message: string, details: Record<string, unknown> = {}): PoiesisError {
   return new PoiesisError("INVALID_LOCAL_TRACKER_STORE", `Refusing to use the local tracker store: ${message}`, details);
+}
+
+/**
+ * Spec #139 / ticket #159 — the typed refusal for a store over the ceiling,
+ * and for a mutation whose CANDIDATE would cross it.
+ *
+ * The details are INERT, and that is the whole design: the exact store path and
+ * two exact numbers, nothing else. Every other operator-facing refusal in this
+ * module still states a procedure, because every other one has a procedure an
+ * operator can carry out on an artifact Poiesis can verify. This one has none —
+ * the store is over the ceiling because the operator's own history is large,
+ * and the only thing that changes it is a decision about their work, which is
+ * theirs and not Poiesis's. So there is nothing to say that a number does not
+ * already say, and a procedure that interpolated the path would hand a command
+ * to whatever the Git common directory's name contains: a space, a quote, a
+ * `;`, a `$(...)`, a pipe.
+ *
+ * `sizeBytes` is what Poiesis ACTUALLY CONSUMED, which is at most one byte over
+ * the ceiling, and never a recount of the rest of the file. That is a
+ * deliberate bound rather than an imprecision: the exact size of a store that is
+ * too large to read is not information an operator can act on differently, and
+ * producing it would mean reading the document this refusal exists to avoid
+ * reading.
+ */
+function storeTooLarge(path: string, sizeBytes: number): PoiesisError {
+  return new PoiesisError(
+    "LOCAL_TRACKER_STORE_TOO_LARGE",
+    "Refusing to use the local tracker store: it is larger than the total serialized-store ceiling",
+    { path, sizeBytes, maxBytes: LOCAL_TRACKER_STORE_MAX_BYTES },
+  );
 }
 
 // -- Canonical location ------------------------------------------------------
@@ -889,6 +960,99 @@ function emptyStore(): LocalTrackerStore {
   return { schema: LOCAL_TRACKER_STORE_SCHEMA, provider: LOCAL_TRACKER_STORE_PROVIDER, nextId: 1, items: {} };
 }
 
+// -- The bounded load ---------------------------------------------------------
+
+/**
+ * Spec #139 / ticket #159 — read at most `max + 1` bytes of the canonical
+ * document, or refuse.
+ *
+ * ONE BYTE OVER THE CEILING IS THE WHOLE POINT, because `stat` cannot bound a
+ * read. The file may grow between the stat and the read, and between two
+ * chunks of the same read: a store that measured 4 KiB when it was opened can
+ * be 40 MiB by the time the bytes arrive, so a read sized from the stat reads
+ * all of it. This loop instead stops at `max + 1` and treats holding that last
+ * byte as the whole answer — the document is over the ceiling, and one byte is
+ * the entire fact needed to say so. Nothing further is read to count the rest,
+ * so the refusal's `sizeBytes` is bounded too.
+ *
+ * The loop, rather than one `read`, is what makes a growth race safe in the
+ * other direction. A short read is legal, and treating the first short read as
+ * the end of the file would hand the parser a TRUNCATED document and report
+ * corruption for a store that is perfectly valid — which is a worse failure
+ * than refusing an oversized one, because it tells the operator their history
+ * is damaged. The buffer is therefore only ever allowed to GROW, and only up to
+ * the bound: past `max + 1` there is nothing further to learn.
+ */
+async function readStoreBytesBounded(path: string): Promise<string> {
+  const ceiling = LOCAL_TRACKER_STORE_MAX_BYTES;
+  const handle = await open(path, "r");
+  try {
+    // An ordinary store gets a buffer the size of an ordinary store; a store
+    // already over the ceiling gets exactly the bound and never more.
+    const stats = await handle.stat();
+    let buffer = Buffer.allocUnsafe(Math.min(ceiling + 1, Math.max(stats.size, 0) + 1));
+    let filled = 0;
+    for (;;) {
+      if (filled === buffer.length) {
+        if (buffer.length >= ceiling + 1) break;
+        // The file grew past what the stat reported, so from here the bound is
+        // the only thing allowed to decide how much to hold.
+        const grown = Buffer.allocUnsafe(ceiling + 1);
+        buffer.copy(grown, 0, 0, filled);
+        buffer = grown;
+      }
+      const { bytesRead } = await handle.read(buffer, filled, buffer.length - filled, filled);
+      if (bytesRead === 0) break;
+      filled += bytesRead;
+    }
+    if (filled > ceiling) throw storeTooLarge(path, filled);
+    return buffer.toString("utf8", 0, filled);
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Spec #139 / ticket #159 — the ONE bounded load of the canonical document.
+ *
+ * Three callers need these bytes — the lock-free read, the mutation's
+ * read-modify-write, and the `verifyTracker` / `doctor` usability check — and
+ * the bound has to hold for all three or it does not hold. A read path that
+ * checked the size and a mutation path that did not would let a store grow
+ * past the ceiling through the second one and then refuse to open itself
+ * through the first; a usability check that did not check it would report a
+ * healthy tracker whose every later operation is refused. So there is one
+ * function, and the ceiling is a property of the BYTES rather than of a call
+ * site.
+ *
+ * The size is settled before `parseLocalTrackerStore` sees a single character,
+ * which is what makes the refusal a fact about the store rather than a verdict
+ * about its contents: bytes that are not JSON at all, truncated mid-document,
+ * or a valid document one byte too large are all the same refusal. For the
+ * lock-free read there is no lock to settle it without, and the size does not
+ * depend on one; the mutation settles it inside the critical section, because
+ * a read outside the lock would be a different document than the one it is
+ * about to replace.
+ */
+async function loadLocalTrackerStore(location: LocalTrackerStoreLocation): Promise<LocalTrackerStore> {
+  await assertSafeDirectory(location.directory, "store directory");
+  // An ABSENT store is a project that has not recorded its first Spec yet, not
+  // a zero-byte one, so it is valid and never measured.
+  if ((await assertSafeRegularFile(location.storePath, "store")) === "absent") return emptyStore();
+  return parseLocalTrackerStore(await readStoreBytesBounded(location.storePath));
+}
+
+/**
+ * The canonical serialization, formed ONCE per mutation and then both measured
+ * and written. Serializing twice — once to size, once to write — would leave a
+ * window in which the two differ, and `JSON.stringify` of a document this size
+ * is not free. The trailing newline is part of the string so the measured
+ * length is the length of the bytes that reach the disk.
+ */
+function serializeLocalTrackerStore(store: LocalTrackerStore): string {
+  return `${JSON.stringify(store, null, 2)}\n`;
+}
+
 // -- Adapter -----------------------------------------------------------------
 
 function assertLocalKind(item: LocalTrackerItemRecord, expected: TrackerItemKind): LocalTrackerItemRecord {
@@ -1056,12 +1220,16 @@ class LocalTrackerAdapter implements TrackerAdapter {
    * cross-process lock is needed. It DOES wait for this instance's own
    * in-flight mutations, so `Promise.all([createSpec(...), getSpec(...)])` in
    * one process observes the committed state rather than racing it.
+   *
+   * Ticket #159: the load goes through the ONE bounded loader, so this path
+   * inherits the store ceiling for free. A live foreign lock, a foreign
+   * temporary, and a concurrent writer are all invisible here, and an
+   * over-ceiling store is refused from its bytes alone — never as a lock
+   * timeout, and never as a parse failure.
    */
   private async read(): Promise<LocalTrackerStore> {
     await this.pending;
-    await assertSafeDirectory(this.location.directory, "store directory");
-    if ((await assertSafeRegularFile(this.location.storePath, "store")) === "absent") return emptyStore();
-    return parseLocalTrackerStore(await readFile(this.location.storePath, "utf8"));
+    return loadLocalTrackerStore(this.location);
   }
 
   /**
@@ -1078,12 +1246,21 @@ class LocalTrackerAdapter implements TrackerAdapter {
       const release = await acquireLocalTrackerLock(location);
       try {
         await removeAbandonedTemporaries(location);
-        const store =
-          (await assertSafeRegularFile(location.storePath, "store")) === "absent"
-            ? emptyStore()
-            : parseLocalTrackerStore(await readFile(location.storePath, "utf8"));
+        const store = await loadLocalTrackerStore(location);
         const value = operation(store);
-        await durableReplace(location.storePath, `${JSON.stringify(store, null, 2)}\n`);
+        // Ticket #159: the candidate is serialized ONCE, measured, and only
+        // then written — and the refusal comes BEFORE `durableReplace`, so no
+        // temporary file is ever created, no `fsync` is skipped, no mode is
+        // lost, and the canonical bytes are exactly the ones already there.
+        // The `finally` below still releases the lock it holds, so a refused
+        // mutation leaves no lock and no guard behind either, and the next
+        // fitting mutation in this process or any other proceeds normally.
+        const candidate = serializeLocalTrackerStore(store);
+        const candidateBytes = Buffer.byteLength(candidate, "utf8");
+        if (candidateBytes > LOCAL_TRACKER_STORE_MAX_BYTES) {
+          throw storeTooLarge(location.storePath, candidateBytes);
+        }
+        await durableReplace(location.storePath, candidate);
         return value;
       } finally {
         await release();
@@ -1245,24 +1422,21 @@ export function createLocalTrackerAdapter(cwd: string = process.cwd()): TrackerA
 }
 
 /**
- * Validate the store paths an operator-facing check depends on WITHOUT
- * creating or mutating anything. `verifyTracker` uses this so a `local`
- * project fails closed on an unusable store instead of reporting a healthy
- * tracker it cannot actually use.
- */
-/**
  * Validate that the store this location names is actually USABLE, without
- * creating or mutating anything. `verifyTracker` depends on the difference
- * between "the paths look right" and "the tracker works": a present but
- * corrupt store must fail closed here rather than let `verifyTracker` and
- * `doctor` report a healthy tracker whose every later operation will be
- * refused. An ABSENT store is valid — a project that has not created its
- * first Spec yet has nothing to validate.
+ * creating or mutating anything. `verifyTracker` and therefore `doctor` depend
+ * on the difference between "the paths look right" and "the tracker works": a
+ * present but corrupt store must fail closed here rather than let them report a
+ * healthy tracker whose every later operation will be refused. An ABSENT store
+ * is valid — a project that has not created its first Spec yet has nothing to
+ * validate.
+ *
+ * Ticket #159: it runs the SAME bounded loader as the read and the mutation, so
+ * an over-ceiling store is reported as a failing tracker check carrying the
+ * bounded `LOCAL_TRACKER_STORE_TOO_LARGE` refusal rather than as a healthy
+ * tracker whose first mutation is refused.
  */
 export async function assertLocalTrackerStoreUsable(location: LocalTrackerStoreLocation): Promise<void> {
-  await assertSafeDirectory(location.directory, "store directory");
-  if ((await assertSafeRegularFile(location.storePath, "store")) === "absent") return;
-  // Strictly parsed and then discarded: the validator is the check, and it
+  // Strictly loaded and then discarded: the validator is the check, and it
   // throws rather than repairing, so a malformed document is a typed refusal.
-  parseLocalTrackerStore(await readFile(location.storePath, "utf8"));
+  await loadLocalTrackerStore(location);
 }
