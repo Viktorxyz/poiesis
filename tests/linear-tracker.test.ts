@@ -270,6 +270,29 @@ function operationNameOf(request: LinearHttpRequest): string {
 }
 
 /**
+ * Ticket #161 — the two wall-clock fixtures, and why they sit on opposite
+ * sides of any real machine clock.
+ *
+ * An HTTP-date `Retry-After` is an ABSOLUTE instant, so the only way to turn
+ * it into a delay is to subtract it from a clock reading the SAME epoch. That
+ * subtraction is the whole reason the wall clock is a seam, and it is why the
+ * two fixtures below are deliberately far from 2026: a 2100 date is "already
+ * past" only to the future fixture, and is 74 years in the future to the
+ * ambient `Date.now()`; a 2000 date is an hour in the future only to the past
+ * fixture, and is 26 years in the past to `Date.now()`. So an implementation
+ * that quietly reverted to the ambient clock cannot produce the answer the
+ * test under it requires — in either direction — and every assertion here
+ * stays a fixed number instead of a number relative to when it runs.
+ */
+const FUTURE_WALL_EPOCH_MS = Date.UTC(2100, 0, 1, 12, 0, 0);
+const PAST_WALL_EPOCH_MS = Date.UTC(2000, 0, 1, 12, 0, 0);
+
+/** An `HTTP-date` `Retry-After` value exactly `offsetMs` after `epochMs`. */
+function retryAfterDate(epochMs: number, offsetMs: number): string {
+  return new Date(epochMs + offsetMs).toUTCString();
+}
+
+/**
  * Deterministic clock / sleep / UUID / TIMER seams.
  *
  * Ticket #150: the timer that fires an attempt's abort is virtual here too.
@@ -280,6 +303,12 @@ function operationNameOf(request: LinearHttpRequest): string {
  * when the test moves virtual time forward, and `advance` fires due callbacks
  * in a fixed order (earliest deadline first, then scheduling order). So a
  * deadline test asserts a SEQUENCE, never a race.
+ *
+ * Ticket #161: the wall clock is a SECOND, independent clock and stays fixed
+ * here. It must not be the monotonic clock in disguise — a test that cannot
+ * tell the two apart cannot prove that an HTTP-date was read against the
+ * right one — and it must not move when `sleep` advances the budget clock,
+ * because a real wall clock is free to disagree with elapsed time.
  */
 function deterministicSeams(): ObservableSeams {
   const sleeps: number[] = [];
@@ -312,6 +341,7 @@ function deterministicSeams(): ObservableSeams {
     attemptTimeouts,
     advance,
     clock: () => now,
+    epochClock: () => FUTURE_WALL_EPOCH_MS,
     sleep: async (ms: number) => {
       sleeps.push(ms);
       advance(ms);
@@ -341,13 +371,16 @@ function deterministicSeams(): ObservableSeams {
  * Poiesis asked for, the deadlines it scheduled, and the identities it
  * generated without waiting or depending on a real random source. Declared
  * explicitly rather than as an intersection with `LinearTrackerSeams` so the
- * injected clock, sleep, UUID, and timer stay REQUIRED here: a test that
+ * injected clocks, sleep, UUID, and timer stay REQUIRED here: a test that
  * passed an optional member through would silently fall back to a real clock.
  */
 type ObservableSeams = {
   readonly env?: Record<string, string | undefined>;
   readonly transport?: LinearTransport;
+  /** The monotonic budget clock: elapsed time only. */
   readonly clock: () => number;
+  /** Ticket #161 — the epoch wall clock an HTTP-date `Retry-After` is read against. */
+  readonly epochClock: () => number;
   readonly sleep: (ms: number) => Promise<void>;
   readonly uuid: () => string;
   readonly timer: LinearTimer;
@@ -1020,6 +1053,145 @@ describe("rate limits are retried within a fixed bound", () => {
     await expect(adapter.getSpec("ENG-1")).rejects.toMatchObject({ code: "LINEAR_RATE_LIMITED" });
     expect(script.requests).toHaveLength(2);
     expect(seams.sleeps).toEqual([10000]);
+  });
+});
+
+/**
+ * Ticket #161 — the HTTP-date form of `Retry-After`.
+ *
+ * The delta-seconds form is a DURATION and needs no clock. The HTTP-date form
+ * is an ABSOLUTE instant, so it can only become a delay by subtraction from a
+ * clock in the same epoch — the wall clock — while the elapsed retry BUDGET is
+ * a duration and must stay on the monotonic clock, which is what these tests
+ * hold apart: one fixture epoch, one frozen budget clock, one exact sleep.
+ */
+describe("an HTTP-date Retry-After is read against the epoch wall clock", () => {
+  it("waits exactly the delay a future HTTP-date names", async () => {
+    // Break: reading the ambient `Date.now()` where the injected wall clock
+    // belongs makes a 2100 date 74 years overdue, so the wait collapses and
+    // Poiesis hammers a workspace that just asked it to stop. Reading the
+    // monotonic budget clock instead (0 in these seams) makes the same date
+    // 41 billion milliseconds away, and the wait is clamped to the maximum.
+    // Only the epoch wall clock yields 3000. The offset is a whole second
+    // because that is all an HTTP-date can express.
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 3_000) }, body: "rate limited" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" });
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    expect(await adapter.getSpec("ENG-1")).toMatchObject({ id: "ENG-1" });
+    expect(seams.sleeps).toEqual([3_000]);
+  });
+
+  it("waits not at all for an HTTP-date that has already passed", async () => {
+    // Break: a date already in the past is not a licence to wait, and
+    // subtracting it the wrong way round yields a negative delay. The clamp is
+    // the only thing that keeps that from becoming a wait, so a test that only
+    // saw "it did not hang" would pass on an implementation that clamps the
+    // wrong side of an unbounded number.
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, -30_000) }, body: "rate limited" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" });
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    expect(await adapter.getSpec("ENG-1")).toMatchObject({ id: "ENG-1" });
+    expect(seams.sleeps).toEqual([0]);
+  });
+
+  it("clamps an HTTP-date further ahead than the maximum single wait", async () => {
+    // Break: honoring an HTTP-date an hour out would stall the CLI for an
+    // hour on a single rate-limited request. The ambient clock cannot produce
+    // this failure — it reads a 2000 date as 26 years overdue and waits for
+    // nothing — so the wait is only clamped after the seam is subtracted,
+    // which is why this case runs on the past fixture's own wall clock.
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(PAST_WALL_EPOCH_MS, 3_600_000) }, body: "rate limited" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams: ObservableSeams = {
+      ...seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }),
+      epochClock: () => PAST_WALL_EPOCH_MS,
+    };
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    await adapter.getSpec("ENG-1");
+
+    expect(seams.sleeps).toEqual([10_000]);
+  });
+
+  it("gives up once repeated HTTP-dates exhaust the total wait budget", async () => {
+    // Break: bounding each HTTP-date delay on its own still lets the
+    // cumulative wait grow. Two 8-second dates are each legal and are 16
+    // seconds together, which is more than the operation will spend waiting,
+    // so the third request must never be made.
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 8_000) }, body: "rate limited" },
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 8_000) }, body: "rate limited" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams = seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" });
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    await expect(adapter.getSpec("ENG-1")).rejects.toMatchObject({
+      code: "LINEAR_RATE_LIMITED",
+      details: { attempts: 2, status: 429 },
+    });
+    expect(script.requests).toHaveLength(2);
+    expect(seams.sleeps).toEqual([8_000]);
+  });
+
+  it("reads the wall clock, not the monotonic budget clock, to size the wait", async () => {
+    // Break: the two clocks are different quantities in different epochs. The
+    // budget clock is frozen at 0 here while the wall clock reads a 2100
+    // epoch, so an implementation that subtracted the date from the wrong one
+    // would see a 41-billion-millisecond wait and clamp it to 10000, and one
+    // that used the ambient clock would see a date 74 years overdue and wait
+    // for nothing. The wait is 4000 only if the wall clock is the source.
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 4_000) }, body: "rate limited" },
+      { kind: "graphql", data: { issue: issueNode() } },
+    );
+    const seams: ObservableSeams = { ...seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }), clock: () => 0 };
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    expect(await adapter.getSpec("ENG-1")).toMatchObject({ id: "ENG-1" });
+    expect(seams.sleeps).toEqual([4_000]);
+  });
+
+  it("measures the elapsed retry wait on the monotonic clock, not on the wall clock", async () => {
+    // Break: the elapsed budget is a DURATION, so it belongs to the clock
+    // that only moves forward. Here the wall clock jumps a minute per read
+    // while the monotonic clock stays at 0. A budget read from the wall clock
+    // would see 60000ms already spent before the FIRST retry and refuse it
+    // after one request; the correct source spends 0, then 4000, then 0 — the
+    // last wait collapsing to nothing because by then the wall clock has
+    // passed the date — and therefore makes the three attempts its cap allows.
+    let reads = 0;
+    const script = new LinearScript(
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 4_000) }, body: "rate limited" },
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 4_000) }, body: "rate limited" },
+      { kind: "http", status: 429, headers: { "retry-after": retryAfterDate(FUTURE_WALL_EPOCH_MS, 4_000) }, body: "rate limited" },
+    );
+    const seams: ObservableSeams = {
+      ...seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }),
+      clock: () => 0,
+      epochClock: () => {
+        reads += 1;
+        return FUTURE_WALL_EPOCH_MS + (reads - 1) * 60_000;
+      },
+    };
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seams);
+
+    await expect(adapter.getSpec("ENG-1")).rejects.toMatchObject({
+      code: "LINEAR_RATE_LIMITED",
+      details: { attempts: 3 },
+    });
+    expect(script.requests).toHaveLength(3);
+    expect(seams.sleeps).toEqual([4_000, 0]);
   });
 });
 

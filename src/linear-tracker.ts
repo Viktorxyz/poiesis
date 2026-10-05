@@ -108,8 +108,27 @@ export interface LinearTrackerSeams {
   readonly env?: Record<string, string | undefined>;
   /** HTTP transport. Defaults to the global `fetch`. */
   readonly transport?: LinearTransport;
-  /** Monotonic millisecond clock, used to bound the retry budget. */
+  /** Monotonic millisecond clock, used SOLELY to bound the retry budget. */
   readonly clock?: () => number;
+  /**
+   * Ticket #161 — the wall clock, in EPOCH milliseconds.
+   *
+   * `Retry-After` has two forms and only one of them needs a clock. The
+   * delta-seconds form is a DURATION Poiesis can wait out by itself; the
+   * HTTP-date form is an ABSOLUTE instant, so the only way to turn it into a
+   * delay is to subtract it from a clock in the SAME epoch. That is the wall
+   * clock, and it is a different quantity from `clock` above: the budget clock
+   * measures elapsed time and must only move forward, while an HTTP-date lives
+   * in epoch time and is meaningless against a monotonic reading. Subtract the
+   * wrong one and every date is either already overdue or billions of
+   * milliseconds away, so the delay is wrong in a way no later check can
+   * repair.
+   *
+   * Defaults to the real wall clock. Like every other seam here it is internal
+   * to the provider: it is not a package-root export, and the durable
+   * configuration has no setting for it.
+   */
+  readonly epochClock?: () => number;
   /** Injected delay, used for rate-limit backoff. */
   readonly sleep?: (ms: number) => Promise<void>;
   /** Injected UUID source, so an idempotent create reuses one identity. */
@@ -133,6 +152,7 @@ interface ResolvedSeams {
   readonly env: Record<string, string | undefined>;
   readonly transport: LinearTransport;
   readonly clock: () => number;
+  readonly epochClock: () => number;
   readonly sleep: (ms: number) => Promise<void>;
   readonly uuid: () => string;
   readonly timer: LinearTimer;
@@ -179,6 +199,10 @@ function resolveSeams(seams: LinearTrackerSeams): ResolvedSeams {
     env,
     transport: seams.transport ?? defaultTransport,
     clock: seams.clock ?? (() => Date.now()),
+    // Ticket #161: the same real clock as the default budget clock, but a
+    // different reading of it. One is elapsed time; the other is the epoch an
+    // HTTP-date is compared against.
+    epochClock: seams.epochClock ?? (() => Date.now()),
     sleep: seams.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
     uuid: seams.uuid ?? (() => randomUUID()),
     timer: seams.timer ?? defaultTimer,
@@ -341,7 +365,7 @@ async function attemptOnce(
     return {
       kind: "rate-limited",
       status: response.status,
-      retryAfterMs: retryAfterMs(response.headers, LINEAR_DEFAULT_RETRY_DELAY_MS),
+      retryAfterMs: retryAfterMs(response.headers, LINEAR_DEFAULT_RETRY_DELAY_MS, seams.epochClock),
     };
   }
   if (response.status >= 500) {
@@ -516,14 +540,25 @@ function boundedDelay(
   return elapsedMs + delay > LINEAR_MAX_RETRY_WAIT_MS ? null : delay;
 }
 
-/** `Retry-After` as milliseconds, honoring both the seconds and date forms. */
-function retryAfterMs(headers: Readonly<Record<string, string>>, fallbackMs: number): number {
+/**
+ * `Retry-After` as milliseconds, honoring both the seconds and date forms.
+ *
+ * Ticket #161: the wall clock is consulted for the date form ONLY. A
+ * delta-seconds value is already a duration, so reading a clock for it would
+ * add an epoch the number does not live in; and an absolute date is exactly
+ * the one form that cannot become a delay without one.
+ */
+function retryAfterMs(
+  headers: Readonly<Record<string, string>>,
+  fallbackMs: number,
+  epochClock: () => number,
+): number {
   const raw = Object.entries(headers).find(([name]) => name.toLowerCase() === "retry-after")?.[1];
   if (raw === undefined) return fallbackMs;
   const seconds = Number(raw.trim());
   if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
   const at = Date.parse(raw.trim());
-  return Number.isNaN(at) ? fallbackMs : Math.max(0, at - Date.now());
+  return Number.isNaN(at) ? fallbackMs : Math.max(0, at - epochClock());
 }
 
 /**
