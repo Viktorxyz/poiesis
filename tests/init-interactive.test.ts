@@ -330,6 +330,47 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect((await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8"))).toContain("openai/gpt-5.6-sol");
   }, 30_000);
 
+  /**
+   * Ticket #160 — the persisted config is the whole point of the discovery
+   * overlay. A draft that states only `postIntegrationCommands` and a
+   * repository whose `package.json` supplies the pre-integration scripts must
+   * end up on disk with BOTH halves, not with the discovered commands having
+   * replaced the block.
+   */
+  it("persists discovered verification commands AND the draft's postIntegrationCommands (ticket #160)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    await writeFile(
+      join(repo.root, "package.json"),
+      [
+        "{",
+        '  "name": "fixture",',
+        '  "version": "0.0.0",',
+        '  "scripts": {',
+        '    "test": "true",',
+        '    "lint": "echo lint"',
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const io = scriptedInitIO({ isTTY: true });
+    const draft: PoiesisConfig = {
+      ...baseDraft(),
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+
+    const manifest = await runInteractiveInit({ root: repo.root, io, draft });
+    expect(manifest).toBeDefined();
+
+    const installed = JSON.parse(await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8")) as {
+      verification: { commands: string[]; postIntegrationCommands?: string[] };
+    };
+    expect(installed.verification.commands).toEqual(["true", "echo lint"]);
+    expect(installed.verification.postIntegrationCommands).toEqual(["pnpm release:notes"]);
+  }, 30_000);
+
   it("prompts the Author via the shared model selector when both model classes are unresolved", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);

@@ -213,6 +213,83 @@ describe("composeInitDiscovery", () => {
     expect(result.detections.verification.source).toBe("package-scripts");
   });
 
+  /**
+   * Ticket #160 — the composer OWNS `verification.commands` when the
+   * package scripts supply them, and it OWNS nothing else. A draft may
+   * legitimately state `postIntegrationCommands` without stating
+   * `commands`; the discovered commands then complete that block instead of
+   * replacing it, so an Author's separate post-integration verification is
+   * never silently deleted on the way into the managed config.
+   */
+  it("overlays discovered commands onto the resolved verification block, preserving a draft's postIntegrationCommands", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true", lint: "echo lint" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      // Only the post-integration half is stated; the pre-integration half is
+      // the package scripts' to answer.
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.config?.verification).toEqual({
+      commands: ["true", "echo lint"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    expect(result.detections.verification.source).toBe("package-scripts");
+  });
+
+  it("keeps a draft's explicit verification block semantically unchanged (commands AND postIntegrationCommands)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true", lint: "echo lint" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      verification: {
+        commands: ["test -f README.md"],
+        postIntegrationCommands: ["pnpm release:notes"],
+      },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    // An explicit draft is the Author's own record: neither half is
+    // replaced by the package scripts.
+    expect(result.config?.verification).toEqual({
+      commands: ["test -f README.md"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    expect(result.detections.verification.source).toBe("explicit");
+  });
+
+  it("preserves both verification halves for a deferred draft and leaves delivery deferred", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      delivery: { mode: "deferred" },
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.config?.verification).toEqual({
+      commands: ["true"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    // The verification overlay is the only seam that changes; the deferred
+    // delivery state is carried through untouched.
+    expect(result.config?.delivery).toEqual({ mode: "deferred" });
+    expect(result.unresolved).not.toContain("delivery.mode");
+    expect(result.unresolved).not.toContain("delivery.preview");
+  });
+
   it("prefills command delivery adapters from scripts/poiesis-preview|staging|production hints", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);

@@ -266,8 +266,17 @@ export async function composeInitDiscovery(
                   deliveryDetection.production,
                 ),
               },
+          // Spec #139 / ticket #160: the composer owns
+          // `verification.commands` and nothing else. The managed block is
+          // OVERLAID, not rebuilt: `autoResolveConfigDefaults` already
+          // resolved the whole block, including a draft's own
+          // `postIntegrationCommands`, and this rebuild used to delete it
+          // whenever the package scripts supplied the commands. A draft that
+          // states only `postIntegrationCommands` is a complete statement
+          // about the post-integration half, so the discovered scripts
+          // complete that block instead of replacing it.
           verification: verificationDetection.source === "package-scripts"
-            ? { commands: [...verificationDetection.commands] }
+            ? { ...resolved.config.verification, commands: [...verificationDetection.commands] }
             : resolved.config.verification,
         };
         if (containsTemplatePlaceholder(finalConfig)) {
