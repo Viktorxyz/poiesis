@@ -575,7 +575,7 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   // candidate-tracked generated config can never be lifecycle authority.
   // The commands themselves still execute in the exact candidate workspace.
   await resolveVerifyAuthority(options.cwd, options.ownershipId);
-  return runVerification(options, options.cwd);
+  return runVerification(options, options.cwd, options.ownershipId ?? null);
 }
 
 /**
@@ -589,7 +589,11 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
  * external caller can hand `verify` a forged authority and skip the
  * ownership / receipt / runtime identity boundary.
  */
-async function runVerification(options: VerifyOptions, cwd: string): Promise<VerifyResult> {
+async function runVerification(
+  options: VerifyOptions,
+  cwd: string,
+  workspaceOwnershipId: string | null,
+): Promise<VerifyResult> {
   const root = await canonicalGitRoot(cwd);
   const candidateSha = await resolveExpectedCommit(root, options.candidateSha, "candidateSha");
   await assertExactClean(root, candidateSha);
@@ -610,6 +614,14 @@ async function runVerification(options: VerifyOptions, cwd: string): Promise<Ver
         cwd: root,
         allowFailure: true,
         timeoutMs,
+        // Spec #168 / ticket #170: verification commands run under a
+        // transient managed process lease, so a verify command that leaks
+        // a background descendant is cleaned before the exact-SHA
+        // clean-after check observes the workspace. The lease names this
+        // operation and, when the caller proved one, the workspace that
+        // owns it; it is in-memory only and never persisted.
+        operationId: "poiesis-verify",
+        ...(workspaceOwnershipId === null ? {} : { workspaceId: workspaceOwnershipId }),
         ...(options.env === undefined ? {} : { env: options.env }),
       });
     } catch (error) {
@@ -1394,7 +1406,7 @@ async function verifyIntegratedCommit(
     const verifyOptions: VerifyOptions = { cwd: path, candidateSha: integratedSha, commands };
     if (outputLimit !== undefined) verifyOptions.outputLimit = outputLimit;
     if (env !== undefined) verifyOptions.env = env;
-    result = await runVerification(verifyOptions, path);
+    result = await runVerification(verifyOptions, path, owned.marker.ownershipId);
   } catch (error) {
     failure = error;
   }

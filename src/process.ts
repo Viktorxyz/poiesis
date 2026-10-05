@@ -1,16 +1,41 @@
 import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
-import { PoiesisError } from "./errors.js";
+import { PoiesisError, asPoiesisError } from "./errors.js";
+import {
+  createManagedProcessLease,
+  isManagedProcessLeaseLabel,
+  settleManagedProcessLease,
+  type ManagedProcessLease,
+} from "./process-tree.js";
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_VERIFY_TIMEOUT_MS = 10 * 60_000;
 const MAX_TIMEOUT_MS = 30 * 60_000;
-const GRACEFUL_TIMEOUT_MS = 2_000;
-const TERMINATION_CONFIRM_MS = 2_000;
 const TASKKILL_TIMEOUT_MS = 5_000;
 const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * Spec #168 / ticket #170 — bounded window a managed command may keep the
+ * runner waiting after the child exited while a descendant still holds the
+ * inherited output. When the window elapses the managed process group is
+ * settled (see `settleManagedProcessLease`) and the run settles with it,
+ * so a leaked background descendant can never hold a Poiesis operation
+ * open indefinitely.
+ */
+const POST_EXIT_GRACE_MS = 2_000;
+
+/** Conventional exit status for a command cancelled by SIGINT-equivalent. */
+const CANCELLED_EXIT_CODE = 130;
+
+/**
+ * Transient fallback workspace label for callers that do not name a
+ * workspace. The lease identity is per-run and in-memory only; Poiesis
+ * never persists it, so no durable identity store is implied.
+ */
+const UNSCOPED_WORKSPACE_ID = "poiesis-unscoped-workspace";
+
+let transientOperationCounter = 0;
 
 export interface RunOptions {
   cwd: string;
@@ -44,6 +69,29 @@ export interface RunOptions {
   allowFailure?: boolean;
   timeoutMs?: number;
   maxBytes?: number;
+  /**
+   * Spec #168 / ticket #170 — the caller's cancellation intent.
+   *
+   * When the signal fires, the runner settles the managed process group
+   * exactly as it does for a timeout and then rejects with
+   * `COMMAND_CANCELLED` (exit code 130). A signal that is already aborted
+   * when `run` is called rejects WITHOUT spawning anything, so a cancelled
+   * operation never creates a subprocess it must then clean up.
+   */
+  signal?: AbortSignal;
+  /**
+   * Spec #168 / ticket #170 — the managed operation identity recorded on
+   * the transient process lease. Optional; when omitted the runner mints a
+   * transient in-memory label. A malformed value is refused with
+   * `PROCESS_LEASE_MALFORMED` before any process is created.
+   */
+  operationId?: string;
+  /**
+   * Spec #168 / ticket #170 — the Poiesis workspace identity recorded on
+   * the transient process lease. Optional; same fail-closed contract as
+   * `operationId`.
+   */
+  workspaceId?: string;
 }
 
 export interface RunResult {
@@ -66,11 +114,37 @@ interface Capture {
   finalized: boolean;
 }
 
+/**
+ * Spec #168 / ticket #170 — run one managed subprocess to a settled state.
+ *
+ * Every exit path — success, non-zero exit, timeout, cancellation, and
+ * internal error — settles only AFTER the managed process group has been
+ * cleaned through its transient identity lease (`src/process-tree.ts`).
+ * The child is spawned `detached: true`, so it leads an isolated process
+ * group that cannot be reached from Poiesis's own group or the terminal's,
+ * and cleanup targets are derived from that lease alone: there is no
+ * process-name, port, user, or age matching anywhere in this path.
+ *
+ * A descendant that outlives the child — the classic "successful command
+ * that leaks a background process" — is cleaned too. While such a
+ * descendant still holds the inherited output the runner waits at most
+ * {@link POST_EXIT_GRACE_MS} for it, then settles the group instead of
+ * blocking until the command timeout.
+ */
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
   const maxBytes = normalizeMaxBytes(options.maxBytes);
   const childEnv = resolveChildEnvironment(options);
+  // The lease identity is validated before anything is spawned, so a
+  // malformed operation or workspace identity can never create a process.
+  const leaseIdentity = resolveLeaseIdentity(options);
   const startedAt = Date.now();
+
+  // A caller that has already cancelled must not create a subprocess that
+  // would then have to be cleaned up.
+  if (options.signal?.aborted === true) {
+    throw cancelledError(command, args, "cancelled before the command was spawned");
+  }
 
   return await new Promise<RunResult>((resolve, reject) => {
     let child: ChildProcess;
@@ -87,9 +161,35 @@ export async function run(command: string, args: string[], options: RunOptions):
       return;
     }
 
+    // The transient lease for this managed process. Windows has no POSIX
+    // process groups, so its tree cleanup runs through taskkill instead.
+    // A spawn that produced no PID has no process to lease: the `error`
+    // event settles it as COMMAND_IO_ERROR.
+    let lease: ManagedProcessLease | null = null;
+    if (!IS_WINDOWS && child.pid !== undefined) {
+      try {
+        lease = createManagedProcessLease({
+          operationId: leaseIdentity.operationId,
+          workspaceId: leaseIdentity.workspaceId,
+          pid: child.pid,
+        });
+      } catch (error) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Best effort; the process never left Poiesis's hands.
+        }
+        child.on("error", () => {
+          // The lease failure is the reported outcome; swallow the late
+          // spawn error so it cannot surface as an unhandled rejection.
+        });
+        reject(asPoiesisError(error));
+        return;
+      }
+    }
+
     const stdout = createCapture();
     const stderr = createCapture();
-    const processGroupId = IS_WINDOWS ? null : (child.pid ?? null);
     let childExited = false;
     let stdoutClosed = child.stdout === null;
     let stderrClosed = child.stderr === null;
@@ -98,11 +198,14 @@ export async function run(command: string, args: string[], options: RunOptions):
     let exitSignal: NodeJS.Signals | null = null;
     let infrastructureError: Error | null = null;
     let timedOut = false;
-    let terminationComplete = true;
+    let cancelled = false;
+    let cleanupError: PoiesisError | null = null;
+    /** True once the managed group was cleaned (or refused). Never earlier. */
+    let cleanupComplete = false;
+    let cleanupStarted = false;
     let settled = false;
+    let lingerTimer: NodeJS.Timeout | null = null;
     let timeoutTimer: NodeJS.Timeout | null = null;
-    let graceTimer: NodeJS.Timeout | null = null;
-    let ownedGroupMembers: Map<number, string> | null = null;
 
     const buildResult = (): RunResult => ({
       command,
@@ -117,15 +220,32 @@ export async function run(command: string, args: string[], options: RunOptions):
       durationMs: Date.now() - startedAt,
     });
 
+    const clearLingerTimer = (): void => {
+      if (lingerTimer === null) return;
+      clearTimeout(lingerTimer);
+      lingerTimer = null;
+    };
+
     const settle = (): void => {
       if (settled) return;
       settled = true;
+      clearLingerTimer();
       if (timeoutTimer !== null) clearTimeout(timeoutTimer);
-      if (graceTimer !== null) clearTimeout(graceTimer);
       timeoutTimer = null;
-      graceTimer = null;
+      if (options.signal !== undefined) options.signal.removeEventListener("abort", onCallerAbort);
 
       const result = buildResult();
+      // A refused or unresolved cleanup outranks every other outcome: it
+      // means a process Poiesis spawned may still be running, so the run
+      // must not report success, failure, or cancellation as settled.
+      if (cleanupError !== null) {
+        reject(cleanupError);
+        return;
+      }
+      if (cancelled) {
+        reject(cancelledError(command, args, "cancelled by the caller", result));
+        return;
+      }
       if (timedOut) {
         reject(
           new PoiesisError(
@@ -169,29 +289,96 @@ export async function run(command: string, args: string[], options: RunOptions):
     };
 
     const tryFinalize = (): void => {
-      if (settled || !childExited || !stdoutClosed || !stderrClosed || !stdinClosed) return;
+      if (settled || !childExited) return;
+      // Once the managed group is settled, no further output can arrive: an
+      // open pipe is a leaked descendant's doing, not a reason to keep
+      // waiting.
+      if (cleanupComplete) {
+        settle();
+        return;
+      }
+      if (!stdoutClosed || !stderrClosed || !stdinClosed) {
+        armLingerTimer();
+        return;
+      }
+      void beginCleanup();
+    };
 
-      if (timedOut && !terminationComplete) {
-        // When an owned process-group snapshot exists, do not trust a single
-        // "PG appears empty" verdict during the grace period: a TERM-handler
-        // descendant that forks a TERM-resistant replacement can briefly
-        // hide that replacement from /proc (the new /proc entry is created
-        // at fork and populated across exec). Always wait for the forced
-        // SIGKILL phase so every TERM-resistant descendant, including
-        // TERM-handler-replacement descendants, is captured and killed
-        // before settlement. The "PG appears empty" verdict is still useful
-        // on non-owned-group paths where the snapshot is untracked.
-        if (ownedGroupMembers !== null) return;
-        const groupExists = processGroupId !== null && processGroupExists(processGroupId);
-        if (processGroupId !== null && !groupExists) {
-          if (graceTimer !== null) clearTimeout(graceTimer);
-          graceTimer = null;
-          terminationComplete = true;
-        } else {
-          return;
+    /**
+     * Bound how long a descendant may hold the runner open after the child
+     * exited. When the window elapses the managed group is settled, which
+     * both bounds the wait and removes the leak.
+     */
+    const armLingerTimer = (): void => {
+      if (lingerTimer !== null || cleanupComplete) return;
+      lingerTimer = setTimeout(() => {
+        lingerTimer = null;
+        void beginCleanup();
+      }, POST_EXIT_GRACE_MS);
+    };
+
+    /**
+     * Clean the managed process group exactly once, and only then let the
+     * run settle. The POSIX path delegates to the lease settler, which
+     * validates process identity before every signal and fails closed with
+     * a typed error instead of claiming a cleanup it could not confirm.
+     */
+    const beginCleanup = async (): Promise<void> => {
+      if (cleanupStarted) return;
+      cleanupStarted = true;
+      clearLingerTimer();
+      if (timeoutTimer !== null) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+      if (lease !== null) {
+        try {
+          await settleManagedProcessLease(lease);
+        } catch (error) {
+          cleanupError = asPoiesisError(error);
+        }
+      } else if (IS_WINDOWS) {
+        // Documented Windows model: no POSIX process groups and no readable
+        // process-start identity, so `taskkill /PID <pid> /T` is the only
+        // way to reach the tree, and it is meaningful ONLY while the PID is
+        // still the process Poiesis spawned. Once the child has exited that
+        // PID has been reaped and may already be recycled, so addressing it
+        // — for a normal completion or for the linger window — could kill an
+        // unrelated process. Nothing is therefore signalled once
+        // `childExited` is set; a normal Windows run is simply already
+        // settled.
+        if (!childExited) await terminateWindowsTree();
+      }
+      // Neither a lease nor Windows: the spawn produced no process, so
+      // there is nothing to clean up before settling.
+      cleanupComplete = true;
+      tryFinalize();
+    };
+
+    const beginTermination = (): void => {
+      if (cleanupComplete) return;
+      void beginCleanup();
+    };
+
+    /** Windows has no POSIX process groups; `taskkill /T` drives the tree. */
+    const terminateWindowsTree = async (): Promise<void> => {
+      const pid = child.pid;
+      if (pid === undefined) return;
+      const gracefulSucceeded = await runTaskkill(pid);
+      if (settled) return;
+      // taskkill /T reports completion for the requested tree. If it fails,
+      // force immediately only while the original child handle is still
+      // active; a delayed /PID call after exit could target a reused PID.
+      if (!gracefulSucceeded && !childExited) {
+        const forced = await runTaskkill(pid, true);
+        if (!forced) {
+          try {
+            child.kill("SIGKILL");
+          } catch {
+            // Best effort after both taskkill phases failed.
+          }
         }
       }
-      settle();
     };
 
     const recordInfrastructureError = (error: Error): void => {
@@ -237,69 +424,18 @@ export async function run(command: string, args: string[], options: RunOptions):
       tryFinalize();
     });
 
-    const forceTermination = async (): Promise<void> => {
-      graceTimer = null;
-      if (processGroupId !== null && ownedGroupMembers !== null) {
-        refreshOwnedProcessGroup(processGroupId, ownedGroupMembers);
-        // Bounded-reliability safety net: even if the snapshot missed a
-        // TERM-handler-replacement descendant due to a /proc race,
-        // SIGKILL the entire group so every descendant is captured
-        // before settlement. The group was created by this runner via
-        // detached: true; every member is a descendant of the original
-        // child and is intended to be terminated.
-        try {
-          process.kill(-processGroupId, "SIGKILL");
-        } catch {
-          // The group may already be gone; the per-member signals below
-          // remain authoritative for PID-reuse verification.
-        }
-        signalOwnedProcesses(processGroupId, ownedGroupMembers, "SIGKILL");
-        await waitForOwnedProcessesExit(ownedGroupMembers, TERMINATION_CONFIRM_MS);
-      } else {
-        await terminateTree(child, processGroupId, true);
-      }
-      if (processGroupId !== null && ownedGroupMembers === null) {
-        await waitForProcessGroupExit(processGroupId, TERMINATION_CONFIRM_MS);
-      }
-      terminationComplete = true;
-      tryFinalize();
-    };
+    function onCallerAbort(): void {
+      if (settled || cancelled) return;
+      cancelled = true;
+      beginTermination();
+    }
 
-    const beginTermination = async (): Promise<void> => {
-      const gracefulSucceeded = await terminateTree(child, processGroupId, false);
-      if (settled) return;
-      if (IS_WINDOWS) {
-        // taskkill /T reports completion for the requested tree. If it fails,
-        // force immediately only while the original child handle is still
-        // active; a delayed /PID call after exit could target a reused PID.
-        if (!gracefulSucceeded && !childExited) {
-          const forced = await terminateTree(child, processGroupId, true);
-          if (!forced) {
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // Best effort after both taskkill phases failed.
-            }
-          }
-        }
-        terminationComplete = true;
-        tryFinalize();
-        return;
-      }
-      graceTimer = setTimeout(() => {
-        void forceTermination();
-      }, GRACEFUL_TIMEOUT_MS);
-      tryFinalize();
-    };
+    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
 
     timeoutTimer = setTimeout(() => {
       timeoutTimer = null;
-      if (processGroupId !== null) {
-        ownedGroupMembers = snapshotLinuxProcessGroup(processGroupId);
-      }
       timedOut = true;
-      terminationComplete = false;
-      void beginTermination();
+      beginTermination();
     }, timeoutMs);
 
     if (options.input !== undefined && child.stdin !== null) {
@@ -387,33 +523,7 @@ function isExpectedStdinClosure(error: Error): boolean {
   );
 }
 
-async function terminateTree(
-  child: ChildProcess,
-  processGroupId: number | null,
-  force: boolean,
-): Promise<boolean> {
-  if (IS_WINDOWS) {
-    const pid = child.pid;
-    if (pid === undefined) return false;
-    return await runTaskkill(pid, force);
-  } else if (processGroupId !== null) {
-    try {
-      process.kill(-processGroupId, force ? "SIGKILL" : "SIGTERM");
-      return true;
-    } catch {
-      // The group may already be gone; fall back to the direct child.
-    }
-  }
-
-  try {
-    return child.kill(force ? "SIGKILL" : "SIGTERM");
-  } catch {
-    // Best effort; lifecycle events still decide settlement.
-    return false;
-  }
-}
-
-async function runTaskkill(pid: number, force: boolean): Promise<boolean> {
+async function runTaskkill(pid: number, force = false): Promise<boolean> {
   return await new Promise<boolean>((resolve) => {
     let helper: ChildProcess;
     try {
@@ -447,93 +557,50 @@ async function runTaskkill(pid: number, force: boolean): Promise<boolean> {
   });
 }
 
-async function waitForProcessGroupExit(processGroupId: number, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (processGroupExists(processGroupId) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-}
-
-function processGroupExists(processGroupId: number): boolean {
-  try {
-    process.kill(-processGroupId, 0);
-    return true;
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    return code !== "ESRCH";
-  }
-}
-
-function snapshotLinuxProcessGroup(processGroupId: number): Map<number, string> | null {
-  if (process.platform !== "linux") return null;
-  const members = new Map<number, string>();
-  try {
-    for (const entry of readdirSync("/proc")) {
-      if (!/^\d+$/.test(entry)) continue;
-      const pid = Number(entry);
-      const identity = readLinuxProcessIdentity(pid);
-      if (identity?.processGroupId === processGroupId) members.set(pid, identity.startTime);
-    }
-    return members;
-  } catch {
-    return null;
-  }
-}
-
-function readLinuxProcessIdentity(
-  pid: number,
-): { processGroupId: number; startTime: string } | null {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const processGroupId = Number(fields[2]);
-    const startTime = fields[19];
-    if (!Number.isSafeInteger(processGroupId) || startTime === undefined) return null;
-    return { processGroupId, startTime };
-  } catch {
-    return null;
-  }
-}
-
-function ownedProcessesExist(members: Map<number, string>): boolean {
-  for (const [pid, startTime] of members) {
-    if (readLinuxProcessIdentity(pid)?.startTime === startTime) return true;
-  }
-  return false;
-}
-
-function refreshOwnedProcessGroup(processGroupId: number, members: Map<number, string>): boolean {
-  const current = snapshotLinuxProcessGroup(processGroupId);
-  if (current === null) return ownedProcessesExist(members);
-  if (current.size === 0) return false;
-  for (const [pid, startTime] of current) members.set(pid, startTime);
-  return true;
-}
-
-function signalOwnedProcesses(
-  processGroupId: number,
-  members: Map<number, string>,
-  signal: NodeJS.Signals,
-): void {
-  for (const [pid, startTime] of members) {
-    const current = readLinuxProcessIdentity(pid);
-    if (current?.startTime !== startTime || current.processGroupId !== processGroupId) continue;
-    try {
-      process.kill(pid, signal);
-    } catch {
-      // The process may exit after its identity check.
+/**
+ * Spec #168 / ticket #170 — resolve the transient lease identity for one
+ * managed run. Both fields must be well-formed lease labels; a malformed
+ * one is refused here, BEFORE `spawn`, so a bad identity can never create
+ * a process. Callers that do not name an operation get a transient,
+ * in-memory label: no durable identity store is introduced.
+ */
+function resolveLeaseIdentity(options: RunOptions): { operationId: string; workspaceId: string } {
+  transientOperationCounter += 1;
+  const operationId = options.operationId ?? `poiesis-operation-${transientOperationCounter}`;
+  const workspaceId = options.workspaceId ?? UNSCOPED_WORKSPACE_ID;
+  for (const [field, value] of [
+    ["operationId", operationId],
+    ["workspaceId", workspaceId],
+  ] as const) {
+    if (!isManagedProcessLeaseLabel(value)) {
+      throw new PoiesisError("PROCESS_LEASE_MALFORMED", `Managed process lease ${field} is not a valid identity`, {
+        field,
+        value,
+      });
     }
   }
+  return { operationId, workspaceId };
 }
 
-async function waitForOwnedProcessesExit(
-  members: Map<number, string>,
-  timeoutMs: number,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (ownedProcessesExist(members) && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
+/**
+ * Cancellation is a typed outcome, not a silent success and not a timeout:
+ * the caller asked for this run to stop, and the managed group has already
+ * been settled by the time this is raised.
+ */
+function cancelledError(command: string, args: string[], reason: string, result?: RunResult): PoiesisError {
+  return new PoiesisError("COMMAND_CANCELLED", `${command} was cancelled: ${reason}`, {
+    command,
+    args,
+    reason,
+    cancelled: true,
+    exitCode: result?.exitCode ?? null,
+    signal: result?.signal ?? null,
+    durationMs: result?.durationMs,
+    stdout: bounded(result?.stdout ?? ""),
+    stderr: bounded(result?.stderr ?? ""),
+    stdoutTruncated: result?.stdoutTruncated ?? false,
+    stderrTruncated: result?.stderrTruncated ?? false,
+  }, CANCELLED_EXIT_CODE);
 }
 
 function commandIoError(

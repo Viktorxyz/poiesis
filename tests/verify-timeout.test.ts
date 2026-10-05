@@ -1,8 +1,9 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { verify } from "../src/git.js";
+import * as processModule from "../src/process.js";
 import { createTestRepository, type TestRepository } from "./helpers.js";
 
 const repositories: TestRepository[] = [];
@@ -192,6 +193,32 @@ describe("deterministic Verify timeout", () => {
       survivorPids.delete(descendantPid);
     },
   );
+});
+
+describe("Verify managed execution lease identity", () => {
+  it("names the verify operation on the transient managed process lease", { timeout: 30000 }, async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const recorder = vi.spyOn(processModule, "run");
+    try {
+      await verify({
+        cwd: repository.root,
+        candidateSha: repository.baseSha,
+        commands: [`printf "%s" ok`],
+      });
+      const verification = recorder.mock.calls.find(
+        ([command, args]) => command === "/bin/sh" && Array.isArray(args) && args[0] === "-c",
+      );
+      // Spec #168 / ticket #170: the verification command runs under a
+      // managed lease that names the operation. A caller-supplied workspace
+      // identity is added on top of it when one was proven; on a
+      // non-project-bound primary checkout there is none to add.
+      expect(verification?.[2]).toMatchObject({ operationId: "poiesis-verify" });
+      expect(verification?.[2]?.workspaceId).toBeUndefined();
+    } finally {
+      recorder.mockRestore();
+    }
+  });
 });
 
 describe("Verify exact-SHA clean-after reporting", () => {

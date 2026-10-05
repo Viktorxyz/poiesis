@@ -579,7 +579,98 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
   );
 });
 
-describe("Windows termination seam", () => {
+/**
+ * Spec #168 / ticket #170 — the Windows cleanup model.
+ *
+ * Windows has no POSIX process groups and no readable process-start
+ * identity, so `taskkill /PID <pid> /T` is the only tree-addressing
+ * primitive available. Its one safety property is the same as any
+ * by-PID call: it is only meaningful while the PID is still the process
+ * Poiesis spawned. Once the child has exited, that PID is reaped and may
+ * already be recycled, so `run()` must not address it at all — not for a
+ * normal completion, and not for the linger window either.
+ *
+ * `process.platform` is redefined for the duration of each test so the
+ * Windows branch of the real module runs on this host; the `taskkill`
+ * helper is faked so its invocations are observable.
+ */
+describe("Windows cleanup model", () => {
+  const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
+  let taskkillCalls: string[][] = [];
+  let killSignalledPids: number[] = [];
+
+  async function runAsWindows(
+    command: string,
+    args: string[],
+    options: Parameters<typeof run>[2],
+  ): Promise<Awaited<ReturnType<typeof run>>> {
+    taskkillCalls = [];
+    killSignalledPids = [];
+    vi.resetModules();
+    vi.doMock("node:child_process", async () => {
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      return {
+        ...actual,
+        spawn: ((...spawnArgs: unknown[]) => {
+          if (spawnArgs[0] !== "taskkill") {
+            return Reflect.apply(actual.spawn, undefined, spawnArgs) as ChildProcess;
+          }
+          const argv = spawnArgs[1] as string[];
+          taskkillCalls.push(argv);
+          const helper = new EventEmitter() as ChildProcess;
+          Object.assign(helper, { kill: () => true });
+          // The graceful phase always fails, so the forced phase is what
+          // actually ends the run — this is the only case where Poiesis may
+          // escalate by PID.
+          setTimeout(() => {
+            killSignalledPids.push(Number(argv[1]));
+            helper.emit("close", argv.includes("/F") ? 0 : 1);
+          }, 25);
+          return helper;
+        }) as typeof actual.spawn,
+      };
+    });
+    Object.defineProperty(process, "platform", { ...originalPlatform, value: "win32" });
+    try {
+      const mocked = await import("../src/process.js");
+      return await mocked.run(command, args, options);
+    } finally {
+      Object.defineProperty(process, "platform", originalPlatform);
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  }
+
+  afterEach(() => {
+    Object.defineProperty(process, "platform", originalPlatform);
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("never addresses a by-PID taskkill when the command completed normally", { timeout: 30_000 }, async () => {
+    const result = await runAsWindows(process.execPath, ["-e", "process.stdout.write('done')"], {
+      cwd: tmpdir(),
+    });
+    expect(result).toMatchObject({ exitCode: 0, stdout: "done" });
+    // The child exited and its PID was reaped. Addressing it now could hit
+    // an unrelated process that inherited the recycled PID.
+    expect(taskkillCalls).toEqual([]);
+    expect(killSignalledPids).toEqual([]);
+  });
+
+  it("does not address a by-PID taskkill for the linger window after a normal exit", { timeout: 60_000 }, async () => {
+    // A descendant that outlives the child keeps the inherited pipes open,
+    // which arms the post-exit linger window. On Windows that window must
+    // still not signal the exited child's recycled PID.
+    const { script } = await stageScript(
+      "#!/bin/sh\n(sleep 30) &\nprintf early\nexit 0\n",
+    );
+    const result = await runAsWindows(script, [], { cwd: tmpdir() });
+    expect(result).toMatchObject({ exitCode: 0 });
+    expect(taskkillCalls).toEqual([]);
+    expect(killSignalledPids).toEqual([]);
+  });
+
   it("awaits taskkill and forces immediately while the original child is active", async () => {
     const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
     const taskkillCalls: string[][] = [];
