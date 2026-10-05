@@ -32,6 +32,7 @@ import {
   validateConfig,
   type ConfiguredDeliveryConfig,
   type PoiesisConfig,
+  type ResolvedDeliveryConfig,
   type ResolvedPoiesisConfig,
 } from "../src/config.js";
 import {
@@ -455,6 +456,152 @@ describe("delivery configuration distinguishes complete targets from explicit de
   });
 });
 
+/**
+ * Spec #139 / ticket #153 — `resolveDelivery` is the ONE seam between the
+ * `delivery` block an Author states and the value `init` / `update --config`
+ * serialize into `.poiesis/config.jsonc`. It rebuilt both honest branches
+ * from the known fields alone, so an extension key that ticket #152 taught
+ * the schema to ACCEPT survived `validateConfig` and was then silently
+ * deleted by the next managed rewrite. An accepted key that the runtime
+ * cannot act on must be carried through, not consumed.
+ *
+ * What is pinned here:
+ *
+ *   1. every unknown OUTER key survives resolution on both branches;
+ *   2. the known fields stay normalized and RESERVED — an extension can
+ *      never introduce a target, never complete a partial block, and never
+ *      rewrite `mode`;
+ *   3. the resolved delivery TYPES represent an extension key, so the
+ *      contract is checked by the compiler and not only at runtime;
+ *   4. the semantic rejections from #152 are unchanged, extension keys
+ *      included.
+ */
+describe("delivery extension keys survive config resolution", () => {
+  /**
+   * The chain both managed rewrites actually run: `validateConfig` (which
+   * accepts an extension key) then `autoResolveConfigDefaults` (which used
+   * to drop it). Resolution is never called with a raw unvalidated literal,
+   * so a unit assertion that skipped the schema would not be evidence.
+   */
+  async function resolveWithDelivery(
+    root: string,
+    delivery: Record<string, unknown>,
+  ): Promise<ResolvedPoiesisConfig> {
+    const validated = validateConfig(
+      { ...baseConfig(), tracker: { provider: "local" }, delivery },
+      "test",
+    );
+    const { config } = await autoResolveConfigDefaults(root, validated);
+    return config;
+  }
+
+  it("keeps unknown outer keys on the configured branch without inventing a mode", async () => {
+    const repository = await createTestRepository();
+    try {
+      const delivery = { ...completeDelivery(), experimental: { note: "kept", retries: 2 } };
+      const config = await resolveWithDelivery(repository.root, delivery);
+      expect(config.delivery).toEqual(delivery);
+      expect("mode" in config.delivery).toBe(false);
+      expect(JSON.parse(serializeConfig(config)).delivery).toEqual(delivery);
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps unknown outer keys on the deferred branch without completing a target", async () => {
+    const repository = await createTestRepository();
+    try {
+      const delivery = { mode: DEFERRED_DELIVERY_MODE, experimental: { note: "kept" }, note: "author annotation" };
+      const config = await resolveWithDelivery(repository.root, delivery);
+      expect(isDeferredDelivery(config.delivery)).toBe(true);
+      expect(config.delivery).toEqual(delivery);
+      expect(verifyDeliveryConfiguration(repository.root, config)).toBe("deferred");
+      expect(JSON.parse(serializeConfig(config)).delivery).toEqual(delivery);
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("normalizes the known fields and reserves them against the extension keys it carries", async () => {
+    const repository = await createTestRepository();
+    try {
+      // A `mode`-shaped key with no usable value is a reserved name, not an
+      // extension: it must not reach the resolved configured block, and it
+      // must never be promoted to the deferred state.
+      const configured = await resolveWithDelivery(repository.root, {
+        ...completeDelivery(),
+        mode: undefined,
+        experimental: { note: "kept" },
+      });
+      // The three targets are the stated values, verbatim, and the resolved
+      // object carries nothing but those targets plus the extension.
+      expect(configured.delivery).toEqual({ ...completeDelivery(), experimental: { note: "kept" } });
+      expect(Object.keys(configured.delivery as Record<string, unknown>).sort()).toEqual([
+        "experimental",
+        "preview",
+        "production",
+        "staging",
+      ]);
+
+      const deferred = await resolveWithDelivery(repository.root, {
+        mode: DEFERRED_DELIVERY_MODE,
+        experimental: { note: "kept" },
+      });
+      // The deferred branch stays deferred: the extension keys never
+      // introduce a target, and `mode` is exactly the deferred literal.
+      const resolvedDeferred = deferred.delivery as Record<string, unknown>;
+      expect(resolvedDeferred["mode"]).toBe(DEFERRED_DELIVERY_MODE);
+      expect(Object.keys(resolvedDeferred).sort()).toEqual(["experimental", "mode"]);
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("represents an extension key in both resolved delivery types", () => {
+    // Compile-time evidence, asserted at runtime as well. If the resolved
+    // delivery types stop representing an extension key, `pnpm check` fails
+    // here even when every runtime assertion above still passes.
+    const deferred: ResolvedDeliveryConfig = {
+      mode: DEFERRED_DELIVERY_MODE,
+      experimental: { note: "kept" },
+    };
+    const configured: ConfiguredDeliveryConfig = {
+      ...completeDelivery(),
+      experimental: { note: "kept" },
+    };
+    expect(isDeferredDelivery(deferred)).toBe(true);
+    expect(deferred["experimental"]).toEqual({ note: "kept" });
+    expect(configured.experimental).toEqual({ note: "kept" });
+    // The extension key does not weaken a known field's type: a target is
+    // still an object with a string `adapter`.
+    const adapter: string = configured.preview.adapter;
+    expect(adapter).toBe("command");
+  });
+
+  it("keeps the semantic rejections intact with extension keys present", () => {
+    // Compatibility relaxation only: the typed, actionable failures from
+    // #152 must not become a silently widened delivery contract.
+    expectInvalidDeliveryConfig(
+      { ...baseConfig(), delivery: { mode: "later", experimental: { note: "kept" } } },
+      { mode: "later" },
+    );
+    expectInvalidDeliveryConfig(
+      {
+        ...baseConfig(),
+        delivery: { preview: { adapter: "command" }, experimental: { note: "kept" } },
+      },
+      { missing: ["staging", "production"] },
+    );
+    expectInvalidDeliveryConfig(
+      {
+        ...baseConfig(),
+        delivery: { mode: DEFERRED_DELIVERY_MODE, preview: { adapter: "command" }, experimental: true },
+      },
+      { mode: DEFERRED_DELIVERY_MODE },
+    );
+  });
+});
+
 describe("publish coordinates are derived from the Git remote", () => {
   it("derives github coordinates from the remote for a local tracker", async () => {
     const repository = await createTestRepository();
@@ -616,5 +763,117 @@ describe("update --config accepts an explicitly deferred delivery block", () => 
 
     const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
     expect(JSON.parse(written).delivery).toEqual({ mode: DEFERRED_DELIVERY_MODE });
+  }, 90_000);
+});
+
+/**
+ * Spec #139 / ticket #153 — the resolution unit assertions above prove
+ * `resolveDelivery` keeps the key; these prove the key actually REACHES
+ * `.poiesis/config.jsonc` through the two managed rewrites that serialize a
+ * resolved config. A unit assertion alone would still pass if the write path
+ * rebuilt the block from the known fields a second time.
+ */
+describe("delivery extension keys survive a managed init and update --config rewrite", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let restoreGh: (() => void) | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    restoreGh?.();
+    restoreGh = undefined;
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  it("persists a configured delivery extension through a fresh init", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const delivery = { ...completeDelivery(), experimental: { note: "kept", retries: 2 } };
+    await init(
+      repository.root,
+      { ...baseConfig(), tracker: { provider: "github", project: "owner/repo" }, delivery },
+      { skipSkills: true },
+    );
+    const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(written).delivery).toEqual(delivery);
+  }, 90_000);
+
+  it("persists a deferred delivery extension through a fresh init", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const delivery: PoiesisConfig["delivery"] = { mode: DEFERRED_DELIVERY_MODE, experimental: { note: "kept" } };
+    await init(
+      repository.root,
+      { ...baseConfig(), tracker: { provider: "github", project: "owner/repo" }, delivery },
+      { skipSkills: true },
+    );
+    const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(written).delivery).toEqual(delivery);
+  }, 90_000);
+
+  it("persists a deferred delivery extension through update --config", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery: completeDelivery(),
+      },
+      { skipSkills: true },
+    );
+
+    const candidatePath = join(repository.parent, "extended-config.jsonc");
+    const delivery: PoiesisConfig["delivery"] = { mode: DEFERRED_DELIVERY_MODE, experimental: { note: "kept" } };
+    await writeFile(
+      candidatePath,
+      serializeConfig({
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery,
+      }),
+    );
+
+    await updateFromConfig(repository.root, candidatePath);
+    const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(written).delivery).toEqual(delivery);
+  }, 90_000);
+
+  it("persists a configured delivery extension through update --config", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery: completeDelivery(),
+      },
+      { skipSkills: true },
+    );
+
+    const candidatePath = join(repository.parent, "extended-configured.jsonc");
+    const delivery = { ...completeDelivery(), note: "author annotation" };
+    await writeFile(
+      candidatePath,
+      serializeConfig({
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery,
+      }),
+    );
+
+    await updateFromConfig(repository.root, candidatePath);
+    const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(written).delivery).toEqual(delivery);
   }, 90_000);
 });

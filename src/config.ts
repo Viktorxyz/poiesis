@@ -88,12 +88,26 @@ export const configuredDeliverySchema = z
 export const deliveryConfigSchema = z.union([deferredDeliverySchema, configuredDeliverySchema]);
 
 export type DeliveryTargetConfig = z.infer<typeof adapterTargetSchema>;
-export type DeferredDeliveryConfig = { mode: typeof DEFERRED_DELIVERY_MODE };
+
+/**
+ * Spec #139 / ticket #153 — the extension keys an outer `delivery` block
+ * may carry: anything Poiesis does not own.
+ *
+ * The zod schemas above are `.loose()`, so `PoiesisConfig` already REPRESENTS
+ * an extension key on the way in (ticket #152). The resolved types had to
+ * represent it too, or the value that init / `update --config` serialize was
+ * typed as if it had already lost the key and a future reconstruction step
+ * would be told it was safe to drop it. `unknown` is the honest value: Poiesis
+ * neither interprets nor validates an extension, it only carries it.
+ */
+export type DeliveryExtensions = { readonly [key: string]: unknown };
+
+export type DeferredDeliveryConfig = { mode: typeof DEFERRED_DELIVERY_MODE } & DeliveryExtensions;
 export type ConfiguredDeliveryConfig = {
   preview: DeliveryTargetConfig;
   staging: DeliveryTargetConfig;
   production: DeliveryTargetConfig;
-};
+} & DeliveryExtensions;
 export type ResolvedDeliveryConfig = DeferredDeliveryConfig | ConfiguredDeliveryConfig;
 
 /**

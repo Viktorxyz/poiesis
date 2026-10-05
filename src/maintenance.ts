@@ -1122,6 +1122,37 @@ async function rollbackDefaultPathGitignore(
 export const DEFAULT_VERIFICATION_COMMAND = "git rev-parse --git-dir";
 
 /**
+ * Spec #139 / ticket #153 — the OUTER delivery keys Poiesis owns and
+ * therefore normalizes itself: the `mode` marker and the three targets.
+ * Everything else at the outer level is an extension key. The reserved set
+ * is keyed by PROPERTY NAME (`mode`), not by the deferred mode's value.
+ *
+ * `assertDeliveryShape` has already refused a block that mixes the two
+ * honest states, so this partition is a naming of the contract, not a new
+ * rule: an extension key can neither introduce, replace, nor complete a
+ * field Poiesis owns.
+ */
+const RESERVED_DELIVERY_KEYS: ReadonlySet<string> = new Set<string>(["mode", ...DELIVERY_TARGETS]);
+
+/**
+ * Spec #139 / ticket #153 — the extension keys of an outer `delivery` block,
+ * carried forward unexamined. This is the fix for the accepted-then-deleted
+ * key: the schema admits an unknown outer key (ticket #152), and the value
+ * that `init` / `update --config` serialize must still hold it, because a
+ * runtime that cannot act on a key must not delete it from the Author's
+ * managed config.
+ */
+function deliveryExtensionKeys(delivery: PoiesisConfig["delivery"]): Record<string, unknown> {
+  const extensions: Record<string, unknown> = {};
+  if (delivery === undefined) return extensions;
+  for (const [key, value] of Object.entries(delivery as Record<string, unknown>)) {
+    if (RESERVED_DELIVERY_KEYS.has(key)) continue;
+    extensions[key] = value;
+  }
+  return extensions;
+}
+
+/**
  * Spec #138: fill an absent `delivery` block from the generated delivery
  * scripts. init creates `scripts/poiesis-<target>.mjs` for any target the
  * project lacks, so the default resolves to a file that will exist by the
@@ -1131,9 +1162,15 @@ export const DEFAULT_VERIFICATION_COMMAND = "git rev-parse --git-dir";
  * `{ mode: "deferred" }` and is NEVER completed with generated command
  * targets. A complete block is returned unchanged, so an existing
  * installation's serialized bytes are untouched.
+ *
+ * Spec #139 / ticket #153: BOTH branches carry the block's extension keys
+ * through unchanged. The known fields are written last, so a reserved key
+ * can never be supplied or rewritten by an extension, and a block with no
+ * extension key resolves to exactly the bytes it did before.
  */
 function resolveDelivery(delivery: PoiesisConfig["delivery"]): ResolvedDeliveryConfig {
-  if (isDeferredDelivery(delivery)) return { mode: DEFERRED_DELIVERY_MODE };
+  const extensions = deliveryExtensionKeys(delivery);
+  if (isDeferredDelivery(delivery)) return { ...extensions, mode: DEFERRED_DELIVERY_MODE };
   const generated: ConfiguredDeliveryConfig = {
     preview: defaultDeliveryAdapter("preview"),
     staging: defaultDeliveryAdapter("staging"),
@@ -1141,6 +1178,7 @@ function resolveDelivery(delivery: PoiesisConfig["delivery"]): ResolvedDeliveryC
   };
   if (delivery === undefined) return generated;
   return {
+    ...extensions,
     preview: delivery.preview,
     staging: delivery.staging,
     production: delivery.production,
