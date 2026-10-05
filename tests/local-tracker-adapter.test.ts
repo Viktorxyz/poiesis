@@ -1596,6 +1596,256 @@ describe("the local tracker is wired into factory, verification and CLI surfaces
   }, 90_000);
 });
 
+/**
+ * Spec #139 / ticket #158 — the Local update path enforces the SAME nonblank
+ * dependency invariant `createTicket` already enforces.
+ *
+ * Ticket #158 makes this explicit because the invariant was only ever stated
+ * about creation. An `updateTicket` that accepted blank dependency text would
+ * commit a store the adapter's own strict validator refuses — the exact failure
+ * the supersession `replacementIds` check was added to prevent — so the two
+ * paths have to agree, and the store bytes have to survive the disagreement.
+ */
+describe("a local ticket update refuses blank dependency text exactly as a create does", () => {
+  it("refuses empty and whitespace-only dependency text and leaves the store byte-identical", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({
+      title: "T",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: EXACT_DEPENDENCY_TEXT,
+    });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const before = await readFile(location.storePath, "utf8");
+
+    for (const dependencyText of ["", " ", "\n", "  \n\t  "]) {
+      // A create refuses the same values, so the parity is asserted on both
+      // sides of the same loop rather than inferred from one of them.
+      await expect(
+        tracker.createTicket({ title: "Fresh", body: "B", parentSpecId: spec.id, dependencyText }),
+      ).rejects.toMatchObject({ code: "INVALID_ADAPTER_INPUT", details: { name: "dependencyText" } });
+      await expect(
+        tracker.updateTicket(ticket.id, { dependencyText }),
+      ).rejects.toMatchObject({ code: "INVALID_ADAPTER_INPUT", details: { name: "dependencyText" } });
+    }
+
+    // Every rejection happened before the durable write, so the canonical bytes
+    // are EXACTLY what they were and the evidence is intact.
+    expect(await readFile(location.storePath, "utf8")).toBe(before);
+    expect((await tracker.getTicket(ticket.id)).dependencyText).toBe(EXACT_DEPENDENCY_TEXT);
+  });
+
+  it("keeps valid dependency text byte-for-byte and leaves it untouched when omitted", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({
+      title: "T",
+      body: "B",
+      parentSpecId: spec.id,
+      dependencyText: "none",
+    });
+
+    const supplied = [
+      "  LOCAL-10 pinned, leading spaces kept  ",
+      "",
+      "\tsecond line with tabs\t",
+      "unicode: αβγ — ✓",
+    ].join("\n");
+    expect((await tracker.updateTicket(ticket.id, { dependencyText: supplied })).dependencyText).toBe(supplied);
+    // Omitted is not "cleared": a title-only update must not disturb it.
+    expect((await tracker.updateTicket(ticket.id, { title: "T, revised" })).dependencyText).toBe(supplied);
+    const reloaded = createLocalTrackerAdapter(repository.root);
+    expect((await reloaded.getTicket(ticket.id)).dependencyText).toBe(supplied);
+  });
+});
+
+/**
+ * Spec #139 / ticket #158 — a LOCAL identifier is EXACTLY `LOCAL-` followed by
+ * a nonzero decimal integer with no leading zero, and nothing else.
+ *
+ * The store validator resolved the number with `/^LOCAL-(\d+)$/`, so `LOCAL-01`
+ * and `LOCAL-1` were two spellings of item number 1. A store could therefore
+ * carry both, the monotonicity check could not see the alias, and a parent or
+ * supersession reference could be written in the padded spelling that resolved
+ * to an item the caller never named. Canonical form is what makes one
+ * identifier mean one item, so it is enforced on BOTH sides of the contract:
+ * the persisted document (fail closed, bytes preserved) and the caller's own
+ * arguments (refused before any write).
+ */
+describe("a LOCAL identifier is canonical or it is nothing", () => {
+  /** Padded, zero, malformed, and unsafe-integer spellings of a LOCAL id. */
+  const NONCANONICAL_IDS = [
+    "LOCAL-01",
+    "LOCAL-007",
+    "LOCAL-0",
+    "LOCAL-000",
+    "LOCAL-",
+    "LOCAL-1x",
+    "LOCAL-1.0",
+    "LOCAL- 1",
+    "LOCAL-+1",
+    "LOCAL-99999999999999999999",
+  ];
+
+  it("refuses a padded item key in persisted state and preserves the exact bytes", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const store = await readStoreJson(location.storePath);
+    const items = store.items as Record<string, { item: { id: string }; history: { snapshot: { id: string } }[] }>;
+    // EVERY copy of the identifier inside the record — the item and each history
+    // snapshot, plus every comment's `itemId` — is rewritten with the padded
+    // spelling, so the identifier-mismatch checks have nothing to report and the
+    // PADDED SPELLING is the only defect in the document. A single padded key
+    // already collides numerically with the canonical spelling of the same
+    // number; keeping both makes the collision literal rather than implied.
+    const repad = (record: { item: { id: string }; history: { snapshot: { id: string } }[] }): void => {
+      record.item.id = "LOCAL-01";
+      for (const entry of record.history) entry.snapshot.id = "LOCAL-01";
+    };
+    const padded = structuredClone(items[spec.id]!);
+    repad(padded);
+    items["LOCAL-01"] = padded;
+    const alias = structuredClone(padded);
+    alias.item.id = "LOCAL-1";
+    for (const entry of alias.history) entry.snapshot.id = "LOCAL-1";
+    items["LOCAL-1"] = alias;
+    const corrupted = `${JSON.stringify(store, null, 2)}\n`;
+    await writeFile(location.storePath, corrupted, { mode: 0o600 });
+
+    // A CANONICAL handle still resolves the document, so the refusal below is
+    // attributable to the document rather than to the handle.
+    for (const call of [
+      () => tracker.getSpec("LOCAL-1"),
+      () => tracker.createSpec({ title: "Never written", body: "B" }),
+      () => tracker.commentSpec("LOCAL-1", "note"),
+    ]) {
+      await expect(call()).rejects.toMatchObject({ code: "INVALID_LOCAL_TRACKER_STORE" });
+    }
+    // The padded handle is refused as the caller's own bad argument, before the
+    // store is read at all — it is never answered out of the padded key.
+    await expect(tracker.getSpec("LOCAL-01")).rejects.toMatchObject({ code: "INVALID_ADAPTER_INPUT" });
+    expect(await readFile(location.storePath, "utf8")).toBe(corrupted);
+  });
+
+  it("refuses a padded item identifier that disagrees with its own canonical key", async () => {
+    // The mirror image: the key is canonical and the record disagrees with it.
+    // Both directions are the same invariant — one key, one spelling, one item.
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const store = await readStoreJson(location.storePath);
+    (store.items as Record<string, { item: { id: string } }>)[spec.id]!.item.id = "LOCAL-01";
+    const corrupted = `${JSON.stringify(store, null, 2)}\n`;
+    await writeFile(location.storePath, corrupted, { mode: 0o600 });
+
+    await expect(tracker.getSpec(spec.id)).rejects.toMatchObject({ code: "INVALID_LOCAL_TRACKER_STORE" });
+    expect(await readFile(location.storePath, "utf8")).toBe(corrupted);
+  });
+
+  it("refuses a noncanonical parent or supersession reference in persisted state", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({ title: "T", body: "B", parentSpecId: spec.id, dependencyText: "none" });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    // Each case is built from a FRESH read of the canonical store, so a case can
+    // only fail because of the reference it plants and never because of the
+    // state a previous case left behind.
+    const cases: readonly (readonly [string, (item: Record<string, unknown>) => void])[] = [
+      ["parentSpecId", (item) => void (item.parentSpecId = "LOCAL-01")],
+      [
+        "supersededBy",
+        (item) => {
+          item.state = "superseded";
+          item.supersededReason = "Replanned";
+          item.supersededBy = ["LOCAL-01"];
+        },
+      ],
+    ];
+    for (const [label, apply] of cases) {
+      const store = await readStoreJson(location.storePath);
+      apply((store.items as Record<string, { item: Record<string, unknown> }>)[ticket.id]!.item);
+      const corrupted = `${JSON.stringify(store, null, 2)}\n`;
+      await writeFile(location.storePath, corrupted, { mode: 0o600 });
+      await expect(tracker.getTicket(ticket.id), `${label} must be refused`).rejects.toMatchObject({
+        code: "INVALID_LOCAL_TRACKER_STORE",
+      });
+      expect(await readFile(location.storePath, "utf8"), `${label} bytes must survive`).toBe(corrupted);
+    }
+  });
+
+  it("refuses a noncanonical identifier a caller supplies, on every operation, before any write", async () => {
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    const spec = await tracker.createSpec({ title: "Intent", body: "B" });
+    const ticket = await tracker.createTicket({ title: "T", body: "B", parentSpecId: spec.id, dependencyText: "none" });
+    const location = await resolveLocalTrackerStoreLocation(repository.root);
+    const before = await readFile(location.storePath, "utf8");
+
+    for (const id of NONCANONICAL_IDS) {
+      for (const call of [
+        () => tracker.getSpec(id),
+        () => tracker.getTicket(id),
+        () => tracker.updateSpec(id, { title: "Renamed" }),
+        () => tracker.updateTicket(id, { body: "Rewritten" }),
+        () => tracker.commentSpec(id, "note"),
+        () => tracker.commentTicket(id, "note"),
+        () => tracker.closeSpec(id),
+        () => tracker.closeTicket(id),
+        () => tracker.supersedeSpec(id, { reason: "Replanned" }),
+        () => tracker.supersedeTicket(id, { reason: "Replanned" }),
+        // A parent reference is PERSISTED, so a padded one would commit a
+        // document this adapter can never read back.
+        () => tracker.createTicket({ title: "Orphan", body: "B", parentSpecId: id, dependencyText: "none" }),
+        // So is a supersession replacement, for the same reason.
+        () => tracker.supersedeTicket(ticket.id, { reason: "Replanned", replacementIds: [id] }),
+      ]) {
+        await expect(call(), `${id} must be refused`).rejects.toMatchObject({ code: "INVALID_ADAPTER_INPUT" });
+      }
+    }
+
+    expect(await readFile(location.storePath, "utf8")).toBe(before);
+    expect((await tracker.getSpec(spec.id)).title).toBe("Intent");
+    expect((await tracker.getTicket(ticket.id)).body).toBe("B");
+  });
+
+  it("keeps canonical multi-digit identifiers working across the whole contract", async () => {
+    // Break: a canonicality rule that refused every multi-digit number, or one
+    // that compared digits rather than their value, would break the very
+    // sequence the store is built to issue.
+    const repository = await newRepository();
+    const tracker = createLocalTrackerAdapter(repository.root);
+    for (let index = 1; index <= 12; index += 1) {
+      await tracker.createSpec({ title: `Intent ${index}`, body: "B" });
+    }
+    expect((await tracker.getSpec("LOCAL-10")).title).toBe("Intent 10");
+    expect((await tracker.getSpec("LOCAL-12")).title).toBe("Intent 12");
+
+    const ticket = await tracker.createTicket({
+      title: "Child of a multi-digit parent",
+      body: "B",
+      parentSpecId: "LOCAL-10",
+      dependencyText: "none",
+    });
+    expect(ticket).toMatchObject({ id: "LOCAL-13", parentSpecId: "LOCAL-10" });
+    expect((await tracker.updateTicket(ticket.id, { dependencyText: "LOCAL-10" })).dependencyText).toBe("LOCAL-10");
+    expect((await tracker.commentTicket(ticket.id, "note")).id).toBe("LOCAL-13-C1");
+    expect(
+      (await tracker.supersedeTicket(ticket.id, { reason: "Replanned", replacementIds: ["LOCAL-12"] })).supersededBy,
+    ).toEqual(["LOCAL-12"]);
+
+    const reloaded = createLocalTrackerAdapter(repository.root);
+    expect((await reloaded.getTicket("LOCAL-13")).state).toBe("superseded");
+    expect((await reloaded.createSpec({ title: "After", body: "B" })).id).toBe("LOCAL-14");
+  });
+});
+
 interface FakeUvEnvironment {
   restore: () => void;
 }

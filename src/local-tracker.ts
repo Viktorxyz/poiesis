@@ -658,8 +658,36 @@ async function removeAbandonedTemporaries(location: LocalTrackerStoreLocation): 
 
 // -- Strict store validation -------------------------------------------------
 
+/**
+ * The prefix every LOCAL identifier starts with. Split out because a caller
+ * that uses it is CLAIMING to name a Poiesis item, and a claim that cannot be
+ * canonical is a different mistake from a name this tracker never issued.
+ */
+const LOCAL_ID_PREFIX = "LOCAL-";
+
+/**
+ * Spec #139 / ticket #158 — `LOCAL-` followed by a NONZERO decimal integer with
+ * no leading zero, and nothing else.
+ *
+ * The former `/^LOCAL-(\d+)$/` accepted `LOCAL-01`, so `LOCAL-01` and `LOCAL-1`
+ * were two spellings of item number 1. A store could hold both, the monotonic
+ * counter check could not see the alias because both keys collapsed to the same
+ * number, and a parent or supersession reference could be PERSISTED in the padded
+ * spelling while naming an item the caller never typed. Canonical form is what
+ * makes one identifier mean exactly one item, so the leading digit is required
+ * to be `1`-`9`: `LOCAL-0` is not an identity a monotonic counter can issue, and
+ * `LOCAL-01` is a second spelling of one it already did.
+ */
+const LOCAL_ID_PATTERN = /^LOCAL-([1-9][0-9]*)$/;
+
+/**
+ * The item number a canonical LOCAL identifier names, or `null` when the text is
+ * not one. A number Poiesis cannot represent as a safe integer (`LOCAL-` plus 20
+ * digits) is refused exactly like a non-LOCAL value rather than silently
+ * truncated into a number that aliases a real item.
+ */
 function localIdNumber(id: string): number | null {
-  const match = /^LOCAL-(\d+)$/.exec(id);
+  const match = LOCAL_ID_PATTERN.exec(id);
   if (match === null) return null;
   const value = Number(match[1]);
   return Number.isSafeInteger(value) && value >= 1 ? value : null;
@@ -667,9 +695,32 @@ function localIdNumber(id: string): number | null {
 
 function requireLocalId(value: unknown, label: string): string {
   if (typeof value !== "string" || localIdNumber(value) === null) {
-    throw invalidStore(`${label} is not a LOCAL identifier`, { label, value });
+    throw invalidStore(`${label} is not a canonical LOCAL identifier`, { label, value });
   }
   return value;
+}
+
+/**
+ * Spec #139 / ticket #158 — a caller-supplied item identifier.
+ *
+ * Blank text is refused by `requiredText`, and text that CLAIMS the `LOCAL-`
+ * prefix must then be canonical: a padded spelling names a number this tracker
+ * issues under exactly one spelling, so accepting it would let two names for one
+ * identity reach the store. Text that does not claim the prefix is not a LOCAL
+ * identifier at all and keeps the ordinary unknown-identifier refusal, so a
+ * JavaScript prototype member still reports `TRACKER_ITEM_NOT_FOUND` (ticket
+ * #150) rather than a canonicality complaint it has nothing to do with.
+ */
+function requireCallerLocalId(value: string, name: string): string {
+  const text = requiredText(value, name);
+  if (text.startsWith(LOCAL_ID_PREFIX) && localIdNumber(text) === null) {
+    throw new PoiesisError("INVALID_ADAPTER_INPUT", `${name} must be a canonical LOCAL identifier`, {
+      name,
+      value: text,
+      pattern: LOCAL_ID_PATTERN.source,
+    });
+  }
+  return text;
 }
 
 function requireTimestamp(value: unknown, label: string): string {
@@ -803,10 +854,20 @@ export function parseLocalTrackerStore(raw: string): LocalTrackerStore {
   }
   if (!isRecord(parsed.items)) throw invalidStore("the store has no item map");
   const items: Record<string, LocalTrackerItemFile> = {};
+  const owners = new Map<number, string>();
   let highest = 0;
   for (const key of Object.keys(parsed.items)) {
     const number = localIdNumber(key);
-    if (number === null) throw invalidStore("an item key is not a LOCAL identifier", { key });
+    if (number === null) throw invalidStore("an item key is not a canonical LOCAL identifier", { key });
+    // Ticket #158: two keys resolving to the SAME number would make the
+    // counter's monotonicity check blind — `highest` could not tell the
+    // collision from one item — so the document is refused by number rather
+    // than by spelling as well.
+    const owner = owners.get(number);
+    if (owner !== undefined) {
+      throw invalidStore("two item keys name the same LOCAL number", { keys: [owner, key], number });
+    }
+    owners.set(number, key);
     highest = Math.max(highest, number);
     items[key] = parseItemFile(key, parsed.items[key]);
   }
@@ -929,7 +990,10 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   async getSpec(id: string): Promise<TrackerItem> {
-    const record = localRecord(await this.read(), id, "spec");
+    // The caller's identifier is checked before the store is even read, so a
+    // padded spelling costs nothing and cannot be answered out of a document.
+    const target = requireCallerLocalId(id, "id");
+    const record = localRecord(await this.read(), target, "spec");
     return toTrackerItem(record.item, this.storeUrl);
   }
 
@@ -950,7 +1014,10 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   async createTicket(input: CreateTicketInput): Promise<TrackerItem> {
-    const parentSpecId = requiredText(input.parentSpecId, "parentSpecId");
+    // Ticket #158: a parent reference is PERSISTED, so a padded one would commit
+    // a document this adapter's own strict validator can never read back. It is
+    // refused here, on the caller's input, before the mutation.
+    const parentSpecId = requireCallerLocalId(input.parentSpecId, "parentSpecId");
     const dependencyText = requiredText(input.dependencyText, "dependencyText");
     // Parent validation happens INSIDE the mutation, against the same store
     // snapshot the mutation is about to rewrite, so a ticket can never be
@@ -959,7 +1026,8 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   async getTicket(id: string): Promise<TrackerItem> {
-    const record = localRecord(await this.read(), id, "ticket");
+    const target = requireCallerLocalId(id, "id");
+    const record = localRecord(await this.read(), target, "ticket");
     return toTrackerItem(record.item, this.storeUrl);
   }
 
@@ -1073,6 +1141,7 @@ class LocalTrackerAdapter implements TrackerAdapter {
     kind: TrackerItemKind,
     input: UpdateTicketInput | UpdateTrackerItemInput,
   ): Promise<TrackerItem> {
+    const target = requireCallerLocalId(id, "id");
     if (input.title !== undefined) requiredText(input.title, "title");
     if (input.body !== undefined && typeof input.body !== "string") {
       throw new PoiesisError("INVALID_ADAPTER_INPUT", "body must be a string", { name: "body" });
@@ -1080,7 +1149,7 @@ class LocalTrackerAdapter implements TrackerAdapter {
     const dependencyText = "dependencyText" in input ? input.dependencyText : undefined;
     if (dependencyText !== undefined) requiredText(dependencyText, "dependencyText");
     return this.mutate((store) => {
-      const record = localRecord(store, id, kind);
+      const record = localRecord(store, target, kind);
       if (input.title !== undefined) record.item.title = input.title;
       if (input.body !== undefined) record.item.body = input.body;
       if (kind === "ticket" && dependencyText !== undefined) record.item.dependencyText = dependencyText;
@@ -1090,9 +1159,10 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   private async comment(id: string, kind: TrackerItemKind, body: string): Promise<TrackerComment> {
+    const target = requireCallerLocalId(id, "id");
     const text = requiredText(body, "comment body");
     return this.mutate((store) => {
-      const record = localRecord(store, id, kind);
+      const record = localRecord(store, target, kind);
       const at = new Date().toISOString();
       const comment: LocalTrackerCommentRecord = {
         id: nextCommentId(record.item.id, record.comments),
@@ -1113,8 +1183,9 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   private async close(id: string, kind: TrackerItemKind): Promise<TrackerItem> {
+    const target = requireCallerLocalId(id, "id");
     return this.mutate((store) => {
-      const record = localRecord(store, id, kind);
+      const record = localRecord(store, target, kind);
       // A superseded item stays superseded: a later close must not erase the
       // fact that a replacement exists.
       if (record.item.state !== "superseded") record.item.state = "closed";
@@ -1124,26 +1195,28 @@ class LocalTrackerAdapter implements TrackerAdapter {
   }
 
   private async supersede(id: string, kind: TrackerItemKind, input: SupersedeInput): Promise<TrackerItem> {
+    const target = requireCallerLocalId(id, "id");
     const reason = requiredText(input.reason, "supersede reason");
     const replacementIds = [...(input.replacementIds ?? [])];
     // `supersededBy` is PERSISTED, and the strict store validator refuses any
-    // entry that is not a LOCAL identifier. An unvalidated value would commit a
-    // store this adapter itself can never read again, so the same invariant is
-    // enforced HERE, on the caller's input, before the mutation. A replacement
-    // this tracker never issued is a caller mistake, not a store to repair:
-    // a cross-provider id (`ENG-123`) is precisely the shape the validator
-    // refuses, and accepting it would convert one bad argument into a
-    // permanently unreadable store.
+    // entry that is not a CANONICAL LOCAL identifier. An unvalidated value would
+    // commit a store this adapter itself can never read again, so the same
+    // invariant is enforced HERE, on the caller's input, before the mutation. A
+    // replacement this tracker never issued is a caller mistake, not a store to
+    // repair: a cross-provider id (`ENG-123`) is precisely the shape the
+    // validator refuses, and a padded one (`LOCAL-01`) is a second spelling of a
+    // number the validator issues under exactly one. Either way, accepting it
+    // would convert one bad argument into a permanently unreadable store.
     for (const replacementId of replacementIds) {
       invariant(
         typeof replacementId === "string" && localIdNumber(replacementId) !== null,
         "INVALID_ADAPTER_INPUT",
-        "A supersession replacement must be a LOCAL identifier issued by this tracker",
-        { name: "replacementIds", value: replacementId },
+        "A supersession replacement must be a canonical LOCAL identifier issued by this tracker",
+        { name: "replacementIds", value: replacementId, pattern: LOCAL_ID_PATTERN.source },
       );
     }
     return this.mutate((store) => {
-      const record = localRecord(store, id, kind);
+      const record = localRecord(store, target, kind);
       const at = new Date().toISOString();
       record.item.state = "superseded";
       record.item.supersededReason = reason;

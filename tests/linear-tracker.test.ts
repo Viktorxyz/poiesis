@@ -116,6 +116,19 @@ function ticketDescription(parentSpecId: string, dependencyText: string, body: s
   ].join("\n");
 }
 
+/**
+ * Ticket #158: dependency text with leading and trailing spaces, a blank line,
+ * tabs, and non-ASCII content. It is Author evidence about ordering, so an
+ * update must carry it through exactly — trimming, reflowing, or re-deriving it
+ * from the new body would silently change the claim the ticket makes.
+ */
+const EXACT_DEPENDENCY_TEXT = [
+  "  ENG-9 pinned, leading spaces kept  ",
+  "",
+  "\tsecond line with tabs\t",
+  "unicode: αβγ — ✓",
+].join("\n");
+
 interface LinearIssueNode {
   id: string;
   identifier: string;
@@ -125,7 +138,6 @@ interface LinearIssueNode {
   state: { type: string };
   team: { id: string };
 }
-
 function issueNode(overrides: Partial<LinearIssueNode> = {}): LinearIssueNode {
   return {
     id: "11111111-1111-4111-8111-111111111111",
@@ -710,6 +722,105 @@ describe("Poiesis identity survives the Linear round trip", () => {
       dependencyText: "none",
     });
     expect(sent.description.endsWith("Revised acceptance")).toBe(true);
+  });
+});
+
+/**
+ * Spec #139 / ticket #158 — an UPDATE enforces the same nonblank dependency
+ * invariant a CREATE already enforces.
+ *
+ * `createTicket` has always refused blank dependency text: the value is
+ * Author evidence about ordering, and an empty claim says nothing while still
+ * looking like evidence. The update path derived the new description from
+ * whatever the caller passed with no check at all, so a single
+ * `updateTicket` could write the exact value the create path refuses — and it
+ * did so AFTER a read round trip, so a rejected call still cost a request and
+ * still revealed that the issue exists.
+ */
+describe("a Linear ticket update enforces the same nonblank dependency invariant as a create", () => {
+  it("refuses empty and whitespace-only dependency text before Linear sees a single request", async () => {
+    // Break: the check lives after `readIssue`, or nowhere at all. The script
+    // has NO scripted reply, so any request at all would surface as an
+    // unscripted-request failure — `requests` is the direct evidence that the
+    // refusal happened before the first byte left the process.
+    const script = new LinearScript();
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }));
+
+    for (const dependencyText of ["", " ", "\n", "  \n\t  "]) {
+      await expect(adapter.updateTicket("ENG-2", { dependencyText })).rejects.toMatchObject({
+        code: "INVALID_ADAPTER_INPUT",
+        details: { name: "dependencyText" },
+      });
+    }
+    expect(script.requests).toEqual([]);
+  });
+
+  it("preserves omitted dependency text byte-for-byte rather than restating it", async () => {
+    // Break: trimming, reflowing, or re-deriving the value from the new body
+    // changes what the ticket claims about ordering, and dependency text is
+    // stored exactly as the Author wrote it.
+    const exact = EXACT_DEPENDENCY_TEXT;
+    const current = issueNode({ identifier: "ENG-2", description: ticketDescription("ENG-1", exact, "Acceptance") });
+    const revised = ticketDescription("ENG-1", exact, "Revised acceptance");
+    const script = new LinearScript(
+      { kind: "graphql", data: { issue: current } },
+      { kind: "graphql", data: { issueUpdate: { success: true, issue: issueNode({ identifier: "ENG-2", description: revised }) } } },
+    );
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }));
+
+    const ticket = await adapter.updateTicket("ENG-2", { body: "Revised acceptance" });
+
+    expect((script.variablesOf(1).input as { description: string }).description).toBe(revised);
+    expect(ticket.dependencyText).toBe(exact);
+  });
+
+  it("writes valid supplied dependency text byte-for-byte", async () => {
+    const current = issueNode({ identifier: "ENG-2", description: ticketDescription("ENG-1", "none", "Acceptance") });
+    const exact = EXACT_DEPENDENCY_TEXT;
+    const revised = ticketDescription("ENG-1", exact, "Acceptance");
+    const script = new LinearScript(
+      { kind: "graphql", data: { issue: current } },
+      { kind: "graphql", data: { issueUpdate: { success: true, issue: issueNode({ identifier: "ENG-2", description: revised }) } } },
+    );
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }));
+
+    const ticket = await adapter.updateTicket("ENG-2", { dependencyText: exact });
+
+    expect((script.variablesOf(1).input as { description: string }).description).toBe(revised);
+    expect(ticket.dependencyText).toBe(exact);
+  });
+
+  it("does not invent an empty dependency claim for a ticket whose description carries none", async () => {
+    // Break: the update substituted `""` for an absent value, so an update that
+    // changed only a TITLE wrote a `Dependencies:` section asserting no
+    // dependencies — a claim the Author never made, and one the create path
+    // would refuse if they had. Omitted means absent stays absent.
+    const bare = [
+      "<!-- poiesis:tracker",
+      '{"kind":"ticket","parentSpecId":"ENG-1"}',
+      "poiesis:tracker -->",
+      "",
+      "**Poiesis Ticket**",
+      "",
+      "Parent Spec: ENG-1",
+      "",
+      "---",
+      "",
+      "Acceptance",
+    ].join("\n");
+    const current = issueNode({ identifier: "ENG-2", description: bare });
+    const script = new LinearScript(
+      { kind: "graphql", data: { issue: current } },
+      { kind: "graphql", data: { issueUpdate: { success: true, issue: issueNode({ identifier: "ENG-2", description: bare }) } } },
+    );
+    const adapter = createLinearTrackerAdapter({ team: "ENG" }, seamsFor(script, { LINEAR_API_KEY: "lin_api_secret" }));
+
+    await adapter.updateTicket("ENG-2", { title: "Slice one, revised" });
+
+    const sent = (script.variablesOf(1).input as { title: string; description: string }).description;
+    expect(sent).toBe(bare);
+    expect(sent).not.toContain("Dependencies");
+    expect(JSON.parse(sent.split("\n")[1] ?? "{}")).toEqual({ kind: "ticket", parentSpecId: "ENG-1" });
   });
 });
 

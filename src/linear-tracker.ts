@@ -876,18 +876,33 @@ class LinearTracker implements TrackerAdapter {
     return readCreatedIssue(data, "issueCreate");
   }
 
+  /**
+   * Spec #139 / ticket #158 — an UPDATE enforces the same nonblank dependency
+   * invariant a CREATE already enforces.
+   *
+   * `createTicket` refuses blank dependency text because the value is Author
+   * evidence about ordering. Accepting one here would let a single update write
+   * the exact value the create path refuses, and it would do so AFTER a read
+   * round trip — so a rejected call still cost a request and still confirmed the
+   * issue exists. The check therefore runs before `readIssue`, on the caller's
+   * input, and never depends on what Linear happens to hold.
+   *
+   * The same reasoning fixes the ABSENT case: the previous `?? ""` substituted
+   * an empty claim for a value the ticket never made, so a title-only update
+   * wrote a `Dependencies:` section asserting no dependencies. Omitted now
+   * means absent stays absent, and a supplied value is carried byte-for-byte.
+   */
   private async updateIssue(
     id: string,
     kind: TrackerItemKind,
     input: UpdateTrackerItemInput,
   ): Promise<LinearIssueNode> {
+    const dependencyText = kind === "ticket" ? (input as UpdateTicketInput).dependencyText : undefined;
+    if (dependencyText !== undefined) requiredText(dependencyText, "dependencyText");
     const node = await this.readIssue(id);
     const current = assertKind(this.toItem(node), kind);
     const metadata = metadataFromItem(current);
-    if (kind === "ticket") {
-      const dependencies = (input as UpdateTicketInput).dependencyText;
-      metadata.dependencyText = dependencies ?? current.dependencyText ?? "";
-    }
+    if (dependencyText !== undefined) metadata.dependencyText = dependencyText;
     return this.writeIssue(
       node,
       input.title === undefined ? current.title : requiredText(input.title, "title"),
