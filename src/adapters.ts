@@ -24,7 +24,7 @@ import {
 export type { TrackerComment, TrackerItem, TrackerItemKind, TrackerItemState };
 import { PoiesisError, invariant } from "./errors.js";
 import { atomicWrite, exists, readUtf8 } from "./fs.js";
-import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
+import { assertDeliveryPolicyAllows, type DeferredBlockedOperation } from "./lifecycle-policy.js";
 import { createLinearTrackerAdapter, type LinearTrackerConfig } from "./linear-tracker.js";
 import { createLocalTrackerAdapter as buildLocalTrackerAdapter } from "./local-tracker.js";
 import { run } from "./process.js";
@@ -1190,6 +1190,44 @@ export function createFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root
   return new FixtureDeliveryAdapter(config, root);
 }
 
+/**
+ * Spec #139 / ticket #157 — the installation AUTHORITY of a delivery mutation
+ * is the PRIMARY checkout's installation, derived here, structurally, and
+ * never handed in by a caller.
+ *
+ * Poiesis installs into the primary checkout of a clone, so a linked worktree
+ * of that clone carries none of the managed Poiesis state. Running the guards
+ * against the root a caller passed therefore made a legitimate Preview or
+ * promotion launched from a linked worktree read the worktree's absence of an
+ * install and refuse — and the `poiesis` CLI, which resolves the installation
+ * root in its own preflight, disagreed with the library seam about the very
+ * same operation.
+ *
+ * So the authority is derived from Git's own two-path report instead: equal
+ * paths are a primary checkout that owns its own installation, differing paths
+ * are a linked worktree whose common directory is the primary's `.git`, and
+ * anything Git cannot answer leaves the invocation root standing rather than a
+ * guess. It is derived structurally and NEVER probed for a config file, because
+ * a project whose installed config is missing is exactly the case the
+ * installed-state guard has to diagnose — a resolver that went looking for one
+ * could not be the thing that decides whether it is there.
+ *
+ * The derivation is a pure function of the report, and the report is read with
+ * the platform's own path semantics, so a Windows linked worktree resolves its
+ * primary the same way a POSIX one does.
+ *
+ * The order is unchanged: runtime identity first, then the single central
+ * policy guard that decides the installed state and the delivery block. The
+ * dynamic import keeps the top-level module graph acyclic (`adapters.ts` and
+ * `maintenance.ts` must not import each other at module-load time).
+ */
+async function assertDeliveryAuthority(root: string, operation: DeferredBlockedOperation | string): Promise<void> {
+  const maintenance = await import("./maintenance.js");
+  const authorityRoot = await maintenance.resolveInstallationRoot(root);
+  await maintenance.assertRuntimeVersionMatchesProject(authorityRoot);
+  await assertDeliveryPolicyAllows(authorityRoot, operation);
+}
+
 export async function previewDelivery(
   config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
   input: PreviewDeliveryInput,
@@ -1198,15 +1236,15 @@ export async function previewDelivery(
   // Spec #104 / ticket #106: pre-mutation runtime identity guard.
   // Preview is not an upgrade channel; the running package must equal
   // the durable `manifest.poiesisVersion` before the adapter creates
-  // a Preview identity. Dynamic import keeps the top-level module
-  // graph acyclic (adapters.ts and maintenance.ts must not import each
-  // other at module-load time).
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
+  // a Preview identity.
   // Spec #139 / ticket #143: the central lifecycle-policy guard. The guard
   // runs before the adapter is constructed, so a deferred install produces no
   // remote revalidation, no delivery subprocess, no delivery artifact, and no
   // Preview identity.
-  await assertDeliveryPolicyAllows(root, "poiesis preview");
+  // Spec #139 / ticket #157: all three read the PRIMARY installation, while
+  // the adapter below still resolves the candidate and runs the delivery
+  // command in the linked worktree the caller named.
+  await assertDeliveryAuthority(root, "poiesis preview");
   return createDeliveryAdapter(config, root).preview(input);
 }
 
@@ -1229,11 +1267,13 @@ export async function promoteDelivery(
   // Promote is the extension of preview into staging / production; the
   // guard mirrors `previewDelivery` so the surfaced error code is
   // uniform across delivery mutations.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
   // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of
   // adapter construction and of the canonical-integration revalidation and
   // release subprocess that follow.
-  await assertDeliveryPolicyAllows(root, `poiesis promote --target ${input.target}`);
+  // Spec #139 / ticket #157: both guards read the PRIMARY installation of the
+  // clone, so a configured linked worktree promotes against the install that
+  // governs it, and the adapter below still promotes in that worktree.
+  await assertDeliveryAuthority(root, `poiesis promote --target ${input.target}`);
   const adapter = createDeliveryAdapter(config, root);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

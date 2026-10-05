@@ -191,6 +191,16 @@ Both `delivery` branches are forward compatible: unknown outer extension keys on
 
 Delivery is configured later through `poiesis update --config`, never by hand-editing the managed config. The change is atomic and leaves the `tracker` block untouched.
 
+### Installation authority and linked worktrees
+
+Poiesis installs into the PRIMARY checkout of a clone, and that installation is the authority for every guarded operation in every linked worktree of the same clone. A linked worktree carries none of the primary's managed Poiesis state, so an operation launched from one is judged by the install that governs the clone, not by the worktree's silence.
+
+The authority is DERIVED, never supplied. `previewDelivery` and `promoteDelivery` read one `git rev-parse --absolute-git-dir --git-common-dir` and reconcile it themselves: two equal paths are a primary checkout that owns its own installation, two different paths are a linked worktree whose common directory is the primary's `.git`, and a report that cannot produce two paths, or that names a filesystem root, leaves the invocation root standing rather than a guess. No caller supplies an authority root, and no guard decides by searching for a config file, because a project whose installed config is missing is exactly the case the installed-state guard has to diagnose. The reconciliation is one side-effect-free subprocess: it never touches the network, a remote, or the working tree.
+
+A configured linked worktree therefore previews and promotes against the PRIMARY install — the runtime-identity guard, the installed-state check, and the delivery-policy guard read the primary's `manifest.poiesisVersion`, `.poiesis/config.jsonc`, and `delivery` block — while the delivery still EXECUTES where it was invoked: the candidate is resolved and the delivery command runs in the linked worktree, so the worktree's own candidate and evidence are the ones the operation is about. A worktree that declares a deferred install of its own does not displace the primary either; the shared authority is the primary's. The `poiesis` CLI and the library seam reach the same decision from the same worktree, so a library caller and an operator see the same code, the same details, and the same delivered artifact.
+
+The derivation uses the platform's own path semantics rather than a POSIX-only string rule. The primary checkout is the directory above the common directory, and the same rule answers for both flavors: `/srv/primary/.git` gives `/srv/primary` and `C:\primary\.git` gives `C:\primary`. Stripping a trailing separator and the last `/`-delimited segment is correct on POSIX and inert on Windows: a Windows path has no `/` in it, so that rule strips nothing, returns its own input, and resolves a linked worktree to itself — which is precisely the authority split this derivation exists to prevent.
+
 ## Repository Intelligence (v1.2)
 
 Poiesis v1.2 adds a rebuildable, non-canonical local graph as a default internal capability. The engine is Graphify, pinned to an exact version, run through `uvx` so Poiesis owns neither a global Graphify install nor a global Python interpreter.
