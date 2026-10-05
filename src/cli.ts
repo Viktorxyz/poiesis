@@ -10,9 +10,11 @@ import {
   checkpoint,
   integrate,
   publish,
+  resolveLifecycleAuthority,
   verify,
   workspaceCleanup,
   workspacePrepare,
+  type LifecycleAuthority,
 } from "./git.js";
 import { inspectProject } from "./inspect.js";
 import {
@@ -541,17 +543,44 @@ async function commandCheckpoint(args: string[]): Promise<void> {
   );
 }
 
-async function commandVerify(args: string[]): Promise<void> {
+/**
+ * Spec #168 / ticket #169 — the shared lifecycle authority for every CLI
+ * entry point that a prepared candidate workspace can reach.
+ *
+ * The authoritative manifest / config / runtime identity always come from the
+ * PRIMARY receipt-authenticated installation that owns the workspace, so a
+ * prepared candidate's own generated `.poiesis/config.jsonc` — stale by
+ * construction, and possibly committed into the candidate tree — can never
+ * become lifecycle authority. Wrong ownership, a missing primary receipt, a
+ * foreign workspace, and a mismatched runtime identity all fail closed here,
+ * before any command runs.
+ */
+async function lifecycleAuthority(cwd: string): Promise<LifecycleAuthority> {
+  return resolveLifecycleAuthority(await resolveGitRoot(cwd));
+}
+
+/**
+ * Spec #168 / ticket #169: exported as a library seam (same pattern as
+ * `commandInit` / `commandUpdate` / `commandModel` / `commandTracker`) so the
+ * candidate-authority behaviour of the Verify dispatch can be exercised
+ * directly. It is intentionally NOT re-exported by `src/index.ts`.
+ */
+export async function commandVerify(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     cwd: { type: "string" },
   });
-  const cwd = cwdOf(values);
-  const repoRoot = await resolveGitRoot(cwd);
-  const configRoot = await resolveConfigRoot(repoRoot);
-  const config = await resolveConfigForRoot(configRoot);
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const config = await resolveConfigForRoot(authority.primaryRoot);
   const commands = config.verification.commands;
-  writeSuccess("verify", await verify({ cwd: repoRoot, candidateSha: required(values, "sha"), commands }));
+  writeSuccess(
+    "verify",
+    await verify({
+      cwd: authority.candidateRoot,
+      candidateSha: required(values, "sha"),
+      commands,
+    }),
+  );
 }
 
 async function commandPublish(args: string[]): Promise<void> {
@@ -564,14 +593,12 @@ async function commandPublish(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const cwd = cwdOf(values);
-  const repoRoot = await resolveGitRoot(cwd);
-  const configRoot = await resolveConfigRoot(repoRoot);
-  const config = await resolveConfigForRoot(configRoot);
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const config = await resolveConfigForRoot(authority.primaryRoot);
   writeSuccess(
     "publish",
     await publish({
-      cwd: repoRoot,
+      cwd: authority.candidateRoot,
       remote: config.repository.remote,
       integrationBranch: config.repository.integrationBranch,
       candidateSha: required(values, "sha"),
@@ -594,10 +621,8 @@ async function commandPreview(args: string[]): Promise<void> {
     publish: { type: "string" },
     cwd: { type: "string" },
   });
-  const cwd = cwdOf(values);
-  const repoRoot = await resolveGitRoot(cwd);
-  const configRoot = await resolveConfigRoot(repoRoot);
-  const config = await resolveConfigForRoot(configRoot);
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const config = await resolveConfigForRoot(authority.primaryRoot);
   writeSuccess(
     "preview",
     await previewDelivery(
@@ -609,7 +634,7 @@ async function commandPreview(args: string[]): Promise<void> {
         publish: json<PublishEvidence>(required(values, "publish"), "publish"),
         remote: config.repository.remote,
       },
-      repoRoot,
+      authority.primaryRoot,
     ),
   );
 }
@@ -626,15 +651,13 @@ async function commandIntegrate(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const cwd = cwdOf(values);
-  const repoRoot = await resolveGitRoot(cwd);
-  const configRoot = await resolveConfigRoot(repoRoot);
-  const config = await resolveConfigForRoot(configRoot);
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const config = await resolveConfigForRoot(authority.primaryRoot);
   const postIntegrationCommands = config.verification.postIntegrationCommands ?? config.verification.commands;
   writeSuccess(
     "integrate",
     await integrate({
-      cwd: repoRoot,
+      cwd: authority.candidateRoot,
       remote: config.repository.remote,
       integrationBranch: config.repository.integrationBranch,
       expectedBaseSha: required(values, "base"),
@@ -661,10 +684,8 @@ async function commandPromote(args: string[]): Promise<void> {
     proof: { type: "string" },
     cwd: { type: "string" },
   });
-  const cwd = cwdOf(values);
-  const repoRoot = await resolveGitRoot(cwd);
-  const configRoot = await resolveConfigRoot(repoRoot);
-  const config = await resolveConfigForRoot(configRoot);
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const config = await resolveConfigForRoot(authority.primaryRoot);
   const target = required(values, "target");
   if (target !== "staging" && target !== "production") {
     throw new PoiesisError("INVALID_DELIVERY_TARGET", "Promotion target must be staging or production", { target });
@@ -678,7 +699,7 @@ async function commandPromote(args: string[]): Promise<void> {
       target,
       candidateTree,
       identity,
-    }, repoRoot));
+    }, authority.primaryRoot));
     return;
   }
   writeSuccess("promote", await promoteDelivery(config.delivery.production, {
@@ -691,7 +712,7 @@ async function commandPromote(args: string[]): Promise<void> {
     integrationBranch: config.repository.integrationBranch,
     proof: json<ProofPayload>(required(values, "proof"), "proof"),
     integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
-  }, repoRoot));
+  }, authority.primaryRoot));
 }
 
 /**

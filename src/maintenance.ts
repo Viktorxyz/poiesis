@@ -242,17 +242,24 @@ export async function packageVersion(): Promise<string> {
  * This helper is the SINGLE shared seam that enforces the rule. Every
  * guarded entry point (`uninstall`, `installAuthorizedCapability`,
  * `setModel`, `workspacePrepare`, `workspaceCleanup`, `checkpoint`,
- * `publish`, `integrate`, `previewDelivery`, `promoteDelivery`, the
- * tracker mutation dispatcher) calls this helper as its first action so
- * the rule is uniform — the spec explicitly forbids a per-command
- * version matrix. The exempt surfaces are:
+ * `publish`, `integrate`, `previewDelivery`, `promoteDelivery`, `verify`,
+ * the tracker mutation dispatcher) calls this helper as its first action
+ * so the rule is uniform — the spec explicitly forbids a per-command
+ * version matrix. Spec #168 / ticket #169 routes every workspace and
+ * delivery entry point through the shared lifecycle authority in
+ * `src/git.ts` first, which resolves the PRIMARY checkout that owns the
+ * workspace and passes THAT root here; a prepared candidate workspace's
+ * own generated config is never consulted. The exempt surfaces are:
  *
  *   - `init` (no manifest yet; this helper is NEVER called from init —
  *     init writes the manifest as its own first durable artifact),
  *   - `doctor` and `inspect` (read-only; needed for mismatch diagnosis),
  *   - `update` and `updateFromConfig` (the explicit, receipt-gated
  *     version-crossing boundary),
- *   - `verify` and `session cleanup` (no project-bound mutation),
+ *   - `verify` and `session cleanup` on a project that never installed
+ *     Poiesis (no project-bound mutation; `verify` still guards every
+ *     owned-candidate and installed-primary invocation through the shared
+ *     lifecycle authority),
  *   - `tracker <kind> get` (read-only dispatch; guarded mutations only).
  *
  * The manifest-less branch fails CLOSED with `RUNTIME_VERSION_MISMATCH`

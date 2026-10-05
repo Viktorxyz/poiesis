@@ -4,7 +4,10 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
 import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
-import { resolveGitRoot } from "./paths.js";
+import { exists } from "./fs.js";
+import { poiesisPath, resolveGitRoot } from "./paths.js";
+import { loadManifest, type Manifest } from "./manifest.js";
+import { assertOwnershipReceipt, type OwnershipReceipt } from "./receipt.js";
 import {
   validateProofEvidence,
   validatePublishEvidence,
@@ -116,6 +119,13 @@ export interface VerifyOptions {
   cwd: string;
   candidateSha: string;
   commands: string[];
+  /**
+   * Spec #168 / ticket #169 — the Poiesis ownership identity of the
+   * candidate workspace. When supplied, the shared lifecycle authority
+   * must resolve a marker with exactly this ownership id or fail closed
+   * with `WORKSPACE_OWNERSHIP_ID_MISMATCH`.
+   */
+  ownershipId?: string;
   timeoutMs?: number;
   outputLimit?: number;
   env?: NodeJS.ProcessEnv;
@@ -210,7 +220,7 @@ export interface WorkspaceCleanupResult {
   delivery: "integrated-tree";
 }
 
-interface OwnershipMarker {
+export interface OwnershipMarker {
   schema: 1;
   owner: "poiesis";
   ownershipId: string;
@@ -223,9 +233,43 @@ interface OwnershipMarker {
   baseSha: string;
 }
 
-interface OwnedWorkspace {
-  root: string;
+/**
+ * Spec #168 / ticket #169 — the shared lifecycle authority result.
+ *
+ * Every project-bound lifecycle operation on a prepared, Poiesis-owned
+ * candidate workspace resolves its authoritative manifest / config / runtime
+ * identity through the PRIMARY receipt-authenticated installation, never
+ * through the candidate's own generated `.poiesis/config.jsonc` (which is
+ * stale the moment the workspace is prepared and may even be committed into
+ * the candidate tree).
+ *
+ * `candidateRoot` is the canonical workspace the command executes in; every
+ * other field is the PRIMARY installation's authority. `marker` is `null`
+ * exactly when `candidateRoot` IS the primary checkout — the primary owns no
+ * Poiesis workspace marker, which is the pre-existing primary-checkout
+ * compatibility surface.
+ */
+export interface LifecycleAuthority {
+  /** Canonical workspace the command executes in. */
+  candidateRoot: string;
+  /** Canonical shared Git common directory of the repository. */
   commonDir: string;
+  /** Absolute path of the immutable ownership marker, or `null` on the primary checkout. */
+  markerPath: string | null;
+  /** The immutable ownership marker record, or `null` on the primary checkout. */
+  marker: OwnershipMarker | null;
+  /** Canonical primary checkout that owns the installation. */
+  primaryRoot: string;
+  /** Receipt-authenticated ownership receipt of the PRIMARY installation. */
+  receipt: OwnershipReceipt;
+  /** Receipt-authenticated manifest of the PRIMARY installation. */
+  manifest: Manifest;
+  /** Runtime identity the PRIMARY installation is bound to. */
+  runtime: string;
+}
+
+/** A `LifecycleAuthority` that is proven to own a Poiesis candidate workspace. */
+interface OwnedCandidateAuthority extends LifecycleAuthority {
   markerPath: string;
   marker: OwnershipMarker;
 }
@@ -459,18 +503,18 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
 export async function checkpoint(options: CheckpointOptions): Promise<CheckpointResult> {
   validateAcceptedReview(options.review);
   validateText(options.message, "message");
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // The receipt-authenticated manifest lives under the primary
-  // checkout that owns this workspace (`owned.marker.repositoryRoot`).
-  // The dynamic import keeps the top-level module graph acyclic.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority. The immutable
+  // ownership marker identifies the PRIMARY checkout that owns this
+  // workspace; the manifest / receipt / runtime identity all come from
+  // there, never from the candidate's own generated config. The staging
+  // and commit still happen in the candidate workspace itself.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   const branch = await assertOwnedBranch(owned);
-  const paths = normalizeExplicitPaths(owned.root, options.paths);
-  const statusBefore = await gitStatus(owned.root);
+  const paths = normalizeExplicitPaths(owned.candidateRoot, options.paths);
+  const statusBefore = await gitStatus(owned.candidateRoot);
   invariant(statusBefore.length > 0, "NO_CHECKPOINT_CHANGES", "Workspace contains no changes to checkpoint");
   const stagedBefore = await run("git", ["diff", "--cached", "--quiet", "--exit-code"], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     allowFailure: true,
   });
   invariant(stagedBefore.exitCode === 0, "PREEXISTING_STAGED_CHANGES", "Refusing to mix preexisting staged changes into a checkpoint");
@@ -481,8 +525,8 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
     "Refusing to checkpoint with unstaged or untracked residue",
     { changedPaths, allowed: paths },
   );
-  await run("git", ["add", "--", ...paths], { cwd: owned.root });
-  const residueAfterStage = parseStatusPaths(await gitStatus(owned.root));
+  await run("git", ["add", "--", ...paths], { cwd: owned.candidateRoot });
+  const residueAfterStage = parseStatusPaths(await gitStatus(owned.candidateRoot));
   invariant(
     residueAfterStage.every((changedPath) => paths.some((path) => pathCovers(path, changedPath))),
     "CHECKPOINT_PATH_ESCAPE",
@@ -490,7 +534,7 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
     { staged: residueAfterStage, allowed: paths },
   );
   const stagedNames = (
-    await run("git", ["diff", "--cached", "--name-only", "-z", "--", ...paths], { cwd: owned.root })
+    await run("git", ["diff", "--cached", "--name-only", "-z", "--", ...paths], { cwd: owned.candidateRoot })
   ).stdout.split("\0").filter(Boolean);
   invariant(stagedNames.length > 0, "NO_CHECKPOINT_CHANGES", "Explicit checkpoint paths contain no changes", { paths });
   try {
@@ -499,7 +543,7 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
       POIESIS_CHECKPOINT: "1",
     };
     const commit = await run("git", ["commit", "-m", options.message], {
-      cwd: owned.root,
+      cwd: owned.candidateRoot,
       allowFailure: true,
       env: commitEnvironment,
     });
@@ -510,14 +554,14 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
         stderr: bounded(commit.stderr),
       });
     }
-    const sha = await resolveCommit(owned.root, "HEAD");
-    const postStatus = parseStatusPaths(await gitStatus(owned.root));
+    const sha = await resolveCommit(owned.candidateRoot, "HEAD");
+    const postStatus = parseStatusPaths(await gitStatus(owned.candidateRoot));
     invariant(postStatus.length === 0, "POST_CHECKPOINT_RESIDUE", "Checkpoint created additional unstaged residue", {
       postStatus,
     });
     return { sha, branch, paths: stagedNames, review: options.review };
   } finally {
-    await run("git", ["reset", "--mixed", "HEAD", "--", ...paths], { cwd: owned.root, allowFailure: true });
+    await run("git", ["reset", "--mixed", "HEAD", "--", ...paths], { cwd: owned.candidateRoot, allowFailure: true });
   }
 }
 
@@ -525,7 +569,28 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   validateSha(options.candidateSha, "candidateSha");
   invariant(options.commands.length > 0, "NO_VERIFICATION_COMMANDS", "At least one verification command is required");
   for (const command of options.commands) validateText(command, "verification command");
-  const root = await canonicalGitRoot(options.cwd);
+  // Spec #168 / ticket #169: resolve the shared lifecycle authority BEFORE
+  // any command runs. The manifest / receipt / runtime identity come from
+  // the PRIMARY receipt-authenticated installation, so a stale or
+  // candidate-tracked generated config can never be lifecycle authority.
+  // The commands themselves still execute in the exact candidate workspace.
+  await resolveVerifyAuthority(options.cwd, options.ownershipId);
+  return runVerification(options, options.cwd);
+}
+
+/**
+ * Spec #168 / ticket #169 — the verification body, split out so
+ * `integrate`'s post-integration verification can run the SAME commands
+ * against its temporary detached worktree. That worktree is not itself a
+ * Poiesis-owned workspace and therefore cannot resolve an authority of its
+ * own; `integrate` already resolved and authenticated the candidate's
+ * authority before the integration side effects ran. Keeping the bypass
+ * module-private (instead of a public `VerifyOptions` field) means no
+ * external caller can hand `verify` a forged authority and skip the
+ * ownership / receipt / runtime identity boundary.
+ */
+async function runVerification(options: VerifyOptions, cwd: string): Promise<VerifyResult> {
+  const root = await canonicalGitRoot(cwd);
   const candidateSha = await resolveExpectedCommit(root, options.candidateSha, "candidateSha");
   await assertExactClean(root, candidateSha);
   const outputLimit = normalizeOutputLimit(options.outputLimit);
@@ -611,13 +676,11 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateText(options.title, "title");
   validateText(options.body, "body");
   validateSha(options.candidateSha, "candidateSha");
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Validates the running package equals the durable
-  // `manifest.poiesisVersion` before any push / change-request side
-  // effect. The receipt-authenticated manifest lives under the primary
-  // checkout that owns this workspace.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority. Validates the
+  // immutable ownership marker, then the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity, before any push or
+  // change-request side effect.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   const branch = await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Publish remote does not match workspace ownership", {
     expected: owned.marker.remote,
@@ -629,11 +692,11 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     "Publish target does not match workspace ownership",
     { expected: owned.marker.integrationBranch, actual: options.integrationBranch },
   );
-  await validateRemote(owned.root, options.remote);
-  await validateBranchName(owned.root, options.integrationBranch);
-  const candidateSha = await resolveExpectedCommit(owned.root, options.candidateSha, "candidateSha");
-  await assertExactClean(owned.root, candidateSha);
-  const candidateTree = await resolveTree(owned.root, candidateSha);
+  await validateRemote(owned.candidateRoot, options.remote);
+  await validateBranchName(owned.candidateRoot, options.integrationBranch);
+  const candidateSha = await resolveExpectedCommit(owned.candidateRoot, options.candidateSha, "candidateSha");
+  await assertExactClean(owned.candidateRoot, candidateSha);
+  const candidateTree = await resolveTree(owned.candidateRoot, candidateSha);
   invariant(candidateTree === options.candidateTree, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
     expected: candidateTree,
     provided: options.candidateTree,
@@ -641,12 +704,12 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateProofEvidence(options.proof, candidateSha, candidateTree);
 
   const remoteRef = `refs/heads/${branch}`;
-  const expectedRemote = await lsRemoteHead(owned.root, options.remote, branch);
+  const expectedRemote = await lsRemoteHead(owned.candidateRoot, options.remote, branch);
   if (expectedRemote !== null) {
     const localIsAncestor = await run(
       "git",
       ["merge-base", "--is-ancestor", expectedRemote, candidateSha],
-      { cwd: owned.root, allowFailure: true },
+      { cwd: owned.candidateRoot, allowFailure: true },
     );
     if (localIsAncestor.exitCode !== 0) {
       throw new PoiesisError(
@@ -656,13 +719,13 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       );
     }
   }
-  await run("git", ["push", "--porcelain", options.remote, `${candidateSha}:${remoteRef}`], { cwd: owned.root });
-  const publishedSha = await lsRemoteHead(owned.root, options.remote, branch);
+  await run("git", ["push", "--porcelain", options.remote, `${candidateSha}:${remoteRef}`], { cwd: owned.candidateRoot });
+  const publishedSha = await lsRemoteHead(owned.candidateRoot, options.remote, branch);
   invariant(publishedSha === candidateSha, "PUBLISHED_SHA_MISMATCH", "Remote branch does not identify the exact candidate", {
     expected: candidateSha,
     actual: publishedSha,
   });
-  await assertExactClean(owned.root, candidateSha);
+  await assertExactClean(owned.candidateRoot, candidateSha);
 
   let providerCompletion: ProviderCompletion;
   if (options.provider === "fixture") {
@@ -672,16 +735,16 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       action: expectedRemote === null ? "pushed" : "updated",
     };
   } else if (options.provider === "github") {
-    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.candidateRoot, expectedRemote === null);
   } else if (options.provider === "gitlab") {
-    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.candidateRoot, expectedRemote === null);
   } else {
     providerCompletion = await publishCommand(
       options,
       branch,
       candidateSha,
       remoteRef,
-      owned.root,
+      owned.candidateRoot,
       expectedRemote === null,
     );
   }
@@ -728,12 +791,11 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateSha(options.candidateSha, "candidateSha");
   validateText(options.message, "message");
   validateText(options.authorAcceptance, "authorAcceptance");
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Validates the running package equals the durable
-  // `manifest.poiesisVersion` before any
-  // commit-tree / fetch-base / push integration side effect.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority resolves the
+  // immutable ownership marker plus the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity before any commit-tree /
+  // fetch-base / push integration side effect.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Integration remote does not match workspace ownership");
   invariant(
@@ -741,12 +803,12 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     "WORKSPACE_INTEGRATION_BRANCH_MISMATCH",
     "Integration branch does not match workspace ownership",
   );
-  await validateRemote(owned.root, options.remote);
-  await validateBranchName(owned.root, options.integrationBranch);
-  const expectedBaseSha = await resolveExpectedCommit(owned.root, options.expectedBaseSha, "expectedBaseSha");
-  const candidateSha = await resolveExpectedCommit(owned.root, options.candidateSha, "candidateSha");
-  await assertExactClean(owned.root, candidateSha);
-  const candidateTree = await resolveTree(owned.root, candidateSha);
+  await validateRemote(owned.candidateRoot, options.remote);
+  await validateBranchName(owned.candidateRoot, options.integrationBranch);
+  const expectedBaseSha = await resolveExpectedCommit(owned.candidateRoot, options.expectedBaseSha, "expectedBaseSha");
+  const candidateSha = await resolveExpectedCommit(owned.candidateRoot, options.candidateSha, "candidateSha");
+  await assertExactClean(owned.candidateRoot, candidateSha);
+  const candidateTree = await resolveTree(owned.candidateRoot, candidateSha);
   invariant(candidateTree === options.candidateTree, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
     expected: candidateTree,
     provided: options.candidateTree,
@@ -754,13 +816,13 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateProofEvidence(options.proof, candidateSha, candidateTree);
   validateStagingEvidence(options.staging, candidateSha, candidateTree);
 
-  const fetchedBase = await fetchIntegrationBase(owned.root, options.remote, options.integrationBranch);
+  const fetchedBase = await fetchIntegrationBase(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(fetchedBase === expectedBaseSha, "STALE_INTEGRATION_BASE", "Remote integration base changed", {
     expected: expectedBaseSha,
     actual: fetchedBase,
   });
   const basedOnExpected = await run("git", ["merge-base", "--is-ancestor", expectedBaseSha, candidateSha], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     allowFailure: true,
   });
   invariant(
@@ -770,34 +832,34 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     { expectedBaseSha, candidateSha },
   );
 
-  const publishedCandidate = await lsRemoteHead(owned.root, options.remote, owned.marker.branch);
+  const publishedCandidate = await lsRemoteHead(owned.candidateRoot, options.remote, owned.marker.branch);
   invariant(
     publishedCandidate === candidateSha,
     "CANDIDATE_NOT_PUBLISHED",
     "Integration requires the exact proven candidate on the published change branch",
     { expected: candidateSha, actual: publishedCandidate },
   );
-  const baseTree = await resolveTree(owned.root, expectedBaseSha);
+  const baseTree = await resolveTree(owned.candidateRoot, expectedBaseSha);
   invariant(candidateTree !== baseTree, "EMPTY_INTEGRATION", "Candidate tree is identical to the integration base");
   const commitEnvironment = identityEnvironment(options.author);
   const commit = await run("git", ["commit-tree", candidateTree, "-p", expectedBaseSha], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     input: `${options.message}\n`,
     ...(commitEnvironment === undefined ? {} : { env: commitEnvironment }),
   });
   const integratedSha = commit.stdout;
   validateSha(integratedSha, "integratedSha");
-  const integratedTree = await resolveTree(owned.root, integratedSha);
+  const integratedTree = await resolveTree(owned.candidateRoot, integratedSha);
   invariant(integratedTree === candidateTree, "INTEGRATED_TREE_MISMATCH", "Squash integration tree differs from candidate", {
     candidateTree,
     integratedTree,
   });
 
-  await assertExactClean(owned.root, candidateSha);
+  await assertExactClean(owned.candidateRoot, candidateSha);
   let postIntegrationVerification: VerifyResult | null = null;
   if (options.postIntegrationCommands !== undefined && options.postIntegrationCommands.length > 0) {
     postIntegrationVerification = await verifyIntegratedCommit(
-      owned.root,
+      owned,
       integratedSha,
       options.postIntegrationCommands,
       options.outputLimit,
@@ -806,21 +868,21 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   }
 
   const remoteRef = `refs/heads/${options.integrationBranch}`;
-  const remoteIntegrationHead = await lsRemoteHead(owned.root, options.remote, options.integrationBranch);
+  const remoteIntegrationHead = await lsRemoteHead(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(
     remoteIntegrationHead === expectedBaseSha,
     "INTEGRATION_BASE_DIVERGED",
     "Refusing to integrate: remote integration branch moved off the expected base",
     { expected: expectedBaseSha, actual: remoteIntegrationHead },
   );
-  await run("git", ["push", "--porcelain", options.remote, `${integratedSha}:${remoteRef}`], { cwd: owned.root });
-  const remoteHead = await lsRemoteHead(owned.root, options.remote, options.integrationBranch);
+  await run("git", ["push", "--porcelain", options.remote, `${integratedSha}:${remoteRef}`], { cwd: owned.candidateRoot });
+  const remoteHead = await lsRemoteHead(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(remoteHead === integratedSha, "INTEGRATION_SHA_MISMATCH", "Remote integration branch has an unexpected revision", {
     expected: integratedSha,
     actual: remoteHead,
   });
-  invariant((await resolveTree(owned.root, integratedSha)) === candidateTree, "INTEGRATED_TREE_MISMATCH", "Integrated content changed unexpectedly");
-  await assertExactClean(owned.root, candidateSha);
+  invariant((await resolveTree(owned.candidateRoot, integratedSha)) === candidateTree, "INTEGRATED_TREE_MISMATCH", "Integrated content changed unexpectedly");
+  await assertExactClean(owned.candidateRoot, candidateSha);
 
   const integration: IntegrationEvidence = {
     candidateSha,
@@ -844,27 +906,26 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
 }
 
 export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promise<WorkspaceCleanupResult> {
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // `workspace cleanup` is the owned-cleanup surface; the running
-  // package must equal the durable `manifest.poiesisVersion` before
-  // any branch / marker / worktree teardown runs.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority resolves the
+  // immutable ownership marker plus the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity before any branch / marker /
+  // worktree teardown runs.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   invariant(
     owned.marker.branch !== owned.marker.integrationBranch,
     "INTEGRATION_WORKSPACE_CLEANUP_FORBIDDEN",
     "Refusing to clean an integration branch workspace",
   );
   const branch = await assertOwnedBranch(owned);
-  const headSha = await resolveCommit(owned.root, "HEAD");
+  const headSha = await resolveCommit(owned.candidateRoot, "HEAD");
   if (options.expectedHeadSha !== undefined) {
-    const expected = await resolveExpectedCommit(owned.root, options.expectedHeadSha, "expectedHeadSha");
+    const expected = await resolveExpectedCommit(owned.candidateRoot, options.expectedHeadSha, "expectedHeadSha");
     invariant(headSha === expected, "WORKSPACE_HEAD_MISMATCH", "Workspace HEAD changed before cleanup", {
       expected,
       actual: headSha,
     });
   }
-  const status = await gitStatus(owned.root);
+  const status = await gitStatus(owned.candidateRoot);
   invariant(status.length === 0, "DIRTY_WORKSPACE_CLEANUP_FORBIDDEN", "Refusing to clean a dirty or untracked workspace", {
     status: status.map(statusEntryForEvidence),
   });
@@ -872,17 +933,17 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
   let delivery: WorkspaceCleanupResult["delivery"] | null = null;
   if (options.deliveredSha !== undefined) {
     validateSha(options.deliveredSha, "deliveredSha");
-    const deliveredSha = await resolveExpectedCommit(owned.root, options.deliveredSha, "deliveredSha");
+    const deliveredSha = await resolveExpectedCommit(owned.candidateRoot, options.deliveredSha, "deliveredSha");
     const fetchedIntegration = await fetchIntegrationBase(
-      owned.root,
+      owned.candidateRoot,
       owned.marker.remote,
       owned.marker.integrationBranch,
     );
     const deliveredIsRemote = await run("git", ["merge-base", "--is-ancestor", deliveredSha, fetchedIntegration], {
-      cwd: owned.root,
+      cwd: owned.candidateRoot,
       allowFailure: true,
     });
-    const sameTree = (await resolveTree(owned.root, deliveredSha)) === (await resolveTree(owned.root, headSha));
+    const sameTree = (await resolveTree(owned.candidateRoot, deliveredSha)) === (await resolveTree(owned.candidateRoot, headSha));
     if (deliveredIsRemote.exitCode === 0 && sameTree) delivery = "integrated-tree";
   }
   invariant(
@@ -892,15 +953,15 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     { branch, headSha },
   );
 
-  const publishedHead = await lsRemoteHead(owned.root, owned.marker.remote, branch);
+  const publishedHead = await lsRemoteHead(owned.candidateRoot, owned.marker.remote, branch);
   if (publishedHead !== null) {
     invariant(publishedHead === headSha, "REMOTE_BRANCH_CHANGED", "Published change branch changed before cleanup", {
       expected: headSha,
       actual: publishedHead,
     });
     const remoteRef = `refs/heads/${branch}`;
-    await run("git", ["push", "--porcelain", owned.marker.remote, `:${remoteRef}`], { cwd: owned.root });
-    const verifyGone = await lsRemoteHead(owned.root, owned.marker.remote, branch);
+    await run("git", ["push", "--porcelain", owned.marker.remote, `:${remoteRef}`], { cwd: owned.candidateRoot });
+    const verifyGone = await lsRemoteHead(owned.candidateRoot, owned.marker.remote, branch);
     invariant(
       verifyGone === null,
       "REMOTE_BRANCH_NOT_DELETED",
@@ -909,9 +970,9 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     );
   }
 
-  await run("git", ["worktree", "remove", owned.root], { cwd: owned.marker.repositoryRoot });
+  await run("git", ["worktree", "remove", owned.candidateRoot], { cwd: owned.primaryRoot });
   const deleteRef = await run("git", ["update-ref", "-d", `refs/heads/${branch}`, headSha], {
-    cwd: owned.marker.repositoryRoot,
+    cwd: owned.primaryRoot,
     allowFailure: true,
   });
   invariant(deleteRef.exitCode === 0, "BRANCH_DELETE_FAILED", "Workspace was removed but its branch changed concurrently", {
@@ -921,7 +982,7 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     markerPath: owned.markerPath,
   });
   await rm(owned.markerPath);
-  return { path: owned.root, branch, headSha, markerPath: owned.markerPath, delivery };
+  return { path: owned.candidateRoot, branch, headSha, markerPath: owned.markerPath, delivery };
 }
 
 async function publishGitHub(
@@ -1310,12 +1371,13 @@ function parsePublishCommandOutput(stdout: string): {
 }
 
 async function verifyIntegratedCommit(
-  repositoryRoot: string,
+  owned: OwnedCandidateAuthority,
   integratedSha: string,
   commands: string[],
   outputLimit: number | undefined,
   env: NodeJS.ProcessEnv | undefined,
 ): Promise<VerifyResult> {
+  const repositoryRoot = owned.primaryRoot;
   const path = join(tmpdir(), `poiesis-integrate-${randomUUID()}`);
   invariant(!(await pathExists(path)), "TEMPORARY_WORKTREE_COLLISION", "Temporary integration worktree path exists", {
     path,
@@ -1324,10 +1386,15 @@ async function verifyIntegratedCommit(
   let result: VerifyResult | null = null;
   let failure: unknown;
   try {
+    // Spec #168 / ticket #169: the temporary detached worktree is not a
+    // Poiesis-owned workspace, so it cannot resolve an authority of its
+    // own. `integrate` already resolved and authenticated the candidate's
+    // authority before the integration side effects ran; the commands
+    // still execute in the temporary worktree.
     const verifyOptions: VerifyOptions = { cwd: path, candidateSha: integratedSha, commands };
     if (outputLimit !== undefined) verifyOptions.outputLimit = outputLimit;
     if (env !== undefined) verifyOptions.env = env;
-    result = await verify(verifyOptions);
+    result = await runVerification(verifyOptions, path);
   } catch (error) {
     failure = error;
   }
@@ -1353,6 +1420,18 @@ async function canonicalGitRoot(cwd: string): Promise<string> {
 async function gitCommonDir(cwd: string): Promise<string> {
   const result = await run("git", ["rev-parse", "--git-common-dir"], { cwd });
   return realpath(isAbsolute(result.stdout) ? result.stdout : resolve(cwd, result.stdout));
+}
+
+/**
+ * The canonical per-worktree Git directory. For the primary checkout this is
+ * the shared common directory; for every linked worktree it is a private
+ * `<commonDir>/worktrees/<name>`. Spec #168 / ticket #169 uses the
+ * distinction to tell a Poiesis-owned candidate apart from foreign linked
+ * work that must not inherit the primary installation's authority.
+ */
+async function gitDir(cwd: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--absolute-git-dir"], { cwd });
+  return realpath(result.stdout);
 }
 
 async function fetchIntegrationBase(root: string, remote: string, integrationBranch: string): Promise<string> {
@@ -1443,10 +1522,10 @@ async function currentBranch(cwd: string): Promise<string | null> {
   return result.exitCode === 0 ? result.stdout : null;
 }
 
-async function assertOwnedBranch(owned: OwnedWorkspace): Promise<string> {
-  const branch = await currentBranch(owned.root);
+async function assertOwnedBranch(owned: OwnedCandidateAuthority): Promise<string> {
+  const branch = await currentBranch(owned.candidateRoot);
   invariant(branch !== null, "DETACHED_OWNED_WORKSPACE", "Owned workspace is unexpectedly detached", {
-    path: owned.root,
+    path: owned.candidateRoot,
   });
   invariant(branch === owned.marker.branch, "OWNED_BRANCH_MISMATCH", "Owned workspace branch differs from its immutable marker", {
     expected: owned.marker.branch,
@@ -1457,36 +1536,166 @@ async function assertOwnedBranch(owned: OwnedWorkspace): Promise<string> {
     "INTEGRATION_BRANCH_FORBIDDEN",
     "Poiesis-owned change workspace cannot use the integration branch",
   );
-  const worktree = (await listWorktrees(owned.root)).find((entry) => entry.path === owned.root);
+  const worktree = (await listWorktrees(owned.candidateRoot)).find((entry) => entry.path === owned.candidateRoot);
   invariant(worktree !== undefined, "WORKTREE_NOT_REGISTERED", "Owned workspace is not registered with Git");
   invariant(worktree.branch === branch, "WORKTREE_BRANCH_MISMATCH", "Registered worktree branch differs from ownership marker");
   return branch;
 }
 
-async function resolveOwnedWorkspace(cwd: string, ownershipId?: string): Promise<OwnedWorkspace> {
-  const root = await canonicalGitRoot(cwd);
-  const commonDir = await gitCommonDir(root);
-  const matches = (await readMarkers(commonDir)).filter(({ marker }) => marker.workspacePath === root);
-  invariant(matches.length === 1, "WORKSPACE_OWNERSHIP_UNKNOWN", "Cannot prove Poiesis owns this workspace", {
-    path: root,
-    matches: matches.length,
-  });
-  const owned = matches[0];
-  invariant(owned !== undefined, "WORKSPACE_OWNERSHIP_UNKNOWN", "Cannot resolve workspace ownership");
-  invariant(owned.marker.repositoryRoot !== root, "PRIMARY_CHECKOUT_OWNERSHIP_INVALID", "Ownership marker points at the primary checkout");
+/**
+ * Spec #168 / ticket #169 — the SINGLE shared lifecycle authority seam.
+ *
+ * Resolves, for any project-bound lifecycle operation, the canonical
+ * candidate workspace together with the PRIMARY receipt-authenticated
+ * installation that owns it: the immutable ownership marker, the primary
+ * repository root, the primary ownership receipt, the receipt-authenticated
+ * primary manifest, and the runtime identity those two bind together.
+ *
+ * Everything fails closed with a typed diagnostic:
+ *   - no single marker owns this workspace, or more than one does
+ *     (`WORKSPACE_OWNERSHIP_UNKNOWN`);
+ *   - an ownership id was claimed but does not match the marker
+ *     (`WORKSPACE_OWNERSHIP_ID_MISMATCH`);
+ *   - the marker names the primary checkout (`PRIMARY_CHECKOUT_OWNERSHIP_INVALID`)
+ *     or a different Git repository (`WORKSPACE_REPOSITORY_MISMATCH`);
+ *   - a linked worktree that Poiesis does not own (`WORKSPACE_OWNERSHIP_UNKNOWN`);
+ *   - the primary receipt is missing or does not match the primary manifest
+ *     (`OWNERSHIP_RECEIPT_MISSING` / `OWNERSHIP_RECEIPT_MISMATCH`);
+ *   - the executing runtime does not equal the primary manifest's recorded
+ *     version (`RUNTIME_VERSION_MISMATCH`).
+ *
+ * The primary checkout is the one compatibility surface: it owns no
+ * Poiesis workspace marker, so `marker` / `markerPath` are `null` and the
+ * primary is its own authority.
+ */
+export async function resolveLifecycleAuthority(
+  cwd: string,
+  ownershipId?: string,
+): Promise<LifecycleAuthority> {
+  const candidateRoot = await canonicalGitRoot(cwd);
+  const commonDir = await gitCommonDir(candidateRoot);
+  const matches = (await readMarkers(commonDir)).filter(({ marker }) => marker.workspacePath === candidateRoot);
   invariant(
-    (await gitCommonDir(owned.marker.repositoryRoot)) === commonDir,
-    "WORKSPACE_REPOSITORY_MISMATCH",
-    "Ownership marker belongs to a different Git repository",
+    matches.length <= 1,
+    "WORKSPACE_OWNERSHIP_UNKNOWN",
+    "Cannot prove Poiesis owns this workspace",
+    { path: candidateRoot, matches: matches.length },
   );
-  if (ownershipId !== undefined) {
+
+  let markerPath: string | null = null;
+  let marker: OwnershipMarker | null = null;
+  let primaryRoot = candidateRoot;
+  if (matches.length === 1) {
+    const owned = matches[0]!;
     invariant(
-      owned.marker.ownershipId === ownershipId,
-      "WORKSPACE_OWNERSHIP_ID_MISMATCH",
-      "Workspace ownership identity does not match",
+      owned.marker.repositoryRoot !== candidateRoot,
+      "PRIMARY_CHECKOUT_OWNERSHIP_INVALID",
+      "Ownership marker points at the primary checkout",
+    );
+    invariant(
+      (await gitCommonDir(owned.marker.repositoryRoot)) === commonDir,
+      "WORKSPACE_REPOSITORY_MISMATCH",
+      "Ownership marker belongs to a different Git repository",
+    );
+    primaryRoot = await canonicalExistingPath(owned.marker.repositoryRoot);
+    const primaryGitDir = await gitDir(primaryRoot);
+    invariant(
+      primaryGitDir === commonDir,
+      "WORKSPACE_REPOSITORY_MISMATCH",
+      "Ownership marker no longer names this repository's primary checkout",
+      { expected: commonDir, actual: primaryGitDir },
+    );
+    if (ownershipId !== undefined) {
+      invariant(
+        owned.marker.ownershipId === ownershipId,
+        "WORKSPACE_OWNERSHIP_ID_MISMATCH",
+        "Workspace ownership identity does not match",
+      );
+    }
+    markerPath = owned.markerPath;
+    marker = owned.marker;
+  } else {
+    // No marker owns this workspace. A claimed ownership identity can
+    // never be satisfied, and a linked worktree Poiesis does not own is
+    // foreign work that must never inherit the primary's authority.
+    invariant(
+      ownershipId === undefined,
+      "WORKSPACE_OWNERSHIP_UNKNOWN",
+      "Cannot prove Poiesis owns this workspace",
+      { path: candidateRoot, matches: 0 },
+    );
+    invariant(
+      (await gitDir(candidateRoot)) === commonDir,
+      "WORKSPACE_OWNERSHIP_UNKNOWN",
+      "Cannot prove Poiesis owns this workspace",
+      { path: candidateRoot, matches: 0, reason: "foreign-worktree" },
     );
   }
-  return { root, commonDir, markerPath: owned.markerPath, marker: owned.marker };
+
+  // Runtime identity first: the absent-manifest branch of the shared guard
+  // is the fail-closed diagnostic for an uninstalled primary and must stay
+  // the surfaced code.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(primaryRoot);
+  const manifest = await loadManifest(primaryRoot);
+  const receipt = await assertOwnershipReceipt(primaryRoot, manifest);
+  return {
+    candidateRoot,
+    commonDir,
+    markerPath,
+    marker,
+    primaryRoot,
+    receipt,
+    manifest,
+    runtime: manifest.poiesisVersion,
+  };
+}
+
+/**
+ * Spec #168 / ticket #169 — the owned-candidate form of the shared
+ * authority. `checkpoint` / `publish` / `integrate` / `workspace cleanup`
+ * mutate a Poiesis-prepared workspace and therefore additionally require a
+ * proven ownership marker.
+ */
+async function resolveOwnedCandidateAuthority(
+  cwd: string,
+  ownershipId?: string,
+): Promise<OwnedCandidateAuthority> {
+  const authority = await resolveLifecycleAuthority(cwd, ownershipId);
+  invariant(
+    authority.marker !== null && authority.markerPath !== null,
+    "WORKSPACE_OWNERSHIP_UNKNOWN",
+    "Cannot prove Poiesis owns this workspace",
+    { path: authority.candidateRoot, matches: 0 },
+  );
+  return {
+    ...authority,
+    markerPath: authority.markerPath,
+    marker: authority.marker,
+  };
+}
+
+/**
+ * Spec #168 / ticket #169 — `verify`'s authority resolution.
+ *
+ * `verify` is not a project-bound mutation, so a repository that never
+ * installed Poiesis stays a valid, non-project-bound verification surface.
+ * As soon as Poiesis IS involved — an owned candidate workspace, an
+ * installed primary checkout, a claimed ownership id, or foreign linked
+ * work — the strict shared resolver runs and fails closed on wrong
+ * ownership, missing receipts, foreign workspaces, and mismatched runtime
+ * identity.
+ */
+async function resolveVerifyAuthority(cwd: string, ownershipId?: string): Promise<LifecycleAuthority | null> {
+  const candidateRoot = await canonicalGitRoot(cwd);
+  const commonDir = await gitCommonDir(candidateRoot);
+  const owned = (await readMarkers(commonDir)).some(({ marker }) => marker.workspacePath === candidateRoot);
+  const installed = await exists(poiesisPath(candidateRoot, "manifest.json"));
+  const nonProjectBound =
+    ownershipId === undefined &&
+    !owned &&
+    !installed &&
+    (await gitDir(candidateRoot)) === commonDir;
+  return nonProjectBound ? null : resolveLifecycleAuthority(candidateRoot, ownershipId);
 }
 
 async function createMarker(commonDir: string, marker: OwnershipMarker): Promise<string> {

@@ -276,6 +276,8 @@ A non-TTY `poiesis model` invocation fails closed with `NON_TTY_MODEL`; the dete
 
 Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
 
+An owned candidate workspace is where the work happens, never where lifecycle authority lives. `verify`, `checkpoint`, `publish`, `preview`, `promote`, `integrate`, and `workspace cleanup` resolve the manifest, the ownership receipt, and the runtime identity through the primary receipt-authenticated installation that owns the workspace, so a candidate's own generated `.poiesis/config.jsonc` — stale the moment the workspace is prepared, and possibly committed into the candidate tree — is never lifecycle authority. Verification commands still execute against the exact candidate workspace. Wrong ownership, a missing primary receipt, a foreign workspace Poiesis does not own, and a runtime identity that does not match the primary manifest all fail closed with a typed error before anything runs.
+
 ## Use with a coding agent
 
 The normal Author experience is to ask Poiesis for something in natural language and let the visible primary agent orchestrate the work. The following prompt is a reusable, internal-mechanics-free recipe for handing a fresh coding agent a project plus Poiesis without teaching it adapter internals:

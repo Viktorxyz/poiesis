@@ -1236,14 +1236,16 @@ export async function previewDelivery(
   input: PreviewDeliveryInput,
   root = process.cwd(),
 ): Promise<PreviewDeliveryResult> {
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Preview is not an upgrade channel; the running package must equal
-  // the durable `manifest.poiesisVersion` before the adapter creates
-  // a Preview identity. Dynamic import keeps the top-level module
-  // graph acyclic (adapters.ts and maintenance.ts must not import each
-  // other at module-load time).
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
-  return createDeliveryAdapter(config, root).preview(input);
+  // Spec #168 / ticket #169: resolve the shared lifecycle authority.
+  // Preview is not an upgrade channel, and the authoritative manifest /
+  // receipt / runtime identity come from the PRIMARY receipt-authenticated
+  // installation — never from a prepared candidate workspace's own
+  // generated config. Delivery therefore runs against
+  // `authority.primaryRoot`. Dynamic imports keep the top-level module
+  // graph acyclic (`adapters.ts` and `git.ts` reference each other only
+  // through type positions and deferred imports).
+  const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
+  return createDeliveryAdapter(config, authority.primaryRoot).preview(input);
 }
 
 export function promoteDelivery(
@@ -1261,11 +1263,10 @@ export async function promoteDelivery(
   input: PromoteDeliveryInput,
   root = process.cwd(),
 ): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Promote is the extension of preview into staging / production; the
-  // guard mirrors `previewDelivery` so the surfaced error code is
-  // uniform across delivery mutations.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
-  const adapter = createDeliveryAdapter(config, root);
+  // Spec #168 / ticket #169: the guard mirrors `previewDelivery` so the
+  // surfaced error code is uniform across delivery mutations, and the
+  // authority is the same PRIMARY receipt-authenticated installation.
+  const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
+  const adapter = createDeliveryAdapter(config, authority.primaryRoot);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }
