@@ -86,9 +86,9 @@ the strongest available model for reasoning and a fast one for execution.
 
 ## 5. Install
 
-Write a config file with ONLY the models and the answers from step 3 — do
-not hand-write delivery commands, repository, or verification blocks.
-Poiesis infers the rest:
+Write a file named \`./poiesis-config.jsonc\` with ONLY the models and the
+answers from step 3 — do not hand-write delivery commands, repository, or
+verification blocks. Poiesis infers the rest:
 
     {
       "schema": 1,
@@ -108,7 +108,11 @@ Production command targets when the human chose configured delivery.
 
 Then run:
 
-    pnpm dlx poiesis-cli@latest init --config ./poiesis-install.jsonc
+    pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init --config ./poiesis-config.jsonc
+
+Copy that command exactly. The \`--config.dlx-cache-max-age=0\` flag is what
+makes \`@latest\` mean *now* instead of a pnpm cache entry up to 1440 minutes
+old, so never drop it from any Poiesis command you run.
 
 If it fails, read the error code. Most failures are a missing prerequisite
 from step 1, not a bug. Fix the prerequisite and re-run the same command.
@@ -132,8 +136,8 @@ Then tell the human, in plain language:
   - A deferred install generates no delivery scripts, because there is
     nothing to run.
   - If the lifecycle is deferred: that work runs locally through Proof and
-    then stops before Publish, and that \`pnpm --config.dlx-cache-max-age=0 dlx
-    poiesis-cli@latest update --config ./poiesis-config.jsonc\` is how they
-    turn delivery on later.
+    then stops before Publish, and that \`pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --config ./poiesis-config.jsonc\`
+    is how they turn delivery on later. It is the same config file the
+    install used.
 
 Do not claim anything you have not seen in command output.`;

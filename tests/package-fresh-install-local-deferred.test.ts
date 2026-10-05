@@ -548,8 +548,11 @@ beforeAll(async () => {
   const remoteBefore = await remoteState(remote);
 
   // 4. Install Poiesis through the real bin with exactly the two blocks a
-  //    project with no forge and no deployment pipeline records.
-  const installConfig = join(projectDir, "poiesis-install.jsonc");
+  //    project with no forge and no deployment pipeline records. The candidate
+  //    file is named `poiesis-config.jsonc` — the one filename the shipped
+  //    bootstrap prompt, the README, and the canonical Method all use for both
+  //    the initial `init --config` and the later `update --config`.
+  const installConfig = join(projectDir, "poiesis-config.jsonc");
   await writeFile(
     installConfig,
     `${JSON.stringify(

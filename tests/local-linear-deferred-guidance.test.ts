@@ -41,6 +41,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { BOOTSTRAP_PROMPT } from "../src/bootstrap-prompt.js";
+import { POIESIS_SCRIPT_COMMAND } from "../src/package-script.js";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
 
@@ -372,5 +373,137 @@ describe("the paste-able bootstrap prompt matches the shipped contract", () => {
   it("does not promise generated delivery scripts for a deferred install", () => {
     expect(BOOTSTRAP_PROMPT).not.toContain("and that generated delivery scripts live in");
     expect(BOOTSTRAP_PROMPT).toContain("A deferred install generates no delivery scripts");
+  });
+});
+
+/**
+ * Ticket #151 — one launcher, one config filename, across the prompt and the
+ * docs that surround it.
+ *
+ * The prompt is the only surface a human hands to an agent and walks away
+ * from, so a command in it is copied verbatim and believed. Two defects made
+ * that unsafe:
+ *
+ *   1. Its `init` used the BARE `pnpm dlx poiesis-cli@latest`. pnpm caches
+ *      `dlx` resolutions for ~1440 minutes, so a paste-able install command
+ *      can silently resolve a stale runtime. The runtime itself already
+ *      treats `--config.dlx-cache-max-age=0` as mandatory
+ *      (`POIESIS_SCRIPT_COMMAND`), so the prompt was weaker than the contract
+ *      it is meant to serve.
+ *   2. Its `init` read `./poiesis-install.jsonc` while the later
+ *      `update --config` in the same prompt read `./poiesis-config.jsonc` —
+ *      and the canon (`POIESIS_METHOD.md` §11) and the README use
+ *      `./poiesis-config.jsonc` for both. A human following the prompt
+ *      literally ended up with a filename that exists nowhere else.
+ *
+ * The assertions below therefore pin the launcher to the RUNTIME's own
+ * constant rather than to a second literal, so the prompt, the `package.json`
+ * script the runtime writes, and the README cannot drift apart.
+ */
+
+/** Every command-looking line in the prompt that resolves `@latest`. */
+function promptLatestCommandLines(): string[] {
+  return BOOTSTRAP_PROMPT.split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.startsWith("pnpm ") && /dlx poiesis-cli@latest\b/.test(line));
+}
+
+/** Every `--config <file>` path the prompt passes to a Poiesis command. */
+function promptConfigPaths(): string[] {
+  // `.jsonc` anchored so the prose mention of a bare `--config` (with no file)
+  // is not mistaken for a path.
+  return [...BOOTSTRAP_PROMPT.matchAll(/--config (\S*\.jsonc)/g)].map((match) => match[1]!);
+}
+
+/** Every documented `--config ./<file>` path in the README. */
+function readmeConfigPaths(readme: string): string[] {
+  return [...readme.matchAll(/--config (\.\/\S+)/g)].map((match) => match[1]!);
+}
+
+describe("the bootstrap prompt uses one canonical fresh-latest launcher", () => {
+  it("launches init through the same constant the runtime writes into package.json", () => {
+    // `POIESIS_SCRIPT_COMMAND` is the runtime's single source of truth for the
+    // fresh-latest `@latest` launcher. If the prompt's own launcher ever stops
+    // being that value, the human is told to run something the runtime itself
+    // refuses to call canonical.
+    expect(POIESIS_SCRIPT_COMMAND).toContain("--config.dlx-cache-max-age=0");
+    expect(BOOTSTRAP_PROMPT).toContain(`${POIESIS_SCRIPT_COMMAND} init --config ./poiesis-config.jsonc`);
+  });
+
+  it("launches the later delivery-configuration update through the same constant", () => {
+    // The turn-delivery-on-later command is printed inside a hand-back bullet.
+    // It was line-wrapped across three lines, so even a reader who copied it
+    // carefully could reassemble it wrong; the whole command must sit on one
+    // line and be byte-identical to the `init` launcher's prefix.
+    expect(BOOTSTRAP_PROMPT).toContain(`${POIESIS_SCRIPT_COMMAND} update --config ./poiesis-config.jsonc`);
+  });
+
+  it("contains no bare `pnpm dlx poiesis-cli@latest` anywhere in the prompt", () => {
+    // Substring, not line-based: a wrapped bare form
+    // (`pnpm dlx poiesis-cli@latest` split across lines) must fail too, which
+    // a line-prefix check would miss.
+    expect(BOOTSTRAP_PROMPT).not.toContain("pnpm dlx poiesis-cli@latest");
+  });
+
+  it("has no `@latest` command line that is not the fresh-latest form", () => {
+    const lines = promptLatestCommandLines();
+    // Sanity: the prompt really does document `@latest` routes (init and the
+    // later update). Zero here would mean the contract below is vacuous.
+    expect(lines.length).toBeGreaterThan(0);
+    for (const line of lines) {
+      expect(line, `prompt @latest command must bypass the dlx cache: ${line}`).toMatch(
+        /^pnpm --config\.dlx-cache-max-age=0\s+dlx poiesis-cli@latest\b/,
+      );
+    }
+  });
+});
+
+describe("the bootstrap prompt names exactly one config file, and so does the README", () => {
+  it("no longer names the stale poiesis-install.jsonc", () => {
+    // `poiesis-install.jsonc` existed only in this prompt. Nothing else in the
+    // product ever wrote or read it.
+    expect(BOOTSTRAP_PROMPT).not.toContain("poiesis-install.jsonc");
+    expect(readRepoFile("README.md")).not.toContain("poiesis-install.jsonc");
+  });
+
+  it("writes, installs from, and later updates the very same file", () => {
+    // The file the agent is told to write, the file `init` is told to read, and
+    // the file the later `update --config` is told to read must be one FILENAME.
+    // Extracting each and comparing is the behaviour: a human following the
+    // prompt literally ends up able to configure delivery later without having
+    // to guess which of two names is real.
+    //
+    // `.jsonc`-anchored so the prose mention of a bare `--config` (with no file)
+    // in step 3 is not mistaken for a path. The leading `./` is cosmetic (it
+    // says "project root"), so it is normalized away rather than pinned —
+    // `promptConfigPaths` below pins the exact path on both commands.
+    const filename = (match: RegExpExecArray | null): string | undefined => match?.[1]?.replace(/^\.\//, "");
+    const written = filename(/Write a file named `([^`]+)`/.exec(BOOTSTRAP_PROMPT));
+    const initPath = filename(/\binit --config (\S+\.jsonc)/.exec(BOOTSTRAP_PROMPT));
+    const updatePath = filename(/\bupdate --config (\S+\.jsonc)/.exec(BOOTSTRAP_PROMPT));
+    expect(written).toBe("poiesis-config.jsonc");
+    expect(initPath).toBe(written);
+    expect(updatePath).toBe(written);
+  });
+
+  it("passes that one filename to every `--config` command in the prompt", () => {
+    // A future edit that introduces a second config name fails here instead of
+    // shipping. Compared as a SET, so adding one more legitimate
+    // `--config <that same file>` command later is not a false alarm.
+    const paths = promptConfigPaths();
+    expect(paths.length).toBeGreaterThan(0);
+    expect(new Set(paths)).toEqual(new Set(["./poiesis-config.jsonc"]));
+  });
+
+  it("agrees with the README and the canonical Method on that one filename", () => {
+    const readme = readRepoFile("README.md");
+    const paths = readmeConfigPaths(readme);
+    expect(paths.length).toBeGreaterThan(0);
+    expect(new Set(paths)).toEqual(new Set(["./poiesis-config.jsonc"]));
+    expect(readme).toContain(`${POIESIS_SCRIPT_COMMAND} init --config ./poiesis-config.jsonc`);
+    expect(readme).toContain(`${POIESIS_SCRIPT_COMMAND} update --config ./poiesis-config.jsonc`);
+    // The canon names the same file for the later delivery configuration, so
+    // the prompt is following the Method rather than inventing a name.
+    expect(readRepoFile("POIESIS_METHOD.md")).toContain("poiesis update --config ./poiesis-config.jsonc");
   });
 });
