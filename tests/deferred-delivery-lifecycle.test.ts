@@ -51,6 +51,7 @@ import {
   type WorkspaceIdentity,
 } from "../src/git.js";
 import { assertDeliveryPolicyAllows, DEFERRED_BLOCKED_OPERATIONS, type DeferredBlockedOperation } from "../src/lifecycle-policy.js";
+import { commandIntegrate, commandPreview, commandPromote, commandPublish } from "../src/cli.js";
 import { doctor, init, updateFromConfig } from "../src/maintenance.js";
 import { PoiesisError } from "../src/errors.js";
 import { run } from "../src/process.js";
@@ -263,6 +264,24 @@ function expectedDeferredFailure(operation: string) {
 }
 
 /**
+ * Ticket #152 — the installed-state failure for a manifest-present project
+ * with no installed `.poiesis/config.jsonc`. It is distinct from both
+ * `DELIVERY_DEFERRED` (delivery is explicitly deferred) and the
+ * `INVALID_DELIVERY_CONFIG` malformed-block failure: nothing is known about
+ * delivery, so the operation must stop at the installed state.
+ */
+function expectedMissingConfigFailure(operation: string) {
+  return {
+    code: "CONFIG_NOT_INSTALLED",
+    details: {
+      operation,
+      path: expect.stringContaining(join(".poiesis", "config.jsonc")),
+      remediation: expect.stringContaining("poiesis init"),
+    },
+  };
+}
+
+/**
  * The zero-side-effect matrix: every delivery-integrated operation, with
  * inputs that are otherwise complete and valid, so a refusal can only come
  * from the lifecycle policy.
@@ -367,6 +386,90 @@ function blockedAttempts(
     {
       operation: "poiesis workspace cleanup",
       attempt: () => workspaceCleanup(ownership),
+    },
+  ];
+}
+
+/**
+ * The same six operations as the operator invokes them, through the CLI
+ * command seams, with complete and otherwise-valid arguments. The CLI
+ * wrappers each run the shared preflight (runtime identity, then the central
+ * lifecycle policy) before they read the installed config or resolve
+ * publishing coordinates, so a refusal can only come from that preflight.
+ */
+function cliAttempts(
+  fixture: DeferredLocalProgress,
+  cwd: string,
+): Array<{ operation: DeferredBlockedOperation; attempt: () => Promise<unknown> }> {
+  const sha = fixture.candidateSha;
+  const tree = fixture.candidateTree;
+  const proof = JSON.stringify(proofShell(sha, tree));
+  const candidate = ["--sha", sha, "--candidate-tree", tree, "--cwd", cwd];
+  const preview = JSON.stringify(previewIdentity(fixture));
+  const staging = JSON.stringify(stagingEvidence(fixture));
+  const authorization = JSON.stringify({
+    candidateSha: sha,
+    candidateTree: tree,
+    stagingArtifactIdentity: "artifact-staging",
+    integrationSha: sha,
+    authorIdentity: "author",
+    approved: true,
+  });
+  const integration = JSON.stringify({
+    candidateSha: sha,
+    candidateTree: tree,
+    integrationSha: sha,
+    integrationTree: tree,
+    contentMatchesCandidate: true,
+  });
+  return [
+    {
+      operation: "poiesis publish",
+      attempt: () =>
+        commandPublish([...candidate, "--proof", proof, "--title", "Spec 1", "--body", "body"]),
+    },
+    {
+      operation: "poiesis preview",
+      attempt: () =>
+        commandPreview([...candidate, "--proof", proof, "--publish", JSON.stringify(publishEvidence(sha, tree, BRANCH))]),
+    },
+    {
+      operation: "poiesis promote --target staging",
+      attempt: () => commandPromote([...candidate, "--target", "staging", "--identity", preview]),
+    },
+    {
+      operation: "poiesis promote --target production",
+      attempt: () =>
+        commandPromote([
+          ...candidate,
+          "--target",
+          "production",
+          "--identity",
+          staging,
+          "--authorization",
+          authorization,
+          "--proof",
+          proof,
+          "--integration",
+          integration,
+        ]),
+    },
+    {
+      operation: "poiesis integrate",
+      attempt: () =>
+        commandIntegrate([
+          ...candidate,
+          "--base",
+          fixture.workspace.baseSha,
+          "--proof",
+          proof,
+          "--staging",
+          staging,
+          "--acceptance",
+          "Yes, this is what I wanted.",
+          "--message",
+          "Spec 1: local work",
+        ]),
     },
   ];
 }
@@ -666,10 +769,209 @@ describe("the lifecycle-policy guard reads the installed config without auto-res
     });
   }, 30_000);
 
-  it("allows a project with no installed config so the runtime identity guard owns the uninstalled failure", async () => {
+  it("refuses a manifest-present project that has no installed config, without running a subprocess", async () => {
+    const fixture = await deferredLocalProgress(repositories);
+    await rm(join(fixture.repository.root, ".poiesis", "config.jsonc"));
+    const mark = markSubprocesses();
+    await expect(assertDeliveryPolicyAllows(fixture.repository.root, "poiesis publish")).rejects.toMatchObject(
+      expectedMissingConfigFailure("poiesis publish"),
+    );
+    expect(subprocessCallsSince(mark)).toEqual([]);
+  }, 30_000);
+});
+
+/**
+ * Spec #139 / ticket #152 — after the runtime identity guard has confirmed
+ * the manifest exists and its version matches, an installed project with no
+ * `.poiesis/config.jsonc` is an INCOMPLETE installed state, not an exemption.
+ *
+ * The absent config is therefore a typed installed-state failure raised by
+ * the one central policy guard, ahead of any caller-supplied delivery
+ * config (Preview / promote are handed a complete command adapter here) and
+ * ahead of every side effect. A missing MANIFEST keeps its existing
+ * precedence: the runtime identity guard refuses first, so the
+ * uninstalled-project failure an Author already sees is unchanged.
+ */
+describe("an installed project with no installed config fails closed at the installed state", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+  let probeCommand: { adapter: "command"; command: string[] };
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+    probeCommand = await deliveryProbeCommand(fixture);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("refuses every guarded operation, however complete the caller-supplied delivery config is", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "config.jsonc"));
+    const headsBefore = await remoteHeads(fixture.repository);
+    const reported: string[] = [];
+    for (const { operation, attempt } of blockedAttempts(fixture, probeCommand)) {
+      const mark = markSubprocesses();
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, `${operation} must be refused`).toMatchObject(expectedMissingConfigFailure(operation));
+      // No push, fetch, remote revalidation, delivery subprocess, integration
+      // commit, worktree removal, or artifact.
+      expect(reachedSideEffects(subprocessCallsSince(mark)), operation).toEqual([]);
+      reported.push((error as PoiesisError).details.operation as string);
+    }
+    expect(reported.sort()).toEqual([...DEFERRED_BLOCKED_OPERATIONS].sort());
+    // The refused operations left the remote, the local candidate, the
+    // delivery state, and the owned workspace exactly as they were.
+    expect(await remoteHeads(fixture.repository)).toBe(headsBefore);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+    expect((await resolveTree(fixture.workspace.path, fixture.candidateSha)).trim()).toBe(fixture.candidateTree);
+    expect(existsSync(fixture.workspace.path)).toBe(true);
+    expect(existsSync(fixture.workspace.markerPath)).toBe(true);
+  }, 60_000);
+
+  it("keeps manifest absence owned by the runtime identity guard", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "manifest.json"));
+    for (const { operation, attempt } of blockedAttempts(fixture, probeCommand)) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, `${operation} must still report the uninstalled-project failure`).toMatchObject({
+        code: "RUNTIME_VERSION_MISMATCH",
+        details: { project: null },
+      });
+    }
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+    expect(existsSync(fixture.workspace.path)).toBe(true);
+  }, 60_000);
+
+  it("does not relax the deferred refusal: an installed deferred config still blocks with DELIVERY_DEFERRED", async () => {
+    for (const { operation, attempt } of blockedAttempts(fixture, probeCommand)) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, operation).toMatchObject(expectedDeferredFailure(operation));
+    }
+  }, 60_000);
+});
+
+/**
+ * Spec #139 / ticket #152 (Review correction) — the CLI operator surface.
+ *
+ * The four delivery-integrated command wrappers each run ONE shared preflight
+ * before they read the installed config or resolve publishing coordinates:
+ * `resolveGitRoot` / `resolveConfigRoot`, then the runtime identity guard, then
+ * the central lifecycle-policy guard. So an operator sees the same typed
+ * failure, with the same `details.operation` / `path` / `remediation`, that the
+ * library seam reports — never an opaque file-read error and never a
+ * wrapper-specific delivery decision.
+ *
+ * The preflight decides from the CONFIG root, so an invocation from a linked
+ * worktree reads the installation itself and can never report a false missing
+ * config; and because runtime identity runs first, an absent manifest keeps
+ * its existing `RUNTIME_VERSION_MISMATCH` precedence.
+ */
+describe("the CLI preflight reports the same typed failures as the policy guard", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  it("refuses every delivery-integrated command with the installed-state failure, from either root", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "config.jsonc"));
+    const headsBefore = await remoteHeads(fixture.repository);
+    const installedConfig = join(fixture.repository.root, ".poiesis", "config.jsonc");
+    for (const cwd of [fixture.repository.root, fixture.workspace.path]) {
+      for (const { operation, attempt } of cliAttempts(fixture, cwd)) {
+        const mark = markSubprocesses();
+        const error = await attempt().then(
+          () => null,
+          (thrown: unknown) => thrown,
+        );
+        expect(error, `${operation} (cwd ${cwd}) must be refused`).toMatchObject({
+          code: "CONFIG_NOT_INSTALLED",
+          details: {
+            operation,
+            // The decision is read from the installation, never from the
+            // invocation root, so a linked-worktree `--cwd` cannot report a
+            // false missing config.
+            path: installedConfig,
+            remediation: expect.stringContaining("poiesis init"),
+          },
+        });
+        expect(reachedSideEffects(subprocessCallsSince(mark)), `${operation} from ${cwd}`).toEqual([]);
+      }
+    }
+    expect(await remoteHeads(fixture.repository)).toBe(headsBefore);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 60_000);
+
+  it("refuses a deferred install with DELIVERY_DEFERRED from either root, before the config is read", async () => {
+    for (const cwd of [fixture.repository.root, fixture.workspace.path]) {
+      for (const { operation, attempt } of cliAttempts(fixture, cwd)) {
+        const error = await attempt().then(
+          () => null,
+          (thrown: unknown) => thrown,
+        );
+        expect(error, `${operation} (cwd ${cwd})`).toMatchObject(expectedDeferredFailure(operation));
+      }
+    }
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 60_000);
+
+  it("keeps manifest absence reported by the runtime identity guard, never as an installed-config failure", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "manifest.json"));
+    for (const { operation, attempt } of cliAttempts(fixture, fixture.workspace.path)) {
+      const error = await attempt().then(
+        () => null,
+        (thrown: unknown) => thrown,
+      );
+      expect(error, operation).toMatchObject({
+        code: "RUNTIME_VERSION_MISMATCH",
+        details: { project: null },
+      });
+    }
+  }, 60_000);
+
+  it("reports the same installed-state failure for a fully uninstalled project only as a runtime-identity failure", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
-    await expect(assertDeliveryPolicyAllows(repository.root, "poiesis publish")).resolves.toBeUndefined();
+    const mark = markSubprocesses();
+    const error = await commandPublish([
+      "--sha",
+      "0".repeat(40),
+      "--candidate-tree",
+      "0".repeat(40),
+      "--proof",
+      "{}",
+      "--title",
+      "Spec 1",
+      "--body",
+      "body",
+      "--cwd",
+      repository.root,
+    ]).then(
+      () => null,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toMatchObject({ code: "RUNTIME_VERSION_MISMATCH", details: { project: null } });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
   }, 30_000);
 });
 

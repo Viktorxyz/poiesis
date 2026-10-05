@@ -67,6 +67,22 @@ function completeDelivery(): ConfiguredDeliveryConfig {
   };
 }
 
+/**
+ * Assert a `delivery` block is refused with the typed, actionable
+ * `INVALID_DELIVERY_CONFIG` failure and the exact reported detail, so a
+ * compatibility relaxation can never weaken the semantic rejections.
+ */
+function expectInvalidDeliveryConfig(config: unknown, details: Record<string, unknown>): void {
+  let thrown: unknown;
+  try {
+    validateConfig(config, "test");
+  } catch (error) {
+    thrown = error;
+  }
+  expect(thrown, "expected validateConfig to reject the delivery block").toBeInstanceOf(PoiesisError);
+  expect(thrown).toMatchObject({ code: "INVALID_DELIVERY_CONFIG", details });
+}
+
 async function pointRemoteAt(repository: TestRepository, url: string): Promise<void> {
   await run("git", ["remote", "set-url", "origin", url], { cwd: repository.root });
 }
@@ -348,6 +364,65 @@ describe("delivery configuration distinguishes complete targets from explicit de
       });
       expect((error as PoiesisError).message).toContain(DEFERRED_DELIVERY_MODE);
     }
+  });
+
+  /**
+   * Spec #139 / ticket #152 — forward compatibility of the delivery block.
+   *
+   * Both honest branches are EXTENSIBLE: an unknown outer key (a newer
+   * runtime's extension, an Author's own annotation) and an unknown nested
+   * target-adapter key must survive parse and serialize, so a Poiesis that
+   * does not know a key does not silently delete it on the next managed
+   * rewrite of `.poiesis/config.jsonc`. This is a COMPATIBILITY relaxation
+   * only: the semantic rejections above (partial targets, unknown modes,
+   * deferred+target mixtures) are unchanged.
+   */
+  it("preserves unknown outer extension keys through parse and serialize on the configured branch", () => {
+    const delivery = { ...completeDelivery(), experimental: { note: "kept", retries: 2 } };
+    const parsed = validateConfig({ ...baseConfig(), delivery }, "test");
+    expect(parsed.delivery).toMatchObject({ experimental: { note: "kept", retries: 2 } });
+    expect(JSON.parse(serializeConfig(parsed)).delivery).toEqual(delivery);
+  });
+
+  it("preserves unknown outer extension keys through parse and serialize on the deferred branch", () => {
+    const delivery = { mode: DEFERRED_DELIVERY_MODE, experimental: { note: "kept" } };
+    const parsed = validateConfig({ ...baseConfig(), delivery }, "test");
+    expect(isDeferredDelivery(parsed.delivery)).toBe(true);
+    expect(JSON.parse(serializeConfig(parsed)).delivery).toEqual(delivery);
+  });
+
+  it("preserves unknown nested target-adapter keys through parse and serialize", () => {
+    const delivery = {
+      preview: { adapter: "command", command: ["echo", "preview", "{sha}"], timeoutMs: 5_000 },
+      staging: { adapter: "command", command: ["echo", "staging", "{sha}"], retries: 2 },
+      production: { adapter: "command", command: ["echo", "production", "{sha}"], note: "kept" },
+    };
+    const parsed = validateConfig({ ...baseConfig(), delivery }, "test");
+    expect(JSON.parse(serializeConfig(parsed)).delivery).toEqual(delivery);
+  });
+
+  it("keeps rejecting an unknown mode that also carries an extension key", () => {
+    expectInvalidDeliveryConfig(
+      { ...baseConfig(), delivery: { mode: "later", experimental: true } },
+      { mode: "later" },
+    );
+  });
+
+  it("keeps rejecting a partial target set that also carries an extension key", () => {
+    expectInvalidDeliveryConfig(
+      { ...baseConfig(), delivery: { preview: { adapter: "command" }, experimental: true } },
+      { missing: ["staging", "production"] },
+    );
+  });
+
+  it("keeps rejecting a deferred block that carries a target alongside an extension key", () => {
+    expectInvalidDeliveryConfig(
+      {
+        ...baseConfig(),
+        delivery: { mode: DEFERRED_DELIVERY_MODE, preview: { adapter: "command" }, experimental: true },
+      },
+      { mode: DEFERRED_DELIVERY_MODE },
+    );
   });
 
   it("requireConfiguredDelivery fails closed with a typed deferred-delivery error", () => {

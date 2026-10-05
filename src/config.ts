@@ -64,15 +64,27 @@ export const trackerConfigSchema = z.discriminatedUnion("provider", [
  * config that mixes the two, or that supplies only some of the three
  * targets, is a partial shape and fails with a typed error rather than
  * being silently completed.
+ *
+ * Ticket #152 — both branches are EXTENSIBLE at the outer delivery level,
+ * exactly like every other Poiesis block: an unknown key (a newer runtime's
+ * extension, or an Author's own annotation) survives parse and serialize, so
+ * a runtime that does not recognize a key never silently deletes it from the
+ * managed `.poiesis/config.jsonc` on its next rewrite. This is a
+ * compatibility relaxation ONLY — the semantic rejections in
+ * `assertDeliveryShape` (a partial target set, an unknown `mode`, and a
+ * deferred block that also carries a target) are unchanged and still run
+ * before the schema result is reported.
  */
 export const DEFERRED_DELIVERY_MODE = "deferred";
 
-export const deferredDeliverySchema = z.strictObject({ mode: z.literal(DEFERRED_DELIVERY_MODE) });
-export const configuredDeliverySchema = z.strictObject({
-  preview: adapterTargetSchema,
-  staging: adapterTargetSchema,
-  production: adapterTargetSchema,
-});
+export const deferredDeliverySchema = z.object({ mode: z.literal(DEFERRED_DELIVERY_MODE) }).loose();
+export const configuredDeliverySchema = z
+  .object({
+    preview: adapterTargetSchema,
+    staging: adapterTargetSchema,
+    production: adapterTargetSchema,
+  })
+  .loose();
 export const deliveryConfigSchema = z.union([deferredDeliverySchema, configuredDeliverySchema]);
 
 export type DeliveryTargetConfig = z.infer<typeof adapterTargetSchema>;

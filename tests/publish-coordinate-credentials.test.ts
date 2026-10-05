@@ -32,7 +32,7 @@
  * CLI — not only the TypeScript source — is the surface an Author sees.
  */
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { asPoiesisError } from "../src/errors.js";
@@ -114,6 +114,36 @@ async function resolvedConfig(repository: TestRepository): Promise<Awaited<Retur
  * transaction. `local` is the tracker because it makes no network call, so
  * the test never depends on a host `gh`.
  */
+/**
+ * Write a hand-written manifest recording the executing runtime version, so
+ * the built CLI's `publish` preflight (ticket #152: runtime identity, then the
+ * central delivery policy) reaches publishing-coordinate resolution — the
+ * surface whose URL redaction this file qualifies — without a full `init`
+ * transaction. The config's own `delivery` block is omitted, which keeps its
+ * legacy resolved state, so no policy refusal precedes the coordinates.
+ */
+async function writeMatchingManifest(root: string): Promise<void> {
+  const packageJson = JSON.parse(await readFile(join(import.meta.dirname, "..", "package.json"), "utf8")) as {
+    version: string;
+  };
+  await mkdir(join(root, ".poiesis"), { recursive: true });
+  await writeFile(
+    join(root, ".poiesis", "manifest.json"),
+    `${JSON.stringify(
+      {
+        schema: 1,
+        poiesisVersion: packageJson.version,
+        adapter: { harness: "opencode", adapterVersion: "test", supportedVersion: packageJson.version },
+        files: [],
+        skills: [],
+        configPatches: [],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+}
+
 async function writeMinimalConfig(root: string): Promise<void> {
   await mkdir(join(root, ".poiesis"), { recursive: true });
   await writeFile(
@@ -314,6 +344,7 @@ describe("the built package never prints a remote credential", () => {
     const cli = cliPath;
     const repository = await repositoryWithRemote(CREDENTIAL_REMOTE_UNRECOGNIZED);
     await writeMinimalConfig(repository.root);
+    await writeMatchingManifest(repository.root);
 
     const inspection = await run("node", [cli, "inspect"], { cwd: repository.root, allowFailure: true });
     expect(inspection.exitCode).toBe(0);

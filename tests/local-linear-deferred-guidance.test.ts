@@ -147,10 +147,14 @@ describe("the canonical Method states one tracker / delivery contract", () => {
     expect(method).toContain("pauses after exact-candidate Proof");
     expect(method).toContain("DELIVERY_DEFERRED");
     expect(method).toContain("must not claim");
-    // The hard stop is a property of the operation, not of check ordering:
-    // publish can refuse one step earlier, and the canon must say so rather
-    // than promise a code it cannot always reach.
-    expect(method).toContain("may refuse one step earlier with `PUBLISH_PROVIDER_UNRESOLVED`");
+    // The hard stop is a property of the installed state and the operation,
+    // decided from the installed config before that config is used for
+    // anything else: the canon must say so rather than promise a code it
+    // cannot always reach. On a CONFIGURED install, coordinate resolution is
+    // the separate condition it names.
+    expect(method).toContain("The refusal is a property of the installed state and the operation");
+    expect(method).toContain("`CONFIG_NOT_INSTALLED`");
+    expect(method).toContain("may refuse with `PUBLISH_PROVIDER_UNRESOLVED`");
     expect(method).toContain("no push, no fetch, no remote revalidation, no change request, and no delivery evidence");
   });
 
@@ -240,8 +244,14 @@ describe("README documents the whole product contract", () => {
     expect(readme).toContain(INDEPENDENCE);
     expect(readme).toContain(LATER_CONFIGURATION_STATEMENT);
     // The deferred section must not promise a code the CLI cannot always
-    // reach: publish resolves its coordinates first.
-    expect(readme).toContain("refuses one step earlier with `PUBLISH_PROVIDER_UNRESOLVED`");
+    // reach. Ticket #152: the CLI preflight decides the installed state and
+    // the deferred state from the installed config BEFORE reading it for
+    // anything else, so all six operations report the same code wherever
+    // they run; coordinate resolution is the separate CONFIGURED-install
+    // condition the same paragraph names.
+    expect(readme).toContain("run one shared preflight before they read your config");
+    expect(readme).toContain("`CONFIG_NOT_INSTALLED` for all six");
+    expect(readme).toContain("refuses with `PUBLISH_PROVIDER_UNRESOLVED` instead");
   });
 
   it("documents recognized-remote publishing coordinates including the fork implication", () => {

@@ -50,15 +50,15 @@
  *     not for the behavior under test.
  *
  * The remote is a filesystem bare repository: a real Git remote with no
- * network, and the shape a Veritium-style project actually has. That is
- * also why `poiesis publish` refuses with `PUBLISH_PROVIDER_UNRESOLVED`
- * rather than `DELIVERY_DEFERRED` here — coordinate resolution runs before
- * the lifecycle policy guard, and a clone-local tracker plus an
- * unrecognized remote yields no publishing coordinates at all. Both codes
- * are fail-closed and both leave the remote untouched, which is the
- * contract under test. `poiesis preview` and `poiesis promote` refuse
- * earlier still, with `DELIVERY_DEFERRED`, because no delivery adapter
- * exists to construct.
+ * network, and the shape a Veritium-style project actually has. Every
+ * delivery-integrated operation is refused by the ONE central lifecycle
+ * policy, through the shared CLI preflight (ticket #152), so the refusal
+ * code no longer depends on the remote's shape: a deferred install reports
+ * `DELIVERY_DEFERRED` for `poiesis publish` exactly as it does for the
+ * other five, before publishing coordinates are resolved at all. On a
+ * CONFIGURED install with an unrecognized remote, `poiesis publish` still
+ * refuses with `PUBLISH_PROVIDER_UNRESOLVED`; that is a separate,
+ * equally fail-closed condition with the same zero remote side effects.
  */
 import { execFile } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
@@ -390,12 +390,12 @@ function blockedAttempts(
 
   return [
     {
-      // A clone-local tracker plus an unrecognized filesystem remote yields
-      // no publishing coordinates at all, so coordinate resolution refuses
-      // before the lifecycle policy guard is consulted. Both conditions are
-      // fail-closed and both leave the remote untouched.
+      // Ticket #152: the CLI preflight runs the central lifecycle policy
+      // before the installed config is read and before publishing
+      // coordinates are resolved, so a deferred install is refused by the
+      // same policy as the other five operations, whatever the remote shape.
       label: "poiesis publish",
-      code: "PUBLISH_PROVIDER_UNRESOLVED",
+      code: "DELIVERY_DEFERRED",
       attempt: () =>
         cli(
           ["publish", "--sha", sha, "--candidate-tree", tree, "--proof", proof, "--title", "Veritium onboarding", "--body", "body"],

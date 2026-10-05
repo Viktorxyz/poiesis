@@ -1660,6 +1660,45 @@ export async function resolveConfigRoot(cwd: string): Promise<string> {
   return resolve(cwd);
 }
 
+/**
+ * Spec #139 / ticket #152 — the root that OWNS the installation, answered
+ * STRUCTURALLY rather than by looking for a config file.
+ *
+ * `resolveConfigRoot` answers "where is the installed config I should read?"
+ * and may legitimately fall back to the invocation root when no config is
+ * there. The runtime identity and lifecycle-policy guards cannot use that
+ * answer: a project whose installed config is missing is precisely the case
+ * they must diagnose, so a resolver that looks for the config cannot be the
+ * one that decides whether it is present.
+ *
+ * The answer is therefore structural. Poiesis installs into the PRIMARY
+ * checkout. Git reports `--absolute-git-dir` and `--git-common-dir` as the
+ * same path in a primary checkout, and as different paths in a linked
+ * worktree, where the common dir is the primary checkout's `.git` directory.
+ * Both facts are read in ONE `git rev-parse` call, so the reconciliation
+ * costs a single side-effect-free subprocess and never touches the network, a
+ * remote, or the working tree.
+ */
+export async function resolveInstallationRoot(repoRoot: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--absolute-git-dir", "--git-common-dir"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  const [gitDir, commonDir] = result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .map((line) => resolve(isAbsolute(line) ? line : resolve(repoRoot, line)));
+  if (result.exitCode !== 0 || gitDir === undefined || commonDir === undefined || gitDir === commonDir) {
+    return resolve(repoRoot);
+  }
+  // A linked worktree: the primary checkout that owns the installation is the
+  // parent of the shared common directory (the primary checkout's `.git`).
+  const primary = commonDir.replace(/\/$/, "").replace(/\/[^/]+$/, "");
+  if (primary === "" || primary === commonDir) return resolve(repoRoot);
+  return primary;
+}
+
 export async function doctor(root: string): Promise<DoctorReport> {
   const resolvedRoot = resolve(root);
   const checks: DoctorCheck[] = [];
