@@ -237,21 +237,32 @@ describe.skipIf(process.platform === "win32")("managed execution cleanup on succ
     expect(isSameProcess(descendantPid, descendantStart)).toBe(true);
   });
 
-  it("reports the same leak without waiting for the linger window when the pipes are already closed", { timeout: 30_000 }, async () => {
+  it("reports the same leak without the output linger delay, after the bounded natural-settlement wait", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageLeakyTree({ detachOutput: true });
+    // Anchored at the invocation rather than after the descendant was found:
+    // the claim is about the whole run, and a clock started after the fixture
+    // was located cannot see the interval this test is actually about.
+    const startedAt = Date.now();
     const { outcome } = startRun(parent, [], { cwd: dir });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
 
-    const startedAt = Date.now();
     await expect(outcome).resolves.toMatchObject({
       code: "PROCESS_CLEANUP_UNRESOLVED",
       details: { reason: "GROUP_AUTHORITY_LOST", membersEnumerated: false },
     });
-    // The pipes closed with the parent, so the leak is observable immediately
-    // and costs no linger window to report.
-    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    // Two different waits are involved, and only one of them is skipped. The
+    // descendant redirected its own output, so the pipes closed WITH the parent
+    // and the runner never has a reason to arm the post-exit linger delay. What
+    // the run still pays is ticket #185's bounded, signal-free natural-settlement
+    // interval: the leader is gone, the group is still observably alive, and
+    // nothing may be signalled while Poiesis waits for it to empty itself.
+    // Both halves are asserted — the interval is genuinely paid, and the whole
+    // settlement stays bounded on a loaded host.
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeGreaterThanOrEqual(1_500);
+    expect(elapsed).toBeLessThan(6_000);
     expect(isSameProcess(descendantPid, startTime)).toBe(true);
   });
 
