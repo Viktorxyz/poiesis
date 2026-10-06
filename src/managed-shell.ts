@@ -35,6 +35,14 @@ export interface ManagedShellCommandOptions {
   workspaceId?: string;
   timeoutMs?: number;
   maxBytes?: number;
+  /**
+   * Spec #168 / ticket #183 — the output limit this caller's own evidence will
+   * apply, forwarded so a rejection envelope retains at least that much of the
+   * captured output. A managed command that ends in a typed rejection has no
+   * settled result, so the error details are the only copy of its output that
+   * exists downstream.
+   */
+  outputLimit?: number;
   allowFailure?: boolean;
   env?: NodeJS.ProcessEnv;
   signal?: AbortSignal;
@@ -61,6 +69,7 @@ export async function runManagedShellCommand(options: ManagedShellCommandOptions
     containment: STRONG_CONTAINMENT_MODEL,
     ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs }),
     ...(options.maxBytes === undefined ? {} : { maxBytes: options.maxBytes }),
+    ...(options.outputLimit === undefined ? {} : { outputLimit: options.outputLimit }),
     ...(options.operationId === undefined ? {} : { operationId: options.operationId }),
     ...(options.workspaceId === undefined ? {} : { workspaceId: options.workspaceId }),
     ...(options.env === undefined ? {} : { env: options.env }),

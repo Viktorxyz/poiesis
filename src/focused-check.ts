@@ -74,7 +74,7 @@ import {
   type VerifyResult,
   type WorktreePathDigest,
 } from "./git.js";
-import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, type RunResult } from "./process.js";
+import { boundedOutput, DEFAULT_VERIFY_TIMEOUT_MS, type RunResult } from "./process.js";
 import { runManagedShellCommand } from "./managed-shell.js";
 import type { VerificationEvidence } from "./verification-receipt.js";
 
@@ -878,6 +878,13 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
       command: input.command,
       allowFailure: true,
       timeoutMs: input.timeoutMs,
+      // Spec #168 / ticket #183: the record's own output limit, declared to the
+      // runner as well. A rejected command has no settled result to read the
+      // streams from, so the runner's error envelope is the ONLY copy of this
+      // command's output that exists — and an envelope that bounded at its own
+      // fixed default would silently make a larger requested limit unreachable
+      // for exactly the commands an operator most needs to read.
+      outputLimit: input.outputLimit,
       // #170: the transient managed lease names this operation and, when the
       // caller proved one, the workspace that owns it. Nothing is persisted.
       operationId: input.operationId,
@@ -894,16 +901,27 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
 
   const stdout = rawString(details, "stdout", result?.stdout);
   const stderr = rawString(details, "stderr", result?.stderr);
-  const boundedStdout = bounded(stdout, input.outputLimit);
-  const boundedStderr = bounded(stderr, input.outputLimit);
+  const stdoutBound = boundedOutput(stdout, input.outputLimit);
+  const stderrBound = boundedOutput(stderr, input.outputLimit);
+  /**
+   * Spec #168 / ticket #183 — three independent bounds can shorten this
+   * record's output, and the flag is the OR of all three:
+   *
+   *   1. the runner's byte capture (`maxBytes`);
+   *   2. the runner's error envelope, which bounds the streams it copied into
+   *      a rejection — the only source there is, because a rejected command
+   *      never produced a settled `RunResult`;
+   *   3. this record's own `outputLimit`.
+   *
+   * Before this ticket the third bound was detected only by comparing against a
+   * `RunResult`, so on the rejected path — the one path where two of the three
+   * bounds apply — nothing re-detected either clip and the record claimed
+   * complete output beside a shortened string.
+   */
   const stdoutTruncated =
-    details.stdoutTruncated === true ||
-    result?.stdoutTruncated === true ||
-    (result !== null && boundedStdout !== result.stdout);
+    details.stdoutTruncated === true || result?.stdoutTruncated === true || stdoutBound.clipped;
   const stderrTruncated =
-    details.stderrTruncated === true ||
-    result?.stderrTruncated === true ||
-    (result !== null && boundedStderr !== result.stderr);
+    details.stderrTruncated === true || result?.stderrTruncated === true || stderrBound.clipped;
 
   const exitCode = typeof details.exitCode === "number" ? details.exitCode : (result?.exitCode ?? null);
   const signal = typeof details.signal === "string" ? details.signal : (result?.signal ?? null);
@@ -934,8 +952,8 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
     durationMs,
     timeoutMs: input.timeoutMs,
     timeoutState,
-    stdout: boundedStdout,
-    stderr: boundedStderr,
+    stdout: stdoutBound.text,
+    stderr: stderrBound.text,
     stdoutTruncated,
     stderrTruncated,
     outputTruncated: stdoutTruncated || stderrTruncated,

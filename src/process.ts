@@ -31,6 +31,12 @@ import {
   type ManagedProcessLease,
 } from "./process-tree.js";
 
+/**
+ * Spec #168 / ticket #183 — the fixed bound an error envelope applies to a
+ * captured stream when its caller named no evidence limit of its own.
+ */
+const DEFAULT_OUTPUT_BOUND_BYTES = 8_000;
+
 const DEFAULT_MAX_BYTES = 256 * 1024;
 const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_VERIFY_TIMEOUT_MS = 10 * 60_000;
@@ -146,6 +152,24 @@ export interface RunOptions {
   allowFailure?: boolean;
   timeoutMs?: number;
   maxBytes?: number;
+  /**
+   * Spec #168 / ticket #183 — the output limit the caller's OWN evidence will
+   * apply, when it knows one.
+   *
+   * `maxBytes` bounds what is CAPTURED and is deliberately wider than any
+   * evidence limit. This option is the other half of that pair: it tells the
+   * runner how much of the capture its caller's downstream surface intends to
+   * retain, so a rejection envelope does not clip output BELOW the limit that
+   * surface already asked for. Without it the envelope keeps its own fixed
+   * bound, and the caller's larger requested limit silently stops being
+   * reachable — for a rejected run, where nothing downstream can recover the
+   * bytes the envelope dropped.
+   *
+   * The envelope therefore retains `max(8_000, outputLimit)` bytes per stream
+   * and no more: the capture bound is still the hard ceiling, so an error
+   * object stays bounded whatever this is set to.
+   */
+  outputLimit?: number;
   /**
    * Spec #168 / ticket #170 — the caller's cancellation intent.
    *
@@ -273,6 +297,10 @@ interface Capture {
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
   const maxBytes = normalizeMaxBytes(options.maxBytes);
+  // Spec #168 / ticket #183: resolved before the spawn, so a malformed
+  // requested evidence limit can never reach an error envelope that then clips
+  // output to a bound nobody asked for.
+  const outputLimit = normalizeOutputLimit(options.outputLimit);
   const childEnv = resolveChildEnvironment(options);
   // The lease identity is validated before anything is spawned, so a
   // malformed operation or workspace identity can never create a process.
@@ -574,10 +602,16 @@ export async function run(command: string, args: string[], options: RunOptions):
         return;
       }
       if (cancelled) {
-        reject(cancelledError(command, args, "cancelled by the caller", result));
+        reject(cancelledError(command, args, "cancelled by the caller", result, outputLimit));
         return;
       }
       if (timedOut) {
+        // Spec #168 / ticket #183: the envelope's OWN bound is part of the
+        // truncation fact. Bounding the text and reporting only the capture's
+        // flag is how a command that emitted 50 KiB ended up described by an
+        // 8,000-byte `stdout` beside `stdoutTruncated: false`.
+        const stdoutBound = boundedOutput(result.stdout, outputLimit);
+        const stderrBound = boundedOutput(result.stderr, outputLimit);
         reject(
           new PoiesisError(
             "COMMAND_TIMEOUT",
@@ -589,10 +623,10 @@ export async function run(command: string, args: string[], options: RunOptions):
               exitCode: result.exitCode,
               signal: result.signal,
               durationMs: result.durationMs,
-              stdout: bounded(result.stdout),
-              stderr: bounded(result.stderr),
-              stdoutTruncated: result.stdoutTruncated,
-              stderrTruncated: result.stderrTruncated,
+              stdout: stdoutBound.text,
+              stderr: stderrBound.text,
+              stdoutTruncated: result.stdoutTruncated || stdoutBound.clipped,
+              stderrTruncated: result.stderrTruncated || stderrBound.clipped,
             },
             124,
           ),
@@ -604,13 +638,17 @@ export async function run(command: string, args: string[], options: RunOptions):
         return;
       }
       if (result.exitCode !== 0 && !options.allowFailure) {
+        // Spec #168 / ticket #183: the same envelope bound as the timeout and
+        // cancellation rejections above — bounded text, and a flag that says
+        // which bound cut it.
+        const stderrBound = boundedOutput(result.stderr, outputLimit);
         reject(
           new PoiesisError("COMMAND_FAILED", `${command} exited with code ${result.exitCode}`, {
             command,
             args,
             exitCode: result.exitCode,
-            stderr: bounded(result.stderr),
-            stderrTruncated: result.stderrTruncated,
+            stderr: stderrBound.text,
+            stderrTruncated: result.stderrTruncated || stderrBound.clipped,
             stdoutTruncated: result.stdoutTruncated,
           }),
         );
@@ -1135,11 +1173,34 @@ export async function run(command: string, args: string[], options: RunOptions):
   });
 }
 
-export function bounded(value: string, limit = 8_000): string {
+/** One bounded string, and whether the bound is what shortened it. */
+export interface BoundedOutput {
+  text: string;
+  clipped: boolean;
+}
+
+/**
+ * Spec #168 / ticket #183 — bound one string AND report whether the bound cut
+ * it.
+ *
+ * `bounded` alone answers only half of the question an error envelope asks. It
+ * returns the bounded text, so a caller can put it in `details.stdout` without
+ * overflowing, but nothing in that string says whether the caller is now
+ * looking at the whole stream or a prefix of it — and a truncation flag that
+ * survives a second bound is the fact that keeps the evidence honest downstream.
+ */
+export function boundedOutput(value: string, limit = DEFAULT_OUTPUT_BOUND_BYTES): BoundedOutput {
   const encoded = Buffer.from(value, "utf8");
-  if (encoded.length <= limit) return value;
+  if (encoded.length <= limit) return { text: value, clipped: false };
   const retained = encoded.subarray(0, completeUtf8PrefixLength(encoded.subarray(0, limit)));
-  return `${retained.toString("utf8")}\n... truncated ${encoded.length - retained.length} bytes`;
+  return {
+    text: `${retained.toString("utf8")}\n... truncated ${encoded.length - retained.length} bytes`,
+    clipped: true,
+  };
+}
+
+export function bounded(value: string, limit = DEFAULT_OUTPUT_BOUND_BYTES): string {
+  return boundedOutput(value, limit).text;
 }
 
 function createCapture(): Capture {
@@ -1277,8 +1338,22 @@ function resolveLeaseIdentity(options: RunOptions): { operationId: string; works
  * Cancellation is a typed outcome, not a silent success and not a timeout:
  * the caller asked for this run to stop, and the managed group has already
  * been settled by the time this is raised.
+ *
+ * Spec #168 / ticket #183: the envelope bound participates in the truncation
+ * flags here too. A cancellation is the outcome a rejected run most often
+ * reaches its downstream evidence through, and a bounded `stdout` beside
+ * `stdoutTruncated: false` is exactly the false completeness those surfaces
+ * could not re-detect — there is no settled `RunResult` to compare against.
  */
-function cancelledError(command: string, args: string[], reason: string, result?: RunResult): PoiesisError {
+function cancelledError(
+  command: string,
+  args: string[],
+  reason: string,
+  result?: RunResult,
+  outputLimit = DEFAULT_OUTPUT_BOUND_BYTES,
+): PoiesisError {
+  const stdoutBound = boundedOutput(result?.stdout ?? "", outputLimit);
+  const stderrBound = boundedOutput(result?.stderr ?? "", outputLimit);
   return new PoiesisError("COMMAND_CANCELLED", `${command} was cancelled: ${reason}`, {
     command,
     args,
@@ -1287,10 +1362,10 @@ function cancelledError(command: string, args: string[], reason: string, result?
     exitCode: result?.exitCode ?? null,
     signal: result?.signal ?? null,
     durationMs: result?.durationMs,
-    stdout: bounded(result?.stdout ?? ""),
-    stderr: bounded(result?.stderr ?? ""),
-    stdoutTruncated: result?.stdoutTruncated ?? false,
-    stderrTruncated: result?.stderrTruncated ?? false,
+    stdout: stdoutBound.text,
+    stderr: stderrBound.text,
+    stdoutTruncated: (result?.stdoutTruncated ?? false) || stdoutBound.clipped,
+    stderrTruncated: (result?.stderrTruncated ?? false) || stderrBound.clipped,
   }, CANCELLED_EXIT_CODE);
 }
 
@@ -1635,6 +1710,23 @@ function normalizeMaxBytes(value: number | undefined): number {
     throw new PoiesisError("INVALID_MAX_BYTES", "Max bytes must be a positive safe integer", { value });
   }
   return value;
+}
+
+/**
+ * Spec #168 / ticket #183 — the bound a rejection envelope applies, given the
+ * evidence limit its caller named.
+ *
+ * The fixed default is a FLOOR, never a ceiling on what the caller asked for: a
+ * caller that requested 20,000 bytes of evidence would otherwise lose bytes at
+ * 8,000 on a rejected run and never learn it, which is the loss this resolves.
+ * The capture bound remains the hard ceiling, so the envelope stays bounded.
+ */
+function normalizeOutputLimit(value: number | undefined): number {
+  if (value === undefined) return DEFAULT_OUTPUT_BOUND_BYTES;
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new PoiesisError("INVALID_OUTPUT_LIMIT", "Output limit must be a positive safe integer", { value });
+  }
+  return Math.max(DEFAULT_OUTPUT_BOUND_BYTES, value);
 }
 
 /**

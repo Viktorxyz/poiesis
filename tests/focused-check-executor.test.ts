@@ -517,6 +517,130 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
   }, 60_000);
 });
 
+/**
+ * Spec #168 / ticket #183 — a focused record must not claim complete output it
+ * does not have.
+ *
+ * A rejected command has no `RunResult`: the record reads the streams out of
+ * the runner's error `details`, and those were bounded on the way in. Before
+ * this ticket the record derived its truncation flags from a comparison against
+ * a result that does not exist on this path, so a command that emitted 50 KiB
+ * and was killed at its timeout was recorded as `stdoutTruncated: false` beside
+ * an 8,000-byte `stdout` — and a record whose own `outputLimit` bound clipped
+ * it was recorded the same way. That flag is what an orchestrator reads to
+ * decide whether it is looking at whole output.
+ */
+describeManagedExecution("focused output truncation on a rejected command (Spec #168 / ticket #183)", () => {
+  /** Emit `bytes` on stdout, then hang until the check's own bound stops it. */
+  const emitThenHang = (bytes: number): string =>
+    `head -c ${bytes} /dev/zero | tr '\\0' x; sleep 30`;
+
+  itManagedExecution("records the runner envelope's clip on a timed-out command", async () => {
+    const candidate = await ownedCandidate("envelope-timeout");
+    const result = await executeCheck({
+      scope: "focused",
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      commands: [emitThenHang(50_000)],
+      timeoutMs: 2_000,
+      samplePressure: () => CALM,
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(result.classification).toBe("timeout");
+    expect(result.commands?.[0]).toMatchObject({
+      status: "failed",
+      classification: "timeout",
+      failureCode: "COMMAND_TIMEOUT",
+      stdoutTruncated: true,
+      stderrTruncated: false,
+      outputTruncated: true,
+    });
+    const stdout = result.commands?.[0]?.stdout ?? "";
+    expect(stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+    expect(Buffer.byteLength(stdout, "utf8")).toBeLessThanOrEqual(8_000 + 64);
+  });
+
+  itManagedExecution("records the runner envelope's clip on a cancelled command", async () => {
+    const candidate = await ownedCandidate("envelope-cancelled");
+    const controller = new AbortController();
+    const invocation = executeCheck({
+      scope: "focused",
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      commands: [emitThenHang(50_000)],
+      timeoutMs: 60_000,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 2_000);
+
+    const result = await invocation;
+
+    expect(result.outcome).toBe("failed");
+    expect(result.classification).toBe("infrastructure");
+    expect(result.commands?.[0]).toMatchObject({
+      status: "failed",
+      failureCode: "COMMAND_CANCELLED",
+      timeoutState: "not-timed-out",
+      stdoutTruncated: true,
+      outputTruncated: true,
+    });
+    expect(result.commands?.[0]?.stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+  });
+
+  itManagedExecution("records the record's OWN bound as truncation on a rejected command", async () => {
+    // 7,000 bytes: more than this record's 500-byte limit, less than the 8,000
+    // bytes the runner's envelope retains, so the envelope clipped NOTHING here
+    // and the clip happened in this record alone. A record that only compared
+    // against a `RunResult` — which a rejection never produces — could not see
+    // its own bound cut the text.
+    const candidate = await ownedCandidate("own-bound");
+    const result = await executeCheck({
+      scope: "focused",
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      commands: [emitThenHang(7_000)],
+      outputLimit: 500,
+      timeoutMs: 2_000,
+      samplePressure: () => CALM,
+    });
+
+    expect(result.commands?.[0]).toMatchObject({
+      status: "failed",
+      stdoutTruncated: true,
+      stderrTruncated: false,
+      outputTruncated: true,
+    });
+    expect(result.commands?.[0]?.stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+    expect(Buffer.byteLength(result.commands?.[0]?.stdout ?? "", "utf8")).toBeLessThanOrEqual(500 + 64);
+  });
+
+  itManagedExecution("keeps the whole captured output when the requested limit exceeds the envelope bound", async () => {
+    // 12,000 bytes, under the 20,000-byte limit this record asked for. Nothing
+    // was lost, so the record must say the output is complete AND still hold
+    // all of it — a record that dropped it at the envelope's fixed 8,000-byte
+    // bound would both lose the evidence and misdescribe what it kept.
+    const candidate = await ownedCandidate("requested-limit");
+    const result = await executeCheck({
+      scope: "focused",
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      commands: [emitThenHang(12_000)],
+      outputLimit: 20_000,
+      timeoutMs: 2_000,
+      samplePressure: () => CALM,
+    });
+
+    expect(result.commands?.[0]).toMatchObject({
+      status: "failed",
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      outputTruncated: false,
+    });
+    expect(Buffer.byteLength(result.commands?.[0]?.stdout ?? "", "utf8")).toBe(12_000);
+  });
+});
+
 describeManagedExecution("proof scope through the same executor (Spec #168 / ticket #172)", () => {
   it("issues the exact-candidate verification receipt and stays authoritative", async () => {
     const candidate = await ownedCandidate("proof");

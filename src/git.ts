@@ -3,7 +3,7 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
-import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
+import { bounded, boundedOutput, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { runManagedShellCommand } from "./managed-shell.js";
 import { exists } from "./fs.js";
 import { poiesisPath, resolveGitRoot } from "./paths.js";
@@ -819,6 +819,13 @@ async function runVerification(
         command,
         allowFailure: true,
         timeoutMs,
+        // Spec #168 / ticket #183: the same evidence limit this Verify applies
+        // to the receipt it is about to write, declared to the runner as well.
+        // A command that ends in a typed rejection has no settled result, so the
+        // runner's error details are the only copy of its output — and an
+        // envelope that bounded below the requested limit would make a larger
+        // requested limit unreachable for exactly the commands that failed.
+        outputLimit,
         // Spec #168 / ticket #170: verification commands run under a
         // transient managed process lease, so a verify command that leaks
         // a background descendant is cleaned before the exact-SHA
@@ -948,6 +955,13 @@ async function runVerification(
  * `COMMAND_CANCELLED` errors carry the executor's own duration and truncation
  * fidelity, so a timed-out command is recorded as a timeout rather than being
  * dropped from the receipt.
+ *
+ * Spec #168 / ticket #183 — the runner's envelope bound and this record's own
+ * `outputLimit` are BOTH facts about truncation, and a command that never
+ * settled has no `RunResult` to compare against. So the record ORs the runner's
+ * reported flag with the fact that its own bound is what shortened the text: a
+ * receipt that held 500 bytes of 7,000 and claimed complete output is exactly
+ * the false evidence Publish later reads.
  */
 function failedCommandEvidence(
   command: string,
@@ -962,8 +976,10 @@ function failedCommandEvidence(
   // never produced a settled result for this command.
   const classification: VerificationCommandClassification = timedOut ? "timeout" : "spawn-error";
   const durationMs = typeof details.durationMs === "number" ? details.durationMs : Math.max(0, Date.now() - startedAtMs);
-  const stdout = typeof details.stdout === "string" ? bounded(details.stdout, outputLimit) : "";
-  const stderr = typeof details.stderr === "string" ? bounded(details.stderr, outputLimit) : "";
+  const stdoutBound = boundedOutput(typeof details.stdout === "string" ? details.stdout : "", outputLimit);
+  const stderrBound = boundedOutput(typeof details.stderr === "string" ? details.stderr : "", outputLimit);
+  const stdoutTruncated = details.stdoutTruncated === true || stdoutBound.clipped;
+  const stderrTruncated = details.stderrTruncated === true || stderrBound.clipped;
   return {
     command,
     status: "failed",
@@ -975,11 +991,11 @@ function failedCommandEvidence(
     durationMs,
     timeoutMs,
     timedOut,
-    stdout,
-    stderr,
-    stdoutTruncated: details.stdoutTruncated === true,
-    stderrTruncated: details.stderrTruncated === true,
-    outputTruncated: details.stdoutTruncated === true || details.stderrTruncated === true,
+    stdout: stdoutBound.text,
+    stderr: stderrBound.text,
+    stdoutTruncated,
+    stderrTruncated,
+    outputTruncated: stdoutTruncated || stderrTruncated,
   };
 }
 

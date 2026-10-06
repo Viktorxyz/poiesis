@@ -5,7 +5,8 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { bounded, run } from "../src/process.js";
+import { bounded, boundedOutput, run } from "../src/process.js";
+import type { PoiesisError } from "../src/errors.js";
 
 const fixtures: string[] = [];
 const survivorPids = new Map<number, string | null>();
@@ -816,6 +817,145 @@ describe("bounded", () => {
       expect(bounded(value, limit)).toBe(
         `${prefix}\n... truncated ${totalBytes - retainedBytes} bytes`,
       );
+    }
+  });
+});
+
+/**
+ * Spec #168 / ticket #183 — an error envelope that clips its output must SAY it
+ * clipped it.
+ *
+ * A timeout or a cancellation rejection carries the captured streams inside
+ * `details`, bounded by a fixed 8,000-byte envelope bound that has nothing to do
+ * with the runner's own capture bound. Before this ticket the envelope
+ * kept the PROCESS capture flags only, so a command that emitted 50 KiB and was
+ * killed at its timeout produced an 8,000-byte `details.stdout` beside
+ * `stdoutTruncated: false`: the text was silently short and the flag claimed it
+ * was whole. Focused evidence and Verify receipt evidence both read that flag,
+ * and neither could re-detect the clip on a rejected run (there is no
+ * `RunResult` to compare against), so a bounded envelope became authoritative
+ * evidence of complete output.
+ *
+ * These assertions are about the public `run` rejection itself: the flags must
+ * be truthful, the text must stay bounded, and the typed code / exit status /
+ * precedence of the rejection must be exactly what they were.
+ */
+describe("error-envelope output bounding (Spec #168 / ticket #183)", () => {
+  /** The one rejection, so its details can be read field by field. */
+  async function rejectionOf(invocation: Promise<unknown>): Promise<PoiesisError> {
+    try {
+      await invocation;
+    } catch (error) {
+      return error as PoiesisError;
+    }
+    throw new Error("expected the run to reject, but it resolved");
+  }
+
+  /** A script that emits `bytes` on stdout and then hangs until it is signalled. */
+  function emittingHang(bytes: number): string {
+    return `#!/bin/sh\nhead -c ${bytes} /dev/zero | tr '\\0' x\nsleep 30\n`;
+  }
+
+  it("reports the envelope's own clip on both streams of a timed-out command", { timeout: 20_000 }, async () => {
+    const { script } = await stageScript(
+      "#!/bin/sh\nhead -c 50000 /dev/zero | tr '\\0' x\nhead -c 20000 /dev/zero | tr '\\0' y 1>&2\nsleep 30\n",
+    );
+
+    const failure = await rejectionOf(run(script, [], { cwd: tmpdir(), timeoutMs: 1_000 }));
+
+    // The typed outcome is untouched: same code, same exit status, same priority.
+    expect(failure.code).toBe("COMMAND_TIMEOUT");
+    expect(failure.exitCode).toBe(124);
+    // The defect: both streams were clipped by the envelope, and both say so.
+    expect(failure.details.stdoutTruncated).toBe(true);
+    expect(failure.details.stderrTruncated).toBe(true);
+    const stdout = String(failure.details.stdout);
+    const stderr = String(failure.details.stderr);
+    expect(stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+    expect(stderr).toMatch(/\.\.\. truncated \d+ bytes$/);
+    // Still bounded: the envelope remains a fixed bound, not the raw capture.
+    expect(Buffer.byteLength(stdout, "utf8")).toBeLessThanOrEqual(8_000 + 64);
+    expect(Buffer.byteLength(stderr, "utf8")).toBeLessThanOrEqual(8_000 + 64);
+  });
+
+  it("reports the envelope's own clip on both streams of a cancelled command", { timeout: 20_000 }, async () => {
+    const { script } = await stageScript(
+      "#!/bin/sh\nhead -c 50000 /dev/zero | tr '\\0' x\nhead -c 20000 /dev/zero | tr '\\0' y 1>&2\nsleep 30\n",
+    );
+    const controller = new AbortController();
+    const invocation = run(script, [], { cwd: tmpdir(), signal: controller.signal });
+    setTimeout(() => controller.abort(), 1_000);
+
+    const failure = await rejectionOf(invocation);
+
+    expect(failure.code).toBe("COMMAND_CANCELLED");
+    expect(failure.exitCode).toBe(130);
+    expect(failure.details.stdoutTruncated).toBe(true);
+    expect(failure.details.stderrTruncated).toBe(true);
+    expect(Buffer.byteLength(String(failure.details.stdout), "utf8")).toBeLessThanOrEqual(8_000 + 64);
+    expect(Buffer.byteLength(String(failure.details.stderr), "utf8")).toBeLessThanOrEqual(8_000 + 64);
+  });
+
+  it("still reports a small timed-out command's output as complete", { timeout: 20_000 }, async () => {
+    const { script } = await stageScript("#!/bin/sh\nprintf small\nsleep 30\n");
+
+    const failure = await rejectionOf(run(script, [], { cwd: tmpdir(), timeoutMs: 1_000 }));
+
+    expect(failure.code).toBe("COMMAND_TIMEOUT");
+    expect(failure.details.stdout).toBe("small");
+    expect(failure.details.stdoutTruncated).toBe(false);
+    expect(failure.details.stderrTruncated).toBe(false);
+  });
+
+  it("retains the captured output a caller's own evidence limit asks for", { timeout: 20_000 }, async () => {
+    // 12,000 bytes, more than the envelope's fixed 8,000-byte default and less
+    // than the requested 20,000-byte limit: the downstream surface asked for
+    // more than the fixed bound, so the envelope must not clip below what its
+    // own caller will retain, and a complete capture must read as complete.
+    const { script } = await stageScript(emittingHang(12_000));
+
+    const failure = await rejectionOf(
+      run(script, [], { cwd: tmpdir(), timeoutMs: 1_000, outputLimit: 20_000 }),
+    );
+
+    expect(failure.code).toBe("COMMAND_TIMEOUT");
+    expect(Buffer.byteLength(String(failure.details.stdout), "utf8")).toBe(12_000);
+    expect(failure.details.stdout).not.toContain("truncated");
+    expect(failure.details.stdoutTruncated).toBe(false);
+  });
+
+  it("reports the clip when the retained output still exceeds the requested limit", { timeout: 20_000 }, async () => {
+    const { script } = await stageScript(emittingHang(50_000));
+
+    const failure = await rejectionOf(
+      run(script, [], { cwd: tmpdir(), timeoutMs: 1_000, outputLimit: 20_000 }),
+    );
+
+    expect(failure.details.stdoutTruncated).toBe(true);
+    const stdout = String(failure.details.stdout);
+    expect(stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+    expect(Buffer.byteLength(stdout, "utf8")).toBeLessThanOrEqual(20_000 + 64);
+  });
+
+  it("refuses a malformed requested evidence limit instead of guessing one", () => {
+    return expect(run(process.execPath, ["-e", "process.exit(0)"], { cwd: tmpdir(), outputLimit: 0 })).rejects.toMatchObject({
+      code: "INVALID_OUTPUT_LIMIT",
+    });
+  });
+});
+
+describe("boundedOutput", () => {
+  it("reports whether the bound clipped the value", () => {
+    expect(boundedOutput("hello", 8)).toEqual({ text: "hello", clipped: false });
+    const clipped = boundedOutput("hello world", 5);
+    expect(clipped.clipped).toBe(true);
+    expect(clipped.text).toBe(bounded("hello world", 5));
+  });
+
+  it("agrees with bounded() on the text for every value it bounds", () => {
+    const value = "aé中😀z".repeat(50);
+    for (const limit of [1, 7, 8, 120, 8_000]) {
+      expect(boundedOutput(value, limit).text).toBe(bounded(value, limit));
     }
   });
 });

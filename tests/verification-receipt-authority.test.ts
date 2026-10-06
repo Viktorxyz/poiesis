@@ -102,6 +102,145 @@ async function acceptedCandidate(repository: TestRepository, specId: string): Pr
   };
 }
 
+/**
+ * Spec #168 / ticket #183 — a receipt entry must not claim complete output it
+ * does not have.
+ *
+ * The per-command record for a command that never settled is built from the
+ * runner's error `details`, because there is no `RunResult` for it: those
+ * streams were bounded on the way into the envelope, and this record bounds
+ * them again to the requested `outputLimit`. Before this ticket only the
+ * runner's own flag survived, so a timed-out command that emitted 50 KiB was
+ * recorded as `stdoutTruncated: false` / `outputTruncated: false` beside an
+ * 8,000-byte `stdout` — and a receipt is exactly the durable evidence a later
+ * Publish reads. The same defect ran the other way: a small requested
+ * `outputLimit` clipped this record's own text while the envelope's flag stayed
+ * false, so neither bound was reported.
+ */
+describeManagedExecution("a failed command's receipt evidence reports real truncation (Spec #168 / ticket #183)", () => {
+  /** Emit `bytes` on stdout, then hang until Verify's own bound stops it. */
+  const emitThenHang = (bytes: number): string => `head -c ${bytes} /dev/zero | tr '\\0' x; sleep 30`;
+
+  /** The receipt a failed Verify minted, read back from the shared store. */
+  async function receiptOfFailure(
+    reference: { receiptId: string },
+    commonDir: string,
+  ): Promise<VerificationReceiptV1> {
+    return await readVerificationReceipt(commonDir, reference.receiptId);
+  }
+
+  it("records the runner envelope's clip for a timed-out command", { timeout: 60_000 }, async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-183-envelope-clip");
+    const authority = await resolveLifecycleAuthority(candidate.path, candidate.ownershipId);
+
+    const failure = await verify({
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      candidateSha: candidate.sha,
+      commands: [emitThenHang(50_000)],
+      timeoutMs: 2_000,
+    }).then(
+      () => {
+        throw new Error("expected the verification to fail");
+      },
+      (error: unknown) => error as { code: string; exitCode: number; details: Record<string, unknown> },
+    );
+
+    // The typed outcome is untouched by the bounding change.
+    expect(failure.code).toBe("COMMAND_TIMEOUT");
+    expect(failure.exitCode).toBe(124);
+
+    const receipt = await receiptOfFailure(
+      failure.details.verification as { receiptId: string },
+      authority.commonDir,
+    );
+    const [entry] = receipt.commands;
+    expect(entry).toMatchObject({
+      command: emitThenHang(50_000),
+      status: "failed",
+      classification: "timeout",
+      timedOut: true,
+      stdoutTruncated: true,
+      stderrTruncated: false,
+      outputTruncated: true,
+    });
+    expect(entry?.stdout).toMatch(/\.\.\. truncated \d+ bytes$/);
+    expect(Buffer.byteLength(String(entry?.stdout ?? ""), "utf8")).toBeLessThanOrEqual(8_000 + 64);
+  });
+
+  it("records the receipt record's own bound as truncation for a rejected command", { timeout: 60_000 }, async () => {
+    // 7,000 bytes: more than this receipt's 500-byte limit and less than the
+    // 8,000 bytes the runner's envelope retains, so the envelope clipped
+    // nothing and the clip happened in this record alone.
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-183-own-bound");
+    const authority = await resolveLifecycleAuthority(candidate.path, candidate.ownershipId);
+
+    const failure = await verify({
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      candidateSha: candidate.sha,
+      commands: [emitThenHang(7_000)],
+      outputLimit: 500,
+      timeoutMs: 2_000,
+    }).then(
+      () => {
+        throw new Error("expected the verification to fail");
+      },
+      (error: unknown) => error as { code: string; details: Record<string, unknown> },
+    );
+
+    const receipt = await receiptOfFailure(
+      failure.details.verification as { receiptId: string },
+      authority.commonDir,
+    );
+    const [entry] = receipt.commands;
+    expect(entry).toMatchObject({
+      status: "failed",
+      classification: "timeout",
+      stdoutTruncated: true,
+      outputTruncated: true,
+    });
+    expect(Buffer.byteLength(String(entry?.stdout ?? ""), "utf8")).toBeLessThanOrEqual(500 + 64);
+  });
+
+  it("keeps the whole captured output when the requested limit exceeds the envelope bound", { timeout: 60_000 }, async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-183-requested-limit");
+    const authority = await resolveLifecycleAuthority(candidate.path, candidate.ownershipId);
+
+    const failure = await verify({
+      cwd: candidate.path,
+      ownershipId: candidate.ownershipId,
+      candidateSha: candidate.sha,
+      commands: [emitThenHang(12_000)],
+      outputLimit: 20_000,
+      timeoutMs: 2_000,
+    }).then(
+      () => {
+        throw new Error("expected the verification to fail");
+      },
+      (error: unknown) => error as { code: string; details: Record<string, unknown> },
+    );
+
+    const receipt = await receiptOfFailure(
+      failure.details.verification as { receiptId: string },
+      authority.commonDir,
+    );
+    const [entry] = receipt.commands;
+    expect(entry).toMatchObject({
+      status: "failed",
+      classification: "timeout",
+      // Nothing was lost, so the receipt says so instead of implying a clip.
+      stdoutTruncated: false,
+      stderrTruncated: false,
+      outputTruncated: false,
+    });
+    expect(Buffer.byteLength(String(entry?.stdout ?? ""), "utf8")).toBe(12_000);
+  });
+});
+
 describeManagedExecution("proof-scope Verify issues a runtime-owned receipt (Spec #168 / ticket #171)", () => {
   it("persists the receipt under the shared Git common directory with restrictive permissions", async () => {
     const repository = await installedRepository();
