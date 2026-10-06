@@ -364,6 +364,10 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       [`pnpm dlx poiesis-cli@${currentVersion} repository query *`]: "allow",
       [`pnpm dlx poiesis-cli@${currentVersion} repository path *`]: "allow",
       [`pnpm dlx poiesis-cli@${currentVersion} repository explain *`]: "allow",
+      // Spec #168 / ticket #173 — the migration advances the Worker to
+      // the single narrow non-authoritative `check` allow, also AFTER
+      // the broad exact-version deny.
+      [`pnpm dlx poiesis-cli@${currentVersion} check *`]: "allow",
     });
     expect(workerAfter.installed as { permission: { bash: Record<string, string> } }).not.toMatchObject({
       permission: { bash: expect.objectContaining({ [`pnpm dlx poiesis-cli@${currentVersion} *`]: "allow" }) },

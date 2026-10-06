@@ -562,7 +562,8 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       expect(primaryBash["pnpm dlx poiesis-cli@1.4.0 *"]).toBe("allow");
       expect(primaryBash["pnpm dlx poiesis-cli@1.1.3 *"]).toBeUndefined();
 
-      // Worker carries the v1.2 Repository Intelligence additive allows.
+      // Worker carries the v1.2 Repository Intelligence additive allows
+      // plus the single narrow non-authoritative `check` allow.
       const workerAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis-worker")!;
       const workerBash = (workerAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
       expect(workerBash).toEqual({
@@ -577,10 +578,12 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
         "pnpm dlx poiesis-cli@1.4.0 repository query *": "allow",
         "pnpm dlx poiesis-cli@1.4.0 repository path *": "allow",
         "pnpm dlx poiesis-cli@1.4.0 repository explain *": "allow",
+        "pnpm dlx poiesis-cli@1.4.0 check *": "allow",
       });
 
       // Specialist bash restored: Planner / Ticket Reviewer / Final Reviewer
-      // all carry the v1.2 narrow Repository Intelligence bash surface.
+      // all carry the v1.2 narrow Repository Intelligence bash surface and
+      // NEVER the Worker's `check` allow — Review ownership is preserved.
       for (const agentName of ["poiesis-planner", "poiesis-reviewer", "poiesis-final-reviewer"] as const) {
         const agentAfter = result.manifest.configPatches.find((p) => p.path[1] === agentName)!;
         const agentBash = (agentAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;

@@ -157,10 +157,22 @@ Material product or architecture expansion discovered during Realize returns to 
 
 Realize owns no new machinery: no new mode, no new stage, no new counter, no new budget, no new cache, no new telemetry, no new durable state, no new database, no new agent. Discipline lives on the existing Realize path.
 
+### Focused ticket checks
+
+Realize proves each ticket with its relevant focused checks, not with the configured full verification plan. That plan is reserved for one Proof run against the exact candidate, inside Prove.
+
+Worker runs focused checks through the one non-authoritative route it owns: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
+
+The same command, state fingerprint, and failure classification does not justify another attempt. A repeat is honest only with a relevant mutation since the last attempt, a concrete new hypothesis, or escalation to Poiesis for reassessment; the reason is stated, never assumed.
+
+A `likely-load-induced-timeout` or `timeout-unknown` classification is not a verdict about the change and not a pass. It calls for bounded reassessment: one justified re-check under a different explicit bound, or escalation to Poiesis. Never repeat it blindly, and never report success the evidence does not support.
+
+Worker owns focused checks for the ticket it implements. Reviewer owns independent review of the same work. Focused checks never substitute for Review, and Review never substitutes for focused checks. No second check or review engine is added: this is discipline over the surfaces already present.
+
 For each ticket:
 
 1. Dispatch a fresh Worker.
-2. Worker implements and runs relevant local checks.
+2. Worker implements and runs relevant focused checks.
 3. Dispatch a fresh independent ticket Reviewer.
 4. If Review identifies a concrete localized issue, the same Worker may make one targeted correction.
 5. Run relevant checks again.
@@ -204,6 +216,8 @@ Run whole-change Proof in this order:
 1. deterministic Verify;
 2. fresh reasoning Spec Review;
 3. fresh reasoning Standards Review.
+
+The configured full verification plan runs once, here, against the exact candidate. It is not an intermediate Realize check: each ticket is proved by its own relevant focused checks, whose evidence is local and non-authoritative, and whole-change authoritative verification belongs to this step alone. Running the configured plan again for the same unchanged candidate is a repeat and needs new evidence, a material state change, or a higher escalation level, exactly like any other repeated action.
 
 The exact candidate identity that flows from Prove into Publish and Preview is one canonical proof object. It must carry:
 
@@ -387,7 +401,7 @@ Then:
 - close implementation/tracker work;
 - close the top-level Spec;
 - safely clean the Poiesis-owned workspace/branch;
-- clean internal child sessions best-effort;
+- clean every internal child session whose identity is known at this deterministic termination;
 - preserve Git, tracker, PR/MR, and release history.
 
 ## Operating rules
@@ -399,7 +413,7 @@ Then:
 - Use deterministic tools for exact repeated mechanics.
 - Do not create a second workflow/state engine.
 - Durable project truth must be recoverable from ordinary project infrastructure.
-- Session cleanup is hygiene, not a correctness dependency.
+- Session cleanup is hygiene, not a correctness dependency. When a child session identity is known at a deterministic handoff or termination, perform the bounded known-session cleanup at that boundary instead of deferring it; it still never blocks, fails, or gates the lifecycle.
 - Do not repeat work without new evidence or a meaningful change in approach.
 - Prefer focused Repository Intelligence queries over broad mechanical rediscovery when the index can answer the question economically.
 - Repository Intelligence is a rebuildable, non-canonical local state, not durable project truth; an unavailable or stale cache falls back to ordinary source exploration without blocking the Method. The fallback is not a new lifecycle phase and does not create new durable state.

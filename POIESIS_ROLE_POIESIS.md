@@ -15,6 +15,9 @@ You own:
 - selecting and dispatching Planner, Worker, Research, Reviewer, and Explore support;
 - deciding correction vs reassessment vs Replan;
 - Realize ownership: Poiesis owns acceptance, localized correction, reassessment, diagnosis, Replan, and Authorize. Before dispatching another implementation Worker, identify the concrete unsatisfied authorized obligation the next ticket must close. Material product or architecture expansion discovered during Realize returns to Authorize before implementation;
+- convergent Realize checks: reserve the configured full verification plan for the single whole-change Proof in Prove, require each ticket's relevant focused checks during Realize, and judge any repeat by the deterministic action fingerprint. The same command, state fingerprint, and failure classification never justifies another attempt by itself; a repeat needs a relevant mutation, a concrete new hypothesis, or escalation;
+- bounded reassessment of a `likely-load-induced-timeout` or `timeout-unknown` focused-check classification instead of a blind repeat or a success claim the evidence does not support;
+- cleaning up a known child session at a deterministic handoff or termination whenever its identity is known, through `poiesis session cleanup --id <session-id>`. It never blocks or gates the lifecycle, but a known identity at a deterministic boundary is cleaned up there rather than deferred;
 - creating/maintaining Spec and tickets through the supported tracker method;
 - coordinating exact-candidate Proof and constructing the canonical identity-bound proof required by Publish and Preview: `candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }` — the runtime-owned receipt reference `poiesis verify` returns, which Publish resolves against the live installation, plan, and candidate before it pushes anything. After Publish succeeds, the runtime produces canonical candidate-bound Publish evidence that Preview MUST receive unchanged as `--publish`; both Publish and Preview MUST receive the same exact dynamic `--candidate-tree`. The canonical Publish evidence carries every required field — `candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef = "refs/heads/<branch>"`, `publishedHeadSha = candidateSha`, `provider`, `action` (`"created" | "updated" | "pushed"`), `changeRequest.id` (string-or-null), `changeRequest.url` (string-or-null), `verification` (the resolved receipt identity). Missing or mismatched proof, tree, or forwarded Publish evidence fail closed without a Preview claim;
 - presenting Preview for Author validation; Preview only after Publish succeeds. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis preview` operation succeeds and returns a concrete Preview identity. A rejected Publish or Preview is fail-closed;
@@ -115,6 +118,10 @@ Deterministic Poiesis operations (`init`, `doctor`, `update`,
 `uninstall`, `capability`, `workspace`, `checkpoint`, `verify`,
 `publish`, `preview`, `promote`, `integrate`, `tracker`) are the only
 authority the runtime recognizes for mutations to the owned surface.
+`check` is deliberately not one of them: it mutates nothing, produces no
+receipt, and carries no authority. It is bounded local feedback for the
+Worker during Realize, and the Worker is granted exactly that one
+subcommand through the exact-version route — never a lifecycle route.
 Invoking one of those operations through the exact generated
 `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` route — the canonical
 exact-version route the installed lifecycle projects into the primary

@@ -308,6 +308,43 @@ function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<stri
   };
 }
 
+/**
+ * Spec #168 / ticket #173 — the narrow focused-check allow for the Worker.
+ *
+ * `check` is the ONE Poiesis subcommand a Worker needs to act on real
+ * focused-check evidence instead of running the configured full verification
+ * plan (reserved for the single whole-change Proof) or guessing from raw
+ * shell output. It is the narrowest useful grant because the subcommand
+ * itself carries no lifecycle authority by construction:
+ *
+ *   - its result is typed so `authoritative` is `false` and `verification` /
+ *     `proof` are literally `null`, so no downstream step can consume it;
+ *   - it writes nothing anywhere — no receipt, no manifest, no durable state;
+ *   - it resolves the shared lifecycle authority and then REQUIRES a proven
+ *     ownership marker, refusing a primary checkout or a foreign linked
+ *     worktree with `WORKSPACE_OWNERSHIP_UNKNOWN`;
+ *   - it never retries: one command at most once per invocation.
+ *
+ * The pattern stops at the subcommand (`check *`) rather than pinning an
+ * argument shape (`check --command *`). OpenCode's resolver matches the
+ * literal prefix, so an argument-shaped pattern would deny ordinary flag
+ * orders such as `check --progress --command ...` — the grant would be
+ * narrower than the usage it exists to permit, and the deny would win instead.
+ * Flag ORDER is the caller's choice; the subcommand is the authority boundary.
+ *
+ * It grants NO general lifecycle authority: not `verify`, `checkpoint`,
+ * `workspace`, `publish`, `preview`, `promote`, `integrate`, `tracker`,
+ * `capability`, `session`, `model`, `update`, nor the broad
+ * `pnpm dlx poiesis-cli@<version> *` route, which remains the primary's alone.
+ * Reviewer ownership is untouched: the Planner, Ticket Reviewer, and Final
+ * Reviewer keep the read-only Repository Intelligence surface, and Research
+ * keeps no bash surface at all.
+ */
+function workerFocusedCheckAllows(poiesisVersion: string): Record<string, string> {
+  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  return { [`${exact} check *`]: "allow" };
+}
+
 function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {
   const reasoning = config.models.reasoning;
   const execution = config.models.execution;
@@ -390,18 +427,13 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           // `pnpm dlx`. Worker retains no exact-version allow for
           // arbitrary Poiesis lifecycle; only the primary does.
           //
-          // Spec #168 / ticket #172 adds `poiesis check` (non-authoritative
-          // focused checks) to the runtime. It is DELIBERATELY NOT granted to
-          // the Worker here: giving a Worker agent a Poiesis CLI route changes
-          // this permission projection — and therefore the manifest, its digest,
-          // and the predecessor-compatibility authority — which is a
-          // consequential security-surface decision owned by dependent ticket
-          // #173 ("Enforce convergent Realize checks without repeated full
-          // Proof"), together with the Method/role guidance that tells a
-          // Worker to run focused checks during Realize. #172 therefore leaves
-          // this projection exactly as #123 left it.
-          // `tests/focused-check-worker-permission.test.ts` is the executable
-          // record of that deferral and fails if this surface is widened.
+          // Spec #168 / ticket #172 added `poiesis check` (non-authoritative
+          // focused checks) to the runtime and deliberately left this
+          // projection untouched, deferring the security-surface decision to
+          // ticket #173. Ticket #173 owns that decision and grants exactly
+          // that one subcommand through `workerFocusedCheckAllows` below:
+          // no broad route, no other subcommand, and the deny ordering above
+          // preserved so the exact-version deny still precedes every allow.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
           // Spec #120 / ticket #123: append the four Repository
@@ -411,6 +443,14 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           // operations and leaves every other Poiesis lifecycle
           // invocation denied.
           ...workerRepositoryIntelligenceAllows(poiesisVersion),
+          // Spec #168 / ticket #173: and then the one narrow focused-check
+          // allow, also AFTER the `pnpm dlx poiesis-cli@*` deny, so the
+          // Worker reaches real focused-check evidence without gaining any
+          // lifecycle authority. The Worker keeps broad project bash, so this
+          // is not a new capability for it; the bounded difference is that the
+          // evidence becomes a deterministic fingerprint rather than
+          // unstructured terminal text.
+          ...workerFocusedCheckAllows(poiesisVersion),
         },
       },
     },

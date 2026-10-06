@@ -40,18 +40,22 @@
  *     progress sink is invoked in-process and its events are discarded when
  *     the call returns.
  *
- * Agent reachability (a deliberate boundary, not an omission): `poiesis check`
- * is reachable by the PRIMARY agent through its exact-version
- * `pnpm dlx poiesis-cli@<version> *` route, and by any caller of the library
- * seam exported from `src/index.ts`. It is deliberately NOT reachable by the
- * ticket Worker, whose OpenCode bash projection denies every Poiesis
- * lifecycle launcher (Spec #104 / #113) and re-allows only the four narrow
- * Repository Intelligence subcommands (Spec #120 / #123). Granting a Worker
- * agent that route changes the manifest's permission projection and its
- * digest, which is owned by dependent ticket #173 along with the Method/role
- * guidance that tells a Worker to use focused checks. #172 leaves the
- * projection untouched; `tests/focused-check-worker-permission.test.ts` is the
- * executable record of that deferral.
+ * Agent reachability (resolved by ticket #173): `poiesis check` is reachable
+ * by the PRIMARY agent through its exact-version `pnpm dlx poiesis-cli@<version>
+ * *` route, by the ticket Worker through exactly one narrower exact-version
+ * route — `pnpm dlx poiesis-cli@<version> check *` — and by any caller of the
+ * library seam exported from `src/index.ts`. The Worker's projection still
+ * denies every Poiesis lifecycle launcher (Spec #104 / #113) and still re-allows
+ * only the four narrow Repository Intelligence subcommands (Spec #120 / #123);
+ * the single added allow is the non-authoritative `check` subcommand, appended
+ * AFTER the `pnpm dlx poiesis-cli@*` deny so last-match-wins still refuses
+ * everything else. That grant is safe precisely because of the two unequal
+ * scopes above: a `focused` result cannot carry authority, writes nothing, and
+ * is refused for any workspace Poiesis cannot prove it owns. The matching
+ * Method/role guidance that tells a Worker to use focused checks instead of
+ * the configured full verification plan also landed in #173.
+ * `tests/focused-check-worker-permission.test.ts` is the executable record of
+ * that boundary.
  */
 import { availableParallelism, freemem, loadavg, totalmem } from "node:os";
 import { asPoiesisError, invariant, type PoiesisError } from "./errors.js";

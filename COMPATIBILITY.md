@@ -75,7 +75,7 @@ Session cleanup targets the supported HTTP endpoints at the OpenCode server (`ht
 - `GET /session/<id>/children` — child enumeration
 - `DELETE /session/<id>` — deletion
 
-Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness. Session-server integration is exercised via black-box acceptance, not by unit tests in this bundle.
+Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness. It is required at a deterministic handoff or termination whenever the child session identity is known, and still never gates the lifecycle. Session-server integration is exercised via black-box acceptance, not by unit tests in this bundle.
 
 ## Skills
 
