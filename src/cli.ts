@@ -25,6 +25,11 @@ import {
   type SupersedeInput,
 } from "./adapters.js";
 import { cleanupOpenCodeSession } from "./session.js";
+import {
+  createStderrCheckProgress,
+  executeCheck,
+  type CheckRetryReason,
+} from "./focused-check.js";
 import { PoiesisError } from "./errors.js";
 import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, PublishEvidence, StagingEvidence } from "./evidence.js";
 import type { ProofPayload, StagingPayload } from "./adapters.js";
@@ -50,6 +55,8 @@ Usage:
   poiesis workspace cleanup [--ownership-id <id>] [--expected-head <sha>] [--delivered <sha>]
   poiesis checkpoint --path <path>... --message <text> --reviewer <id> --evidence <text>
   poiesis verify --sha <sha>   # Runs the installation's live verification plan against the exact clean candidate and returns a runtime-owned verification receipt as \`verification\` (receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest). Forward it in the proof; Poiesis never accepts an asserted \`verified: true\` on its own.
+  poiesis check --command <command>... [--timeout <ms>] [--output-limit <bytes>] [--ownership-id <id>] [--progress] [--retry-reason <token>]
+                                             # Spec #168 / ticket #172 — NON-AUTHORITATIVE focused checks for ticket work. Runs EXPLICIT commands in a Poiesis-owned (possibly dirty) candidate workspace and returns bounded per-command evidence (command, workspace state fingerprint, exit/signal, duration, timeout state, bounded output, truncation), a deterministic action fingerprint, and a deterministic failure classification (command-failed | timeout | timeout-unknown | likely-load-induced-timeout | infrastructure | dirty-candidate). It never creates a verification receipt or any other proof and never retries; whole-change authority stays with \`poiesis verify\`. A failed check exits non-zero with the full result under \`details.check\`.
   poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>   # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }, verification { ...Verify's receipt reference }) for the same clean candidate. Publish resolves that receipt from runtime storage and revalidates it against the live installation, live plan, and live candidate before pushing anything.
   poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest, verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }) that drove the successful Publish; Preview validates the forwarded receipt reference and the remote change-branch head. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
@@ -99,6 +106,8 @@ async function main(argv: string[]): Promise<void> {
       return commandCheckpoint(rest);
     case "verify":
       return commandVerify(rest);
+    case "check":
+      return commandCheck(rest);
     case "publish":
       return commandPublish(rest);
     case "preview":
@@ -581,6 +590,79 @@ export async function commandVerify(args: string[]): Promise<void> {
       commands,
     }),
   );
+}
+
+/**
+ * Spec #168 / ticket #172 — `poiesis check`.
+ *
+ * The focused-scope entry point: EXPLICIT commands, a Poiesis-OWNED (and
+ * possibly dirty) candidate workspace, bounded per-command evidence, a
+ * deterministic action fingerprint, and a deterministic failure
+ * classification. It is deliberately NOT a second verification surface — it
+ * cannot produce a receipt or any other proof, and whole-change authority
+ * stays exclusively with `poiesis verify`.
+ *
+ * Lifecycle authority is explicit rather than inherited: the command runs in
+ * `authority.candidateRoot` while refusing any workspace Poiesis does not
+ * own, and the classification/evidence envelope is emitted by the one
+ * executor rather than reassembled here.
+ *
+ * A failed focused check is a FAILURE, not a result with a sad field: it
+ * raises `FOCUSED_CHECK_FAILED` carrying the complete bounded result under
+ * `details.check`, so the structured failure envelope the CLI already
+ * promises still reaches the caller with the evidence attached.
+ *
+ * Exported as a library seam (same pattern as `commandVerify`); it is
+ * intentionally NOT re-exported by `src/index.ts`.
+ */
+export async function commandCheck(args: string[]): Promise<void> {
+  const values = options(args, {
+    command: { type: "string", multiple: true },
+    timeout: { type: "string" },
+    "output-limit": { type: "string" },
+    "retry-reason": { type: "string" },
+    progress: { type: "boolean" },
+    "ownership-id": { type: "string" },
+    cwd: { type: "string" },
+  });
+  const authority = await lifecycleAuthority(cwdOf(values));
+  const progress = boolean(values, "progress") ? createStderrCheckProgress() : undefined;
+  // The executor validates the token against its closed vocabulary and
+  // refuses an undeclared one with `INVALID_CHECK_RETRY_REASON`, so the CLI
+  // passes the caller's raw string through rather than second-guessing it.
+  const retryReason = many(values, "retry-reason")?.[0];
+  const result = await executeCheck({
+    scope: "focused",
+    cwd: authority.candidateRoot,
+    commands: requiredMany(values, "command"),
+    ...optional(values, "ownership-id", "ownershipId"),
+    ...(values.timeout === undefined ? {} : { timeoutMs: boundedInteger(values, "timeout") }),
+    ...(values["output-limit"] === undefined ? {} : { outputLimit: boundedInteger(values, "output-limit") }),
+    ...(progress === undefined ? {} : { progress }),
+    ...(retryReason === undefined ? {} : { retryReason: retryReason as CheckRetryReason }),
+  });
+  if (result.outcome !== "passed") {
+    throw new PoiesisError("FOCUSED_CHECK_FAILED", "Focused checks did not pass", {
+      check: result,
+      migration:
+        "Focused checks carry no proof. Fix the failure, or escalate to whole-change `poiesis verify`; do not repeat an unchanged command and state fingerprint.",
+    });
+  }
+  writeSuccess("check", result);
+}
+
+/**
+ * Parse a positive-integer flag. `parseArgs` keeps everything a string so
+ * the failure is a typed Poiesis refusal rather than a silent `NaN` that
+ * would later surface as a confusing bound violation.
+ */
+function boundedInteger(values: Values, key: string): number {
+  const raw = values[key];
+  const parsed = Number(raw);
+  if (typeof raw !== "string" || raw.trim().length === 0 || !Number.isSafeInteger(parsed) || parsed <= 0) {
+    throw new PoiesisError("INVALID_ARGUMENT", `--${key} must be a positive integer`, { key, value: raw ?? null });
+  }
+  return parsed;
 }
 
 async function commandPublish(args: string[]): Promise<void> {

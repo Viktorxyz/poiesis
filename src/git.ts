@@ -294,6 +294,81 @@ interface OwnedCandidateAuthority extends LifecycleAuthority {
   marker: OwnershipMarker;
 }
 
+/**
+ * Spec #168 / ticket #172 — the observable, read-only state of a workspace
+ * a check ran against. Every field is evidence: `null` means "could not be
+ * proven", never "absent".
+ */
+export interface WorktreeStateFingerprint {
+  /** Canonical workspace the reading was taken from. */
+  root: string;
+  head: string | null;
+  tree: string | null;
+  dirty: boolean;
+  changedFiles: string[];
+  changedFilesTruncated: boolean;
+  /**
+   * Bounded per-path content digests for the changed paths.
+   *
+   * Without these, editing the CONTENTS of an already-dirty file leaves
+   * `head`, `tree`, `dirty`, and `changedFiles` all identical, so a changed
+   * state would be indistinguishable from an unchanged one.
+   */
+  pathDigests: WorktreePathDigest[];
+  pathDigestsTruncated: boolean;
+}
+
+/**
+ * One changed path's content digest.
+ *
+ * `blob` is Git's own object id for the path's CURRENT worktree contents —
+ * the same digest family Git already stores in the index, trees, and the
+ * #171 verification receipt's `candidateTree`. It is a content digest, not
+ * content: it reveals no file bytes and no secret, and it is stable for
+ * identical bytes and different for different bytes.
+ *
+ * `absent` marks a changed path that no longer exists on disk (a deletion).
+ * It is deliberately NOT a valid object id, so a deleted path can never
+ * collide with a present one and two distinct states cannot collapse into one
+ * fingerprint input.
+ */
+export interface WorktreePathDigest {
+  path: string;
+  blob: string;
+}
+
+/**
+ * How many changed paths get a content digest.
+ *
+ * Bounded on purpose: each digest costs one Git invocation, and a state
+ * fingerprint is evidence, not an exhaustive manifest. Beyond this bound the
+ * digests are partial and `pathDigestsTruncated` says so, so a caller can
+ * tell "unchanged" from "not fully observed".
+ */
+const MAX_PATH_DIGESTS = 16;
+
+/** Digest recorded for a changed path that does not exist on disk. */
+const ABSENT_PATH_DIGEST = "absent";
+
+/**
+ * Read one changed path's content digest.
+ *
+ * `--no-filters` keeps the digest a pure function of the bytes on disk, so a
+ * `.gitattributes` clean/smudge filter can never make the fingerprint depend
+ * on the local Git configuration. The path is passed after `--`, so a
+ * repository-supplied path can never be read as an option. A path Git
+ * refuses (deleted, unreadable) records the explicit `absent` sentinel rather
+ * than an empty string, which would collide with other states.
+ */
+async function readPathContentDigest(root: string, path: string): Promise<string> {
+  const result = await run("git", ["hash-object", "--no-filters", "--", path], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const blob = result.exitCode === 0 ? result.stdout.trim() : "";
+  return SHA_PATTERN.test(blob) ? blob : ABSENT_PATH_DIGEST;
+}
+
 export async function inspect(options: InspectOptions): Promise<InspectResult> {
   const root = await canonicalGitRoot(options.cwd);
   const commonDir = await gitCommonDir(root);
@@ -1714,6 +1789,54 @@ async function assertExactClean(cwd: string, expectedSha: string): Promise<{ sha
     status: status.map(statusEntryForEvidence),
   });
   return { sha };
+}
+
+/**
+ * Spec #168 / ticket #172 — the READ-ONLY workspace state fingerprint.
+ *
+ * A focused check records the state it ran against so an unchanged failure
+ * is recognizable as unchanged. That reading deliberately reuses this
+ * module's own `gitStatus` / `parseStatusPaths` porcelain semantics and its
+ * own `normalizeOutputLimit` bound, rather than opening a second, subtly
+ * different definition of "clean": the focused fingerprint and the exact
+ * clean-candidate proof check must never disagree about the same tree.
+ *
+ * Read-only and unprivileged by construction: it resolves nothing, mutates
+ * nothing, and asserts nothing. An unreadable HEAD or tree is reported as
+ * `null` (state that cannot be proven) instead of throwing, because a
+ * fingerprint is evidence, not a gate.
+ */
+export async function readWorktreeState(cwd: string, outputLimit?: number): Promise<WorktreeStateFingerprint> {
+  const limit = normalizeOutputLimit(outputLimit);
+  const root = await canonicalGitRoot(cwd);
+  const headResult = await run("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const head = headResult.exitCode === 0 && SHA_PATTERN.test(headResult.stdout) ? headResult.stdout : null;
+  const entries = await gitStatus(root);
+  const paths = parseStatusPaths(entries);
+  const tree = head === null ? null : await resolveTree(root, head).catch(() => null);
+
+  // Sorted and de-duplicated so the digest list — and therefore the state
+  // fingerprint derived from it — is a deterministic function of the tree,
+  // never of Git's status ordering or of a rename's dual paths.
+  const digestPaths = [...new Set(paths)].sort().slice(0, MAX_PATH_DIGESTS);
+  const pathDigests: WorktreePathDigest[] = [];
+  for (const path of digestPaths) {
+    pathDigests.push({ path, blob: await readPathContentDigest(root, path) });
+  }
+
+  return {
+    root,
+    head,
+    tree,
+    dirty: entries.length > 0,
+    changedFiles: paths.slice(0, limit),
+    changedFilesTruncated: paths.length > limit,
+    pathDigests,
+    pathDigestsTruncated: paths.length > digestPaths.length,
+  };
 }
 
 async function currentBranch(cwd: string): Promise<string | null> {

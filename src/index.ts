@@ -2,6 +2,16 @@ export * from "./adapters.js";
 export * from "./config.js";
 export * from "./errors.js";
 export * from "./evidence.js";
+// Spec #168 / ticket #172 — the ONE scope-aware check executor.
+//
+// Public because it is a peer of `verify` at the same seam: a caller that can
+// reach whole-change proof must be able to reach the non-authoritative
+// focused path with the same classification and fingerprint vocabulary, and
+// the `poiesis check` CLI is only one of its callers. The scope is encoded in
+// the return type — a `FocusedCheckResult` has `verification` and `proof`
+// typed `null`, so the compiler, not a convention, is what keeps focused
+// checks from ever authorizing delivery.
+export * from "./focused-check.js";
 export * from "./git.js";
 export * from "./hash.js";
 export * from "./inspect.js";

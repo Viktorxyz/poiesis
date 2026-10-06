@@ -389,6 +389,19 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           // invoke the same authorized primary canonical route through
           // `pnpm dlx`. Worker retains no exact-version allow for
           // arbitrary Poiesis lifecycle; only the primary does.
+          //
+          // Spec #168 / ticket #172 adds `poiesis check` (non-authoritative
+          // focused checks) to the runtime. It is DELIBERATELY NOT granted to
+          // the Worker here: giving a Worker agent a Poiesis CLI route changes
+          // this permission projection — and therefore the manifest, its digest,
+          // and the predecessor-compatibility authority — which is a
+          // consequential security-surface decision owned by dependent ticket
+          // #173 ("Enforce convergent Realize checks without repeated full
+          // Proof"), together with the Method/role guidance that tells a
+          // Worker to run focused checks during Realize. #172 therefore leaves
+          // this projection exactly as #123 left it.
+          // `tests/focused-check-worker-permission.test.ts` is the executable
+          // record of that deferral and fails if this surface is widened.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
           // Spec #120 / ticket #123: append the four Repository
