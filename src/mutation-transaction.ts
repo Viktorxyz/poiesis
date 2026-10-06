@@ -353,6 +353,111 @@ export interface WorkspaceMutationLock {
   release(): Promise<void>;
 }
 
+/** Spec #168 / ticket #174 — what the lock file says about its holder. */
+interface MutationLockHolder extends Record<string, unknown> {
+  /** The pid recorded in the lock token, or `null` when it cannot be attributed. */
+  holderPid: number | null;
+  /** `true` / `false` when the holder is attributable, `null` when it is not. */
+  holderRunning: boolean | null;
+  /** Stable machine-readable classification of the blocked state. */
+  hint: "live-mutation-lock" | "stale-mutation-lock" | "unattributable-mutation-lock";
+  /** The one recovery that is correct for this exact state. */
+  recovery: string;
+}
+
+/**
+ * `process.kill(pid, 0)` is the only portable liveness probe available here,
+ * and it is a probe, not a claim of identity: it answers "does a process with
+ * this pid exist right now", never "is it still the Poiesis session that wrote
+ * the lock". The diagnostic therefore reports liveness as evidence and never
+ * lets it decide anything on its own.
+ *
+ * `EPERM` means the process exists but is owned by another user, which still
+ * answers `true`. Every other error (notably `ESRCH`) means it is gone.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Spec #168 / ticket #174 — turn a held lock into an ACTIONABLE refusal.
+ *
+ * A lock survives its holder: when a Poiesis session dies without releasing
+ * it, the next mutation finds a file whose owner is gone. Reporting only the
+ * path leaves the operator unable to answer the two questions that matter
+ * ("is something actually running?" and "what do I do now?"), and the
+ * tempting wrong answer — deleting the lock — is precisely the bypass this
+ * path must never take, because a LIVE concurrent mutation would be stolen.
+ *
+ * So the refusal names the holder, states whether it is still running, and
+ * gives the one recovery valid for that state:
+ *
+ *   - live holder → wait for it, then re-run. Never remove a live lock.
+ *   - stale holder → confirm no Poiesis mutation is running, then remove this
+ *     one file and re-run. Never reclaimed automatically.
+ *   - unattributable holder → the bytes are not a Poiesis lock token, so
+ *     Poiesis refuses to guess who owns them; inspect the file, then remove it
+ *     and re-run.
+ *
+ * Every branch still refuses. Nothing here writes, removes, or rewrites the
+ * lock, and the caller still gets the same `POIESIS_MUTATION_LOCKED` code it
+ * has always handled.
+ */
+async function describeMutationLockHolder(path: string): Promise<MutationLockHolder> {
+  let token: string;
+  try {
+    token = await readFile(path, "utf8");
+  } catch {
+    // The holder released between our create attempt and this read. The
+    // mutation is still refused — a lock this race-y is not one Poiesis may
+    // assume it owns — but the operator is told the state is unattributable.
+    return {
+      path,
+      holderPid: null,
+      holderRunning: null,
+      hint: "unattributable-mutation-lock",
+      recovery: `Another Poiesis mutation may be finishing for this workspace. Re-run the same command; if it keeps failing, confirm no Poiesis mutation is running, then remove ${path} and re-run.`,
+    };
+  }
+  // The token is exactly `<pid>:<uuid>\n`. A positive-integer pid is required,
+  // not cosmetic: `process.kill(0, 0)` addresses a whole process group, so a
+  // `0` pid would probe something other than a single holder. Anything that is
+  // not a well-formed token — including a pid Poiesis would refuse to probe —
+  // is unattributable, which is the fail-closed answer.
+  const match = /^([1-9][0-9]*):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?$/.exec(token);
+  if (match === null) {
+    return {
+      path,
+      holderPid: null,
+      holderRunning: null,
+      hint: "unattributable-mutation-lock",
+      recovery: `${path} is held by bytes that are not a Poiesis mutation lock, so Poiesis cannot tell who owns them. Inspect the file, then remove ${path} and re-run the same command.`,
+    };
+  }
+  const holderPid = Number.parseInt(match[1]!, 10);
+  if (isProcessAlive(holderPid)) {
+    return {
+      path,
+      holderPid,
+      holderRunning: true,
+      hint: "live-mutation-lock",
+      recovery: `A Poiesis mutation is running for this workspace (pid ${holderPid}). Wait for it to finish, then re-run the same command. Do NOT remove ${path}: the running mutation still owns it.`,
+    };
+  }
+  return {
+    path,
+    holderPid,
+    holderRunning: false,
+    hint: "stale-mutation-lock",
+    recovery: `${path} is a stale lock: the Poiesis mutation that wrote it (pid ${holderPid}) is no longer running. Poiesis will not reclaim it automatically. Confirm no Poiesis mutation is running, then remove ${path} and re-run the same command.`,
+  };
+}
+
 /** Acquire one fail-fast, cooperating mutation lock for the canonical workspace receipt key. */
 export async function acquireWorkspaceMutationLock(root: string): Promise<WorkspaceMutationLock> {
   const receiptPath = await ownershipReceiptLocation(root);
@@ -363,7 +468,8 @@ export async function acquireWorkspaceMutationLock(root: string): Promise<Worksp
     await atomicCreate(path, token);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new PoiesisError("POIESIS_MUTATION_LOCKED", "Another Poiesis mutation is active for this workspace", { path });
+      const holder = await describeMutationLockHolder(path);
+      throw new PoiesisError("POIESIS_MUTATION_LOCKED", "Another Poiesis mutation is active for this workspace", holder);
     }
     throw error;
   }

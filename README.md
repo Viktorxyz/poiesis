@@ -92,6 +92,12 @@ pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update
 
 Same-version reconciliation and intentional human upgrade are distinct: the former stays pinned to `manifest.poiesisVersion`, the latter uses the fresh-latest `@latest` form. The OpenCode config projection only ever admits the exact-version route; the fresh-latest form is reserved for the human/operator shell.
 
+A release may add one narrow permission without bumping the runtime version, which leaves an installed project recording the current `poiesisVersion` with an earlier projection. The receipt-gated `update` migrates that exact projection forward — see [COMPATIBILITY.md](./COMPATIBILITY.md#same-release-projection-migration-pre-focused-check). Any drift from both the current and the recognized predecessor projections still fails closed with `MANIFEST_AUTHORITY_INVALID`, and the projection `update` installs never grants a broad, `@latest`, or unversioned launcher route.
+
+An OpenCode session that was already running when `update` finished keeps the permission projection it loaded at start, so a Worker in that session still has the pre-migration surface and its `check` route stays denied. Restart OpenCode (or open a new session) after `update`; Poiesis does not restart it for you and never widens a permission to cover a stale session — the correct fix is always re-running against the migrated projection.
+
+Workspace mutations are serialized by one fail-fast lock next to the ownership receipt. If a Poiesis session dies without releasing it, the next mutation fails with `POIESIS_MUTATION_LOCKED` and a diagnostic that names the holder pid, whether it is still running, and the one correct recovery. Poiesis never reclaims the lock automatically: removing a live holder's lock would let two mutations run at once.
+
 Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
 
 ```bash
@@ -282,6 +288,8 @@ Do not pass any external path such as `/tmp/...` or any location outside the pro
 An owned candidate workspace is where the work happens, never where lifecycle authority lives. `verify`, `checkpoint`, `publish`, `preview`, `promote`, `integrate`, and `workspace cleanup` resolve the manifest, the ownership receipt, and the runtime identity through the primary receipt-authenticated installation that owns the workspace, so a candidate's own generated `.poiesis/config.jsonc` — stale the moment the workspace is prepared, and possibly committed into the candidate tree — is never lifecycle authority. Verification commands still execute against the exact candidate workspace. Wrong ownership, a missing primary receipt, a foreign workspace Poiesis does not own, and a runtime identity that does not match the primary manifest all fail closed with a typed error before anything runs.
 
 `poiesis check` is the focused-check surface for ticket work. It runs EXPLICIT commands in a Poiesis-owned (possibly dirty) candidate workspace, refuses any workspace Poiesis cannot prove it owns, never retries, and returns bounded per-command evidence plus a deterministic action fingerprint over the command, the workspace state fingerprint, and a deterministic failure classification. It creates no verification receipt and no other proof: whole-change authority stays with `poiesis verify`. The ticket Worker reaches exactly this one subcommand through the exact-version route; no other Poiesis lifecycle route is granted to it.
+
+`poiesis integrate` runs post-integration verification only when the project configures `verification.postIntegrationCommands`. The configured `verification.commands` plan is never substituted for it: that plan already ran once, in the owned candidate, before Publish. With no `postIntegrationCommands`, integration runs nothing after the push and proves exact identity in Git instead — the integrated commit's tree equals the accepted candidate's tree byte-for-byte, and the published integration ref is exactly that commit.
 
 ## Use with a coding agent
 

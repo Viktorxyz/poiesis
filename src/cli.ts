@@ -721,7 +721,25 @@ async function commandPreview(args: string[]): Promise<void> {
   );
 }
 
-async function commandIntegrate(args: string[]): Promise<void> {
+/**
+ * `poiesis integrate` — exported for the same reason `commandInit`,
+ * `commandUpdate`, `commandModel`, `commandVerify`, `commandCheck`, and
+ * `commandRepository` are: so the ticket-level tests drive the real CLI
+ * argument wiring (which is where the post-integration command list is
+ * resolved from config) instead of a hand-rolled approximation of it.
+ *
+ * Spec #168 / ticket #174: `postIntegrationCommands` is OPT-IN. When the
+ * project does not configure it, integration runs nothing — the configured
+ * full `verification.commands` plan is NOT substituted as a fallback, because
+ * the whole-change proof already ran that plan once, in the owned candidate,
+ * before Publish. Re-running it per integration is the redundancy Spec #168
+ * removes. In its place integration keeps the EXACT IDENTITY validation it
+ * already performs in Git: the squash commit's tree must equal the candidate
+ * tree byte-for-byte (`INTEGRATED_TREE_MISMATCH`), the remote integration ref
+ * must be exactly the commit Poiesis created (`INTEGRATION_SHA_MISMATCH`), and
+ * the tree must still match after the push (`INTEGRATED_TREE_MISMATCH`).
+ */
+export async function commandIntegrate(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     base: { type: "string" },
@@ -735,7 +753,15 @@ async function commandIntegrate(args: string[]): Promise<void> {
   });
   const authority = await lifecycleAuthority(cwdOf(values));
   const config = await resolveConfigForRoot(authority.primaryRoot);
-  const postIntegrationCommands = config.verification.postIntegrationCommands ?? config.verification.commands;
+  // Spec #168 / ticket #174: `postIntegrationCommands` is OPT-IN and is the
+  // ONLY source. There is deliberately no `?? config.verification.commands`:
+  // the whole-change proof already ran that plan once, in the owned candidate,
+  // before Publish, and re-running it per integration is the redundancy this
+  // Spec removes. An absent value therefore means "run nothing", and the
+  // absence is still covered by the exact identity validation `integrate`
+  // performs in Git (integrated tree === candidate tree, published ref ===
+  // integrated sha, tree still matching after the push).
+  const postIntegrationCommands = config.verification.postIntegrationCommands;
   writeSuccess(
     "integrate",
     await integrate({

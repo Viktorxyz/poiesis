@@ -51,6 +51,17 @@ Action keys are the singular OpenCode `1.18.29` / `1.18.30` / `1.18.31` keys: `r
 
 The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by any certified tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
 
+### Same-release projection migration (pre-focused-check)
+
+A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the current example: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`.
+
+A project installed by an earlier image of the same release therefore records the current version with a `configPatches` set that no longer equals the current projection. The compatible migration is:
+
+- **Admitted:** the exact **pre-focused-check** projection for `poiesisVersion = "1.4.0"`, and only through the receipt-gated `poiesis update`. The predecessor differs from the current projection in exactly one field — `agent.poiesis-worker.permission.bash` omits the single focused-check allow key, derived through the same builder the current projection uses.
+- **Not admitted:** any drift from that exact set. A `1.4.0` manifest that does not match is rethrown by the strict check and never falls through to the older 1.0.x projection.
+- **Not admitted elsewhere:** `doctor`, `uninstall`, `capability install`, and `poiesis update --config` remain current-projection-only, so a mismatched install is always visible as a `doctor` failure instead of being silently tolerated.
+- **No launcher widening:** the projection the migration installs is the current one. It grants the exact-version canonical route `pnpm dlx poiesis-cli@<version> …` only — never a broad `pnpm dlx poiesis-cli@<version> *`, `@latest`, or unversioned route. An off-version runtime (`RUNTIME_VERSION_MISMATCH`) still fails closed before any mutation.
+
 ### Subagent visibility
 
 Five internal specialists are projected with `mode: "subagent"` and `hidden: true`:

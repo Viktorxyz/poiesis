@@ -363,7 +363,11 @@ Internal ticket checkpoints must not become permanent canonical history.
 After integration:
 - capture the exact integration revision;
 - verify that the integrated content matches the accepted candidate;
-- run the required deterministic post-integration verification.
+- run the deterministic post-integration verification the project configured in `verification.postIntegrationCommands`.
+
+Post-integration verification is opt-in and is NOT the whole-change Proof plan. The Proof plan already ran once, in the owned candidate, before Publish; integration never re-runs it.
+
+When the project configures no `postIntegrationCommands`, integration runs nothing after the push and instead proves exact identity in Git: the integrated commit's tree must equal the accepted candidate's tree byte-for-byte, and the published integration ref must be exactly that commit.
 
 ## 17. Production authorization
 

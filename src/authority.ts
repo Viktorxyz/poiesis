@@ -9,6 +9,7 @@ import {
   CERTIFIED_OPENCODE_VERSION,
   desiredOpenCodePatches,
   isCertifiedOpenCodeVersion,
+  workerFocusedCheckAllowKey,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
 import { templateMappings } from "./templates.js";
@@ -472,6 +473,59 @@ export function predecessorProjectionV113V114(
 }
 
 /**
+ * Spec #168 / ticket #174 — the exact pre-focused-check predecessor
+ * projection for the OpenCode adapter.
+ *
+ * Ticket #173 added ONE narrow allow — the Worker's
+ * `pnpm dlx poiesis-cli@<version> check *` focused-check route — without
+ * bumping the runtime version. A project installed by an EARLIER image of the
+ * SAME release therefore carries a `configPatches` set that no longer equals
+ * `desiredOpenCodePatches`, while its `manifest.poiesisVersion` still equals
+ * the current release. Without this projection that manifest is admitted by
+ * NEITHER the strict gate NOR any accepted predecessor, so the only migration
+ * boundary — the receipt-authenticated `update` — fails closed with
+ * `MANIFEST_AUTHORITY_INVALID` and an already-installed project can never
+ * reach the faster authoritative flow.
+ *
+ * Differs from the current projection in exactly ONE field:
+ *   - `agent.poiesis-worker.permission.bash` omits the single focused-check
+ *     allow key.
+ *
+ * Everything else — the primary's exact-version canonical route, the ordered
+ * launcher denies, the Repository Intelligence additive allows, the Specialist
+ * bash surfaces, and every model / task wiring — is UNCHANGED. In particular
+ * the projection stays fail-closed on launcher identity: the migration
+ * restores the current projection and grants no broad `…@<version> *`,
+ * `@latest`, or unversioned route.
+ *
+ * The removed key is derived through `workerFocusedCheckAllowKey`, the same
+ * builder the current projection uses, so this helper can only ever delete a
+ * key the current projection still emits. If a future release drops that
+ * allow, the deletion is a no-op and this projection simply collapses onto the
+ * current one, which the gate already admitted before it ever reaches here.
+ *
+ * Kept intentionally narrow: this is a migration-only exact predecessor
+ * projection, not a general historical-normalization helper. New patches must
+ * NOT be added here without an explicit ticket and migration contract.
+ */
+export function predecessorProjectionPreFocusedCheck(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  const focusedCheckAllow = workerFocusedCheckAllowKey(poiesisVersion);
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
+    if (patch.path.length === 2 && patch.path[0] === "agent" && patch.path[1] === "poiesis-worker") {
+      const installed = patch.value as Record<string, unknown>;
+      const permission = installed.permission as Record<string, unknown> & { bash: Record<string, string> };
+      const bash = { ...permission.bash };
+      delete bash[focusedCheckAllow];
+      return { ...patch, value: { ...installed, permission: { ...permission, bash } } };
+    }
+    return patch;
+  });
+}
+
+/**
  * Returns true if `manifest.configPatches` exactly matches the given projection:
  * same length, same `(file, path)` keys, and `isDeepStrictEqual` values.
  * Used to verify that a predecessor manifest is byte-for-byte the v1.0.0/1.0.1/1.0.2
@@ -509,7 +563,7 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
  * Callers MUST pass the explicit predecessor version set they accept. The
  * default accepts the three v1.0.0/1.0.1/1.0.2 versions, but bootstrap and
  * update paths use different subsets per ticket #24 Replan:
- *   - receipt-authenticated update: `["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4"]`
+ *   - receipt-authenticated update: `["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"]`
  *     (1.1.1 is accepted only here, on explicit `update`, because the
  *     primary-bash surface changed in 1.1.2 and any pre-existing 1.1.1
  *     install must be transitioned through the receipt-gated update path;
@@ -520,6 +574,16 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
  *   - bootstrap legacy ownership: `["1.0.0"]` (the version is already pinned
  *     by `validateLegacyInstallation`, so this is defense-in-depth)
  *
+ * `"1.4.0"` is accepted by the receipt-gated `update` for the
+ * Spec #168 / ticket #174 same-release reason: ticket #173's narrow
+ * focused-check allow changed the exact projection WITHOUT bumping the
+ * runtime version, so a project installed by an earlier image of the SAME
+ * release records `poiesisVersion = "1.4.0"` with a pre-focused-check
+ * `configPatches` set. Only that exact set is admitted, and only the
+ * receipt-gated `update` may transition it; `doctor`, `uninstall`,
+ * `installCapability`, and the explicit `updateFromConfig` remain
+ * current-projection-only.
+ *
  * If the manifest matches neither projection, the original strict failure
  * is rethrown unchanged so callers see the same diagnostic.
  */
@@ -527,7 +591,7 @@ export async function assertManifestAuthorityToleratingPredecessor(
   root: string,
   manifest: Manifest,
   config: PoiesisConfig,
-  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4"> = [
+  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4" | "1.4.0"> = [
     "1.0.0",
     "1.0.1",
     "1.0.2",
@@ -578,6 +642,27 @@ export async function assertManifestAuthorityToleratingPredecessor(
       await assertManifestAuthorityImpl(root, manifest, predecessor);
       return;
     }
+  }
+  // Spec #168 / ticket #174 — the pre-focused-check SAME-RELEASE
+  // predecessor. Ticket #173 changed the exact projection without a
+  // version bump, so an install made by an earlier image of the current
+  // release records the current `poiesisVersion` with one allow key
+  // missing. This branch is reached ONLY for `poiesisVersion === "1.4.0"`
+  // and ONLY after the receipt already authenticated the manifest digest.
+  //
+  // It deliberately does NOT fall through to the legacy 1.0.x projection
+  // when the manifest does not match exactly: a 1.4.0 manifest can never
+  // legitimately carry the 1.0.x surface, so continuing would only widen
+  // what an accepted version admits. A non-matching 1.4.0 manifest is drift
+  // and is rethrown by the strict check below.
+  if (manifest.poiesisVersion === "1.4.0") {
+    const predecessor = predecessorProjectionPreFocusedCheck(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, predecessor);
+      return;
+    }
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
+    return;
   }
   // v1.0.0 predecessor projection: primary-bash, worker-bash, AND
   // reviewer.task all differ from current. Only the explicit

@@ -216,6 +216,30 @@ export async function assertOpenCodeAdapterContract(
   }
   return contract;
 }
+
+/**
+ * Spec #104 / tickets #105 / #110 / #173 / #174 — the ONE derivation of the
+ * exact-version canonical Poiesis route.
+ *
+ * Every launcher allow key this module projects — the primary's canonical
+ * lifecycle route, the Repository Intelligence subcommand routes, and the
+ * Worker's focused-check route — is built from this single function. A second
+ * literal `pnpm dlx poiesis-cli@${version}` template anywhere in the module
+ * would be a place where the projected launcher could drift away from the
+ * routes the rest of the module asserts, and the compatible migration in
+ * `src/authority.ts` deletes keys derived from it.
+ *
+ * `poiesisVersion` is always the manifest's recorded `poiesisVersion` (or the
+ * runtime version a transaction is installing), never a range, a dist-tag, or
+ * an unversioned launcher. Every projected key stays inside this route, so
+ * the ordered `…@*` deny remains the only thing that could ever admit an
+ * off-version launcher, and the exact-version allows that follow it stay the
+ * sole reachable route.
+ */
+function primaryExactRoute(poiesisVersion: string): string {
+  return `pnpm dlx poiesis-cli@${poiesisVersion}`;
+}
+
 /**
  * Spec #104 / tickets #105 / #110: the runtime identity boundary for the
  * primary (Poiesis) agent. The generated normal installed lifecycle
@@ -243,7 +267,7 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
     "npx poiesis *": "deny",
     "pnpm dlx poiesis-cli *": "deny",
     "pnpm dlx poiesis-cli@*": "deny",
-    [`pnpm dlx poiesis-cli@${poiesisVersion} *`]: "allow",
+    [`${primaryExactRoute(poiesisVersion)} *`]: "allow",
   };
 }
 
@@ -273,7 +297,7 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
  * absent: only the exact `<manifest.poiesisVersion>` route survives.
  */
 function repositoryIntelligenceBashPermissions(poiesisVersion: string): Record<string, string> {
-  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  const exact = primaryExactRoute(poiesisVersion);
   return {
     "*": "deny",
     [`${exact} repository status`]: "allow",
@@ -299,7 +323,7 @@ function repositoryIntelligenceBashPermissions(poiesisVersion: string): Record<s
  * precedes the exact-version allow keys.
  */
 function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<string, string> {
-  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  const exact = primaryExactRoute(poiesisVersion);
   return {
     [`${exact} repository status`]: "allow",
     [`${exact} repository query *`]: "allow",
@@ -341,8 +365,27 @@ function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<stri
  * keeps no bash surface at all.
  */
 function workerFocusedCheckAllows(poiesisVersion: string): Record<string, string> {
-  const exact = `pnpm dlx poiesis-cli@${poiesisVersion}`;
-  return { [`${exact} check *`]: "allow" };
+  return { [workerFocusedCheckAllowKey(poiesisVersion)]: "allow" };
+}
+
+/**
+ * Spec #168 / ticket #174 — the ONE derivation of the narrow focused-check
+ * allow key.
+ *
+ * The current Worker projection and the pre-focused-check predecessor
+ * projection in `src/authority.ts` both build this key here, so the
+ * compatible migration can only ever delete a key the current projection
+ * still emits. Two literal copies of the string would let the migration
+ * silently stop matching the next time the allow moved, which is exactly the
+ * kind of drift that makes a predecessor projection admit a manifest it must
+ * not.
+ *
+ * The key stays inside the exact-version canonical route
+ * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`; no `@latest`,
+ * unversioned, or broad `…@<version> *` launcher is reachable through it.
+ */
+export function workerFocusedCheckAllowKey(poiesisVersion: string): string {
+  return `${primaryExactRoute(poiesisVersion)} check *`;
 }
 
 function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {

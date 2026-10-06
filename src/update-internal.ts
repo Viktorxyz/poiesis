@@ -457,13 +457,24 @@ async function runLockedUpdateTransaction(
   // Tolerant authority check: accepts the strict current projection OR
   // the exact v1.0.1/v1.0.2 legacy predecessor projection OR the exact
   // v1.1.1 predecessor primary-bash projection OR the exact v1.1.3 /
-  // v1.1.4 predecessor projection (only here, on explicit
+  // v1.1.4 predecessor projection OR the exact pre-focused-check
+  // same-release projection (only here, on explicit
   // receipt-authenticated `update`). The 1.1.3 / 1.1.4 surface only
   // differs from the current 1.2.x surface on the v1.2 Specialist
   // bash additive, so the migration transitions the manifest from
   // the pre-#123 Specialist bash surface to the v1.2 narrow Repository
   // Intelligence bash surface for Planner / Reviewer / Final Reviewer.
-  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4"]);
+  //
+  // Spec #168 / ticket #174: `"1.4.0"` is accepted here for the
+  // same-release migration. Ticket #173's narrow focused-check allow
+  // changed the exact projection WITHOUT bumping the runtime version, so a
+  // project installed by an earlier image of this release records
+  // `poiesisVersion = "1.4.0"` with that one allow key missing. Accepting
+  // the exact pre-focused-check set lets the receipt-gated update install
+  // the authoritative projection on it. The accepted surface stays
+  // fail-closed: only the exact set is admitted, and the projection the
+  // transaction writes grants no broad / `@latest` / unversioned launcher.
+  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"]);
   await verifyGitRepository(resolvedRoot, config);
   // The transaction's actual capability probes (`models` via
   // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run
