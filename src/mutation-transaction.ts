@@ -40,7 +40,35 @@ export interface RollbackDiagnostic {
   expected?: ArtifactIdentity;
   actual?: ArtifactIdentity;
   error?: string;
+  /**
+   * Spec #168 / ticket #178 — where the preimage still exists when the
+   * destination could not be restored.
+   *
+   * A restoration that fails leaves its preimage where an operator can recover
+   * it, and this names that location. It is never a path the journal then
+   * removes: deleting the only remaining copy would turn a reported
+   * incomplete rollback into unrecoverable data loss.
+   */
+  preimageRecoveredAt?: string;
 }
+
+/**
+ * Spec #168 / ticket #178 — the seams the directory-mode restoration reads the
+ * host through.
+ *
+ * `moveRestorationCandidate` defaults to `rename`. It exists because the failure
+ * this redesign exists to survive is a DEVICE failure, and a test machine whose
+ * `os.tmpdir()` shares the workspace's filesystem would never produce one. The
+ * seam changes WHAT the restore calls, never WHAT it accepts: the production
+ * default is the real `rename`, and an injected `EXDEV` only makes the
+ * same-device guarantee fail the way a real cross-device host does.
+ */
+export interface ArtifactJournalOptions {
+  moveRestorationCandidate?: (from: string, to: string) => Promise<void>;
+}
+
+/** Prefix of the transient, Poiesis-owned directory a preimage is staged into. */
+const RESTORE_STAGING_PREFIX = ".poiesis-restore-";
 
 async function identity(path: string): Promise<ArtifactIdentity> {
   try {
@@ -103,8 +131,14 @@ function identitiesEqual(left: ArtifactIdentity, right: ArtifactIdentity): boole
 export class ArtifactJournal {
   readonly entries: ArtifactJournalEntry[] = [];
   private backupRoot: string | undefined;
+  private readonly options: ArtifactJournalOptions;
 
-  constructor(private readonly limit: number) {}
+  constructor(
+    private readonly limit: number,
+    options: ArtifactJournalOptions = {},
+  ) {
+    this.options = options;
+  }
 
   private async ensureBackupRoot(): Promise<string> {
     if (this.backupRoot !== undefined) return this.backupRoot;
@@ -318,30 +352,136 @@ export class ArtifactJournal {
       await this.cleanupBackup(entry);
       return;
     }
-    try {
-      if (entry.physicalExists) {
-        if (entry.preimageBackup === undefined) {
-          diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: "preimage backup missing" });
-          return;
-        }
-        // The transaction-owned directory still matches the journal's
-        // transaction-written identity, so the foreign-write window is
-        // closed: rename the preimage backup back to the destination.
-        // This atomically overwrites the transaction-authored tree and
-        // is the byte-for-byte preimage restored by the journal.
+    if (!entry.physicalExists) {
+      // The destination did not exist before the transaction. Roll
+      // back by removing the transaction-authored directory.
+      try {
         await rm(entry.path, { recursive: true, force: true });
-        await rename(entry.preimageBackup, entry.path);
-      } else {
-        // The destination did not exist before the transaction. Roll
-        // back by removing the transaction-authored directory.
-        await rm(entry.path, { recursive: true, force: true });
+      } catch (error) {
+        diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: String(error) });
       }
-    } catch (error) {
-      diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: String(error) });
+      await this.cleanupBackup(entry);
+      return;
     }
+    if (entry.preimageBackup === undefined) {
+      diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: "preimage backup missing" });
+      return;
+    }
+    // Spec #168 / ticket #178: the preimage is COPIED onto the destination's
+    // own filesystem FIRST. The journal's backup lives under `os.tmpdir()`,
+    // which is routinely a different device from the workspace it protects, so
+    // the `rename(backup -> destination)` this path used to perform could fail
+    // `EXDEV` — after the transaction-written destination had already been
+    // removed — and the backup was then cleaned up as though the restoration
+    // had worked. That destroyed the only copy of the preimage while the run
+    // merely reported an incomplete rollback.
+    //
+    // Copying first removes the device dependency from the move that matters:
+    // `cp` reads across devices by definition, and the staged candidate then
+    // shares a filesystem with the destination. Nothing is removed until that
+    // candidate exists, and the backup survives every step that follows, so a
+    // failure can only ever leave a recoverable copy behind — never none.
+    let staged: string;
+    try {
+      staged = await this.stageRestorationCandidate(entry);
+    } catch (error) {
+      // The destination is untouched at this point, and the backup is retained:
+      // a failed restoration must cost the operator nothing.
+      diagnostics.push({
+        path: entry.path,
+        reason: "restore-failed",
+        expected,
+        actual,
+        error: `the preimage could not be staged on the destination filesystem: ${String(error)}`,
+        preimageRecoveredAt: entry.preimageBackup,
+      });
+      return;
+    }
+    try {
+      await rm(entry.path, { recursive: true, force: true });
+      await (this.options.moveRestorationCandidate ?? rename)(staged, entry.path);
+    } catch (error) {
+      // Either the destination could not be removed or the same-device move
+      // failed. The staged candidate still holds the preimage and is named, so
+      // the operator can recover it; the backup is retained alongside it.
+      diagnostics.push({
+        path: entry.path,
+        reason: "restore-failed",
+        expected,
+        actual,
+        error: String(error),
+        preimageRecoveredAt: staged,
+      });
+      return;
+    }
+    // The preimage is back in place, so the backup has done its job.
     await this.cleanupBackup(entry);
   }
 
+  /**
+   * Spec #168 / ticket #178 — put a byte-for-byte copy of the preimage on the
+   * DESTINATION's own filesystem, and prove it is that preimage.
+   *
+   * The same identity and symlink safety the journal already applies to the
+   * destination is applied to the candidate before anything is removed: it must
+   * be a real directory (never a symlink or a device) and, whenever the capture
+   * recorded a preimage hash, it must hash to exactly that. A candidate that
+   * fails either check is removed immediately and the caller keeps the backup —
+   * so a wrong or unsafe candidate can never become the restored tree.
+   */
+  private async stageRestorationCandidate(entry: ArtifactJournalEntry): Promise<string> {
+    const backup = entry.preimageBackup;
+    if (backup === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_BACKUP_MISSING", "Directory rollback has no preimage backup", {
+        path: entry.path,
+      });
+    }
+    const staged = `${dirname(entry.path)}/${RESTORE_STAGING_PREFIX}${randomUUID()}`;
+    try {
+      await cp(backup, staged, { recursive: true, errorOnExist: true, force: false });
+    } catch (error) {
+      await rm(staged, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+    try {
+      const stats = await lstat(staged);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new PoiesisError("ARTIFACT_IDENTITY_INVALID", "Staged restoration candidate is not a real directory", {
+          path: staged,
+        });
+      }
+      const stagedIdentity: ArtifactIdentity = {
+        exists: true,
+        kind: "directory",
+        hash: await hashDirectoryTree(staged),
+      };
+      if (
+        entry.expectedPreWriteIdentity.hash !== undefined &&
+        stagedIdentity.hash !== entry.expectedPreWriteIdentity.hash
+      ) {
+        throw new PoiesisError("ARTIFACT_IDENTITY_DRIFT", "Staged restoration candidate is not the captured preimage", {
+          path: staged,
+          expected: entry.expectedPreWriteIdentity,
+          actual: stagedIdentity,
+        });
+      }
+      return staged;
+    } catch (error) {
+      await rm(staged, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Remove a backup whose preimage no longer needs protecting: the transaction
+   * committed, the destination did not exist before it, or the journal declined
+   * to overwrite a foreign write.
+   *
+   * Spec #168 / ticket #178: this is deliberately NOT reached from a
+   * restoration that failed. A backup is the only copy of a preimage that
+   * failed to come back, so it is retained and named in the diagnostic
+   * instead — a rollback that cannot restore must not also delete.
+   */
   private async cleanupBackup(entry: ArtifactJournalEntry): Promise<void> {
     if (entry.preimageBackup === undefined) return;
     await rm(entry.preimageBackup, { recursive: true, force: true }).catch(() => undefined);

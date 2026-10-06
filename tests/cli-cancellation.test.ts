@@ -47,6 +47,16 @@ import { createTestRepository, describeManagedExecution, testConfig, type TestRe
 
 const PLAN_COMMAND = "sleep 30";
 
+/**
+ * Spec #168 / ticket #178 — bounded window the readiness sentinel is waited for.
+ *
+ * A readiness sentinel has to be waited for under a bound or a hang is
+ * indistinguishable from a slow start. It is generous because it covers a cold
+ * CLI start, authority resolution, boundary provisioning, admission, and the
+ * command's own first write — none of which is instant on a loaded host.
+ */
+const ADMITTED_BOUND_MS = 90_000;
+
 let repository: TestRepository;
 let plainRepository: TestRepository;
 let commonDir: string;
@@ -424,8 +434,41 @@ describeManagedExecution("CLI cancellation of managed commands (Spec #168 / tick
   });
 });
 
+/**
+ * Wait for a bounded window for `path` to appear. Used as a READINESS sentinel,
+ * never as a delay: the caller learns the operation is live, and a sentinel that
+ * never arrives fails the assertion instead of racing it.
+ */
+async function waitForFile(path: string, boundMs: number): Promise<boolean> {
+  const deadline = Date.now() + boundMs;
+  while (Date.now() < deadline) {
+    if (existsSync(path)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return existsSync(path);
+}
+
+/**
+ * Spec #168 / ticket #178 — the packaged bin honours the same cancellation
+ * contract, and the interruption is aimed rather than timed.
+ *
+ * The previous version waited a fixed two seconds and then signalled. That is a
+ * scheduler race dressed as a test: on a loaded host the signal can land before
+ * the operation is running at all (a green run, and a test that passes for the
+ * wrong reason), and on an idle one it can land after it has finished. Neither
+ * outcome says anything about the contract.
+ *
+ * The sentinel below is produced by the operation itself: the managed command
+ * writes the file, and caller command text can only run AFTER the admission
+ * prologue confirmed its own kernel membership and `exec`'d the processor. So
+ * observing it proves the invocation's handlers are installed (they go up
+ * synchronously with the dispatch) and the admitted operation is genuinely live,
+ * and the signal is then aimed at that state. The claim asserted afterwards is
+ * the whole contract: the structured `COMMAND_CANCELLED` envelope on stderr AND
+ * exit status 130, with the bounded evidence still attached.
+ */
 describeManagedExecution("the packaged bin honours the same cancellation contract", () => {
-  it("exits COMMAND_CANCELLED when the operator interrupts it", { timeout: 180_000 }, async () => {
+  it("exits COMMAND_CANCELLED when the operator interrupts a live admitted command", { timeout: 180_000 }, async () => {
     await run(
       "node",
       [
@@ -443,26 +486,54 @@ describeManagedExecution("the packaged bin honours the same cancellation contrac
     expect(existsSync(cliPath)).toBe(true);
     cleanupDirs.push(CLONE_DIR);
 
-    const child = spawn(process.execPath, [cliPath, ...verifyArgv()], {
-      cwd: candidate!.path,
-      detached: true,
-      stdio: ["ignore", "pipe", "pipe"],
-    });
+    // Outside the repository, so the sentinel cannot make the candidate dirty.
+    const sentinel = join(tmpdir(), `poiesis-admitted-${process.pid}-${Date.now()}.marker`);
+    const child = spawn(
+      process.execPath,
+      [cliPath, ...checkArgv(`printf admitted > "${sentinel}"; sleep 30`)],
+      {
+        cwd: candidate!.path,
+        detached: true,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
     let stderr = "";
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
     const exited = new Promise<number | null>((r) => child.once("exit", (code) => r(code)));
 
-    await new Promise((r) => setTimeout(r, 2_000));
-    process.kill(-(child.pid as number), "SIGINT");
-    const code = await Promise.race([
-      exited,
-      new Promise<null>((r) => setTimeout(() => r(null), 30_000)),
-    ]);
+    try {
+      expect(
+        await waitForFile(sentinel, ADMITTED_BOUND_MS),
+        "the packaged bin must reach its admitted managed command before the interruption",
+      ).toBe(true);
 
-    expect(code).toBe(130);
-    expect(stderr).toContain("COMMAND_CANCELLED");
+      process.kill(-(child.pid as number), "SIGINT");
+      const code = await Promise.race([
+        exited,
+        new Promise<null>((r) => setTimeout(() => r(null), 30_000)),
+      ]);
+
+      expect(code).toBe(130);
+      // The structured envelope, not just the code appearing somewhere: the
+      // operator's contract is the JSON document `writeFailure` emits.
+      const envelope = JSON.parse(stderr.trim()) as {
+        ok: boolean;
+        error: { code: string; details: Record<string, unknown> };
+      };
+      expect(envelope.ok).toBe(false);
+      expect(envelope.error.code).toBe("COMMAND_CANCELLED");
+      expect(envelope.error.details).toMatchObject({
+        cancelled: true,
+        command: `printf admitted > "${sentinel}"; sleep 30`,
+        // The bounded evidence survives the cancellation: an operator can still
+        // see which command was stopped and against which state.
+        check: { scope: "focused", authoritative: false, outcome: "failed" },
+      });
+    } finally {
+      if (sentinel !== undefined) await rm(sentinel, { force: true });
+    }
   });
 });
 

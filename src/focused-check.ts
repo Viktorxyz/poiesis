@@ -503,13 +503,20 @@ export interface CheckStateFingerprint {
  *
  * Read field by field out of the runner's own rejection details, so a
  * caller-shaped value is never trusted wholesale: an absent or non-string field
- * becomes `null` evidence rather than a fabricated one. Only the four fields
- * that make a containment refusal actionable are carried, and none of them is
- * unbounded output.
+ * becomes `null` evidence rather than a fabricated one. Only the bounded fields
+ * that make a pre-spawn refusal actionable are carried — the containment model,
+ * the platform, the processor that was rejected (`COMMAND_PROCESSOR_UNAVAILABLE`),
+ * and the reason/detail/remediation — and none of them is unbounded output.
  */
 export interface FocusedFailureCause {
   readonly containment: string | null;
   readonly platform: string | null;
+  /**
+   * Spec #168 / ticket #178 — the processor path or name a
+   * `COMMAND_PROCESSOR_UNAVAILABLE` refused, so the operator is told WHICH
+   * processor to repair rather than only that one was unusable.
+   */
+  readonly processor: string | null;
   readonly reason: string | null;
   readonly detail: string | null;
   readonly remediation: string | null;
@@ -848,6 +855,13 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
     // strong-containment seam Verify uses, so a focused command is interpreted
     // by the same validated processor and runs inside the same boundary. There
     // is no second interpreter and no weaker containment on this surface.
+    //
+    // The runner's own capture bound is deliberately NOT narrowed to
+    // `outputLimit` (Spec #168 / ticket #178 review note): the evidence limit
+    // bounds what the RESULT carries, while the capture bound is what makes the
+    // reported "... truncated N bytes" honest, and it already caps buffering at
+    // a fixed 256 KiB per stream. Narrowing it would save that fixed, small
+    // amount while making the recorded byte count a fabrication.
     result = await runManagedShellCommand({
       cwd: input.root,
       command: input.command,
@@ -930,12 +944,12 @@ function rawString(details: Record<string, unknown>, key: string, fallback: stri
  *
  * `null` for the whole record when the rejection carried none of these strings,
  * which is the common case (a cancellation or a cleanup failure says nothing
- * about the containment capability) and keeps the field from implying a
- * containment story that was never told.
+ * about the containment capability or the processor) and keeps the field from
+ * implying a host story that was never told.
  */
 function readFailureCause(details: Record<string, unknown>): FocusedFailureCause | null {
   const cause: Record<string, string> = {};
-  for (const key of ["containment", "platform", "reason", "detail", "remediation"] as const) {
+  for (const key of ["containment", "platform", "processor", "reason", "detail", "remediation"] as const) {
     const value = details[key];
     if (typeof value === "string" && value.length > 0) cause[key] = value;
   }
@@ -943,6 +957,7 @@ function readFailureCause(details: Record<string, unknown>): FocusedFailureCause
   return {
     containment: cause.containment ?? null,
     platform: cause.platform ?? null,
+    processor: cause.processor ?? null,
     reason: cause.reason ?? null,
     detail: cause.detail ?? null,
     remediation: cause.remediation ?? null,

@@ -229,3 +229,9 @@ On a refused host the three surfaces above fail with `PROCESS_CONTAINMENT_UNAVAI
 Post-integration commands are gated by the same rule as the verification plan. A host that cannot contain the candidate's plan cannot contain the integrated revision either; `postIntegrationCommands` is not a weaker surface and does not fall back to `verification.commands`.
 
 When the host does provide the capability but admission cannot be confirmed, the run is refused with `PROCESS_CONTAINMENT_REFUSED`. When the boundary cannot be confirmed settled, it fails with `PROCESS_CLEANUP_UNRESOLVED`. Both outrank success, failure, timeout, and cancellation, because they mean a process Poiesis spawned may still be running.
+
+### Command-processor availability
+
+The processor is resolved and validated BEFORE any process exists, so a host with no usable one refuses rather than failing as an opaque spawn error. `COMMAND_PROCESSOR_UNAVAILABLE` carries `details.reason` (`PROCESSOR_NOT_EXECUTABLE` on POSIX; `COMSPEC_MISSING`, `COMSPEC_NOT_ABSOLUTE`, `COMSPEC_NOT_COMMAND_PROCESSOR`, `COMSPEC_UNAVAILABLE` on Windows), `details.platform`, `details.processor` (the path that was rejected), `details.detail`, and a `details.remediation` for the host.
+
+`poiesis check` passes that refusal through with its own code and those fields intact, and with the bounded `details.check` evidence attached — it is a host limitation, not a failing command. It deliberately attaches none of the `details.migration` advice that a genuine `FOCUSED_CHECK_FAILED` carries, because `poiesis verify` resolves command text through the same processor and would refuse identically. `verify` keeps its own fail-closed propagation of the same error. Nothing is spawned either way.

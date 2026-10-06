@@ -431,9 +431,35 @@ export function provisionContainment(input: {
   // a few microseconds stale can never become a promise about it.
   for (const required of REQUIRED_LEAF_CONTROLS) {
     if (existsSync(join(leaf, required))) continue;
-    rmdirSync(leaf);
+    // Spec #168 / ticket #178: the typed refusal is the outcome, so the cleanup
+    // of the leaf it leaves behind can never replace it. `rmdir` is asked for
+    // on a directory the kernel itself refused to expose controls for, which is
+    // exactly the state where it can answer `EACCES` or `EBUSY`; raising that
+    // raw errno would replace an actionable "this host cannot provide
+    // containment" with an opaque filesystem failure that names neither the
+    // missing control nor the host requirement. Cleanup stays best effort, and
+    // the leaf it could not remove is named in the refusal's bounded detail so
+    // the operator can see it.
+    let cleanupError: string | null = null;
+    try {
+      rmdirSync(leaf);
+    } catch (error) {
+      cleanupError = (error as NodeJS.ErrnoException).code ?? "unknown";
+    }
+    const unusable = unavailable(
+      input.model,
+      "NO_CGROUP_KILL",
+      `The managed cgroup leaf ${leaf} exposes no ${required}.`,
+      capability.parent,
+    );
     throw containmentUnavailableError(
-      unavailable(input.model, "NO_CGROUP_KILL", `The managed cgroup leaf ${leaf} exposes no ${required}.`, capability.parent),
+      {
+        ...unusable,
+        detail:
+          cleanupError === null
+            ? unusable.detail
+            : `${unusable.detail} The unusable leaf ${leaf} could not be removed (${cleanupError}); remove it before re-running.`,
+      },
       input.remediation,
     );
   }

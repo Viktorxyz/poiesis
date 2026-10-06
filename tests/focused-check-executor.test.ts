@@ -22,7 +22,7 @@ import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
 import { isAbsolute, join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { workspacePrepare, type WorkspaceIdentity } from "../src/git.js";
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
@@ -779,6 +779,15 @@ describe("an actionable containment refusal survives the focused surface (Spec #
   it("rethrows a pre-spawn PROCESS_CONTAINMENT_UNAVAILABLE with its own reason and remediation", { timeout: 60_000 }, async () => {
     const candidate = await ownedCandidate("cli-unavailable");
     const marker = "poiesis-must-not-run-marker";
+    // Spec #168 / ticket #178: the platform and the POSIX processor are both
+    // scripted so this assertion is about the CONTAINMENT refusal on every host.
+    // The report reads the platform before it reads any hierarchy (so macOS and
+    // Windows would answer `UNSUPPORTED_PLATFORM` instead), and the processor is
+    // resolved before containment is provisioned (so a host without `/bin/sh`
+    // would refuse in that seam first). Both facts are covered on their own in
+    // `tests/command-processor.test.ts`.
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...original, value: "linux" });
     const observed = await dispatchWithMockedKernel(
       () => {
         recordSpawns();
@@ -792,11 +801,15 @@ describe("an actionable containment refusal survives the focused surface (Spec #
               }
               return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
             }) as typeof actual.readFileSync,
+            accessSync: ((path: string, ...rest: unknown[]) => {
+              if (path === "/bin/sh") return undefined;
+              return Reflect.apply(actual.accessSync, undefined, [path, ...rest]) as void;
+            }) as typeof actual.accessSync,
           };
         });
       },
       ["--command", `printf %s ${marker}`, "--ownership-id", candidate.ownershipId, "--cwd", candidate.path],
-    );
+    ).finally(() => Object.defineProperty(process, "platform", original));
 
     expect(observed.error).toMatchObject({
       code: "PROCESS_CONTAINMENT_UNAVAILABLE",
@@ -906,5 +919,156 @@ describe("an actionable containment refusal survives the focused surface (Spec #
     const details = (observed.error as { details: Record<string, unknown> }).details;
     expect(details.migration).toBeUndefined();
     expect(details.remediation).toBeUndefined();
+  });
+});
+
+/**
+ * Spec #168 / ticket #178 — a missing command processor is not a failed check
+ * either, and the reason is the same.
+ *
+ * `poiesis check` executes caller-supplied command TEXT, and the interpreter
+ * that text needs is resolved and validated BEFORE any process exists. A host
+ * with no usable processor therefore refuses the same way a host with no
+ * containment boundary does: not your code failed, and nothing ran. Collapsing
+ * it into `FOCUSED_CHECK_FAILED` would send the operator to edit code, and the
+ * `migration` line that failure carries points at `poiesis verify` — which
+ * drives managed command text through the very same processor seam and would
+ * refuse identically.
+ *
+ * These assertions are pure control flow over the public `commandCheck` seam and
+ * script the processor, so they run on every host. The POSIX processor is asked
+ * for explicitly, because `/bin/sh` is the branch under test and a Windows host
+ * takes the `ComSpec` branch instead — the production per-platform behaviour is
+ * untouched, and `tests/command-processor.test.ts` still covers both shapes.
+ */
+describe("an actionable processor refusal survives the focused surface (Spec #168 / ticket #178)", () => {
+  /** One flattened argv per spawn attempt, so "no command ran" is observable. */
+  let spawns: string[] = [];
+
+  afterEach(() => {
+    vi.doUnmock("node:fs");
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("rethrows COMMAND_PROCESSOR_UNAVAILABLE with its reason, processor, and remediation, and spawns nothing", { timeout: 60_000 }, async () => {
+    const candidate = await ownedCandidate("cli-processor");
+    const marker = "poiesis-must-not-run-marker";
+    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+    Object.defineProperty(process, "platform", { ...original, value: "linux" });
+    spawns = [];
+    try {
+      vi.resetModules();
+      vi.doMock("node:child_process", async () => {
+        const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+        return {
+          ...actual,
+          spawn: ((...args: unknown[]) => {
+            spawns.push([String(args[0]), ...(args[1] as string[]).map((arg) => String(arg))].join(" "));
+            return Reflect.apply(actual.spawn, undefined, args) as never;
+          }) as typeof actual.spawn,
+        };
+      });
+      vi.doMock("node:fs", async () => {
+        const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+        return {
+          ...actual,
+          accessSync: ((path: string, ...rest: unknown[]) => {
+            if (path === "/bin/sh") {
+              throw Object.assign(new Error("not executable"), { code: "EACCES" });
+            }
+            return Reflect.apply(actual.accessSync, undefined, [path, ...rest]) as void;
+          }) as typeof actual.accessSync,
+        };
+      });
+
+      const { commandCheck } = await import("../src/cli.js");
+      let error: unknown = null;
+      try {
+        await commandCheck([
+          "--command",
+          `printf %s ${marker}`,
+          "--ownership-id",
+          candidate.ownershipId,
+          "--cwd",
+          candidate.path,
+        ]);
+      } catch (thrown) {
+        error = thrown;
+      }
+
+      expect(error).toMatchObject({
+        code: "COMMAND_PROCESSOR_UNAVAILABLE",
+        details: {
+          reason: "PROCESSOR_NOT_EXECUTABLE",
+          platform: "linux",
+          processor: "/bin/sh",
+          detail: expect.stringContaining("/bin/sh"),
+          remediation: expect.stringContaining("command processor"),
+          command: `printf %s ${marker}`,
+          commandIndex: 0,
+          // The bounded evidence is attached: this is not a failure with no
+          // record of what was attempted, against which state.
+          check: {
+            scope: "focused",
+            authoritative: false,
+            outcome: "failed",
+            verification: null,
+            proof: null,
+            commands: [
+              {
+                index: 0,
+                status: "failed",
+                failureCode: "COMMAND_PROCESSOR_UNAVAILABLE",
+                classification: "infrastructure",
+              },
+            ],
+          },
+        },
+      });
+      // Not the generic failed check, and not advice to escalate to a surface
+      // that resolves the processor the same way.
+      const details = (error as { details: Record<string, unknown>; message: string }).details;
+      expect(details.migration).toBeUndefined();
+      expect((error as { message: string }).message).not.toContain("poiesis verify");
+      // Pre-spawn, like every processor refusal: the interpreter that would run
+      // the command never existed, so the only spawns are the fixed-argv `git`
+      // calls this surface makes to resolve authority and fingerprint state.
+      expect(spawns.filter((argv) => argv.includes(marker))).toEqual([]);
+      expect(spawns.filter((argv) => argv.startsWith("/bin/sh "))).toEqual([]);
+    } finally {
+      Object.defineProperty(process, "platform", original);
+      vi.doUnmock("node:fs");
+      vi.doUnmock("node:child_process");
+      vi.resetModules();
+    }
+  });
+
+  it("documents the processor refusal as a host refusal, not a code failure", async () => {
+    // The advice an operator reads has to agree with the envelope: this surface
+    // carries no Verify escalation for a processor refusal, because Verify needs
+    // the same processor.
+    const [readme, compatibility] = await Promise.all([
+      readFile(join(import.meta.dirname, "..", "README.md"), "utf8"),
+      readFile(join(import.meta.dirname, "..", "COMPATIBILITY.md"), "utf8"),
+    ]);
+    for (const [label, text] of [
+      ["README.md", readme],
+      ["COMPATIBILITY.md", compatibility],
+    ] as const) {
+      // Both documents wrap prose, so the claims are matched against one line.
+      const prose = text.replace(/\s+/g, " ");
+      expect(prose, `${label} must name the processor refusal`).toContain("COMMAND_PROCESSOR_UNAVAILABLE");
+      // A refusal, raised before anything exists — not a failing command.
+      expect(prose, `${label} must state it precedes any process`).toMatch(/before any process exists/i);
+      // Actionable: the fields that tell an operator what to repair.
+      for (const field of ["reason", "platform", "processor", "remediation"]) {
+        expect(prose, `${label} must name details.${field}`).toContain(`details.${field}`);
+      }
+    }
+    // And the specific consequence this ticket exists for: the focused surface
+    // does not send the operator to Verify for a host limitation.
+    expect(readme.replace(/\s+/g, " ")).toContain("poiesis verify");
+    expect(compatibility.replace(/\s+/g, " ")).toContain("details.migration");
   });
 });

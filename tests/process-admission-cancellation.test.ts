@@ -318,6 +318,87 @@ describe("admission confirmation survives a late report (Spec #168 / ticket #176
   });
 });
 
+/**
+ * Spec #168 / ticket #178 — the admission report channel is released, not disarmed.
+ *
+ * Once the admission verdict exists, this gate's own listeners have no further
+ * job: nothing else reads the report channel, and the prologue closes it before
+ * `exec` so the command never inherits the pipe. The channel itself is NOT
+ * necessarily finished at that moment, though, so the runner resumes it to let
+ * any trailing byte drain and keep the handle from holding Node open.
+ *
+ * Stripping EVERY listener and then resuming an unfinished stream is how a run
+ * that has already reported its outcome brings the process down: a late `error`
+ * on a resumed stream with no `error` listener is an unhandled `error` event,
+ * which is fatal — for a contained Verify that is a crash where the receipt
+ * either exists or does not, decided by a scheduling artifact on a pipe nothing
+ * reads any more. So the decision retires only its OWN listeners, by reference,
+ * and leaves an error sink behind.
+ */
+describe("a settled admission channel keeps an error sink (Spec #168 / ticket #178)", () => {
+  it("retires its own listeners and survives a late stream error", { timeout: 60_000 }, async () => {
+    const probe = newProbe();
+    mockContainment(probe);
+    const admission = scriptAdmissionChild(({ child, report }) => {
+      report.write("a");
+      setTimeout(() => child.emit("exit", 0, null), 20);
+    });
+
+    const managed = await import("../src/managed-shell.js");
+    const result = await managed.runManagedShellCommand({
+      cwd: tmpdir(),
+      command: "printf admitted-and-settled",
+      operationId: "poiesis-admission-sink",
+    });
+    expect(result).toMatchObject({ exitCode: 0 });
+    expect(probe.released).toEqual([FAKE_LEAF]);
+
+    const report = admission.report;
+    const uncaught: unknown[] = [];
+    const capture = (error: unknown): void => {
+      uncaught.push(error);
+    };
+    process.on("uncaughtException", capture);
+    try {
+      report.emit("error", new Error("late admission channel failure"));
+      // Two turns of the loop, so a failure delivered from a stream callback
+      // would have surfaced by now.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+    } finally {
+      process.off("uncaughtException", capture);
+    }
+    // The claim that matters: the late failure is not a new fact about a run
+    // that has already reported one, so it must not become an unhandled `error`
+    // event — the difference between a finished run and a crashed process.
+    expect(uncaught).toEqual([]);
+    // How it holds: the decision's own listeners are gone, by reference, and a
+    // sink is deliberately left in their place.
+    expect(report.listenerCount("data")).toBe(0);
+    expect(report.listenerCount("close")).toBe(0);
+    expect(report.listenerCount("end")).toBe(0);
+    expect(report.listenerCount("error")).toBeGreaterThan(0);
+  });
+
+  it("keeps the sink after a refused admission too", { timeout: 60_000 }, async () => {
+    const probe = newProbe();
+    mockContainment(probe);
+    // The channel closes with no confirmation: the verdict is a refusal, and the
+    // refusal's own settle/release sequence runs afterwards.
+    const admission = scriptAdmissionChild(({ report }) => {
+      report.end();
+    });
+    probe.onSettle = () => admission.child.emit("exit", null, "SIGKILL");
+
+    const managed = await import("../src/managed-shell.js");
+    await expect(
+      managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" }),
+    ).rejects.toMatchObject({ code: "PROCESS_CONTAINMENT_REFUSED" });
+
+    expect(admission.report.listenerCount("error")).toBeGreaterThan(0);
+  });
+});
+
 describe("an admission refusal settles the boundary it provisioned (Spec #168 / ticket #176)", () => {
   it("settles the provisioned leaf before releasing it", { timeout: 60_000 }, async () => {
     const probe = newProbe();

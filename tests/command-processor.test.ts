@@ -220,6 +220,11 @@ describe("Verify runs its plan through the shared command-processor seam", () =>
     fixtures.push(repository.parent);
     const shellSpawns: string[] = [];
     vi.resetModules();
+    // Spec #168 / ticket #178: the POSIX processor is the branch under test here,
+    // so the platform is asked for explicitly. On a Windows host the seam would
+    // otherwise take the `ComSpec` branch and this would report that host rather
+    // than the missing `/bin/sh`; the Windows branch has its own tests above.
+    Object.defineProperty(process, "platform", { ...ORIGINAL_PLATFORM, value: "linux" });
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
       return {

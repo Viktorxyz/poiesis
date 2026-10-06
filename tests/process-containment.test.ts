@@ -56,6 +56,7 @@ afterEach(async () => {
   Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
   vi.doUnmock("node:fs");
   vi.doUnmock("node:child_process");
+  vi.doUnmock("../src/containment.js");
   vi.resetModules();
   while (fixtures.length > 0) {
     await rm(fixtures.pop()!, { recursive: true, force: true });
@@ -248,6 +249,40 @@ describeManagedExecution("command text reaches the processor verbatim, through t
   },
 );
 
+/**
+ * Script the kernel boundary so the ADMISSION gate itself is what runs.
+ *
+ * Spec #168 / ticket #178: these assertions are about what the parent does with
+ * an unconfirmed report, not about whether this host can contain anything — and
+ * a host that cannot (Windows, macOS, an under-provisioned Linux) would refuse
+ * inside `provisionContainment` before the gate is ever reached, reporting its
+ * own correct answer in place of the one under test. Only provisioning,
+ * settlement, and release are substituted; the report format, the confirmation
+ * predicate, and the refusal itself stay the real implementation.
+ */
+const SCRIPTED_LEAF = "/poiesis-scripted-cgroup-leaf";
+
+function scriptContainmentBoundary(): void {
+  vi.doMock("../src/containment.js", async () => {
+    const actual = await vi.importActual<typeof import("../src/containment.js")>("../src/containment.js");
+    return {
+      ...actual,
+      provisionContainment: (input: { model: string; operationId: string }) => ({
+        model: input.model,
+        operationId: input.operationId,
+        leaf: SCRIPTED_LEAF,
+      }),
+      settleContainment: async (lease: { model: string; leaf: string | null }) => ({
+        model: lease.model,
+        leaf: lease.leaf,
+        survived: [],
+        confirmed: true,
+      }),
+      releaseContainment: () => undefined,
+    };
+  });
+}
+
 describe("unconfirmed admission is refused, never silently accepted", () => {
   /**
    * Drive the public managed-command seam with a child that never reports an
@@ -260,6 +295,7 @@ describe("unconfirmed admission is refused, never silently accepted", () => {
   ): Promise<{ error: unknown; spawnCalls: number }> {
     const spawnCalls = { count: 0 };
     vi.resetModules();
+    scriptContainmentBoundary();
     vi.doMock("node:child_process", async () => {
       const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
       return {
@@ -340,6 +376,11 @@ describe("honest refusal when strong containment cannot be established", () => {
   }> {
     const spawnCalls = { count: 0 };
     vi.resetModules();
+    // Spec #168 / ticket #178: asked for explicitly. The report reads
+    // `process.platform` before it reads any hierarchy, so on Windows or macOS
+    // this would otherwise answer `UNSUPPORTED_PLATFORM` (or refuse in the
+    // processor seam) and report THIS host instead of the missing subtree.
+    Object.defineProperty(process, "platform", { ...ORIGINAL_PLATFORM, value: "linux" });
     vi.doMock("node:fs", async () => {
       const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
       return {
@@ -350,6 +391,15 @@ describe("honest refusal when strong containment cannot be established", () => {
           }
           return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
         }) as typeof actual.readFileSync,
+        // Spec #168 / ticket #178: the processor is resolved before containment
+        // is provisioned, so a host without `/bin/sh` would stop at the
+        // processor seam and report THAT host instead of the missing subtree
+        // under test. The processor's own availability is covered in
+        // `tests/command-processor.test.ts`.
+        accessSync: ((path: string, ...rest: unknown[]) => {
+          if (path === "/bin/sh") return undefined;
+          return Reflect.apply(actual.accessSync, undefined, [path, ...rest]) as void;
+        }) as typeof actual.accessSync,
       };
     });
     vi.doMock("node:child_process", async () => {

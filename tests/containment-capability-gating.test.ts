@@ -43,8 +43,18 @@ const PROBE_PREFIX = "poiesis-capability-probe-";
  * `resolveContainmentCapability` reads, so denying them is the same shape of
  * answer a Windows or macOS host gives — a typed refusal naming the missing
  * capability, not a runtime failure.
+ *
+ * Spec #168 / ticket #178: the platform is injected as Linux for the same
+ * reason the filesystem is scripted. Without it a macOS or Windows host would
+ * answer `UNSUPPORTED_PLATFORM` before any of these facts are read, and every
+ * assertion about the cgroup files would be a host report wearing a test's
+ * name. Production semantics are untouched — the unsupported-platform answer is
+ * asserted separately, from a host that really is that platform.
  */
-async function withoutStrongContainment<T>(run: () => Promise<T>): Promise<T> {
+async function withoutStrongContainment<T>(
+  run: () => Promise<T>,
+  platform: NodeJS.Platform = "linux",
+): Promise<T> {
   vi.resetModules();
   vi.doMock("node:fs", async () => {
     const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
@@ -56,14 +66,50 @@ async function withoutStrongContainment<T>(run: () => Promise<T>): Promise<T> {
         }
         return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
       }) as typeof actual.readFileSync,
+      ...posixProcessorProbe(actual),
     };
   });
+  const restore = injectPlatform(platform);
   try {
     return await run();
   } finally {
+    restore();
     vi.doUnmock("node:fs");
     vi.resetModules();
   }
+}
+
+/**
+ * Spec #168 / ticket #178 — answer the capability report as this platform for
+ * the duration of a scripted-filesystem assertion.
+ *
+ * The report consults `process.platform` before it reads any hierarchy, so a
+ * non-Linux host would never reach the scripted facts at all. Restored by the
+ * returned function, so no test can leave the runtime lying about its platform.
+ */
+function injectPlatform(platform: NodeJS.Platform): () => void {
+  const original = Object.getOwnPropertyDescriptor(process, "platform")!;
+  Object.defineProperty(process, "platform", { ...original, value: platform });
+  return () => Object.defineProperty(process, "platform", original);
+}
+
+/**
+ * Spec #168 / ticket #178 — report the POSIX processor as present.
+ *
+ * The processor is resolved BEFORE containment is provisioned, so on a host
+ * without `/bin/sh` these assertions would stop one seam earlier and report that
+ * host's missing interpreter instead of the containment answer under test. The
+ * processor's own availability is covered where it is the subject
+ * (`tests/command-processor.test.ts`); here it is only the thing that has to
+ * stop objecting before the boundary is asked.
+ */
+function posixProcessorProbe(actual: typeof import("node:fs")): Record<string, unknown> {
+  return {
+    accessSync: ((path: string, ...rest: unknown[]) => {
+      if (path === "/bin/sh") return undefined;
+      return Reflect.apply(actual.accessSync, undefined, [path, ...rest]) as void;
+    }) as typeof actual.accessSync,
+  };
 }
 
 const fixtures: string[] = [];
@@ -84,10 +130,17 @@ async function scratch(): Promise<string> {
  * refusal paths too, and it must be able to do so without this test creating a
  * real directory on whatever host it happens to run on. Everything else passes
  * through to the real `node:fs`.
+ *
+ * Spec #168 / ticket #178: `hideRealControl` and `rmdir` answer for the leaf
+ * REAL provisioning creates (as opposed to the transient capability probe), so
+ * the provisioning path can be driven — including its own revalidation of the
+ * leaf it just created — without a real cgroup hierarchy anywhere.
  */
 interface ProbeRecord {
   readonly created: string[];
   readonly removed: string[];
+  /** Real leaves whose `rmdir` was refused, with the errno that refused it. */
+  readonly rmdirFailed: { path: string; code: string }[];
 }
 
 async function withCgroupFilesystem<T>(
@@ -96,30 +149,38 @@ async function withCgroupFilesystem<T>(
     controllers?: boolean;
     mkdir?: "deny";
     hideControl?: string | null;
+    /** Hides a control from the leaf real provisioning creates. */
+    hideRealControl?: string | null;
+    /** Makes `rmdir` of a real leaf fail the way a busy or forbidden kernel answers. */
+    rmdir?: "EBUSY" | "EACCES" | null;
   },
   run: (probe: ProbeRecord) => Promise<T>,
 ): Promise<T> {
-  const probe: ProbeRecord = { created: [], removed: [] };
+  const probe: ProbeRecord = { created: [], removed: [], rmdirFailed: [] };
   vi.resetModules();
   vi.doMock("node:fs", async () => {
     const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
     const underCgroupRoot = (path: unknown): path is string =>
       typeof path === "string" && path.startsWith("/sys/fs/cgroup/");
+    const isProbeLeaf = (path: string): boolean => path.includes(PROBE_PREFIX);
     return {
       ...actual,
       existsSync: ((path: string, ...rest: unknown[]) => {
         if (overrides.controllers !== undefined && path === "/sys/fs/cgroup/cgroup.controllers") {
           return overrides.controllers;
         }
-        if (overrides.hideControl != null && underCgroupRoot(path) && path.endsWith(`/${overrides.hideControl}`)) {
-          return false;
-        }
-        // A SIMULATED leaf: because `mkdir` below creates nothing on disk, the
-        // controls of a leaf it did create have to be answered here, or every
-        // probe would look like it found none of them.
         if (underCgroupRoot(path)) {
-          const leaf = path.slice(0, path.lastIndexOf("/"));
-          if (probe.created.includes(leaf)) return true;
+          const parent = path.slice(0, path.lastIndexOf("/"));
+          if (overrides.hideControl != null && path.endsWith(`/${overrides.hideControl}`)) {
+            return false;
+          }
+          if (overrides.hideRealControl != null && path.endsWith(`/${overrides.hideRealControl}`) && !isProbeLeaf(path)) {
+            return false;
+          }
+          // A SIMULATED leaf: because `mkdir` below creates nothing on disk, the
+          // controls of a leaf it did create have to be answered here, or every
+          // probe would look like it found none of them.
+          if (probe.created.includes(parent)) return true;
         }
         return Reflect.apply(actual.existsSync, undefined, [path, ...rest]) as boolean;
       }) as typeof actual.existsSync,
@@ -150,6 +211,10 @@ async function withCgroupFilesystem<T>(
       }) as typeof actual.mkdirSync,
       rmdirSync: ((path: string, ...rest: unknown[]) => {
         if (underCgroupRoot(path)) {
+          if (overrides.rmdir != null && !isProbeLeaf(path)) {
+            probe.rmdirFailed.push({ path, code: overrides.rmdir });
+            throw Object.assign(new Error(`rmdir refused: ${overrides.rmdir}`), { code: overrides.rmdir });
+          }
           probe.removed.push(path);
           return undefined;
         }
@@ -157,9 +222,14 @@ async function withCgroupFilesystem<T>(
       }) as typeof actual.rmdirSync,
     };
   });
+  // Spec #168 / ticket #178: the report reads `process.platform` before it
+  // reads any hierarchy, so a non-Linux host must still be answered as Linux
+  // here or these assertions would report that host instead of this code.
+  const restorePlatform = injectPlatform("linux");
   try {
     return await run(probe);
   } finally {
+    restorePlatform();
     vi.doUnmock("node:fs");
     vi.resetModules();
   }
@@ -426,6 +496,94 @@ describe("the capability report earns its verdict (Spec #168 / ticket #177)", ()
   });
 });
 
+/**
+ * Spec #168 / ticket #178 — the leaf real provisioning creates is revalidated
+ * on its own terms.
+ *
+ * The capability report proves the prerequisites on a throwaway probe, which
+ * answers "can this host do it at all". The leaf a run actually provisions is
+ * checked again, control by control, and a leaf that fails that revalidation is
+ * refused with `PROCESS_CONTAINMENT_UNAVAILABLE` and asked to be removed first.
+ *
+ * That `rmdir` is best-effort in exactly the state where it can fail — the
+ * kernel just refused to expose the controls of that directory — so its errno
+ * must never become the reported outcome. An `EACCES` or `EBUSY` from the
+ * cleanup used to replace the actionable refusal with an opaque filesystem
+ * failure that named neither the missing control nor the host requirement, and
+ * the caller could not tell a host limitation from a bug.
+ */
+describe("provisioning revalidation keeps the typed refusal (Spec #168 / ticket #178)", () => {
+  it.each(["EBUSY", "EACCES"] as const)(
+    "reports the missing control, not the %s from cleaning up the unusable leaf",
+    async (code) => {
+      const observed = await withCgroupFilesystem(
+        { unified: "0::/\n", controllers: true, hideRealControl: "cgroup.kill", rmdir: code },
+        async (probe) => {
+          const containment = await import("../src/containment.js");
+          try {
+            containment.provisionContainment({
+              model: "cgroup-v2",
+              operationId: "spec-t178-revalidation",
+              remediation: "Run this operation on a host that provides strong containment.",
+            });
+            return { error: null, probe };
+          } catch (error) {
+            return { error, probe };
+          }
+        },
+      );
+
+      // The refusal is still the refusal: its own code, its own reason, and the
+      // control that was missing — whatever the cleanup answered.
+      expect(observed.error).toMatchObject({
+        code: "PROCESS_CONTAINMENT_UNAVAILABLE",
+        details: {
+          containment: "cgroup-v2",
+          reason: "NO_CGROUP_KILL",
+          detail: expect.stringContaining("cgroup.kill"),
+          remediation: expect.stringContaining("strong containment"),
+        },
+      });
+      expect((observed.error as Error).message).toContain("cgroup.kill");
+      // The cleanup failure is bounded context on that refusal, not the outcome:
+      // the operator is told the leaf is still there and how to remove it.
+      expect(observed.error).toMatchObject({ details: { detail: expect.stringContaining(code) } });
+      // Cleanup was still attempted, and the transient capability probe — which
+      // has every control — was removed as usual.
+      expect(observed.probe.rmdirFailed).toHaveLength(1);
+      expect(observed.probe.rmdirFailed[0]?.path).not.toContain(PROBE_PREFIX);
+      expect(observed.probe.removed).toEqual([observed.probe.created[0]]);
+    },
+  );
+
+  it("removes the unusable leaf and refuses identically when the cleanup succeeds", async () => {
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true, hideRealControl: "cgroup.events" },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        try {
+          containment.provisionContainment({
+            model: "cgroup-v2",
+            operationId: "spec-t178-cleanup",
+            remediation: "Run this operation on a host that provides strong containment.",
+          });
+          return { error: null, probe };
+        } catch (error) {
+          return { error, probe };
+        }
+      },
+    );
+
+    expect(observed.error).toMatchObject({
+      code: "PROCESS_CONTAINMENT_UNAVAILABLE",
+      details: { reason: "NO_CGROUP_KILL", detail: expect.stringContaining("cgroup.events") },
+    });
+    // Nothing is left behind for the next run to trip over.
+    expect(observed.probe.removed).toEqual(observed.probe.created);
+    expect(observed.probe.rmdirFailed).toEqual([]);
+  });
+});
+
 describeManagedExecution("capability probing leaves no residue (Spec #168 / ticket #177)", () => {
   it("removes its own probe leaf from the delegated subtree", () => {
     const capability = resolveContainmentCapability();
@@ -484,18 +642,28 @@ describe("pure fail-closed assertions still run on a capability-unavailable host
   });
 
   it("still reports the unsupported-platform reason for Windows verbatim", async () => {
-    const original = Object.getOwnPropertyDescriptor(process, "platform")!;
-    Object.defineProperty(process, "platform", { ...original, value: "win32" });
-    try {
-      const capability = await withoutStrongContainment(async () => {
-        const containment = await import("../src/containment.js");
-        return containment.resolveContainmentCapability();
-      });
-      expect(capability).toMatchObject({ available: false, platform: "win32", reason: "UNSUPPORTED_PLATFORM" });
-      // Actionable, not merely negative: it names the primitive that is missing.
-      expect(capability.detail).toContain("Job Object");
-    } finally {
-      Object.defineProperty(process, "platform", original);
+    // Asked for explicitly rather than inherited from this host: the point of the
+    // assertion is that the PRODUCTION branch answers this platform with the
+    // primitive it lacks, on every host that runs this suite.
+    const capability = await withoutStrongContainment(async () => {
+      const containment = await import("../src/containment.js");
+      return containment.resolveContainmentCapability();
+    }, "win32");
+
+    expect(capability).toMatchObject({ available: false, platform: "win32", reason: "UNSUPPORTED_PLATFORM" });
+    // Actionable, not merely negative: it names the primitive that is missing.
+    expect(capability.detail).toContain("Job Object");
+  });
+
+  it("reports the real reason on whichever platform this host actually is", async () => {
+    // Spec #168 / ticket #178: a non-Linux host has its own correct answer, and
+    // these assertions must describe THIS runtime's real capability rather than
+    // the answer a Linux CI box would give.
+    const capability = resolveContainmentCapability();
+    expect(strongContainmentAvailable()).toBe(capability.available);
+    if (process.platform !== "linux") {
+      expect(capability).toMatchObject({ available: false, reason: "UNSUPPORTED_PLATFORM" });
+      expect(capability.platform).toBe(process.platform);
     }
   });
 });

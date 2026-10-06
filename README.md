@@ -201,6 +201,17 @@ this runtime does not ship; on macOS and the other POSIX platforms no portable
 strong primitive exists at all. Use the library `run()` seam with a fixed argv
 for work that does not need arbitrary command text on such a host.
 
+The command processor is validated on the same terms, before any process
+exists. `verify` and `check` refuse with `COMMAND_PROCESSOR_UNAVAILABLE`
+carrying `details.reason` (`PROCESSOR_NOT_EXECUTABLE`, or the `ComSpec` reasons
+`COMSPEC_MISSING`, `COMSPEC_NOT_ABSOLUTE`, `COMSPEC_NOT_COMMAND_PROCESSOR`,
+`COMSPEC_UNAVAILABLE`), `details.platform`, the rejected `details.processor`,
+`details.detail`, and a `details.remediation`. `check` passes that refusal
+through with its own code and those fields intact and the bounded
+`details.check` evidence attached — and without the "escalate to `poiesis
+verify`" line a failing check carries, because Verify resolves command text
+through the same processor and would refuse in exactly the same way.
+
 `SIGINT` / `SIGTERM` cancel the two operations that actually consume a signal —
 `poiesis verify` and `poiesis check`. One AbortController per invocation,
 temporary handlers removed in `finally`, the first signal aborts once. Every

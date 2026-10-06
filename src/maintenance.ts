@@ -1260,6 +1260,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         const preserved = diagnostics.map((diagnostic) => ({
           path: relative(resolvedRoot, diagnostic.path),
           reason: diagnostic.reason,
+          // Spec #168 / ticket #178: a restoration that failed KEEPS its preimage
+          // (#178), so the location has to reach the operator — a retained copy
+          // nobody can find is the same as a lost one. Omitted when the
+          // destination holds a foreign write instead, which is not a failure to
+          // restore.
+          ...(diagnostic.preimageRecoveredAt === undefined
+            ? {}
+            : { preimageRecoveredAt: diagnostic.preimageRecoveredAt }),
         }));
         throw new PoiesisError("SKILL_ROLLBACK_INCOMPLETE", "Some default-skill mutations could not be rolled back", {
           preserved,

@@ -965,29 +965,40 @@ async function awaitAdmissionConfirmation(child: ChildProcess): Promise<{
     return { confirmed: false, detail: "the admission report channel was never opened" };
   }
   const confirmedDetail = "the prologue confirmed its own kernel membership";
+  // Spec #168 / ticket #178: every listener this gate installs is held BY
+  // REFERENCE so the decision can be retired exactly — its own listeners, and
+  // nothing else on the channel.
+  let onConfirmation: ((chunk: Buffer | string) => void) | undefined;
+  let onChannelFailure: (() => void) | undefined;
+  let onChannelClosed: (() => void) | undefined;
+  let onChannelEnded: (() => void) | undefined;
+  let onDeclaredExit: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
   const declaredExit = new Promise<{ confirmed: false; detail: string }>((resolve) => {
-    child.once("exit", (code, signal) => {
+    onDeclaredExit = (code, signal): void => {
       resolve({
         confirmed: false,
         detail: `the admission prologue finished without reporting (exit code ${String(code)}, signal ${String(signal)})`,
       });
-    });
+    };
+    child.once("exit", onDeclaredExit);
   });
   const channelClosed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
-    report.once("error", () => resolve({ confirmed: false, detail: "the admission report channel failed" }));
-    report.once("close", () =>
-      resolve({ confirmed: false, detail: "the admission report channel closed without reporting" }),
-    );
-    report.once("end", () =>
-      resolve({ confirmed: false, detail: "the admission report channel ended without reporting" }),
-    );
+    onChannelFailure = (): void => resolve({ confirmed: false, detail: "the admission report channel failed" });
+    onChannelClosed = (): void =>
+      resolve({ confirmed: false, detail: "the admission report channel closed without reporting" });
+    onChannelEnded = (): void =>
+      resolve({ confirmed: false, detail: "the admission report channel ended without reporting" });
+    report.once("error", onChannelFailure);
+    report.once("close", onChannelClosed);
+    report.once("end", onChannelEnded);
   });
   const confirmed = new Promise<{ confirmed: true; detail: string }>((resolve) => {
-    report.on("data", (chunk: Buffer | string) => {
+    onConfirmation = (chunk: Buffer | string): void => {
       if (isAdmissionConfirmation(chunk.toString("utf8"))) {
         resolve({ confirmed: true, detail: confirmedDetail });
       }
-    });
+    };
+    report.on("data", onConfirmation);
   });
   const elapsed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
     const timer = setTimeout(
@@ -1001,13 +1012,38 @@ async function awaitAdmissionConfirmation(child: ChildProcess): Promise<{
   // The refusal reason stays whatever the gate actually observed; the drain only
   // gets the chance to convert an ordering artifact into a real verdict.
   const verdict = outcome.confirmed ? outcome : ((await drainAdmissionReport(report)) ?? outcome);
-  // The report channel is single-use: the prologue closes it before `exec`, so
-  // nothing further is read from it and the command never inherits the pipe.
-  report.removeAllListeners();
+  // Spec #168 / ticket #178: the decision is over, so the listeners THIS gate
+  // installed are removed — by reference, not with `removeAllListeners()`, which
+  // would also detach anything else the channel's owner put on it. What is
+  // deliberately retained is an error sink: the channel can still be open (the
+  // prologue `exec`s with fd3 closed but a descendant may hold it), and resuming
+  // a still-open stream with no `error` listener turns one late stream error
+  // into an unhandled `error` event, which crashes the process over a run that
+  // has already reported its outcome. The sink swallows nothing that is
+  // reported: it only keeps a post-decision stream failure from being fatal.
+  report.off("data", onConfirmation!);
+  report.off("error", onChannelFailure!);
+  report.off("close", onChannelClosed!);
+  report.off("end", onChannelEnded!);
+  child.off("exit", onDeclaredExit!);
+  report.on("error", onSettledChannelError);
   const drained = report as Partial<NodeJS.ReadableStream> & { resume?: () => void; unref?: () => void };
   drained.resume?.();
   drained.unref?.();
   return verdict;
+}
+
+/**
+ * Spec #168 / ticket #178 — the retained no-op error sink for an admission
+ * report channel whose decision is already reported.
+ *
+ * ONE shared function, so re-attaching it is idempotent (a channel holds at
+ * most one listener per function) and repeated ownership of one channel can
+ * never accumulate sinks.
+ */
+function onSettledChannelError(): void {
+  // The admission verdict is already reported. A late stream failure on a
+  // channel nothing reads any more is not a new fact about this run.
 }
 
 /**

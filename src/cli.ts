@@ -698,6 +698,11 @@ export async function commandVerify(args: string[], signal?: AbortSignal): Promi
  * failing command, and pointing the operator at Verify — which needs the same
  * capability — would only send them somewhere that refuses identically.
  *
+ * Spec #168 / ticket #178 adds the third, for the same reason: a host with no
+ * usable command processor is refused with `COMMAND_PROCESSOR_UNAVAILABLE`
+ * BEFORE any process exists, so it is equally not a failing check, and Verify
+ * resolves command text through the very same processor seam.
+ *
  * Exported as a library seam (same pattern as `commandVerify`); it is
  * intentionally NOT re-exported by `src/index.ts`.
  */
@@ -768,6 +773,15 @@ export async function commandCheck(args: string[], signal?: AbortSignal): Promis
     if (failed !== undefined && isActionableContainmentRefusal(failed.failureCode)) {
       throw containmentRefusal(failed, result);
     }
+    // Spec #168 / ticket #178: a missing command PROCESSOR is the same class of
+    // refusal for the same reason. It is raised before a process exists, it is
+    // actionable (the operator can fix the host), and `poiesis verify` reaches
+    // command text through the very same seam — so the `migration` advice would
+    // send the operator to a surface that refuses identically. It keeps its own
+    // typed code and its own reason/platform/processor/remediation.
+    if (failed !== undefined && failed.failureCode === "COMMAND_PROCESSOR_UNAVAILABLE") {
+      throw processorUnavailableRefusal(failed, result);
+    }
     throw new PoiesisError("FOCUSED_CHECK_FAILED", "Focused checks did not pass", {
       check: result,
       migration:
@@ -830,10 +844,52 @@ function causeDetails(cause: FocusedFailureCause | null): Record<string, unknown
     cause: { ...cause },
     ...(cause.containment === null ? {} : { containment: cause.containment }),
     ...(cause.platform === null ? {} : { platform: cause.platform }),
+    ...(cause.processor === null ? {} : { processor: cause.processor }),
     ...(cause.reason === null ? {} : { reason: cause.reason }),
     ...(cause.detail === null ? {} : { detail: cause.detail }),
     ...(cause.remediation === null ? {} : { remediation: cause.remediation }),
   };
+}
+
+/**
+ * Spec #168 / ticket #178 — rethrow the processor seam's own refusal, with the
+ * bounded check evidence attached.
+ *
+ * `COMMAND_PROCESSOR_UNAVAILABLE` is raised BEFORE any process exists, so the
+ * focused command never ran and nothing about the operator's code failed. The
+ * reason (`PROCESSOR_NOT_EXECUTABLE`, a `ComSpec` that is missing, relative,
+ * or not `cmd.exe`), the platform, the processor that was rejected, and the
+ * runtime's own remediation are carried through verbatim, so the operator is
+ * told exactly what to repair.
+ *
+ * Deliberately ABSENT is the `migration` advice attached to a genuine
+ * `FOCUSED_CHECK_FAILED`. Escalating to `poiesis verify` is not a workaround
+ * here: Verify executes managed command text through the same validated
+ * processor and would refuse identically, so pointing there would replace an
+ * accurate host diagnosis with a dead end.
+ */
+function processorUnavailableRefusal(failed: FocusedCommandEvidence, result: CheckResult): PoiesisError {
+  const cause = failed.failureCause;
+  const detail =
+    cause?.detail ?? "this runtime could not resolve a usable command processor for the focused command text.";
+  return new PoiesisError(
+    "COMMAND_PROCESSOR_UNAVAILABLE",
+    `Focused check did not run: managed command text requires a usable command processor, which this runtime could not provide: ${detail}`,
+    {
+      check: result,
+      // Bounded evidence about the command that never started, so the
+      // fingerprint still identifies what was attempted and what state it was
+      // attempted against.
+      command: failed.command,
+      commandIndex: failed.index,
+      classification: result.classification,
+      exitCode: failed.exitCode,
+      durationMs: failed.durationMs,
+      stdoutTruncated: failed.stdoutTruncated,
+      stderrTruncated: failed.stderrTruncated,
+      ...causeDetails(cause),
+    },
+  );
 }
 
 /**
