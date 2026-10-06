@@ -17,11 +17,11 @@
  * that leaks a descendant, times out, or is cancelled is still settled
  * before the result is returned.
  */
-import { readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import type { ChildProcess } from "node:child_process";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { workspacePrepare, type WorkspaceIdentity } from "../src/git.js";
 import { init } from "../src/maintenance.js";
@@ -94,6 +94,33 @@ async function ownedCandidate(label: string): Promise<WorkspaceIdentity> {
     branch: `poiesis/${specId}`,
     specId,
   });
+}
+
+/**
+ * Spec #168 / ticket #179 — the width of one untracked porcelain record, and a
+ * repository-relative path of exactly that width whose every component stays
+ * inside the 250-byte filesystem limit. The fixture uses it to push a real
+ * status stream across the runner's byte-capture bound.
+ */
+const LONG_PATH_BYTES = 2000;
+
+function longPath(prefix: string, index: number, length: number): string {
+  const parts: string[] = [`${prefix}${index}`];
+  let used = parts[0]!.length;
+  while (used < length) {
+    const size = Math.min(250, length - used - 1);
+    parts.push("z".repeat(size));
+    used += size + 1;
+  }
+  return parts.join("/");
+}
+
+async function seedLongUntrackedFiles(root: string, prefix: string, from: number, to: number): Promise<void> {
+  for (let index = from; index < to; index += 1) {
+    const name = longPath(prefix, index, LONG_PATH_BYTES);
+    await mkdir(dirname(join(root, name)), { recursive: true });
+    await writeFile(join(root, name), "", "utf8");
+  }
 }
 
 async function receiptsExist(): Promise<boolean> {
@@ -401,6 +428,59 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(renamed.state.pathDigests).toEqual([{ path: "README.md", blob: "absent" }, { path: "notes.txt", blob: renamed.state.pathDigests.find((d) => d.path === "notes.txt")!.blob }]);
     expect(renamed.actionFingerprint).not.toBe(deleted.actionFingerprint);
   }, 60_000);
+
+  itManagedExecution(
+    "never fingerprints a status capture the byte bound cut short as the complete state it was cut from",
+    async () => {
+      // Spec #168 / ticket #179. 130 untracked files of 2,000 bytes each occupy
+      // 260,519 bytes of porcelain status; one more record — named so it sorts
+      // last — straddles the runner's 262,144-byte capture bound. Both reads
+      // therefore observe the SAME 130 whole records, the same head, the same
+      // tree, and the same content digests; the only fact that differs is
+      // whether the capture was read whole. If the fingerprint ignored that, an
+      // incompletely observed workspace would be reported as an unchanged action.
+      const candidate = await ownedCandidate("status-capture");
+      await seedLongUntrackedFiles(candidate.path, "a", 0, 130);
+      const run = () =>
+        executeCheck({
+          scope: "focused",
+          cwd: candidate.path,
+          ownershipId: candidate.ownershipId,
+          commands: ["true"],
+        });
+
+      const complete = await run();
+      expect(complete.state.statusCaptureTruncated).toBe(false);
+      expect(complete.state.changedFiles).toHaveLength(130);
+
+      await seedLongUntrackedFiles(candidate.path, "z", 0, 1);
+      const cut = await run();
+      expect(cut.state.statusCaptureTruncated).toBe(true);
+      expect(cut.state.changedFiles).toHaveLength(130);
+      expect(cut.state.head).toBe(complete.state.head);
+      expect(cut.state.tree).toBe(complete.state.tree);
+      expect(cut.state.dirty).toBe(complete.state.dirty);
+      expect(cut.state.changedFiles).toEqual(complete.state.changedFiles);
+      expect(cut.state.changedFilesTruncated).toBe(complete.state.changedFilesTruncated);
+      expect(cut.state.pathDigests).toEqual(complete.state.pathDigests);
+      expect(cut.state.pathDigestsTruncated).toBe(complete.state.pathDigestsTruncated);
+      expect(cut.operationId).toBe(complete.operationId);
+      // The whole point: an incomplete read is not an unchanged action.
+      expect(cut.actionFingerprint).not.toBe(complete.actionFingerprint);
+
+      // The same incomplete state fingerprints deterministically...
+      const again = await run();
+      expect(again.actionFingerprint).toBe(cut.actionFingerprint);
+      expect(again.state).toEqual(cut.state);
+
+      // ...and the complete state it was cut from still fingerprints as itself.
+      await rm(join(candidate.path, longPath("z", 0, LONG_PATH_BYTES)), { force: true });
+      const restored = await run();
+      expect(restored.state.statusCaptureTruncated).toBe(false);
+      expect(restored.actionFingerprint).toBe(complete.actionFingerprint);
+    },
+    60_000,
+  );
 
   itManagedExecution("emits bounded progress events that carry no command text, output, or environment values", async () => {
     const candidate = await ownedCandidate("progress");

@@ -317,7 +317,22 @@ export interface WorktreeStateFingerprint {
   tree: string | null;
   dirty: boolean;
   changedFiles: string[];
+  /**
+   * The changed-path LIST was bounded for evidence. A different fact from
+   * {@link statusCaptureTruncated}: everything below was read, and only this
+   * list was shortened.
+   */
   changedFilesTruncated: boolean;
+  /**
+   * Spec #168 / ticket #179 — the status BYTES themselves were cut short by the
+   * process runner's capture bound, so the workspace was not read whole and
+   * more changed paths exist beyond this reading than the list can show.
+   *
+   * This is the only field of the three that means "state nobody observed".
+   * `changedFiles` and `pathDigests` below are derived exclusively from whole
+   * porcelain records, so neither can contain a path the bound cut in half.
+   */
+  statusCaptureTruncated: boolean;
   /**
    * Bounded per-path content digests for the changed paths.
    *
@@ -326,6 +341,10 @@ export interface WorktreeStateFingerprint {
    * state would be indistinguishable from an unchanged one.
    */
   pathDigests: WorktreePathDigest[];
+  /**
+   * The digest LIST was bounded by its own path count, not by how much of the
+   * status was read.
+   */
   pathDigestsTruncated: boolean;
 }
 
@@ -1851,7 +1870,12 @@ export async function readWorktreeState(cwd: string, outputLimit?: number): Prom
     allowFailure: true,
   });
   const head = headResult.exitCode === 0 && SHA_PATTERN.test(headResult.stdout) ? headResult.stdout : null;
-  const entries = await gitStatus(root);
+  // Spec #168 / ticket #179: the capture's own completeness is read alongside
+  // its records, and the records themselves are whole ones only. A fingerprint
+  // is evidence, not a gate, so an incomplete read is REPORTED rather than
+  // thrown — it simply must never be reportable as a complete one.
+  const capture = await captureGitStatus(root);
+  const entries = capture.entries;
   const paths = parseStatusPaths(entries);
   const tree = head === null ? null : await resolveTree(root, head).catch(() => null);
 
@@ -1871,6 +1895,7 @@ export async function readWorktreeState(cwd: string, outputLimit?: number): Prom
     dirty: entries.length > 0,
     changedFiles: paths.slice(0, limit),
     changedFilesTruncated: paths.length > limit,
+    statusCaptureTruncated: capture.truncated,
     pathDigests,
     pathDigestsTruncated: paths.length > digestPaths.length,
   };
@@ -2193,16 +2218,66 @@ function flagValue(fields: string[], flag: string): string | null {
   return field === flag ? "" : field.slice(flag.length + 1);
 }
 
-async function gitStatus(cwd: string): Promise<string[]> {
+/**
+ * Spec #168 / ticket #179 — one status capture, and whether it was read WHOLE.
+ *
+ * The process runner bounds every capture it takes, so once a worktree's
+ * porcelain status exceeds that bound the reader sees only its prefix, and the
+ * bound can stop part-way through a record. That makes two different facts that
+ * must never be conflated:
+ *
+ *   - the CAPTURE was cut short (`truncated`) — there is workspace state
+ *     nobody read, so the observation cannot be reported as a complete one;
+ *   - a complete capture whose path list was then bounded for evidence, which
+ *     is `readWorktreeState`'s `changedFilesTruncated` / `pathDigestsTruncated`
+ *     and says nothing about how much of the worktree was read.
+ *
+ * `entries` therefore holds COMPLETE records only (see `captureGitStatus` for
+ * how the final unterminated record is told apart from a cut one). A record the
+ * bound cut through is discarded instead of parsed, because half a porcelain
+ * record is not a change: its path is a prefix of a real path that does not
+ * exist on disk, and reporting it would put a content digest on a file the
+ * worktree does not contain.
+ */
+export interface GitStatusCapture {
+  entries: string[];
+  truncated: boolean;
+}
+
+async function captureGitStatus(cwd: string): Promise<GitStatusCapture> {
   const result = await run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd });
-  if (!result.stdout) return [];
-  const parts = result.stdout.split("\0").filter(Boolean);
+  if (!result.stdout) return { entries: [], truncated: result.stdoutTruncated };
+  // `-z` porcelain terminates every record with NUL EXCEPT the last one, so the
+  // trailing segment is that final whole record when the capture was read to
+  // the end of the stream, and a record the capture stopped inside when the
+  // runner reported output remaining. Only the second is incomplete, and it is
+  // discarded rather than parsed: half a porcelain record is not a change.
+  const records = result.stdout.split("\0");
+  const trailing = records.pop() ?? "";
+  const truncated = result.stdoutTruncated;
+  const whole = records.filter((record) => record.length > 0);
+  if (!truncated && trailing.length > 0) whole.push(trailing);
+  return { entries: parseStatusRecords(whole, truncated), truncated };
+}
+
+/**
+ * Pair up the whole records of a `-z` porcelain capture.
+ *
+ * A rename or copy is TWO NUL-terminated fields — the destination then the
+ * source — and the bound can stop between them. An incomplete capture is the
+ * only thing that explains a missing source field, so there the half-read
+ * record is dropped rather than reported as a change whose source was
+ * reconstructed from the bytes that happened to arrive. A COMPLETE capture
+ * missing the field is Git's own invalid output and still fails closed.
+ */
+function parseStatusRecords(records: string[], truncated: boolean): string[] {
   const entries: string[] = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const entry = parts[index];
+  for (let index = 0; index < records.length; index += 1) {
+    const entry = records[index];
     if (entry === undefined) continue;
     if (entry[0] === "R" || entry[0] === "C" || entry[1] === "R" || entry[1] === "C") {
-      const source = parts[index + 1];
+      const source = records[index + 1];
+      if (source === undefined && truncated) break;
       invariant(source !== undefined, "INVALID_GIT_OUTPUT", "Git omitted a rename/copy source path");
       entries.push(`${entry}\0${source}`);
       index += 1;
@@ -2211,6 +2286,27 @@ async function gitStatus(cwd: string): Promise<string[]> {
     }
   }
   return entries;
+}
+
+/**
+ * The status read every clean/dirty authority shares: `inspect`, `checkpoint`,
+ * the exact-candidate clean assertions, workspace cleanup, and the temporary
+ * post-integration worktree.
+ *
+ * Spec #168 / ticket #179 — this is deliberately the WHOLE-RECORDS half of
+ * {@link captureGitStatus} and it deliberately keeps its `string[]` signature,
+ * because those callers ask "is anything changed?" and a single whole record
+ * already proves "yes"; a capture bounded at 256KiB can never hold fewer than
+ * one whole record, so a bounded read can never report a dirty tree as clean.
+ * What it can no longer do is turn the bound's last fragment into a claim: the
+ * fragment is a path prefix that does not exist on disk, and matching it as
+ * checkpoint residue or reporting it as a changed file would be a statement
+ * about the worktree that the worktree contradicts. Callers that must know
+ * whether the workspace was read WHOLE — the state fingerprint — read the
+ * detailed capture instead.
+ */
+async function gitStatus(cwd: string): Promise<string[]> {
+  return (await captureGitStatus(cwd)).entries;
 }
 
 function parseStatusPaths(entries: string[]): string[] {

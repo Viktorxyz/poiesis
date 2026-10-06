@@ -494,6 +494,17 @@ export interface CheckStateFingerprint {
   dirty: boolean;
   changedFiles: string[];
   changedFilesTruncated: boolean;
+  /**
+   * Spec #168 / ticket #179 — the status bytes behind this reading were cut
+   * short, so the workspace was observed only in part.
+   *
+   * It is carried here, rather than folded into `changedFilesTruncated`,
+   * because it is the one of the three bounds that means "state nobody read":
+   * the fingerprint below must separate a partially observed workspace from the
+   * complete one it was cut from, or a check would report an incomplete reading
+   * as an unchanged action.
+   */
+  statusCaptureTruncated: boolean;
   pathDigests: WorktreePathDigest[];
   pathDigestsTruncated: boolean;
 }
@@ -1140,6 +1151,7 @@ async function readStateFingerprintFor(cwd: string, ownershipId?: string): Promi
       dirty: state.dirty,
       changedFiles: state.changedFiles,
       changedFilesTruncated: state.changedFilesTruncated,
+      statusCaptureTruncated: state.statusCaptureTruncated,
       pathDigests: state.pathDigests,
       pathDigestsTruncated: state.pathDigestsTruncated,
     };
@@ -1156,6 +1168,7 @@ async function readStateFingerprint(authority: LifecycleAuthority): Promise<Chec
     dirty: state.dirty,
     changedFiles: state.changedFiles,
     changedFilesTruncated: state.changedFilesTruncated,
+    statusCaptureTruncated: state.statusCaptureTruncated,
     pathDigests: state.pathDigests,
     pathDigestsTruncated: state.pathDigestsTruncated,
   };
@@ -1210,6 +1223,10 @@ function actionFingerprint(input: {
       // fingerprint stays a pure function of the (sorted) digest list.
       input.state.pathDigests.map((digest) => `${digest.path}\0${digest.blob}`),
       input.state.pathDigestsTruncated,
+      // Spec #168 / ticket #179: appended last so every COMPLETE reading keeps
+      // the exact fingerprint it already had, and a partially observed one is
+      // separated from the complete state it was cut from.
+      input.state.statusCaptureTruncated,
     ]),
   );
 }
