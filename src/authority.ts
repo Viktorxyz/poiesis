@@ -477,17 +477,20 @@ export function predecessorProjectionV113V114(
  * projection for the OpenCode adapter.
  *
  * Ticket #173 added ONE narrow allow — the Worker's
- * `pnpm dlx poiesis-cli@<version> check *` focused-check route — without
- * bumping the runtime version. A project installed by an EARLIER image of the
- * SAME release therefore carries a `configPatches` set that no longer equals
- * `desiredOpenCodePatches`, while its `manifest.poiesisVersion` still equals
- * the current release. Without this projection that manifest is admitted by
- * NEITHER the strict gate NOR any accepted predecessor, so the only migration
- * boundary — the receipt-authenticated `update` — fails closed with
- * `MANIFEST_AUTHORITY_INVALID` and an already-installed project can never
- * reach the faster authoritative flow.
+ * `pnpm dlx poiesis-cli@<version> check *` focused-check route — inside the
+ * `1.4.0` release line WITHOUT bumping `manifest.poiesisVersion`. A project
+ * installed by the EARLIER image of that line therefore records
+ * `poiesisVersion = "1.4.0"` and a `configPatches` set that no longer equals
+ * `desiredOpenCodePatches(config, "1.4.0")`. Without this projection that
+ * manifest is admitted by NEITHER the strict gate NOR any accepted
+ * predecessor, so the only migration boundary — the receipt-authenticated
+ * `update` — fails closed with `MANIFEST_AUTHORITY_INVALID` and an
+ * already-installed project can never reach the faster authoritative flow.
  *
- * Differs from the current projection in exactly ONE field:
+ * The projection is keyed off the SUPPLIED `poiesisVersion`, which is the
+ * predecessor release itself (`"1.4.0"`), never the running runtime. For that
+ * version it differs from that version's own strict projection in exactly ONE
+ * field:
  *   - `agent.poiesis-worker.permission.bash` omits the single focused-check
  *     allow key.
  *
@@ -574,13 +577,13 @@ export function isExactProjection(manifest: Manifest, patches: ReadonlyArray<{ p
  *   - bootstrap legacy ownership: `["1.0.0"]` (the version is already pinned
  *     by `validateLegacyInstallation`, so this is defense-in-depth)
  *
- * `"1.4.0"` is accepted by the receipt-gated `update` for the
- * Spec #168 / ticket #174 same-release reason: ticket #173's narrow
- * focused-check allow changed the exact projection WITHOUT bumping the
- * runtime version, so a project installed by an earlier image of the SAME
- * release records `poiesisVersion = "1.4.0"` with a pre-focused-check
- * `configPatches` set. Only that exact set is admitted, and only the
- * receipt-gated `update` may transition it; `doctor`, `uninstall`,
+ * `"1.4.0"` is accepted by the receipt-gated `update` as the PUBLISHED
+ * PREDECESSOR of the current release: ticket #173's narrow focused-check
+ * allow changed the exact 1.4.0 projection WITHOUT bumping the release
+ * version, so a project installed by the earlier 1.4.0 image records
+ * `poiesisVersion = "1.4.0"` with a pre-focused-check `configPatches` set.
+ * Only that exact set is admitted, and only the receipt-gated `update` may
+ * transition it onto the current projection; `doctor`, `uninstall`,
  * `installCapability`, and the explicit `updateFromConfig` remain
  * current-projection-only.
  *
@@ -643,12 +646,12 @@ export async function assertManifestAuthorityToleratingPredecessor(
       return;
     }
   }
-  // Spec #168 / ticket #174 — the pre-focused-check SAME-RELEASE
-  // predecessor. Ticket #173 changed the exact projection without a
-  // version bump, so an install made by an earlier image of the current
-  // release records the current `poiesisVersion` with one allow key
-  // missing. This branch is reached ONLY for `poiesisVersion === "1.4.0"`
-  // and ONLY after the receipt already authenticated the manifest digest.
+  // Spec #168 / ticket #174 — the pre-focused-check predecessor, which is the
+  // PUBLISHED PREDECESSOR release `1.4.0`. Ticket #173 changed the exact 1.4.0
+  // projection without a version bump, so an install made by the earlier
+  // 1.4.0 image records `poiesisVersion = "1.4.0"` with one allow key missing.
+  // This branch is reached ONLY for `poiesisVersion === "1.4.0"` and ONLY after
+  // the receipt already authenticated the manifest digest.
   //
   // It deliberately does NOT fall through to the legacy 1.0.x projection
   // when the manifest does not match exactly: a 1.4.0 manifest can never

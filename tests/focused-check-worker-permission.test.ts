@@ -29,13 +29,29 @@
  *     `session`, `model`, `update`, or bare/`exec`/`npx`/unversioned route;
  *   - the primary remains the only holder of the broad exact-version route.
  */
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { rm } from "node:fs/promises";
+import { packageVersion } from "../src/maintenance.js";
 import { desiredOpenCodePatches } from "../src/opencode.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
-const POIESIS_VERSION = "1.4.0";
+/**
+ * The release whose projection is under test. Derived from the runtime seam
+ * rather than pinned, because the contract is "the CURRENT release grants the
+ * Worker exactly this one subcommand" — a literal here would only re-state the
+ * version bump and rot on the next one.
+ */
+let POIESIS_VERSION = "";
+/**
+ * A version label deliberately outside the released line, used to prove the
+ * exact-version allow key never widens to an off-version route.
+ */
+const FOREIGN_VERSION = "9.9.9";
 const repositories: TestRepository[] = [];
+
+beforeAll(async () => {
+  POIESIS_VERSION = await packageVersion();
+});
 
 afterEach(async () => {
   await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
@@ -98,7 +114,7 @@ describe("Worker focused-check reachability (Spec #168 / ticket #173)", () => {
     expect(bash).not.toHaveProperty(`pnpm dlx poiesis-cli check *`);
     expect(bash).not.toHaveProperty(`pnpm dlx poiesis-cli@latest check *`);
     // A different exact version must not inherit the grant.
-    expect(bash).not.toHaveProperty("pnpm dlx poiesis-cli@1.4.1 check *");
+    expect(bash).not.toHaveProperty(`pnpm dlx poiesis-cli@${FOREIGN_VERSION} check *`);
     expect(bash).not.toHaveProperty("pnpm dlx poiesis-cli@* check *");
   });
 

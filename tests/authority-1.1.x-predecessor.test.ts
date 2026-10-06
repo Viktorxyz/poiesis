@@ -1,8 +1,8 @@
 /**
  * Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection.
  *
- * This file proves every contract surface the v1.4.0 release adds so
- * existing 1.1.3 / 1.1.4 installs can transition to 1.4.0 through the
+ * This file proves every contract surface the current release adds so
+ * existing 1.1.3 / 1.1.4 installs can transition to it through the
  * receipt-authenticated ordinary `update` transaction.
  *
  * The deterministic test surface covers:
@@ -13,7 +13,8 @@
  *      literals are compared against the helper output using
  *      `isDeepStrictEqual`. This proves the projection is byte-for-byte
  *      equivalent to the legacy 1.1.3 / 1.1.4 install on every shipped
- *      surface.
+ *      surface. These assertions are historical facts about the published
+ *      1.1.3 / 1.1.4 artifacts and do NOT move with the current release.
  *
  *   2. Specialist agents (Planner / Ticket Reviewer / Final Reviewer /
  *      Research) carry NO `permission.bash` key in 1.1.3 / 1.1.4.
@@ -30,14 +31,14 @@
  *      fail-closed (the gate throws `MANIFEST_AUTHORITY_INVALID`).
  *
  *   5. Strict `assertManifestAuthority` rejects 1.1.3 / 1.1.4 (the
- *      Specialist bash surface differs from the current 1.2.x
- *      projection; the strict check is migration-unaware).
+ *      Specialist bash surface differs from the current projection;
+ *      the strict check is migration-unaware).
  *
  *   6. Receipt-authenticated `update` accepts the 1.1.3 / 1.1.4
- *      predecessor manifest, writes the post-update manifest with
- *      `poiesisVersion = "1.4.0"` exactly once, advances the receipt
+ *      predecessor manifest, writes the post-update manifest with the
+ *      CURRENT `poiesisVersion` exactly once, advances the receipt
  *      generation by one, and re-emits the OpenCode config so the
- *      primary bash is keyed off `pnpm dlx poiesis-cli@1.4.0 *`, the
+ *      primary bash is keyed off `pnpm dlx poiesis-cli@<current> *`, the
  *      Worker carries the v1.2 Repository Intelligence additive
  *      allows (status / query / path / explain), and the Specialist
  *      bash surface is restored.
@@ -65,7 +66,7 @@
  * The fake-opencode binary is the certified `1.18.29` plus the
  * stable model list documented in `tests/fake-opencode.ts`. The
  * fake-uv binary mirrors the `installFakeUv` pattern from
- * `tests/release-contract-v1.2.test.ts`.
+ * `tests/release-contract-v1.4.1.test.ts`.
  */
 import { spawnSync } from "node:child_process";
 import { access, mkdir, readFile, rm } from "node:fs/promises";
@@ -440,8 +441,9 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       } finally {
         setRuntimePackageVersionOverrideForTest(null);
       }
-      // Sanity: the running version is back to the real one.
-      expect(await packageVersion()).toBe("1.4.0");
+      // Sanity: the runtime override was cleared, so `packageVersion()`
+      // reports the real running version again — not the fake one.
+      expect(await packageVersion()).not.toBe("9.9.9-fake");
     });
 
     it("helper output differs only in the exact-version allow key between 1.1.3 and 1.1.4", () => {
@@ -532,7 +534,7 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
     const repositories: TestRepository[] = [];
     afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
 
-    it("receipt-authenticated update accepts 1.1.3 predecessor and writes 1.4.0 manifest exactly once with the current OpenCode projection shape", async () => {
+    it("receipt-authenticated update accepts 1.1.3 predecessor and writes the current manifest exactly once with the current OpenCode projection shape", async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
       await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
@@ -541,16 +543,17 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       expect(beforeReceipt.generation).toBe(2);
 
       const result = await update(repository.root, { skipSkills: true });
+      const current = await packageVersion();
 
-      // Manifest advanced to 1.4.0 exactly once.
-      expect(result.manifest.poiesisVersion).toBe("1.4.0");
+      // Manifest advanced to the current release exactly once.
+      expect(result.manifest.poiesisVersion).toBe(current);
       expect(result.manifest.configPatches.length).toBe(9);
 
       // Receipt advanced by exactly one.
       const afterReceipt = await readOwnershipReceipt(repository.root);
       expect(afterReceipt.generation).toBe(beforeReceipt.generation + 1);
 
-      // Primary bash keyed off `pnpm dlx poiesis-cli@1.4.0 *`.
+      // Primary bash keyed off `pnpm dlx poiesis-cli@<current> *`.
       const primaryAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis")!;
       const primaryBash = (primaryAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
       expect(primaryBash["*"]).toBe("allow");
@@ -559,7 +562,7 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
       expect(primaryBash["npx poiesis *"]).toBe("deny");
       expect(primaryBash["pnpm dlx poiesis-cli *"]).toBe("deny");
       expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
-      expect(primaryBash["pnpm dlx poiesis-cli@1.4.0 *"]).toBe("allow");
+      expect(primaryBash[`pnpm dlx poiesis-cli@${current} *`]).toBe("allow");
       expect(primaryBash["pnpm dlx poiesis-cli@1.1.3 *"]).toBeUndefined();
 
       // Worker carries the v1.2 Repository Intelligence additive allows
@@ -574,11 +577,11 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
         "npx poiesis *": "deny",
         "pnpm dlx poiesis-cli *": "deny",
         "pnpm dlx poiesis-cli@*": "deny",
-        "pnpm dlx poiesis-cli@1.4.0 repository status": "allow",
-        "pnpm dlx poiesis-cli@1.4.0 repository query *": "allow",
-        "pnpm dlx poiesis-cli@1.4.0 repository path *": "allow",
-        "pnpm dlx poiesis-cli@1.4.0 repository explain *": "allow",
-        "pnpm dlx poiesis-cli@1.4.0 check *": "allow",
+        [`pnpm dlx poiesis-cli@${current} repository status`]: "allow",
+        [`pnpm dlx poiesis-cli@${current} repository query *`]: "allow",
+        [`pnpm dlx poiesis-cli@${current} repository path *`]: "allow",
+        [`pnpm dlx poiesis-cli@${current} repository explain *`]: "allow",
+        [`pnpm dlx poiesis-cli@${current} check *`]: "allow",
       });
 
       // Specialist bash restored: Planner / Ticket Reviewer / Final Reviewer
@@ -589,15 +592,15 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
         const agentBash = (agentAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
         expect(agentBash).toEqual({
           "*": "deny",
-          "pnpm dlx poiesis-cli@1.4.0 repository status": "allow",
-          "pnpm dlx poiesis-cli@1.4.0 repository query *": "allow",
-          "pnpm dlx poiesis-cli@1.4.0 repository path *": "allow",
-          "pnpm dlx poiesis-cli@1.4.0 repository explain *": "allow",
+          [`pnpm dlx poiesis-cli@${current} repository status`]: "allow",
+          [`pnpm dlx poiesis-cli@${current} repository query *`]: "allow",
+          [`pnpm dlx poiesis-cli@${current} repository path *`]: "allow",
+          [`pnpm dlx poiesis-cli@${current} repository explain *`]: "allow",
         });
       }
     }, 90_000);
 
-    it("receipt-authenticated update accepts 1.1.4 predecessor and writes 1.4.0 manifest exactly once with the current OpenCode projection shape", async () => {
+    it("receipt-authenticated update accepts 1.1.4 predecessor and writes the current manifest exactly once with the current OpenCode projection shape", async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
       await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
@@ -607,13 +610,13 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
 
       const result = await update(repository.root, { skipSkills: true });
 
-      expect(result.manifest.poiesisVersion).toBe("1.4.0");
+      expect(result.manifest.poiesisVersion).toBe(await packageVersion());
       const afterReceipt = await readOwnershipReceipt(repository.root);
       expect(afterReceipt.generation).toBe(beforeReceipt.generation + 1);
 
       const primaryAfter = result.manifest.configPatches.find((p) => p.path[1] === "poiesis")!;
       const primaryBash = (primaryAfter.installed as { permission: { bash: Record<string, string> } }).permission.bash;
-      expect(primaryBash["pnpm dlx poiesis-cli@1.4.0 *"]).toBe("allow");
+      expect(primaryBash[`pnpm dlx poiesis-cli@${await packageVersion()} *`]).toBe("allow");
       expect(primaryBash["pnpm dlx poiesis-cli@1.1.4 *"]).toBeUndefined();
     }, 90_000);
 

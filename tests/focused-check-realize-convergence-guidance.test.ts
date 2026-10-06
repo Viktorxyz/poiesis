@@ -34,7 +34,7 @@ import { createHash } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { init, update } from "../src/maintenance.js";
+import { init, packageVersion, update } from "../src/maintenance.js";
 import { asPredecessorManifest, rebindReceipt, setupCurrentInstall } from "./predecessor-migration-fixtures.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
@@ -308,6 +308,7 @@ describe("Spec #168 / ticket #173 — convergent Realize check guidance", () => 
     it("init writes the corrected canonical projections and the narrow Worker check allow", async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
+      const current = await packageVersion();
       await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
 
       const method = await readFile(join(repository.root, ".poiesis", "METHOD.md"), "utf8");
@@ -321,18 +322,20 @@ describe("Spec #168 / ticket #173 — convergent Realize check guidance", () => 
       expect(rolePoiesis).toContain(SESSION_CLEANUP_ROUTE);
 
       const openCode = await readFile(join(repository.root, "opencode.jsonc"), "utf8");
-      expect(openCode).toContain(`"pnpm dlx poiesis-cli@1.4.0 check *"`);
+      expect(openCode).toContain(`"pnpm dlx poiesis-cli@${current} check *"`);
     }, 120_000);
 
     it("a trusted predecessor update regenerates the corrected projections as manifest-owned bytes", async () => {
       const repository = await createTestRepository();
       repositories.push(repository);
+      const current = await packageVersion();
       await setupCurrentInstall(repository);
       await asPredecessorManifest(repository, "1.1.1", { keepReceipt: true });
       await rebindReceipt(repository);
 
       const result = await update(repository.root, { skipSkills: true });
-      expect(result.manifest.poiesisVersion).toBe("1.4.0");
+      // The migration ends on the CURRENT release, never on the predecessor.
+      expect(result.manifest.poiesisVersion).toBe(current);
 
       const method = await readFile(join(repository.root, ".poiesis", "METHOD.md"), "utf8");
       const rolePoiesis = await readFile(join(repository.root, ".poiesis", "roles", "poiesis.md"), "utf8");
@@ -355,9 +358,9 @@ describe("Spec #168 / ticket #173 — convergent Realize check guidance", () => 
       // no lifecycle route.
       const workerPatch = result.manifest.configPatches.find((patch) => patch.path[1] === "poiesis-worker")!;
       const workerBash = (workerPatch.installed as { permission: { bash: Record<string, string> } }).permission.bash;
-      expect(workerBash["pnpm dlx poiesis-cli@1.4.0 check *"]).toBe("allow");
-      expect(workerBash["pnpm dlx poiesis-cli@1.4.0 *"]).toBeUndefined();
-      expect(workerBash["pnpm dlx poiesis-cli@1.4.0 verify *"]).toBeUndefined();
+      expect(workerBash[`pnpm dlx poiesis-cli@${current} check *`]).toBe("allow");
+      expect(workerBash[`pnpm dlx poiesis-cli@${current} *`]).toBeUndefined();
+      expect(workerBash[`pnpm dlx poiesis-cli@${current} verify *`]).toBeUndefined();
     }, 120_000);
   });
 });

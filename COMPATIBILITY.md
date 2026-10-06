@@ -53,12 +53,12 @@ The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not
 
 ### Same-release projection migration (pre-focused-check)
 
-A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the current example: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`.
+A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.4.1 is the current release and the migration boundary for that install.
 
-A project installed by an earlier image of the same release therefore records the current version with a `configPatches` set that no longer equals the current projection. The compatible migration is:
+A project installed by the earlier `1.4.0` image therefore records `poiesisVersion = "1.4.0"` with a `configPatches` set that no longer equals the `1.4.0` focused-check projection. The compatible migration is:
 
-- **Admitted:** the exact **pre-focused-check** projection for `poiesisVersion = "1.4.0"`, and only through the receipt-gated `poiesis update`. The predecessor differs from the current projection in exactly one field — `agent.poiesis-worker.permission.bash` omits the single focused-check allow key, derived through the same builder the current projection uses.
-- **Not admitted:** any drift from that exact set. A `1.4.0` manifest that does not match is rethrown by the strict check and never falls through to the older 1.0.x projection.
+- **Admitted:** the exact **pre-focused-check** projection for `poiesisVersion = "1.4.0"` — that published predecessor version and no other — and only through the receipt-gated `poiesis update`. For the version it is keyed on, the predecessor differs from that version's own projection in exactly one field: `agent.poiesis-worker.permission.bash` omits the single focused-check allow key, derived through the same builder the current projection uses.
+- **Not admitted:** any other version, and any drift from that exact set. A `1.4.0` manifest that does not match is rethrown by the strict check and never falls through to the older 1.0.x projection.
 - **Not admitted elsewhere:** `doctor`, `uninstall`, `capability install`, and `poiesis update --config` remain current-projection-only, so a mismatched install is always visible as a `doctor` failure instead of being silently tolerated.
 - **No launcher widening:** the projection the migration installs is the current one. It grants the exact-version canonical route `pnpm dlx poiesis-cli@<version> …` only — never a broad `pnpm dlx poiesis-cli@<version> *`, `@latest`, or unversioned route. An off-version runtime (`RUNTIME_VERSION_MISMATCH`) still fails closed before any mutation.
 

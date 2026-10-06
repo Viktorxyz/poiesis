@@ -3,25 +3,28 @@
  * launcher projection.
  *
  * Ticket #173 (the narrow focused-check allow for the Worker) changed the
- * exact current OpenCode projection without bumping the runtime version, so a
- * project installed by an EARLIER image of the SAME release now carries a
- * manifest whose `configPatches` no longer match `desiredOpenCodePatches`.
- * Before this ticket that manifest was admitted by NEITHER the strict check
- * nor any accepted predecessor, so the receipt-authenticated `update` — the
- * only migration boundary — failed closed with `MANIFEST_AUTHORITY_INVALID`
- * and the installed project could never reach the faster authoritative flow.
+ * exact 1.4.0 OpenCode projection without bumping the release version, so a
+ * project installed by the EARLIER image of the 1.4.0 release line now carries
+ * a manifest whose `poiesisVersion` is `"1.4.0"` and whose `configPatches` no
+ * longer match `desiredOpenCodePatches(config, "1.4.0")`. Before this ticket
+ * that manifest was admitted by NEITHER the strict check nor any accepted
+ * predecessor, so the receipt-authenticated `update` — the only migration
+ * boundary — failed closed with `MANIFEST_AUTHORITY_INVALID` and the installed
+ * project could never reach the faster authoritative flow.
  *
  * This file proves the compatible migration closes that hole WITHOUT widening
  * the launcher surface:
  *
  *   1. Current install: the exact current projection is admitted by the
  *      strict gate, unchanged.
- *   2. Predecessor: the exact pre-focused-check same-release projection is
- *      admitted ONLY by the explicitly accepted version set.
+ *   2. Predecessor: the exact pre-focused-check projection of the PUBLISHED
+ *      PREDECESSOR `1.4.0` is admitted ONLY by the explicitly accepted version
+ *      set, and the receipt-gated update migrates it onto the CURRENT
+ *      projection.
  *   3. Drift: a manifest that drifts from BOTH the current and the
  *      predecessor projection still fails closed.
- *   4. Receipt-gated `update` transitions the pre-focused-check manifest onto
- *      the current projection, advances the receipt generation by exactly
+ *   4. Receipt-gated `update` transitions the 1.4.0 pre-focused-check manifest
+ *      onto the current projection, advances the receipt generation by exactly
  *      one, and never grants a broad / `@latest` / unversioned launcher route.
  *   5. `doctor` reports the drifted-by-one-release install as a FAIL, not a
  *      bypass: read-only diagnosis stays strict.
@@ -37,6 +40,7 @@ import {
 import { parseJsonc } from "../src/config.js";
 import { readUtf8 } from "../src/fs.js";
 import { doctor, init, packageVersion, update } from "../src/maintenance.js";
+import { desiredOpenCodePatches } from "../src/opencode.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
@@ -71,6 +75,15 @@ async function installFakeUv(): Promise<FakeUvEnvironment> {
 /** The accepted-predecessor set the receipt-gated `update` passes. */
 const UPDATE_PREDECESSOR_VERSIONS = ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"] as const;
 
+/**
+ * The published predecessor release this migration absorbs. `1.4.0` shipped
+ * two exact projections under one version label: the earlier image's
+ * pre-focused-check set and the current image's set with the Worker's narrow
+ * `check *` allow. The current release therefore admits `1.4.0` — and only that
+ * exact version — as a predecessor.
+ */
+const PREDECESSOR_VERSION = "1.4.0";
+
 function workerBash(manifest: Manifest): Record<string, string> {
   const patch = manifest.configPatches.find((p) => p.path.length === 2 && p.path[1] === "poiesis-worker");
   if (patch === undefined) throw new Error("manifest carries no poiesis-worker patch");
@@ -100,16 +113,18 @@ async function writeOpenCodeFromManifest(repository: TestRepository, manifest: M
 }
 
 /**
- * The pre-focused-check projection derived INDEPENDENTLY of the runtime
- * helper under test: exactly the current projection minus the single
- * focused-check allow. Keeping the fixture free of the helper is what makes
- * the migration tests below honest — they fail today because the authority
- * gate refuses the projection, not because the helper is missing.
+ * The exact `1.4.0` pre-focused-check predecessor projection, derived
+ * INDEPENDENTLY of `predecessorProjectionPreFocusedCheck` (the runtime helper
+ * under test): the `1.4.0` projection built by the ordinary projection
+ * builder, minus the single focused-check allow. Keeping the fixture free of
+ * the helper is what makes the migration tests below honest — they fail
+ * because the authority gate refuses the projection, not because the helper is
+ * missing or because the predecessor version is really the running runtime.
  */
-function preFocusedCheckProjection(manifest: Manifest): Array<{ path: string[]; value: unknown }> {
-  return manifest.configPatches.map((patch) => {
-    if (patch.path.length !== 2 || patch.path[1] !== "poiesis-worker") return { path: patch.path, value: patch.installed };
-    const installed = patch.installed as { permission: { bash: Record<string, string> } };
+function preFocusedCheckProjection(repository: TestRepository): Array<{ path: string[]; value: unknown }> {
+  return desiredOpenCodePatches(testConfig(repository), PREDECESSOR_VERSION).map((patch) => {
+    if (patch.path.length !== 2 || patch.path[1] !== "poiesis-worker") return { path: patch.path, value: patch.value };
+    const installed = patch.value as { permission: { bash: Record<string, string> } };
     const bash = { ...installed.permission.bash };
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
@@ -119,13 +134,16 @@ function preFocusedCheckProjection(manifest: Manifest): Array<{ path: string[]; 
 }
 
 /**
- * Downgrade a current install to the pre-focused-check same-release
- * projection and rebind the receipt, so the ONLY thing standing between the
- * project and the migration is the authority gate under test.
+ * Downgrade a current install to the real `1.4.0` pre-focused-check
+ * predecessor — the exact predecessor manifest AND version label a project
+ * installed by the earlier `1.4.0` image recorded — and rebind the receipt, so
+ * the ONLY thing standing between the project and the migration is the
+ * authority gate under test.
  */
 async function asPreFocusedCheckInstall(repository: TestRepository): Promise<Manifest> {
   const manifest = await loadManifest(repository.root);
-  const predecessor = preFocusedCheckProjection(manifest);
+  const predecessor = preFocusedCheckProjection(repository);
+  manifest.poiesisVersion = PREDECESSOR_VERSION;
   manifest.configPatches = manifest.configPatches.map((patch) => {
     const matching = predecessor.find(
       (p) => p.path.length === patch.path.length && p.path.every((s, i) => s === patch.path[i]),
@@ -154,16 +172,24 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
-  it("names a pre-focused-check predecessor that differs from the current projection in exactly one key", async () => {
+  it("names a pre-focused-check predecessor that differs from that version's own projection in exactly one key", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const manifest = await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
-    const version = await packageVersion();
+    // The admitted predecessor is the published `1.4.0`, so the one-key delta
+    // is proven against the projection `1.4.0` itself would install — the
+    // running runtime's own projection is re-proven below under its own label.
+    const version = PREDECESSOR_VERSION;
     const predecessor = predecessorProjectionPreFocusedCheck(testConfig(repository), version);
 
     expect(predecessor.map((patch) => patch.path.join("\0"))).toEqual(manifest.configPatches.map((patch) => patch.path.join("\0")));
 
-    const currentWorker = workerBash(manifest);
+    const strict = desiredOpenCodePatches(testConfig(repository), version);
+    const currentWorker = (
+      strict.find((patch) => patch.path.length === 2 && patch.path[1] === "poiesis-worker")!.value as {
+        permission: { bash: Record<string, string> };
+      }
+    ).permission.bash;
     const predecessorWorker = (
       predecessor.find((p) => p.path.length === 2 && p.path[1] === "poiesis-worker")!.value as {
         permission: { bash: Record<string, string> };
@@ -176,9 +202,16 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     for (const [key, value] of Object.entries(predecessorWorker)) {
       expect(currentWorker[key], `predecessor key ${key}`).toBe(value);
     }
+
+    // The same one-key delta holds for the running runtime's own version, so
+    // the helper stays keyed off its supplied version rather than a literal.
+    const current = await packageVersion();
+    const currentPredecessor = predecessorProjectionPreFocusedCheck(testConfig(repository), current);
+    expect((currentPredecessor.find((p) => p.path[1] === "poiesis-worker")!.value as { permission: { bash: Record<string, string> } }).permission.bash)
+      .not.toHaveProperty(`pnpm dlx poiesis-cli@${current} check *`);
   }, 60_000);
 
-  it("admit-miss: the strict current gate rejects the pre-focused-check projection", async () => {
+  it("admit-miss: the strict current gate rejects the 1.4.0 pre-focused-check projection", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
@@ -214,21 +247,29 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     ).rejects.toMatchObject({ code: "MANIFEST_AUTHORITY_INVALID" });
   }, 120_000);
 
-  it("receipt-gated update installs the current projection onto a pre-focused-check install without widening the launcher", async () => {
+  it("receipt-gated update migrates the 1.4.0 pre-focused-check install onto the current projection without widening the launcher", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
     const before = await asPreFocusedCheckInstall(repository);
     const beforeGeneration = (await readOwnershipReceipt(repository.root)).generation;
     const version = await packageVersion();
-    expect(workerBash(before)).not.toHaveProperty(`pnpm dlx poiesis-cli@${version} check *`);
+    // The predecessor really is the published 1.4.0 install: it records that
+    // version label and omits the focused-check allow keyed on it.
+    expect(before.poiesisVersion).toBe(PREDECESSOR_VERSION);
+    expect(workerBash(before)).not.toHaveProperty(`pnpm dlx poiesis-cli@${PREDECESSOR_VERSION} check *`);
 
     const result = await update(repository.root, { skipSkills: true });
 
     expect(result.manifest.poiesisVersion).toBe(version);
+    // The migration advanced the manifest onto the current version, so the
+    // predecessor's version-keyed routes are gone with it.
+    expect(result.manifest.poiesisVersion).not.toBe(PREDECESSOR_VERSION);
     // The projection the manifest records is the current one.
     const afterWorker = workerBash(result.manifest);
     expect(afterWorker[`pnpm dlx poiesis-cli@${version} check *`]).toBe("allow");
+    expect(afterWorker).not.toHaveProperty(`pnpm dlx poiesis-cli@${PREDECESSOR_VERSION} check *`);
+    expect(primaryBash(result.manifest)).not.toHaveProperty(`pnpm dlx poiesis-cli@${PREDECESSOR_VERSION} *`);
     // Fail-closed launcher: no broad, `@latest`, or unversioned route is
     // introduced by the migration.
     expect(afterWorker["pnpm dlx poiesis-cli@*"]).toBe("deny");
@@ -249,7 +290,7 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     await expect(assertManifestAuthority(repository.root, onDisk, testConfig(repository))).resolves.toBeUndefined();
   }, 180_000);
 
-  it("doctor reports the pre-focused-check install as a fail rather than bypassing it", async () => {
+  it("doctor reports the 1.4.0 pre-focused-check install as a fail rather than bypassing it", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
@@ -264,17 +305,18 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
   it("the pre-focused-check projection is keyed off the supplied version, not the running runtime", async () => {
     const config = testConfig({ parent: "/tmp", root: "/tmp", remote: "/tmp", fixtures: "/tmp", baseSha: "x" });
     const { setRuntimePackageVersionOverrideForTest } = await import("../src/maintenance.js");
-    const baseline = JSON.stringify(predecessorProjectionPreFocusedCheck(config, "1.4.0"));
+    const baseline = JSON.stringify(predecessorProjectionPreFocusedCheck(config, PREDECESSOR_VERSION));
     try {
       setRuntimePackageVersionOverrideForTest("9.9.9-fake");
-      expect(JSON.stringify(predecessorProjectionPreFocusedCheck(config, "1.4.0"))).toBe(baseline);
+      expect(JSON.stringify(predecessorProjectionPreFocusedCheck(config, PREDECESSOR_VERSION))).toBe(baseline);
     } finally {
       setRuntimePackageVersionOverrideForTest(null);
     }
-    const other = predecessorProjectionPreFocusedCheck(config, "1.4.1");
+    const current = await packageVersion();
+    const other = predecessorProjectionPreFocusedCheck(config, current);
     const keys = (other.find((p) => p.path[1] === "poiesis-worker")!.value as { permission: { bash: Record<string, string> } })
       .permission.bash;
-    expect(keys["pnpm dlx poiesis-cli@1.4.1 repository status"]).toBe("allow");
+    expect(keys[`pnpm dlx poiesis-cli@${current} repository status`]).toBe("allow");
     expect(keys).not.toHaveProperty("pnpm dlx poiesis-cli@1.4.0 repository status");
     // The published contract file keeps the migration documented.
     const compatibility = await readFile(join(import.meta.dirname, "..", "COMPATIBILITY.md"), "utf8");

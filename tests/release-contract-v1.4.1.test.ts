@@ -1,20 +1,22 @@
 /**
- * Poiesis 1.4.0 release / update contract.
+ * Poiesis 1.4.1 release / update contract.
  *
- * Spec #133 / ticket #136 ships 1.4.0. The 1.4.0 feature is additive:
- * `init` and `update` maintain a `pnpm poiesis` script in the project's
- * `package.json`. Nothing about the OpenCode permission projection, the
- * exact-version agent launcher, or the packed canonical surface changes,
- * so this file's contract is inherited from the 1.2 release with the
- * version string advanced.
+ * Spec #133 / ticket #136 shipped the 1.4.0 feature set: `init` and `update`
+ * maintain a `pnpm poiesis` script in the project's `package.json`. The 1.4.1
+ * release carries that contract forward unchanged — nothing about the OpenCode
+ * permission projection, the exact-version agent launcher, or the packed
+ * canonical surface changes, so this file's contract is inherited from the
+ * 1.4.0 release with the version string advanced. The 1.4 migration tests the
+ * predecessor file carried (the `1.1.3` / `1.1.4` and `1.2.1` crossings) stay
+ * here and now assert the CURRENT release, not a literal.
  *
- * This file proves the 1.4.0 release contract at the existing seams the
+ * This file proves the 1.4.1 release contract at the existing seams the
  * runtime already exposes for the same version-bounded invariants:
  *
- *   - `packageVersion()` (the runtime identity seam) reads the published
- *     package version and the value is exactly `1.4.0`. This is the
- *     durable half of the runtime identity boundary the OpenCode
- *     projection keys off (`pnpm dlx poiesis-cli@<manifest.poiesisVersion>`).
+ *   - `package.json::version` and `packageVersion()` (the runtime identity
+ *     seam) are the 1.4.1 release. This is the durable half of the runtime
+ *     identity boundary the OpenCode projection keys off
+ *     (`pnpm dlx poiesis-cli@<manifest.poiesisVersion>`).
  *
  *   - `package.json::files` enumerates the durable canonical surface
  *     that ships in the npm tarball. The contract is:
@@ -30,26 +32,25 @@
  *     canonical surface (e.g. a deleted role file) is caught here
  *     before any real publish.
  *
- *   - the same-version reconciliation contract still holds when the
- *     package is at 1.4.0: a receipt-authenticated `update` on a
- *     1.4.0 install stamps `manifest.poiesisVersion = "1.4.0"`. This
- *     pins the new exact-version route the OpenCode projection
- *     admits so a fresh consumer install lands on the 1.4.0
- *     canonical surface.
+ *   - the same-version reconciliation contract still holds at 1.4.1: a
+ *     receipt-authenticated `update` on a 1.4.1 install stamps
+ *     `manifest.poiesisVersion = "1.4.1"`. This pins the new exact-version
+ *     route the OpenCode projection admits so a fresh consumer install lands
+ *     on the 1.4.1 canonical surface.
  *
- *   - Spec #131 / ticket #132 — the package at 1.4.0 still admits
+ *   - Spec #131 / ticket #132 — the package at 1.4.1 still admits
  *     the v1.1.3 / v1.1.4 predecessor projection through the
  *     receipt-authenticated ordinary `update` transaction. A 1.1.3 /
  *     1.1.4 install with a trusted receipt is accepted, the manifest
- *     version advances to 1.4.0, the primary bash is keyed off
- *     `pnpm dlx poiesis-cli@1.4.0 *`, the Worker carries the v1.2
+ *     version advances to 1.4.1, the primary bash is keyed off
+ *     `pnpm dlx poiesis-cli@1.4.1 *`, the Worker carries the v1.2
  *     Repository Intelligence additive allows, and the Specialist
  *     bash is restored. (Covered by
  *     `tests/authority-1.1.x-predecessor.test.ts`.)
  *
- *   - Spec #133 / ticket #136 — the version crossing from 1.2.1 to
- *     1.4.0. A project installed at 1.2.1 runs `poiesis update` under a
- *     1.4.0 runtime and succeeds, WITHOUT 1.2.1 being added to the
+ *   - Spec #133 / ticket #136 — the version crossing from 1.2.1 to the
+ *     current release. A project installed at 1.2.1 runs `poiesis update` under
+ *     the 1.4.1 runtime and succeeds, WITHOUT 1.2.1 being added to the
  *     accepted predecessor set: `assertManifestAuthorityToleratingPredecessor`
  *     builds its strict projection from the MANIFEST's own
  *     `poiesisVersion`, not the runtime's, so a 1.2.1 manifest matches
@@ -90,6 +91,9 @@ import { createTestRepository, testConfig, type TestRepository } from "./helpers
 const execFileAsync = promisify(execFile);
 
 const REPO_ROOT = join(import.meta.dirname, "..");
+
+/** The release this contract pins. `packageVersion()` must agree with it. */
+const RELEASE_VERSION = "1.4.1";
 
 interface FakeUvEnvironment {
   parent: string;
@@ -225,14 +229,14 @@ const FORBIDDEN_PACKED_PATHS = [
   "node_modules/",
 ] as const;
 
-describe("Poiesis 1.4.0 release / update contract", () => {
-  it("package.json version is the 1.4.0 release", async () => {
+describe("Poiesis 1.4.1 release / update contract", () => {
+  it("package.json version is the 1.4.1 release", async () => {
     const pkg = await readPackageJson();
-    expect(pkg.version).toBe("1.4.0");
+    expect(pkg.version).toBe(RELEASE_VERSION);
   });
 
-  it("packageVersion() runtime seam returns the 1.4.0 release", async () => {
-    expect(await packageVersion()).toBe("1.4.0");
+  it("packageVersion() runtime seam returns the 1.4.1 release", async () => {
+    expect(await packageVersion()).toBe(RELEASE_VERSION);
   });
 
   it("the pnpm poiesis script value is the literal cache-bypassing @latest route, not version-interpolated", async () => {
@@ -249,7 +253,7 @@ describe("Poiesis 1.4.0 release / update contract", () => {
     expect(POIESIS_SCRIPT_COMMAND).toContain("--config.dlx-cache-max-age=0");
     expect(POIESIS_SCRIPT_COMMAND).toContain("@latest");
     expect(POIESIS_SCRIPT_COMMAND).not.toContain(pkg.version);
-    expect(POIESIS_SCRIPT_COMMAND).not.toContain("1.4.0");
+    expect(POIESIS_SCRIPT_COMMAND).not.toContain(RELEASE_VERSION);
     expect(POIESIS_SCRIPT_COMMAND).not.toMatch(/@\d+\.\d+\.\d+/);
     expect(pkg.scripts?.[POIESIS_SCRIPT_NAME]).toBeUndefined();
   });
@@ -358,11 +362,11 @@ describe("Poiesis 1.4.0 release / update contract", () => {
   });
 
   it(
-    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.4.0 and advances the receipt once",
+    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.4.1 and advances the receipt once",
     async () => {
       // The receipt-authenticated ordinary `update` is the same-version
       // reconciliation path. A successful run on a v1.2 install must
-      // stamp the manifest with the current package version (1.4.0)
+      // stamp the manifest with the current package version (1.4.1)
       // and advance the receipt generation by exactly one. This is the
       // deterministic contract the OpenCode projection's
       // `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` allow key
@@ -387,7 +391,7 @@ describe("Poiesis 1.4.0 release / update contract", () => {
           skipSkills: true,
           allowFixtureAdapters: true,
         });
-        expect(initial.poiesisVersion).toBe("1.4.0");
+        expect(initial.poiesisVersion).toBe(RELEASE_VERSION);
 
         const beforeReceipt = await readOwnershipReceipt(repository.root);
         const result = await update(repository.root, { skipSkills: true });
@@ -395,11 +399,11 @@ describe("Poiesis 1.4.0 release / update contract", () => {
         // Same-version reconciliation succeeds and re-stamps the
         // manifest version (no-op semantically, but the projection is
         // re-applied against proven-owned state).
-        expect(result.manifest.poiesisVersion).toBe("1.4.0");
+        expect(result.manifest.poiesisVersion).toBe(RELEASE_VERSION);
 
         // The on-disk manifest reflects the re-stamped version.
         const reloaded = await loadManifest(repository.root);
-        expect(reloaded.poiesisVersion).toBe("1.4.0");
+        expect(reloaded.poiesisVersion).toBe(RELEASE_VERSION);
 
         // Receipt advanced by exactly one.
         const afterReceipt = await readOwnershipReceipt(repository.root);
@@ -418,14 +422,14 @@ describe("Poiesis 1.4.0 release / update contract", () => {
   );
 
   it(
-    "a 1.2.1 install updates under the 1.4.0 runtime without joining the accepted predecessor set",
+    "a 1.2.1 install updates under the 1.4.1 runtime without joining the accepted predecessor set",
     async () => {
       // Spec #133 / ticket #136 — the migration claim, proven rather than
       // assumed. `assertManifestAuthorityToleratingPredecessor` builds
       // its strict projection with `desiredOpenCodePatches(config,
       // manifest.poiesisVersion)`, so a manifest that says 1.2.1 is
       // compared against the 1.2.1 strict surface, NOT against the
-      // 1.4.0 runtime. That is why "1.2.1" does NOT need to be added to
+      // 1.4.1 runtime. That is why "1.2.1" does NOT need to be added to
       // the accepted predecessor set in `runLockedUpdateTransaction`.
       const fakeOpenCodeEnv: FakeOpenCodeEnvironment = await installFakeOpenCode();
       const fakeUvEnv: FakeUvEnvironment = await installFakeUv();
@@ -446,14 +450,14 @@ describe("Poiesis 1.4.0 release / update contract", () => {
         const bashBefore = (primaryBefore.installed as { permission: { bash: Record<string, string> } })
           .permission.bash;
         expect(bashBefore["pnpm dlx poiesis-cli@1.2.1 *"]).toBe("allow");
-        expect(bashBefore["pnpm dlx poiesis-cli@1.4.0 *"]).toBeUndefined();
+        expect(bashBefore[`pnpm dlx poiesis-cli@${RELEASE_VERSION} *`]).toBeUndefined();
 
         // The production accepted-predecessor set does NOT contain
         // "1.2.1" — assert that at runtime AND note the compile-time
         // guarantee: the parameter is a closed literal union, so
         // "1.2.1" is not even assignable without widening the type.
         const { assertManifestAuthorityToleratingPredecessor } = await import("../src/authority.js");
-        const productionSet = ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4"] as const;
+        const productionSet = ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"] as const;
         expect([...productionSet]).not.toContain("1.2.1");
         // It resolves without throwing: the strict path already matches.
         await expect(
@@ -468,9 +472,9 @@ describe("Poiesis 1.4.0 release / update contract", () => {
         const beforeReceipt = await readOwnershipReceipt(repository.root);
         const result = await update(repository.root, { skipSkills: true });
 
-        // The crossing succeeds and the manifest advances to 1.4.0.
-        expect(result.manifest.poiesisVersion).toBe("1.4.0");
-        expect((await loadManifest(repository.root)).poiesisVersion).toBe("1.4.0");
+        // The crossing succeeds and the manifest advances to 1.4.1.
+        expect(result.manifest.poiesisVersion).toBe(RELEASE_VERSION);
+        expect((await loadManifest(repository.root)).poiesisVersion).toBe(RELEASE_VERSION);
 
         // The receipt advanced by exactly one.
         expect((await readOwnershipReceipt(repository.root)).generation).toBe(
@@ -478,20 +482,20 @@ describe("Poiesis 1.4.0 release / update contract", () => {
         );
 
         // The exact-version launcher is re-keyed off the NEW runtime
-        // version, and the old key is gone: `pnpm dlx poiesis-cli@1.4.0 *`
+        // version, and the old key is gone: `pnpm dlx poiesis-cli@1.4.1 *`
         // and nothing else on the primary agent.
         const primaryAfter = result.manifest.configPatches.find((patch) => patch.path[1] === "poiesis")!;
         const bashAfter = (primaryAfter.installed as { permission: { bash: Record<string, string> } })
           .permission.bash;
-        expect(bashAfter["pnpm dlx poiesis-cli@1.4.0 *"]).toBe("allow");
+        expect(bashAfter[`pnpm dlx poiesis-cli@${RELEASE_VERSION} *`]).toBe("allow");
         expect(bashAfter["pnpm dlx poiesis-cli@1.2.1 *"]).toBeUndefined();
         expect(bashAfter["pnpm dlx poiesis-cli@*"]).toBe("deny");
         expect(bashAfter["pnpm dlx poiesis-cli *"]).toBe("deny");
 
-        // The on-disk OpenCode config carries the 1.4.0 key too, not just
+        // The on-disk OpenCode config carries the 1.4.1 key too, not just
         // the manifest record.
         const onDisk = await readFile(join(repository.root, "opencode.jsonc"), "utf8");
-        expect(onDisk).toContain('"pnpm dlx poiesis-cli@1.4.0 *"');
+        expect(onDisk).toContain(`"pnpm dlx poiesis-cli@${RELEASE_VERSION} *"`);
         expect(onDisk).not.toContain('"pnpm dlx poiesis-cli@1.2.1 *"');
       } finally {
         fakeUvEnv.restore();
