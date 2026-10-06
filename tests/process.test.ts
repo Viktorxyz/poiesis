@@ -118,15 +118,28 @@ describe("process runner", () => {
     });
   });
 
-  it("waits for inherited output to close and captures late output", async () => {
-    const { script } = await stageScript(
-      "#!/bin/sh\n(sleep 0.15; printf late) &\nprintf early\nexit 0\n",
-    );
-    const startedAt = Date.now();
-    const result = await run(script, [], { cwd: tmpdir() });
-    expect(result.stdout).toBe("earlylate");
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(100);
-  });
+  it(
+    "waits for inherited output to close and captures late output",
+    { timeout: 15_000 },
+    async () => {
+      // The background writer keeps the inherited stdout open after the leader
+      // has exited, so cleanup begins while the group is still briefly
+      // observable. Ticket #185: that window is reaping, not ownership, so it is
+      // waited out with no signal and then settled rather than reported as a leak.
+      const { script } = await stageScript(
+        "#!/bin/sh\n(sleep 0.15; printf late) &\nprintf early\nexit 0\n",
+      );
+      const startedAt = Date.now();
+      const result = await run(script, [], { cwd: tmpdir() });
+      expect(result.stdout).toBe("earlylate");
+      const duration = Date.now() - startedAt;
+      expect(duration).toBeGreaterThanOrEqual(100);
+      // Bounded the way a loaded host allows: generous enough to absorb one, and
+      // tight enough that a settlement which waits out the whole natural-settlement
+      // window instead of returning the moment the group empties fails loudly.
+      expect(duration).toBeLessThan(6_000);
+    },
+  );
 
   it("drains output after each byte budget is exhausted", { timeout: 15_000 }, async () => {
     const { script } = await stageScript(
@@ -527,6 +540,60 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
         expect(await isSameProcess(pid, startTime)).toBe(false);
         survivorPids.delete(pid);
       }
+    },
+  );
+
+  /**
+   * The other side of the inherited-output case: the late writer never stops.
+   *
+   * The runner waits out the bounded natural-settlement window and the group is
+   * still there, so the honest report is the unresolved one — a process Poiesis
+   * spawned is still running, and the run may not claim success.
+   */
+  it(
+    "rejects a run whose inherited-output writer outlives the group",
+    { timeout: 30_000 },
+    async () => {
+      const dir = await mkdtemp(join(tmpdir(), "poiesis-inherited-"));
+      fixtures.push(dir);
+      const pidFile = join(dir, "writer.pid");
+      const writer = join(dir, "writer.sh");
+      const leader = join(dir, "leader.sh");
+      // The writer inherits stdout, never releases it, and stays running: the
+      // leader that gave the group its id is gone, so nothing may reach it.
+      await writeFile(
+        writer,
+        ["#!/bin/sh", 'printf "%s\\n" "$$" > "$1"', "while :; do sleep 1; done", ""].join("\n"),
+        "utf8",
+      );
+      await chmod(writer, 0o755);
+      await writeFile(leader, `#!/bin/sh\n"${writer}" "${pidFile}" &\nprintf early\nexit 0\n`, "utf8");
+      await chmod(leader, 0o755);
+
+      const startedAt = Date.now();
+      const invocation = run(leader, [], { cwd: dir });
+      const writerPid = await waitForPid(pidFile);
+      const writerStartTime = await processStartTime(writerPid);
+      survivorPids.set(writerPid, writerStartTime);
+
+      await expect(invocation).rejects.toMatchObject({
+        code: "PROCESS_CLEANUP_UNRESOLVED",
+        details: {
+          reason: "GROUP_AUTHORITY_LOST",
+          phase: "before-sigterm",
+          leaderState: "gone",
+          membersEnumerated: false,
+          confirmed: false,
+        },
+      });
+      // Bounded: the survivor is reported rather than waited on forever. The
+      // post-exit linger window plus the natural-settlement window is a few
+      // seconds of work, so this absorbs a loaded host without accepting a
+      // settlement that stops waiting on its own.
+      expect(Date.now() - startedAt).toBeLessThan(10_000);
+      // It really is still running — nothing was killed that Poiesis could not
+      // prove was the process it leased.
+      expect(await isSameProcess(writerPid, writerStartTime)).toBe(true);
     },
   );
 });

@@ -165,6 +165,24 @@ interface DeliveredSignal {
 }
 
 /**
+ * Wait until the lease can no longer see a live leader at `lease.pid`.
+ *
+ * The spawned child is unreferenced, so its own `exit` event is not a fact this
+ * suite can rely on; the kernel's answer is. A leader that is `gone` or already
+ * `terminal` satisfies this, because either way the process Poiesis leased has
+ * finished and no signal may be derived from its PID.
+ */
+async function waitForLeaseGone(lease: ManagedProcessLease, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const validation = validateManagedProcessLease(lease);
+    if (validation.accepted && validation.state === "gone") return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error(`leased leader ${lease.pid} was still live after ${timeoutMs}ms`);
+}
+
+/**
  * Record every signal `process.kill` delivers, and run `body` with the real
  * deliverer in place, so a test can assert on what was sent (and prove that
  * nothing was) rather than only on how the settlement ended.
@@ -211,15 +229,22 @@ interface SettleObservation {
  * Flipping on a real kernel event rather than on a read count keeps the case
  * meaningful: it is the same moment in the algorithm either way, and it does not
  * depend on how many times the implementation happens to read the leader.
+ *
+ * `groupAliveProbes` scripts how many group liveness probes answer "exists"
+ * before the group answers "gone" — the shape of a group that empties itself,
+ * such as one whose only remaining members have exited and are being reaped. It
+ * exists so a case can decide what it is testing: with the group gone there is
+ * nothing left to survive, so only the LEADER's state can decide the verdict.
  */
 async function settleWithLeaderState(
   lease: ManagedProcessLease,
   flipOn: "group-probe" | "group-sigterm",
   state: LeaderState,
-  options: { graceMs?: number; confirmMs?: number } = {},
+  options: { graceMs?: number; confirmMs?: number; groupAliveProbes?: number } = {},
 ): Promise<SettleObservation> {
   const flipped = { active: false };
   const signals: DeliveredSignal[] = [];
+  let groupProbes = 0;
   const deliver = process.kill.bind(process);
   vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
     const isGroupProbe = pid < 0 && signal === 0;
@@ -231,6 +256,12 @@ async function settleWithLeaderState(
       return delivered;
     }
     if (flipOn === "group-probe" && isGroupProbe) flipped.active = true;
+    if (isGroupProbe) {
+      groupProbes += 1;
+      if (options.groupAliveProbes !== undefined && groupProbes > options.groupAliveProbes) {
+        throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      }
+    }
     return deliver(pid, 0);
   }) as typeof process.kill);
 
@@ -325,6 +356,29 @@ async function stageLeaderValidTree(): Promise<{
     ),
     "utf8",
   );
+  await chmod(leader, 0o755);
+  return { leader, descendant, pidFile };
+}
+
+/**
+ * A leader that leaves at once and a descendant whose own body decides how long
+ * the group outlives it. The group is therefore observably alive for a while
+ * after the leader that gave it its id has been reaped — the shape a command
+ * leaves behind when a background writer closes its inherited output late.
+ */
+async function stageLeaderExitsTree(descendantBody: readonly string[]): Promise<{
+  leader: string;
+  descendant: string;
+  pidFile: string;
+}> {
+  const dir = await mkdtemp(join(tmpdir(), "poiesis-lease-natural-"));
+  fixtures.push(dir);
+  const descendant = join(dir, "descendant.sh");
+  const leader = join(dir, "leader.sh");
+  const pidFile = join(dir, "descendant.pid");
+  await writeFile(descendant, ["#!/bin/sh", 'printf "%s\\n" "$$" > "$1"', ...descendantBody, ""].join("\n"), "utf8");
+  await chmod(descendant, 0o755);
+  await writeFile(leader, `#!/bin/sh\n"${descendant}" "${pidFile}" &\nexit 0\n`, "utf8");
   await chmod(leader, 0o755);
   return { leader, descendant, pidFile };
 }
@@ -1045,6 +1099,140 @@ describe("managed process group settlement", () => {
     // confirmable member is terminal is not a group Poiesis will signal.
     expect(signals).toEqual([]);
   });
+});
+
+/**
+ * Spec #168 / ticket #185 — a group that outlives its leader by a moment.
+ *
+ * A leader that has exited — or become a zombie — does not take the group it
+ * created with it. Its descendants can still be running, and even after every one
+ * of them has finished their unreaped task entries keep the group observable for
+ * a while. That window is a fact about REAPING, not about ownership: the group id
+ * is still just a free PID the moment the leader is gone, so nothing may be
+ * signalled in it, and group liveness still proves absence and nothing more.
+ *
+ * What may legitimately change inside that window is the settlement's VERDICT. A
+ * group that empties itself is settled, and a group that outlives the bounded
+ * natural-settlement window is still `PROCESS_CLEANUP_UNRESOLVED` /
+ * `GROUP_AUTHORITY_LOST` with nothing signalled. The states that mean "this is
+ * not the process Poiesis spawned" — reused, foreign, unreadable — are never
+ * laundered into completion, however empty the group then looks.
+ */
+describe("natural settlement of a group whose leader is gone (ticket #185)", () => {
+  it.skipIf(!isLinux())(
+    "settles without a signal when a gone leader's group empties itself",
+    { timeout: 20_000 },
+    async () => {
+      const { leader, pidFile } = await stageLeaderExitsTree(["sleep 0.3", "exit 0"]);
+      const { lease } = await spawnManagedChild(leader, {
+        operationId: "operation-natural",
+        workspaceId: "workspace-natural",
+      });
+      const descendantPid = await waitForPid(pidFile);
+      tracked.push({ pid: descendantPid, startIdentity: startTimeOf(descendantPid) });
+      // The leader is reaped before settlement starts, so its PID is now only a
+      // number while its descendant is still inside the group: the group is
+      // observably alive and provably unowned at the same moment.
+      await waitForLeaseGone(lease);
+
+      const { outcome, signals } = await recordingSignals(() =>
+        settleManagedProcessLease(lease, { graceMs: 200, confirmMs: 3_000 }),
+      );
+      // The descendant finishes on its own, reaping clears the group, and the
+      // settlement reports the one fact that counts: the group no longer exists.
+      await expect(outcome).resolves.toMatchObject({
+        operationId: "operation-natural",
+        workspaceId: "workspace-natural",
+        processGroupId: lease.processGroupId,
+        confirmed: true,
+        membersEnumerated: false,
+      });
+      // Not one signal: waiting for a group to empty itself is not a licence to
+      // signal it, and its leader's PID was free for the whole wait.
+      expect(signals).toEqual([]);
+    },
+  );
+
+  it.skipIf(!isLinux())(
+    "keeps GROUP_AUTHORITY_LOST when a gone leader's group outlives the natural-settlement window",
+    { timeout: 20_000 },
+    async () => {
+      const { leader, pidFile } = await stageLeaderExitsTree([
+        "trap '' TERM",
+        "while :; do sleep 1; done",
+      ]);
+      const { lease } = await spawnManagedChild(leader, {
+        operationId: "operation-survivor",
+        workspaceId: "workspace-survivor",
+      });
+      const descendantPid = await waitForPid(pidFile);
+      tracked.push({ pid: descendantPid, startIdentity: startTimeOf(descendantPid) });
+      await waitForLeaseGone(lease);
+
+      const startedAt = Date.now();
+      const { outcome, signals } = await recordingSignals(() =>
+        settleManagedProcessLease(lease, { graceMs: 200, confirmMs: 300 }),
+      );
+      // A group that empties itself is settled; one that is still there when the
+      // window closes is the same unresolved report as before, because nothing
+      // about a survivor became provable while Poiesis waited.
+      await expect(outcome).rejects.toMatchObject({
+        code: "PROCESS_CLEANUP_UNRESOLVED",
+        details: {
+          reason: "GROUP_AUTHORITY_LOST",
+          phase: "before-sigterm",
+          leaderState: "gone",
+          processGroupId: lease.processGroupId,
+          membersEnumerated: false,
+          confirmed: false,
+        },
+      });
+      expect(signals).toEqual([]);
+      expect(isSignalAlive(descendantPid)).toBe(true);
+      // The wait is bounded: a survivor is reported, never waited on forever.
+      expect(Date.now() - startedAt).toBeLessThan(6_000);
+    },
+  );
+
+  const NON_NATURAL_LEADER_STATES = ["unreadable", "reused", "foreign"] as const;
+
+  for (const state of NON_NATURAL_LEADER_STATES) {
+    it.skipIf(!isLinux())(
+      `never reports natural completion when the leader reads as ${state}, even as the group goes away`,
+      { timeout: 20_000 },
+      async () => {
+        const { leader, pidFile } = await stageLeaderValidTree();
+        const { child, lease } = await spawnManagedChild(leader, {
+          operationId: `operation-not-natural-${state}`,
+          workspaceId: `workspace-not-natural-${state}`,
+        });
+        const descendantPid = await waitForPid(pidFile);
+        tracked.push({ pid: descendantPid, startIdentity: startTimeOf(descendantPid) });
+
+        // The group answers "exists" once and then "gone", so an empty group is
+        // available to launder into a success. What must decide the verdict is
+        // the leader's identity, and these states are exactly the ones that
+        // leave nothing to own.
+        const observed = await settleWithLeaderState(lease, "group-probe", state, {
+          graceMs: 300,
+          confirmMs: 300,
+          groupAliveProbes: 1,
+        });
+        expect(observed.error).toMatchObject({
+          code: "PROCESS_CLEANUP_UNRESOLVED",
+          details: {
+            reason: "GROUP_AUTHORITY_LOST",
+            phase: "before-sigterm",
+            leaderState: state,
+            membersEnumerated: false,
+            confirmed: false,
+          },
+        });
+        expect(observed.signals).toEqual([]);
+        expect(isSignalAlive(child.pid!)).toBe(true);
+      },
+    );
+  }
 });
 
 /**

@@ -41,10 +41,19 @@ import { PoiesisError } from "./errors.js";
  *      proves a group exists, nothing more.
  *   5. So the leader's identity — its exact start identity and its exact
  *      process-group id — is re-read immediately before EACH signal. If that
- *      read says the leader is gone, terminal, unreadable, reused, or
- *      foreign, no further signal is sent and the cleanup is reported
- *      unresolved with `GROUP_AUTHORITY_LOST`. Success is confirmed by
- *      exactly one thing: the group no longer exists.
+ *      read says the leader is unreadable, reused, or foreign, no further
+ *      signal is sent and the cleanup is reported unresolved with
+ *      `GROUP_AUTHORITY_LOST`. Success is confirmed by exactly one thing: the
+ *      group no longer exists.
+ *
+ * Ticket #185 keeps that rule and separates a VERDICT from an ACTION for one
+ * case. A leader that is gone or terminal cannot be signalled and cannot be
+ * owned — the group id is a free number from that moment — but a group may stay
+ * observably alive for a short while afterwards simply because its descendants
+ * have not been reaped. So the settlement waits that window out without sending
+ * anything and settles when the group empties itself; a group still there when
+ * the bounded wait closes is unresolved exactly as before. Ambiguity about
+ * WHICH process a PID was never turned into a natural completion.
  */
 
 /** Schema version carried by every lease, so a future shape change is visible. */
@@ -84,6 +93,27 @@ export const PROCESS_TERMINATION_GRACE_MS = 2_000;
 
 /** Default bounded window for confirming that the managed group is gone. */
 export const PROCESS_TERMINATION_CONFIRM_MS = 2_000;
+
+/**
+ * Spec #168 / ticket #185 — the leader states that mean "the process Poiesis
+ * leased has finished", as opposed to "Poiesis can no longer tell what this PID
+ * is".
+ *
+ * A group can outlive the leader that created it for a perfectly ordinary
+ * reason: its descendants may still be running, and once they have all exited
+ * their unreaped task entries keep the group observable until the kernel reaps
+ * them. That window is a fact about REAPING. It grants no authority — the group
+ * id is still a free PID the moment the leader is gone, so nothing here may be
+ * signalled while the wait runs — but it does decide the settlement's verdict,
+ * because a group that empties itself has nothing left in it.
+ *
+ * The states left out are the ones where the PID may belong to somebody else:
+ * `reused`, `foreign`, `unreadable` and `unconfirmed` never become a natural
+ * completion, however empty the group happens to look.
+ */
+export const PROCESS_NATURALLY_FINISHED_LEADER_STATES: ReadonlySet<ManagedProcessLeaderState> = new Set<
+  ManagedProcessLeaderState
+>(["gone", "terminal"]);
 
 const MAX_IDENTITY_LENGTH = 64;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
@@ -199,7 +229,13 @@ export interface ManagedProcessLeaseValidationContext {
 export interface ProcessSettlementOptions {
   /** Bounded window between the graceful and forced phase. Defaults to 2s. */
   graceMs?: number;
-  /** Bounded confirmation window. Defaults to 2s. `0` disables waiting. */
+  /**
+   * Bounded window for confirming that the managed group is gone. Defaults to
+   * 2s. `0` disables waiting. It bounds the wait after a forced signal AND the
+   * natural-settlement wait a group whose leader has already finished is given
+   * (see {@link PROCESS_NATURALLY_FINISHED_LEADER_STATES}) — both are the same
+   * question, asked until the group stops existing.
+   */
   confirmMs?: number;
 }
 
@@ -556,11 +592,16 @@ export function validateManagedProcessLease(
  *   5. re-confirm the leader the same way, then signal the GROUP with SIGKILL;
  *   6. wait, bounded, for the group to disappear.
  *
- * If a re-confirmation fails while the group still exists, no signal follows it:
- * the settlement reports `PROCESS_CLEANUP_UNRESOLVED` / `GROUP_AUTHORITY_LOST`
- * with the phase it reached and what the leader then read as. A group that
- * outlives both phases while its leader stayed provable is reported as
- * `GROUP_STILL_PRESENT` — also unresolved, because Poiesis did not empty it.
+ * If a re-confirmation fails while the group still exists, no signal follows it.
+ * When the leader has merely FINISHED — `gone` or `terminal` — the group may be
+ * observably alive only because its descendants have not been reaped yet, so the
+ * settlement waits out that window in bounded, signal-free fashion and settles if
+ * the group empties itself (ticket #185). Any other failed re-confirmation, and
+ * any group still there when the wait closes, is reported as
+ * `PROCESS_CLEANUP_UNRESOLVED` / `GROUP_AUTHORITY_LOST` with the phase it
+ * reached and what the leader then read as. A group that outlives both phases
+ * while its leader stayed provable is reported as `GROUP_STILL_PRESENT` — also
+ * unresolved, because Poiesis did not empty it.
  */
 export async function settleManagedProcessLease(
   lease: ManagedProcessLease,
@@ -597,6 +638,9 @@ export async function settleManagedProcessLease(
 
   const graceful = confirmGroupAuthority(lease);
   if (!graceful.held) {
+    if (await awaitNaturalSettlement(processGroupId, graceful, confirmMs)) {
+      return settled(operationId, workspaceId, processGroupId, true);
+    }
     throw authorityLost({ operationId, workspaceId, processGroupId, pid: shape?.pid ?? null, phase: "before-sigterm", leader: graceful });
   }
   signalIsolatedGroup(processGroupId, "SIGTERM");
@@ -606,6 +650,9 @@ export async function settleManagedProcessLease(
 
   const forced = confirmGroupAuthority(lease);
   if (!forced.held) {
+    if (await awaitNaturalSettlement(processGroupId, forced, confirmMs)) {
+      return settled(operationId, workspaceId, processGroupId, true);
+    }
     throw authorityLost({ operationId, workspaceId, processGroupId, pid: shape?.pid ?? null, phase: "before-sigkill", leader: forced });
   }
   signalIsolatedGroup(processGroupId, "SIGKILL");
@@ -691,6 +738,33 @@ function leaderStateOfRejection(reason: ManagedProcessLeaseRejection): ManagedPr
 }
 
 /**
+ * Spec #168 / ticket #185 — wait, without signalling, for a group whose leader
+ * has already finished to empty itself.
+ *
+ * A leader that is `gone` or `terminal` cannot be signalled and cannot be owned,
+ * so nothing is sent here: the group's id may already have been handed to another
+ * process, and liveness still proves absence only. What the wait buys is a verdict
+ * rather than an action. Descendants that have finished but are not yet reaped
+ * keep a group observable for a short while, and a run whose whole group is in
+ * that state is a settled run, not a leak — reporting it as one turns ordinary
+ * completion into a failure that has to be investigated.
+ *
+ * The wait is bounded by the same confirmation window the rest of the settlement
+ * uses, and a group still there when it closes settles nothing: the caller
+ * reports the unresolved failure it would have reported without this wait. Every
+ * state that means "this PID may belong to somebody else" is refused outright, so
+ * no ambiguity can be laundered into completion.
+ */
+async function awaitNaturalSettlement(
+  processGroupId: number,
+  leader: GroupAuthority,
+  windowMs: number,
+): Promise<boolean> {
+  if (!PROCESS_NATURALLY_FINISHED_LEADER_STATES.has(leader.leaderState)) return false;
+  return waitForGroupGone(processGroupId, windowMs);
+}
+
+/**
  * The typed failure for a group Poiesis may no longer signal. The details name
  * the phase reached, what the leader read as, the group, and the fact that no
  * member list exists — an operator reading this learns that something is still
@@ -755,7 +829,9 @@ function signalIsolatedGroup(processGroupId: number, signal: NodeJS.Signals): vo
 /**
  * Bounded wait for the leased group to stop existing. It waits on group
  * liveness alone, because that is the only fact that can be waited on without
- * enumerating the processes inside it.
+ * enumerating the processes inside it. This is the same question both
+ * termination phases and the natural settlement of ticket #185 ask, so it is
+ * the same wait: bounded, and answered by absence.
  */
 async function waitForGroupGone(processGroupId: number, windowMs: number): Promise<boolean> {
   const deadline = Date.now() + windowMs;
