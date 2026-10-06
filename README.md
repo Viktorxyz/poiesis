@@ -154,6 +154,33 @@ transient in-memory identity lease, and is settled through that lease alone.
 That is isolation, not containment — and it is honest here precisely because
 nothing in a Poiesis-chosen argv can `setsid` its way out of the group.
 
+Cleaning that group has one precondition, and it is not a formality. A process
+group may be signalled only while the leased leader that gave the group its id
+can still be re-confirmed by exact **process-start identity** and exact process
+group — the Linux model, read from the kernel's per-PID process table. Group
+liveness is an absence fact, never an ownership one: a group that still exists
+after its leader is gone names a PID that any later process may be handed, and
+Poiesis will not signal on the strength of a number it cannot attribute.
+
+| Situation | What Poiesis does |
+| --- | --- |
+| Linux, live leader still provable | group `SIGTERM`, bounded wait, re-confirm, group `SIGKILL`, bounded wait; success is confirmed only when the group no longer exists |
+| Linux, leader gone / terminal / unreadable / reused / foreign while the group remains | sends **no further signal** and rejects `PROCESS_CLEANUP_UNRESOLVED` with `details.reason: GROUP_AUTHORITY_LOST`, `details.phase`, `details.leaderState`, `details.pid`, `details.processGroupId`, `details.membersEnumerated: false` |
+| Linux, group survives both phases under a provable leader | rejects `PROCESS_CLEANUP_UNRESOLVED` with `details.reason: GROUP_STILL_PRESENT` |
+| non-Linux POSIX (macOS, the BSDs), live leader, no readable process-start identity | sends **no signal at all** and rejects `PROCESS_CLEANUP_REFUSED` with `details.reason: UNSUPPORTED_IDENTITY` plus the actionable `details.pid` and `details.processGroupId`. Poiesis never pretends a termination it could not perform, and it never falls back to the weaker "the child leads the group it was spawned into" argument, because that group id IS that child's PID and the PID becomes reusable the moment the leader exits |
+| already-empty group | settled; nothing to signal and nothing to prove |
+| Windows | unchanged: no POSIX groups, so the tree is reached with `taskkill /PID <pid> /T` only while the child has not exited, then `child.kill`, each phase bounded by the child's own `exit` |
+| Linux, run contained in a cgroup v2 leaf | unchanged, and authoritative: `cgroup.kill` plus a `populated 0` reading from `cgroup.events` empties the leaf, and once that is confirmed no group-local settlement runs at all |
+
+These envelopes are not contained-path-only. `PROCESS_CLEANUP_REFUSED` and
+`PROCESS_CLEANUP_UNRESOLVED` describe a managed process group on any platform,
+and both outrank success, failure, timeout, and cancellation, because they mean
+a process Poiesis spawned may still be running.
+
+Poiesis never enumerates the group to work out what is inside it. There is no
+`/proc` walk, no member snapshot, no per-PID signal, and therefore no survivor
+list to report: cleanup addresses the group or it does nothing.
+
 **Command TEXT** can do exactly that. Three surfaces run it: `poiesis verify`'s
 plan, `poiesis check`'s explicit commands, and the configured
 `postIntegrationCommands` that `poiesis integrate` runs against the integrated
@@ -198,8 +225,16 @@ remediation: run the operation on a Linux host with a delegated cgroup v2
 subtree. Nothing runs and nothing is reported as verified. On Windows the
 missing primitive is a no-breakaway Job Object, which needs a native launcher
 this runtime does not ship; on macOS and the other POSIX platforms no portable
-strong primitive exists at all. Use the library `run()` seam with a fixed argv
-for work that does not need arbitrary command text on such a host.
+strong primitive exists at all.
+
+The library `run()` seam with a fixed argv remains available on such a host for
+work that needs no arbitrary command text, and it is a different trade rather
+than an equivalent cleanup: on Windows its tree cleanup is `taskkill`-based as
+described above, while on macOS and the BSDs a command that is still running at
+a timeout or a cancellation gets a typed fail-closed refusal
+(`PROCESS_CLEANUP_REFUSED` / `UNSUPPORTED_IDENTITY`) instead of a termination.
+Choose it when a caller can act on that refusal; do not read it as the Linux
+behaviour.
 
 The command processor is validated on the same terms, before any process
 exists. `verify` and `check` refuse with `COMMAND_PROCESSOR_UNAVAILABLE`

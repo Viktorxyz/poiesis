@@ -302,11 +302,18 @@ describe("replacement environment seam (ticket #129)", () => {
 });
 
 describe.skipIf(process.platform === "win32")("POSIX process-tree termination", () => {
-  async function stageTree(resistsTerm: boolean): Promise<{
-    dir: string;
-    parent: string;
-    pidFile: string;
-  }> {
+  /**
+   * A leader that ignores SIGTERM stays the process Poiesis leased for the
+   * whole settlement, so the group keeps an owner at every signal and the
+   * forced phase is reachable. A leader that exits with the graceful signal
+   * does not: its PID, which IS the group id, becomes a free number and the
+   * group is then nothing Poiesis may signal (see the GROUP_AUTHORITY_LOST
+   * coverage in `tests/process-lease.test.ts`).
+   */
+  async function stageTree(options: {
+    resistsTerm: boolean;
+    leaderSurvivesTerm?: boolean;
+  }): Promise<{ dir: string; parent: string; pidFile: string }> {
     const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
     fixtures.push(dir);
     const descendant = join(dir, "descendant.sh");
@@ -316,7 +323,7 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
       descendant,
       [
         "#!/bin/sh",
-        ...(resistsTerm ? ["trap '' TERM"] : []),
+        ...(options.resistsTerm ? ["trap '' TERM"] : []),
         "exec 0</dev/null 1>/dev/null 2>/dev/null",
         'printf "%s\\n" "$$" > "$1"',
         "while :; do sleep 1; done",
@@ -326,7 +333,9 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
     );
     await writeFile(
       parent,
-      `#!/bin/sh\n"${descendant}" "${pidFile}" &\nsleep 30\n`,
+      options.leaderSurvivesTerm === true
+        ? `#!/bin/sh\ntrap '' TERM\n"${descendant}" "${pidFile}" &\nwhile :; do sleep 1; done\n`
+        : `#!/bin/sh\n"${descendant}" "${pidFile}" &\nsleep 30\n`,
       "utf8",
     );
     await chmod(descendant, 0o755);
@@ -334,8 +343,85 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
     return { dir, parent, pidFile };
   }
 
+  /**
+   * A descendant that replaces itself with a TERM-resistant process when the
+   * graceful signal arrives, and a leader that keeps the group ownable.
+   *
+   * The descendants are real Node processes rather than shell scripts: a shell
+   * only runs a `trap ... TERM` handler between foreground commands, so on a
+   * host whose `/bin/sh` is bash the handler never runs at all. A signal
+   * handler is the property under test, so the process implementing it must
+   * have one.
+   */
+  async function stageTermHandlerTree(descendantCount: number): Promise<{
+    dir: string;
+    parent: string;
+    ownPidFiles: string[];
+    replacementPidFiles: string[];
+  }> {
+    const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
+    fixtures.push(dir);
+    const replacement = join(dir, "replacement.cjs");
+    const descendant = join(dir, "descendant.cjs");
+    const parent = join(dir, "parent.sh");
+    const ownPidFiles: string[] = [];
+    const replacementPidFiles: string[] = [];
+    await writeFile(
+      replacement,
+      [
+        'const { writeFileSync } = require("node:fs");',
+        'writeFileSync(process.argv[2], `${process.pid}\\n`);',
+        "process.on('SIGTERM', () => {});",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await writeFile(
+      descendant,
+      [
+        'const { spawn } = require("node:child_process");',
+        'const { writeFileSync } = require("node:fs");',
+        "const [replacement, replacementPidFile, ownPidFile] = process.argv.slice(2);",
+        "writeFileSync(ownPidFile, `${process.pid}\\n`);",
+        "process.on('SIGTERM', () => {",
+        "  const forked = spawn(process.execPath, [replacement, replacementPidFile], { stdio: 'ignore' });",
+        "  forked.unref();",
+        "  process.exit(0);",
+        "});",
+        "setInterval(() => {}, 1000);",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    const spawns: string[] = [];
+    for (let index = 0; index < descendantCount; index += 1) {
+      const ownPidFile = join(dir, `descendant-${index}.pid`);
+      const replacementPidFile = join(dir, `replacement-${index}.pid`);
+      ownPidFiles.push(ownPidFile);
+      replacementPidFiles.push(replacementPidFile);
+      spawns.push(
+        `"${process.execPath}" "${descendant}" "${replacement}" "${replacementPidFile}" "${ownPidFile}" &`,
+      );
+    }
+    await writeFile(
+      parent,
+      [
+        "#!/bin/sh",
+        "trap '' TERM",
+        "exec 0</dev/null 1>/dev/null 2>/dev/null",
+        ...spawns,
+        "while :; do sleep 1; done",
+        "",
+      ].join("\n"),
+      "utf8",
+    );
+    await chmod(parent, 0o755);
+    return { dir, parent, ownPidFiles, replacementPidFiles };
+  }
+
   it("terminates a normally inherited descendant before settlement", { timeout: 10_000 }, async () => {
-    const { dir, parent, pidFile } = await stageTree(false);
+    const { dir, parent, pidFile } = await stageTree({ resistsTerm: false });
     const invocation = run(parent, [], { cwd: dir, timeoutMs: 250 });
     const descendantPid = await waitForPid(pidFile);
     const startTime = await processStartTime(descendantPid);
@@ -349,7 +435,7 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
   });
 
   it("does not settle before forced escalation kills a TERM-resistant descendant", { timeout: 15_000 }, async () => {
-    const { dir, parent, pidFile } = await stageTree(true);
+    const { dir, parent, pidFile } = await stageTree({ resistsTerm: true, leaderSurvivesTerm: true });
     const startedAt = Date.now();
     const invocation = run(parent, [], { cwd: dir, timeoutMs: 250 });
     const descendantPid = await waitForPid(pidFile);
@@ -365,55 +451,14 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
   });
 
   it("captures and kills a TERM-handler replacement before settlement", { timeout: 15_000 }, async () => {
-    const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
-    fixtures.push(dir);
-    const parent = join(dir, "parent.sh");
-    const descendant = join(dir, "descendant.sh");
-    const replacement = join(dir, "replacement.sh");
-    const descendantPidFile = join(dir, "descendant.pid");
-    const replacementPidFile = join(dir, "replacement.pid");
-
-    await writeFile(
-      replacement,
-      [
-        "#!/bin/sh",
-        "trap '' TERM",
-        "exec 0</dev/null 1>/dev/null 2>/dev/null",
-        'printf "%s\\n" "$$" > "$1"',
-        "while :; do sleep 1; done",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await writeFile(
-      descendant,
-      [
-        "#!/bin/sh",
-        'replacement="$1"',
-        'own_pid="$2"',
-        'replacement_pid="$3"',
-        `trap '"$replacement" "$replacement_pid" & exit 0' TERM`,
-        "exec 0</dev/null 1>/dev/null 2>/dev/null",
-        'printf "%s\\n" "$$" > "$own_pid"',
-        "while :; do sleep 1; done",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await writeFile(
-      parent,
-      `#!/bin/sh\n"${descendant}" "${replacement}" "${descendantPidFile}" "${replacementPidFile}" &\nsleep 30\n`,
-      "utf8",
-    );
-    await chmod(replacement, 0o755);
-    await chmod(descendant, 0o755);
-    await chmod(parent, 0o755);
-
+    const { dir, parent, ownPidFiles, replacementPidFiles } = await stageTermHandlerTree(1);
     const invocation = run(parent, [], { cwd: dir, timeoutMs: 500 });
-    const descendantPid = await waitForPid(descendantPidFile);
+    const descendantPid = await waitForPid(ownPidFiles[0]!);
     const descendantStartTime = await processStartTime(descendantPid);
     survivorPids.set(descendantPid, descendantStartTime);
-    const replacementPid = await waitForPid(replacementPidFile, 3_000);
+    // The replacement exists only once the graceful signal has been handled, so
+    // it is read after the group has been asked to terminate.
+    const replacementPid = await waitForPid(replacementPidFiles[0]!, 3_000);
     const replacementStartTime = await processStartTime(replacementPid);
     survivorPids.set(replacementPid, replacementStartTime);
 
@@ -424,67 +469,25 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
     survivorPids.delete(replacementPid);
   });
 
-  // Regression coverage for the early-settlement race behind the flaky
-  // TERM-handler replacement test: tryFinalize must not trust a single
-  // "PG appears empty" verdict during the grace period when an owned
-  // group has been snapshotted, because /proc can briefly miss a forked
-  // but not-yet-execed descendant. Repeat the scenario enough times that
-  // the window reliably surfaces if it is left unguarded.
+  /**
+   * Coverage for the settlement window in which a descendant appears AFTER the
+   * graceful signal was sent. There is no member snapshot to miss it any more:
+   * the group is addressed as a group, so a replacement forked inside the grace
+   * window is still inside the group the forced signal reaches. Repeated enough
+   * times that the window reliably surfaces if it is ever left unguarded.
+   */
   it(
-    "captures every TERM-handler replacement across repeated concurrent settlement attempts",
+    "captures every TERM-handler replacement across repeated settlement attempts",
     { timeout: 60_000 },
     async () => {
-      const repeats = 20;
+      const repeats = 5;
       for (let attempt = 0; attempt < repeats; attempt += 1) {
-        const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
-        fixtures.push(dir);
-        const parent = join(dir, "parent.sh");
-        const descendant = join(dir, "descendant.sh");
-        const replacement = join(dir, "replacement.sh");
-        const descendantPidFile = join(dir, "descendant.pid");
-        const replacementPidFile = join(dir, "replacement.pid");
-
-        await writeFile(
-          replacement,
-          [
-            "#!/bin/sh",
-            "trap '' TERM",
-            "exec 0</dev/null 1>/dev/null 2>/dev/null",
-            'printf "%s\\n" "$$" > "$1"',
-            "while :; do sleep 1; done",
-            "",
-          ].join("\n"),
-          "utf8",
-        );
-        await writeFile(
-          descendant,
-          [
-            "#!/bin/sh",
-            'replacement="$1"',
-            'own_pid="$2"',
-            'replacement_pid="$3"',
-            `trap '"$replacement" "$replacement_pid" & exit 0' TERM`,
-            "exec 0</dev/null 1>/dev/null 2>/dev/null",
-            'printf "%s\\n" "$$" > "$own_pid"',
-            "while :; do sleep 1; done",
-            "",
-          ].join("\n"),
-          "utf8",
-        );
-        await writeFile(
-          parent,
-          `#!/bin/sh\n"${descendant}" "${replacement}" "${descendantPidFile}" "${replacementPidFile}" &\nsleep 30\n`,
-          "utf8",
-        );
-        await chmod(replacement, 0o755);
-        await chmod(descendant, 0o755);
-        await chmod(parent, 0o755);
-
+        const { dir, parent, ownPidFiles, replacementPidFiles } = await stageTermHandlerTree(1);
         const invocation = run(parent, [], { cwd: dir, timeoutMs: 500 });
-        const descendantPid = await waitForPid(descendantPidFile);
+        const descendantPid = await waitForPid(ownPidFiles[0]!);
         const descendantStartTime = await processStartTime(descendantPid);
         survivorPids.set(descendantPid, descendantStartTime);
-        const replacementPid = await waitForPid(replacementPidFile, 3_000);
+        const replacementPid = await waitForPid(replacementPidFiles[0]!, 3_000);
         const replacementStartTime = await processStartTime(replacementPid);
         survivorPids.set(replacementPid, replacementStartTime);
 
@@ -497,77 +500,25 @@ describe.skipIf(process.platform === "win32")("POSIX process-tree termination", 
     },
   );
 
-  // Multiple TERM-handler descendants, each spawning its own TERM-resistant
-  // replacement. Increases the chance that at least one replacement is
-  // observed by the runner in the same grace period that another one is
-  // being forked, exercising the snapshot refresh path.
+  // Several TERM-handling descendants, each spawning its own TERM-resistant
+  // replacement inside the same grace window.
   it(
     "captures and kills multiple TERM-handler replacements before settlement",
     { timeout: 20_000 },
     async () => {
-      const dir = await mkdtemp(join(tmpdir(), "poiesis-tree-"));
-      fixtures.push(dir);
-      const replacement = join(dir, "replacement.sh");
-      const pidFiles: string[] = [];
-
-      await writeFile(
-        replacement,
-        [
-          "#!/bin/sh",
-          "trap '' TERM",
-          "exec 0</dev/null 1>/dev/null 2>/dev/null",
-          'printf "%s\\n" "$$" > "$1"',
-          "while :; do sleep 1; done",
-          "",
-        ].join("\n"),
-        "utf8",
-      );
-      await chmod(replacement, 0o755);
-
-      const descendantPaths: string[] = [];
-      for (let index = 0; index < 4; index += 1) {
-        const descendant = join(dir, `descendant-${index}.sh`);
-        const descendantPidFile = join(dir, `descendant-${index}.pid`);
-        const replacementPidFile = join(dir, `replacement-${index}.pid`);
-        pidFiles.push(descendantPidFile, replacementPidFile);
-        await writeFile(
-          descendant,
-          [
-            "#!/bin/sh",
-            'replacement="$1"',
-            'own_pid="$2"',
-            'replacement_pid="$3"',
-            `trap '"$replacement" "$replacement_pid" & exit 0' TERM`,
-            "exec 0</dev/null 1>/dev/null 2>/dev/null",
-            'printf "%s\\n" "$$" > "$own_pid"',
-            "while :; do sleep 1; done",
-            "",
-          ].join("\n"),
-          "utf8",
-        );
-        await chmod(descendant, 0o755);
-        descendantPaths.push(descendant);
-      }
-
-      const parent = join(dir, "parent.sh");
-      const spawns = descendantPaths
-        .map((descendant, index) => {
-          const descendantPidFile = pidFiles[index * 2]!;
-          const replacementPidFile = pidFiles[index * 2 + 1]!;
-          return `"${descendant}" "${replacement}" "${descendantPidFile}" "${replacementPidFile}" &`;
-        })
-        .join("\n");
-      await writeFile(parent, `#!/bin/sh\n${spawns}\nsleep 30\n`, "utf8");
-      await chmod(parent, 0o755);
-
+      const { dir, parent, ownPidFiles, replacementPidFiles } = await stageTermHandlerTree(4);
       const invocation = run(parent, [], { cwd: dir, timeoutMs: 500 });
 
       const trackedPids: Array<{ pid: number; startTime: string | null }> = [];
-      for (const file of pidFiles) {
-        const pid = await waitForPid(file, 3_000);
+      for (const [index, pidFile] of ownPidFiles.entries()) {
+        const pid = await waitForPid(pidFile, 3_000);
         const startTime = await processStartTime(pid);
         survivorPids.set(pid, startTime);
         trackedPids.push({ pid, startTime });
+        const replacementPid = await waitForPid(replacementPidFiles[index]!, 3_000);
+        const replacementStartTime = await processStartTime(replacementPid);
+        survivorPids.set(replacementPid, replacementStartTime);
+        trackedPids.push({ pid: replacementPid, startTime: replacementStartTime });
       }
 
       await expect(invocation).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });

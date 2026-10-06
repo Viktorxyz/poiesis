@@ -199,7 +199,25 @@ All external command execution is bounded:
 - structured `COMMAND_TIMEOUT` error with diagnostic detail on timeout;
 - `COMMAND_FAILED` on ordinary non-zero exit;
 - `stdoutTruncated`/`stderrTruncated` flags recorded when bound is hit;
-- safe SIGTERM then SIGKILL termination on timeout.
+- bounded SIGTERM then SIGKILL termination of the managed process group, on the platforms where the group can still be attributed to the lease (see below).
+
+### Group-local cleanup: what a platform must be able to prove
+
+A managed process group is addressed as a group or not at all. Poiesis never enumerates it: there is no process-table walk, no member snapshot, no per-PID signal, and therefore no survivor list to report. The group may be signalled only while the leased leader that gave the group its id can still be re-confirmed by exact **process-start identity** and exact process-group id — the Linux model, read from the kernel's per-PID process table. Group liveness proves absence, never ownership: once the leader is gone, the group id is a PID that any later process may be handed.
+
+| Host | Live managed group at timeout, cancellation, or a lingering leak |
+| --- | --- |
+| Linux | settled: group `SIGTERM`, bounded wait, leader re-confirmed, group `SIGKILL`, bounded wait, success confirmed only when the group no longer exists |
+| macOS and the other non-Linux POSIX platforms | no signal is sent at all; the run rejects `PROCESS_CLEANUP_REFUSED` with `details.reason: UNSUPPORTED_IDENTITY` and the actionable `details.pid` / `details.processGroupId`, because nothing about the group can be attributed without a readable process-start identity. A command that exits on its own still settles normally |
+| Windows | no POSIX groups exist; the tree is reached with `taskkill /PID <pid> /T`, then `/F`, then `child.kill`, each phase bounded by the child's own `exit` event, and each PID-directed step suppressed once the child has exited |
+| Linux with a delegated cgroup v2 leaf | unchanged and authoritative: `cgroup.kill` empties the leaf and `cgroup.events` confirms `populated 0`; once that confirmation lands, no group-local settlement runs at all |
+
+Two failure envelopes describe a managed process group on any platform, and both outrank success, failure, timeout, and cancellation because they mean a process Poiesis spawned may still be running:
+
+- `PROCESS_CLEANUP_REFUSED` — nothing was signalled and nothing can be. Carries `details.reason` (`MALFORMED_LEASE`, `UNSAFE_TARGET`, `UNSUPPORTED_IDENTITY`, `IDENTITY_AMBIGUOUS`, `PID_REUSE`, `FOREIGN_PROCESS`), `details.detail`, `details.operationId`, `details.workspaceId`, `details.pid`, `details.processGroupId`.
+- `PROCESS_CLEANUP_UNRESOLVED` — a signal was sent but the group is still there, or Poiesis declined to send the next one. Carries `details.reason` (`GROUP_AUTHORITY_LOST` when the leader stopped being provable while the group remained — nothing further is signalled; `GROUP_STILL_PRESENT` when a provable leader still did not empty it), `details.phase` (`before-sigterm`, `before-sigkill`, `confirm`), `details.leaderState` (`live`, `gone`, `terminal`, `unreadable`, `reused`, `foreign`, `unconfirmed`), `details.pid`, `details.processGroupId`, `details.membersEnumerated: false`, `details.confirmed: false`. On Windows the same code carries `details.platform` and `details.phases` instead, because that path is `taskkill`-based.
+
+A zombie is terminal: it can never be a signal target, and it is never reported as a surviving process.
 
 ### Strong containment for arbitrary command text
 

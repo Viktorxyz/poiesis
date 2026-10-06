@@ -64,10 +64,10 @@ const ADMISSION_SHELL = "/bin/sh";
 /**
  * Spec #168 / ticket #170 — bounded window a managed command may keep the
  * runner waiting after the child exited while a descendant still holds the
- * inherited output. When the window elapses the managed process group is
- * settled (see `settleManagedProcessLease`) and the run settles with it,
- * so a leaked background descendant can never hold a Poiesis operation
- * open indefinitely.
+ * inherited output. When the window elapses the managed cleanup runs — the
+ * contained boundary where there is one, otherwise the leased process group
+ * (see `settleManagedProcessLease`) — and the run settles with it, so a leaked
+ * background descendant can never hold a Poiesis operation open indefinitely.
  */
 const POST_EXIT_GRACE_MS = 2_000;
 
@@ -177,22 +177,30 @@ interface Capture {
 }
 
 /**
- * Spec #168 / ticket #170, extended by ticket #176 — run one managed
+ * Spec #168 / ticket #170, extended by tickets #176 and #180 — run one managed
  * subprocess to a settled state.
  *
  * Every exit path — success, non-zero exit, timeout, cancellation, and
- * internal error — settles only AFTER the managed process group has been
- * cleaned through its transient identity lease (`src/process-tree.ts`).
- * The child is spawned `detached: true`, so it leads an isolated process
- * group that cannot be reached from Poiesis's own group or the terminal's,
- * and cleanup targets are derived from that lease alone: there is no
- * process-name, port, user, or age matching anywhere in this path.
+ * internal error — settles only AFTER the managed cleanup has run: the
+ * process group the transient identity lease names (`src/process-tree.ts`),
+ * or the kernel boundary this run was contained in
+ * (`src/containment.ts`). The child is spawned `detached: true`, so it leads an
+ * isolated process group that cannot be reached from Poiesis's own group or the
+ * terminal's, and cleanup targets are derived from that lease alone: there is
+ * no process-name, port, user, or age matching anywhere in this path.
  *
- * A descendant that outlives the child — the classic "successful command
- * that leaks a background process" — is cleaned too. While such a
- * descendant still holds the inherited output the runner waits at most
- * {@link POST_EXIT_GRACE_MS} for it, then settles the group instead of
- * blocking until the command timeout.
+ * A descendant that outlives the child — the classic "successful command that
+ * leaks a background process" — is bounded two different ways, and which one
+ * applies is a property of the leader rather than of the descendant. While the
+ * leased leader is still provably the process Poiesis spawned, the group is
+ * still Poiesis's to signal, and the leak is cleaned through both a graceful
+ * and a forced phase. Once that leader has exited, its PID — which IS the
+ * group id — is a number any later process may be handed, so nothing about the
+ * surviving group is provable any more: Poiesis sends no further signal and
+ * reports the run as an unresolved cleanup instead of a settled one. That is
+ * the honest direction, and it is why the surface that runs caller-supplied
+ * command text is contained rather than group-isolated: a cgroup leaf is
+ * emptied atomically and does not depend on a leader being alive.
  *
  * Spec #168 / ticket #176 bounds what that group IS. It is isolation, not
  * containment: `setsid(2)` and reparenting both leave it. So a caller that
@@ -496,11 +504,19 @@ export async function run(command: string, args: string[], options: RunOptions):
      * Clean the managed containment, then the managed process group, exactly
      * once, and only then let the run settle.
      *
-     * Containment comes first and is the stronger boundary: a cgroup leaf
-     * reaches a descendant that `setsid`'d or was reparented out of the group.
-     * The POSIX process-group lease still settles afterwards so the run keeps
-     * its per-PID identity evidence; either phase failing is a cleanup error,
-     * and the first one recorded is the one reported.
+     * Spec #168 / ticket #180: containment comes first and is the authority. A
+     * cgroup leaf reaches a descendant that `setsid`'d or was reparented out of
+     * the group, and it is emptied atomically by `cgroup.kill` and confirmed by
+     * the kernel's own `populated` flag. Once that confirmation has landed there
+     * is nothing left for a process-group settlement to do, and running one
+     * anyway would only re-derive a weaker authority: group liveness proves
+     * absence, never ownership. So a run whose containment settled cleanly skips
+     * the group phase entirely.
+     *
+     * The group phase still runs — and is still the only phase — when there was
+     * no containment, when containment could not confirm the leaf is empty, and
+     * on Windows, where there are no POSIX groups at all. Either phase failing
+     * is a cleanup error, and the first one recorded is the one reported.
      *
      * The returned promise is the cleanup itself, so a caller that must know the
      * boundary is settled gets that fact rather than a second cleanup.
@@ -514,20 +530,16 @@ export async function run(command: string, args: string[], options: RunOptions):
         timeoutTimer = null;
       }
       cleanupInFlight = (async (): Promise<void> => {
+        let containmentConfirmed = false;
         if (containment !== null) {
           try {
-            await settleContainment(containment);
+            const boundary = await settleContainment(containment);
+            containmentConfirmed = boundary.confirmed;
           } catch (error) {
             cleanupError ??= asPoiesisError(error);
           }
         }
-        if (lease !== null) {
-          try {
-            await settleManagedProcessLease(lease);
-          } catch (error) {
-            cleanupError ??= asPoiesisError(error);
-          }
-        } else if (IS_WINDOWS) {
+        if (lease === null) {
           // Documented Windows model: no POSIX process groups and no readable
           // process-start identity, so `taskkill /PID <pid> /T` is the only
           // way to reach the tree, and it is meaningful ONLY while the PID is
@@ -537,7 +549,13 @@ export async function run(command: string, args: string[], options: RunOptions):
           // unrelated process. Nothing is therefore signalled once
           // `childExited` is set; a normal Windows run is simply already
           // settled.
-          if (!childExited) await terminateWindowsTree();
+          if (IS_WINDOWS && !childExited) await terminateWindowsTree();
+        } else if (!containmentConfirmed) {
+          try {
+            await settleManagedProcessLease(lease);
+          } catch (error) {
+            cleanupError ??= asPoiesisError(error);
+          }
         }
         // Neither a lease nor Windows: the spawn produced no process, so
         // there is nothing to clean up before settling.

@@ -1,8 +1,9 @@
-import { readFileSync, readdirSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import { PoiesisError } from "./errors.js";
 
 /**
- * Spec #168 / ticket #170 — transient managed-process identity leases.
+ * Spec #168 / ticket #170, extended by ticket #180 — transient managed-process
+ * identity leases, and the one authority cleanup may act on.
  *
  * Every subprocess Poiesis spawns through managed execution is leased, not
  * merely remembered. A lease is a plain in-memory value that names the
@@ -18,15 +19,32 @@ import { PoiesisError } from "./errors.js";
  * foreign identity is refused rather than signalled, and an unresolved
  * cleanup surfaces as a typed failure instead of a silent success.
  *
- * Two hard rules bound the implementation:
+ * Ticket #180 sharpens that into a single rule with no exceptions:
  *
- *   1. Cleanup targets are derived ONLY from a validated lease. There is
- *      no process-name, port, user, or age matching anywhere in this
- *      module — a same-named unrelated process is never a target.
+ *   1. Cleanup targets are derived ONLY from a validated lease. There is no
+ *      process-name, port, user, or age matching anywhere in this module — a
+ *      same-named unrelated process is never a target.
  *   2. A managed process group must be isolated. A lease that names the
  *      Poiesis process, process group 0/1, or Poiesis's own process group
  *      is refused, because signalling it would reach processes Poiesis
  *      never spawned.
+ *   3. THE GROUP IS ADDRESSED AS A GROUP, NEVER AS A LIST OF MEMBERS. Nothing
+ *      here enumerates the process table: no process-table walk, no member
+ *      snapshot, no per-PID signal, and therefore no survivor list to
+ *      report. A member that Poiesis cannot identify is never a target.
+ *   4. THE GROUP MAY BE SIGNALLED ONLY WHILE ITS LEADER IS STILL PROVABLE.
+ *      A process-group id is the PID of the process that created it, so once
+ *      that leader is gone the id is a free PID that any later process may
+ *      be handed — and a process that becomes a group leader with that id
+ *      owns a brand-new group. Liveness of the group is therefore an
+ *      ABSENCE fact and never an ownership one: `kill(-pgid, 0)` answering
+ *      proves a group exists, nothing more.
+ *   5. So the leader's identity — its exact start identity and its exact
+ *      process-group id — is re-read immediately before EACH signal. If that
+ *      read says the leader is gone, terminal, unreadable, reused, or
+ *      foreign, no further signal is sent and the cleanup is reported
+ *      unresolved with `GROUP_AUTHORITY_LOST`. Success is confirmed by
+ *      exactly one thing: the group no longer exists.
  */
 
 /** Schema version carried by every lease, so a future shape change is visible. */
@@ -55,51 +73,16 @@ export const PROCESS_GROUPS_SUPPORTED = process.platform !== "win32";
 /**
  * True when this runtime can read the kernel process-start identity.
  *
- * Where it cannot, a lease carries `startIdentity: null` and Poiesis falls
- * back to the group-isolation model documented on
- * {@link PROCESS_GROUP_ONLY_IDENTITY_MODEL} rather than refusing every
- * cleanup.
+ * Where it cannot, Poiesis has no ownership proof for a live managed group, so
+ * it signals nothing at all and lets cleanup refuse — see the
+ * `UNSUPPORTED_IDENTITY` rejection in {@link validateManagedProcessLease}.
  */
 export const PROCESS_START_IDENTITY_SUPPORTED = PROCESS_START_IDENTITY_AVAILABLE;
-
-/**
- * The documented identity model for POSIX platforms without a readable
- * process-start identity (macOS, the BSDs, and any other POSIX that is not
- * Linux).
- *
- * Without `starttime` Poiesis cannot prove "this PID is still the process I
- * spawned", so it does not try. Instead it relies on the one property the
- * OS itself guarantees about the group it created:
- *
- *   - The runner spawns the child `detached: true`, so the child is the
- *     leader of a brand-new session and process group whose id EQUALS the
- *     child's PID. Poiesis records that pair at spawn time.
- *   - Group membership is a property of the group, not of a PID, so the
- *     group can only contain that child and processes descended from it.
- *   - Cleanup addresses the group (`kill(-pgid, …)`) and NEVER an individual
- *     PID from outside it. A PID that has exited and been recycled cannot be
- *     re-entered into a group whose leader PID Poiesis still holds, and a
- *     recycled PID is never signalled individually.
- *   - Because per-PID identity cannot be re-confirmed, settlement on these
- *     platforms confirms by GROUP EMPTINESS (`kill(-pgid, 0)`), not by a
- *     per-PID identity scan, and reports the reduced evidence it actually
- *     has: `terminated` is empty when members cannot be enumerated.
- *   - A lease whose group id is not its PID is refused (`FOREIGN_PROCESS`):
- *     the detached-leader invariant is the only ownership proof available
- *     here, so a lease that does not satisfy it gets no cleanup at all.
- *
- * The trade is explicit: on these platforms a recycled group-leader PID is
- * the residual risk, and it is bounded by the fact that the leader PID is
- * held by the runner's own `ChildProcess` for the whole lifetime of the
- * run. It is strictly safer than the previous behaviour, which reported
- * every live PID as ambiguous and therefore refused to clean up anything.
- */
-export const PROCESS_GROUP_ONLY_IDENTITY_MODEL = PROCESS_GROUPS_SUPPORTED && !PROCESS_START_IDENTITY_AVAILABLE;
 
 /** Default bounded window between the graceful and forced termination phases. */
 export const PROCESS_TERMINATION_GRACE_MS = 2_000;
 
-/** Default bounded window for confirming that every descendant is gone. */
+/** Default bounded window for confirming that the managed group is gone. */
 export const PROCESS_TERMINATION_CONFIRM_MS = 2_000;
 
 const MAX_IDENTITY_LENGTH = 64;
@@ -148,6 +131,41 @@ export type ManagedProcessLeaseRejection =
   /** The live process is not in the process group the lease names. */
   | "FOREIGN_PROCESS";
 
+/**
+ * What the kernel said about the leased leader when cleanup last looked.
+ *
+ * `live` is the only state that authorises a signal; every other value means
+ * Poiesis cannot prove the group is still the one it created.
+ */
+export type ManagedProcessLeaderState =
+  /** Confirmed: the exact start identity, in the exact leased group. */
+  | "live"
+  /** No process-table entry at that PID any more. */
+  | "gone"
+  /** A zombie or dead task still holding the PID until it is reaped. */
+  | "terminal"
+  /** Alive, but its identity cannot be read. */
+  | "unreadable"
+  /** The PID now holds a different process-start identity. */
+  | "reused"
+  /** Alive and identified, but in a different process group. */
+  | "foreign"
+  /** This runtime cannot confirm a start identity at all. */
+  | "unconfirmed";
+
+/** Why a settlement could not confirm that the managed group is gone. */
+export type ManagedProcessCleanupUnresolvedReason =
+  /**
+   * The leader that made the group id meaningful stopped being provable while
+   * the group still existed, so Poiesis had no authority left to signal it.
+   */
+  | "GROUP_AUTHORITY_LOST"
+  /** The leader stayed provable and the group still existed anyway. */
+  | "GROUP_STILL_PRESENT";
+
+/** The phase a settlement had reached when it gave up. */
+export type ManagedProcessCleanupPhase = "before-sigterm" | "before-sigkill" | "confirm";
+
 export type ManagedProcessLeaseValidation =
   | {
       readonly accepted: true;
@@ -156,6 +174,12 @@ export type ManagedProcessLeaseValidation =
       readonly state: "live" | "gone";
       /** True only when the live target's identity was confirmed. */
       readonly verified: boolean;
+      /**
+       * True only for a `gone` state that still holds its PID because the task
+       * is terminated (`Z`/`X`): a zombie is never a signal target and never a
+       * survivor, and this is what lets a caller tell it apart from a reaped PID.
+       */
+      readonly terminal?: boolean;
     }
   | {
       readonly accepted: false;
@@ -183,12 +207,22 @@ export interface ManagedProcessSettlement {
   readonly operationId: string;
   readonly workspaceId: string;
   readonly processGroupId: number;
-  /** PIDs the settlement identified as owned group members. */
-  readonly terminated: number[];
-  /** PIDs still alive with the exact identity the settlement recorded. */
-  readonly survived: number[];
-  /** True only when every recorded descendant was confirmed terminated. */
+  /**
+   * Always `false`. Settlement reads no member list, so it reports no
+   * terminated or surviving PIDs: an empty array here would be a claim about
+   * processes it never enumerated.
+   */
+  readonly membersEnumerated: false;
+  /** True only when the group no longer exists. */
   readonly confirmed: boolean;
+}
+
+/** What the last identity read of the leased leader said about the group. */
+interface GroupAuthority {
+  /** True only while the leader is provably still Poiesis's own. */
+  readonly held: boolean;
+  readonly leaderState: ManagedProcessLeaderState;
+  readonly detail: string;
 }
 
 interface ProcessIdentity {
@@ -203,9 +237,9 @@ type ProcessIdentityProbe =
   | { readonly state: "gone"; readonly terminal: boolean }
   /**
    * Alive by `kill(pid, 0)` on a POSIX platform that cannot confirm a
-   * process-start identity. This is the reduced-evidence state described by
-   * {@link PROCESS_GROUP_ONLY_IDENTITY_MODEL}: the process exists, but the
-   * only thing Poiesis can act on is the isolated group it created.
+   * process-start identity. Poiesis has no ownership proof for such a
+   * process and therefore no authority over its group either, so every
+   * cleanup path here fails closed on it.
    */
   | { readonly state: "unidentified-live" }
   | { readonly state: "unreadable" };
@@ -215,7 +249,7 @@ type ProcessIdentityProbe =
  *
  * A zombie (`Z`) has already terminated and is only waiting for its parent
  * to reap it; `X`/`x` is dead. Such a PID is still allocated, so it still
- * answers `kill(pid, 0)` and still appears in `/proc`, but no signal can
+ * answers `kill(pid, 0)` and still has a process-table entry, but no signal can
  * affect it and no code in it can run. Counting one as a live process would
  * report every completed cleanup as unresolved; counting one as a signal
  * target would be a no-op at best. It is therefore terminal: gone for
@@ -231,6 +265,9 @@ const TERMINAL_TASK_STATES = new Set(["Z", "X", "x"]);
  * 0, 2, and 19 in the split. A stat line Poiesis cannot parse is reported
  * as `unreadable` rather than guessed: an unparseable identity is
  * ambiguity, and ambiguity fails closed.
+ *
+ * This is the ONLY process-table read in the managed lifecycle, and it reads
+ * exactly one PID: the leased leader. Nothing here enumerates the table.
  */
 function probeProcessIdentity(pid: number): ProcessIdentityProbe {
   if (!Number.isSafeInteger(pid) || pid <= 0) {
@@ -238,8 +275,8 @@ function probeProcessIdentity(pid: number): ProcessIdentityProbe {
   }
   if (PROCESS_GROUP_IDENTITY_AVAILABLE) return probeLinuxProcessIdentity(pid);
   // No readable process table (non-Linux POSIX): liveness comes from
-  // signal(0) alone, so the target can only be treated as "alive, identity
-  // unconfirmable" and cleanup is restricted to its isolated group.
+  // signal(0) alone, so the target can never become an identity-confirmed
+  // leader and no signal may be derived from it.
   return isSignalAlive(pid) ? { state: "unidentified-live" } : { state: "gone", terminal: false };
 }
 
@@ -422,31 +459,39 @@ export function validateManagedProcessLease(
     if (!probe.terminal && isSignalAlive(lease.pid)) {
       return rejected("IDENTITY_AMBIGUOUS", `PID ${lease.pid} is signal-alive but has no readable identity`);
     }
-    return { accepted: true, lease, state: "gone", verified: false };
+    return {
+      accepted: true,
+      lease,
+      state: "gone",
+      verified: false,
+      ...(probe.terminal ? { terminal: true } : {}),
+    };
   }
   if (probe.state === "unreadable") {
     return rejected("IDENTITY_AMBIGUOUS", `PID ${lease.pid} is alive but its identity is unreadable`);
   }
 
   if (probe.state === "unidentified-live") {
-    // Documented group-only model: the platform cannot confirm a
-    // process-start identity, so the lease is accepted ONLY when the OS's
-    // own detached-spawn invariant proves the group is Poiesis's. A group
-    // whose id differs from its leader PID was not created by this runner,
-    // so it is refused rather than signalled on a weaker basis than Linux.
+    // No readable process table: the process exists, but nothing about it can
+    // be confirmed, so nothing about its group can be owned either. A group
+    // whose id is not its leader's PID was never this runner's group at all.
     if (lease.processGroupId !== lease.pid) {
       return rejected(
         "FOREIGN_PROCESS",
         `PID ${lease.pid} is alive but the lease names group ${lease.processGroupId}, which is not the detached group this runner creates`,
       );
     }
-    if (requireStartIdentity) {
-      return rejected(
-        "UNSUPPORTED_IDENTITY",
-        `A process-start identity is required but this runtime cannot confirm one for PID ${lease.pid}`,
-      );
-    }
-    return { accepted: true, lease, state: "live", verified: false };
+    // Spec #168 / ticket #180: fail closed. Cleanup may signal a group only
+    // while the leader that created it can be re-confirmed by exact start
+    // identity and exact process-group id, and on a platform with no readable
+    // process table neither field exists. "The child leads the group it was
+    // spawned into" is not a weaker proof of ownership — it is none: the group
+    // id IS that PID, and the PID becomes reusable the moment the leader
+    // exits. So a live group here gets no signal at all.
+    return rejected(
+      "UNSUPPORTED_IDENTITY",
+      `PID ${lease.pid} is live but this runtime cannot confirm a process-start identity, so its process group cannot be owned and no signal may be sent to it`,
+    );
   }
 
   if (lease.startIdentity === null) {
@@ -474,14 +519,27 @@ export function validateManagedProcessLease(
 }
 
 /**
- * Settle a managed process lease: terminate every process in the leased
- * group and confirm it is gone, or fail with a typed error.
+ * Settle a managed process lease: terminate the group it created and confirm
+ * the group is gone, or fail with a typed error.
  *
- * The settlement is bounded in both phases and never broad-matches: the
- * targets are the leased PID and the group members observed under that
- * exact process-group id with their exact start identities. Every member
- * signal re-reads the member's identity first, so a PID reused between the
- * snapshot and the signal is skipped rather than signalled.
+ * Spec #168 / ticket #180. The group is the ONLY thing addressed: no member is
+ * enumerated and no individual PID is ever signalled, so the settlement reports
+ * `membersEnumerated: false` and no PID arrays. The algorithm is:
+ *
+ *   1. validate the lease (shape, safety, identity) — a refusal signals nothing;
+ *   2. if the group does not exist, it is settled. Group liveness is an absence
+ *      fact, so its absence settles the run with nothing to terminate;
+ *   3. re-confirm the leader's exact start identity and process-group id, then
+ *      signal the GROUP with SIGTERM;
+ *   4. wait, bounded, for the group to disappear;
+ *   5. re-confirm the leader the same way, then signal the GROUP with SIGKILL;
+ *   6. wait, bounded, for the group to disappear.
+ *
+ * If a re-confirmation fails while the group still exists, no signal follows it:
+ * the settlement reports `PROCESS_CLEANUP_UNRESOLVED` / `GROUP_AUTHORITY_LOST`
+ * with the phase it reached and what the leader then read as. A group that
+ * outlives both phases while its leader stayed provable is reported as
+ * `GROUP_STILL_PRESENT` — also unresolved, because Poiesis did not empty it.
  */
 export async function settleManagedProcessLease(
   lease: ManagedProcessLease,
@@ -511,83 +569,136 @@ export async function settleManagedProcessLease(
     );
   }
 
-  // Fast path, and the leaked-descendant path alike: when the leased
-  // process has already exited the group it left behind still has to be
-  // settled — that is exactly the "successful command that leaks a
-  // background process" case — but an empty group has nothing to clean, so
-  // a normal run pays one `kill(-pgid, 0)` syscall and no /proc scan.
-  if (!isGroupSignalAlive(processGroupId)) {
-    return { operationId, workspaceId, processGroupId, terminated: [], survived: [], confirmed: true };
+  // The group is gone, so there is nothing left to terminate and nothing to
+  // own: a successful command that leaked nothing, and the leaked-descendant
+  // case whose descendants have already finished, both settle here.
+  if (!isGroupSignalAlive(processGroupId)) return settled(operationId, workspaceId, processGroupId, true);
+
+  const graceful = confirmGroupAuthority(lease);
+  if (!graceful.held) {
+    throw authorityLost({ operationId, workspaceId, processGroupId, pid: shape?.pid ?? null, phase: "before-sigterm", leader: graceful });
   }
-
-  // PID -> recorded start identity for every group member observed. `null`
-  // means this runtime cannot enumerate members, so settlement degrades to
-  // the isolated group signal only.
-  const members = snapshotProcessGroupMembers(processGroupId);
-
   signalIsolatedGroup(processGroupId, "SIGTERM");
-  signalIdentifiedMembers(members, "SIGTERM");
-  await waitForProcessGroupSettled(processGroupId, members, graceMs);
-
-  // Re-snapshot before the forced phase: a TERM-handler descendant can fork
-  // a replacement that the first snapshot could not have seen, and the
-  // group leader's own exit can momentarily empty the group.
-  refreshProcessGroupMembers(processGroupId, members);
-  signalIsolatedGroup(processGroupId, "SIGKILL");
-  signalIdentifiedMembers(members, "SIGKILL");
-  await waitForProcessGroupSettled(processGroupId, members, confirmMs);
-
-  const survived =
-    members === null
-      ? []
-      : [...members.entries()]
-          .filter(([pid, startIdentity]) => readStartIdentity(pid) === startIdentity)
-          .map(([pid]) => pid)
-          .sort((left, right) => left - right);
-
-  // When members could not be enumerated there is no identity-confirmed
-  // evidence that the forced phase emptied the group, so the group itself
-  // is the only remaining evidence available. Claiming `confirmed` from an
-  // absence of evidence would be exactly the unsupported unsafe behavior
-  // this contract refuses.
-  //
-  // Known residual of the group-only model: an unreaped zombie left in the
-  // group keeps `kill(-pgid, 0)` succeeding, so it reads as a
-  // not-emptied group and the settlement fails closed. That is the safe
-  // direction (Poiesis reports "not confirmed" rather than asserting a
-  // cleanup it cannot see), and in practice killing the group leader
-  // reparents the zombie to init, which reaps it. On Linux the per-PID
-  // identity scan classifies zombies as terminated explicitly, so this
-  // residual does not arise there.
-  const groupStillExists = isGroupSignalAlive(processGroupId);
-
-  const settlement: ManagedProcessSettlement = {
-    operationId,
-    workspaceId,
-    processGroupId,
-    terminated: members === null ? [] : [...members.keys()].sort((left, right) => left - right),
-    survived,
-    confirmed: survived.length === 0 && !groupStillExists,
-  };
-
-  if (!settlement.confirmed) {
-    throw new PoiesisError(
-      "PROCESS_CLEANUP_UNRESOLVED",
-      `Managed process cleanup could not confirm termination of ${
-        survived.length > 0 ? `${survived.length} process(es)` : "the managed process group"
-      }`,
-      {
-        operationId,
-        workspaceId,
-        pid: shape?.pid ?? null,
-        processGroupId,
-        survived,
-        membersEnumerated: members !== null,
-        confirmed: false,
-      },
-    );
+  if (await waitForGroupGone(processGroupId, graceMs)) {
+    return settled(operationId, workspaceId, processGroupId, true);
   }
-  return settlement;
+
+  const forced = confirmGroupAuthority(lease);
+  if (!forced.held) {
+    throw authorityLost({ operationId, workspaceId, processGroupId, pid: shape?.pid ?? null, phase: "before-sigkill", leader: forced });
+  }
+  signalIsolatedGroup(processGroupId, "SIGKILL");
+  if (await waitForGroupGone(processGroupId, confirmMs)) {
+    return settled(operationId, workspaceId, processGroupId, true);
+  }
+
+  throw new PoiesisError(
+    "PROCESS_CLEANUP_UNRESOLVED",
+    `Managed process group ${processGroupId} still exists after SIGTERM and SIGKILL`,
+    {
+      reason: "GROUP_STILL_PRESENT",
+      phase: "confirm",
+      operationId,
+      workspaceId,
+      pid: shape?.pid ?? null,
+      processGroupId,
+      membersEnumerated: false,
+      confirmed: false,
+    },
+  );
+}
+
+function settled(
+  operationId: string,
+  workspaceId: string,
+  processGroupId: number,
+  confirmed: boolean,
+): ManagedProcessSettlement {
+  return { operationId, workspaceId, processGroupId, membersEnumerated: false, confirmed };
+}
+
+/**
+ * Spec #168 / ticket #180 — did the kernel just confirm the leader?
+ *
+ * This is the ONLY authority cleanup has. `held` is true only when the leased
+ * PID is alive with the exact start identity the lease recorded AND is still
+ * in the exact process group the lease names — read now, not remembered from
+ * lease creation, because the whole point is that the group id (which IS that
+ * PID) may have been reused since.
+ */
+function confirmGroupAuthority(lease: ManagedProcessLease): GroupAuthority {
+  const validation = validateManagedProcessLease(lease);
+  if (!validation.accepted) {
+    return {
+      held: false,
+      leaderState: leaderStateOfRejection(validation.reason),
+      detail: validation.detail,
+    };
+  }
+  if (validation.verified && validation.state === "live") {
+    return {
+      held: true,
+      leaderState: "live",
+      detail: `PID ${validation.lease.pid} still holds start identity ${String(validation.lease.startIdentity)} in group ${validation.lease.processGroupId}`,
+    };
+  }
+  const leaderState: ManagedProcessLeaderState =
+    validation.state === "gone" ? (validation.terminal === true ? "terminal" : "gone") : "unconfirmed";
+  return {
+    held: false,
+    leaderState,
+    detail:
+      leaderState === "gone"
+        ? `PID ${validation.lease.pid} no longer exists while its process group ${validation.lease.processGroupId} still does`
+        : leaderState === "terminal"
+          ? `PID ${validation.lease.pid} is a terminated task (zombie), so its group ${validation.lease.processGroupId} can no longer be owned`
+          : `PID ${validation.lease.pid} carries no confirmed start identity for group ${validation.lease.processGroupId}`,
+  };
+}
+
+function leaderStateOfRejection(reason: ManagedProcessLeaseRejection): ManagedProcessLeaderState {
+  switch (reason) {
+    case "PID_REUSE":
+      return "reused";
+    case "FOREIGN_PROCESS":
+      return "foreign";
+    case "IDENTITY_AMBIGUOUS":
+      return "unreadable";
+    default:
+      return "unconfirmed";
+  }
+}
+
+/**
+ * The typed failure for a group Poiesis may no longer signal. The details name
+ * the phase reached, what the leader read as, the group, and the fact that no
+ * member list exists — an operator reading this learns that something is still
+ * running that Poiesis declined to touch, not which processes those were.
+ */
+function authorityLost(input: {
+  readonly operationId: string;
+  readonly workspaceId: string;
+  readonly processGroupId: number;
+  readonly pid: number | null;
+  readonly phase: ManagedProcessCleanupPhase;
+  readonly leader: GroupAuthority;
+}): PoiesisError {
+  return new PoiesisError(
+    "PROCESS_CLEANUP_UNRESOLVED",
+    `Managed process cleanup lost the authority to signal group ${input.processGroupId}: the leader reads as ${input.leader.leaderState}`,
+    {
+      reason: "GROUP_AUTHORITY_LOST",
+      phase: input.phase,
+      leaderState: input.leader.leaderState,
+      detail: input.leader.detail,
+      operationId: input.operationId,
+      workspaceId: input.workspaceId,
+      pid: input.pid,
+      processGroupId: input.processGroupId,
+      membersEnumerated: false,
+      confirmed: false,
+    },
+  );
 }
 
 function normalizeWindow(value: number | undefined, fallback: number, label: string): number {
@@ -603,90 +714,35 @@ function normalizeWindow(value: number | undefined, fallback: number, label: str
 }
 
 /**
- * Enumerate the current members of a process group, keyed by PID with the
- * start identity observed for each. Returns `null` when member
- * enumeration is unsupported or the group could not be read, which callers
- * treat as "trust the isolated group only".
- */
-function snapshotProcessGroupMembers(processGroupId: number): Map<number, string> | null {
-  if (!PROCESS_GROUP_IDENTITY_AVAILABLE) return null;
-  const members = new Map<number, string>();
-  try {
-    for (const entry of readdirSync("/proc")) {
-      if (!/^\d+$/.test(entry)) continue;
-      const pid = Number(entry);
-      const probe = probeProcessIdentity(pid);
-      if (probe.state !== "live") continue;
-      if (probe.identity.processGroupId === processGroupId) members.set(pid, probe.identity.startIdentity);
-    }
-    return members;
-  } catch {
-    return null;
-  }
-}
-
-/** Fold newly observed group members into the recorded identities. */
-function refreshProcessGroupMembers(processGroupId: number, members: Map<number, string> | null): void {
-  if (members === null) return;
-  const current = snapshotProcessGroupMembers(processGroupId);
-  if (current === null) return;
-  for (const [pid, startIdentity] of current) members.set(pid, startIdentity);
-}
-
-/**
- * Signal every recorded member, re-reading its identity first. A member
- * whose PID was reused (different start identity) or which left the leased
- * group is skipped: it is not the process Poiesis leased.
- */
-function signalIdentifiedMembers(members: Map<number, string> | null, signal: NodeJS.Signals): void {
-  if (members === null) return;
-  for (const [pid, startIdentity] of members) {
-    const probe = probeProcessIdentity(pid);
-    if (probe.state !== "live") continue;
-    if (probe.identity.startIdentity !== startIdentity) continue;
-    signalProcess(pid, signal);
-  }
-}
-
-/**
- * Signal the isolated group. The group was created by the runner via
- * `detached: true`, so every member is a descendant the runner intends to
- * terminate. If the group signal fails, the validated lease still permits
- * signalling its own leader by PID.
+ * Signal the isolated group — the ONLY signal this module ever sends.
+ *
+ * The group was created by the runner via `detached: true`, so every member is
+ * a descendant the runner intends to terminate, and it is addressed as a group
+ * because no member can be individually identified. The caller re-confirmed the
+ * leader immediately before this ran. A failure here is not reported as a
+ * problem: the emptiness confirmation that follows is the authority, not the
+ * delivery of the request.
  */
 function signalIsolatedGroup(processGroupId: number, signal: NodeJS.Signals): void {
   try {
     process.kill(-processGroupId, signal);
   } catch {
-    // The group may already be gone, or may not be group-addressable on
-    // this platform; the identified member pass below is authoritative.
-  }
-}
-
-function signalProcess(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(pid, signal);
-  } catch {
-    // The process exited after its identity check.
+    // The group may already be gone; the confirmation below decides the outcome.
   }
 }
 
 /**
- * Bounded wait until the leased group is empty and no recorded member is
- * still alive. Exits early only when the group itself no longer exists and
- * no recorded member survives; a still-existing group (for example one
- * holding a freshly forked replacement) always uses the full window.
+ * Bounded wait for the leased group to stop existing. It waits on group
+ * liveness alone, because that is the only fact that can be waited on without
+ * enumerating the processes inside it.
  */
-async function waitForProcessGroupSettled(
-  processGroupId: number,
-  members: Map<number, string> | null,
-  windowMs: number,
-): Promise<void> {
+async function waitForGroupGone(processGroupId: number, windowMs: number): Promise<boolean> {
   const deadline = Date.now() + windowMs;
   while (Date.now() < deadline) {
-    if (!isGroupSignalAlive(processGroupId) && !anyMemberAlive(members)) return;
+    if (!isGroupSignalAlive(processGroupId)) return true;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  return !isGroupSignalAlive(processGroupId);
 }
 
 function isGroupSignalAlive(processGroupId: number): boolean {
@@ -696,12 +752,4 @@ function isGroupSignalAlive(processGroupId: number): boolean {
   } catch (error) {
     return (error as NodeJS.ErrnoException).code !== "ESRCH";
   }
-}
-
-function anyMemberAlive(members: Map<number, string> | null): boolean {
-  if (members === null) return false;
-  for (const [pid, startIdentity] of members) {
-    if (readStartIdentity(pid) === startIdentity) return true;
-  }
-  return false;
 }

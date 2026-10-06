@@ -167,6 +167,47 @@ describeManagedExecution("strong containment for arbitrary managed shell command
       expect(isSameProcess(escapedPid, startIdentity)).toBe(true);
     });
 
+    it(
+      "settles a contained run through the kernel boundary alone, never through a process-group signal", { timeout: 60_000 }, async () => {
+      // The leaked descendant calls `setsid(2)`, so it leaves the managed
+      // process group entirely: nothing that addresses a group can reach it.
+      // Only the cgroup leaf can, which makes this the case where a redundant
+      // group settlement afterwards would be pure cost — and where skipping it
+      // is observable.
+      const dir = await stageDir("poiesis-containment-authority-");
+      const pidFile = join(dir, "escape.pid");
+      const script = join(dir, "parent.sh");
+      await writeFile(script, `#!/bin/sh\n${setsidEscapeCommand(pidFile)}\n`, "utf8");
+      await chmod(script, 0o755);
+
+      // Every address this runner directs at a PROCESS GROUP — a liveness probe
+      // included — is a negative PID. `cgroup.kill` plus `populated 0` is the
+      // authority for a contained run, so there must be none.
+      const groupAddresses: Array<{ pid: number; signal: string | number | undefined }> = [];
+      const deliver = process.kill.bind(process);
+      const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+        if (pid < 0) groupAddresses.push({ pid, signal });
+        return signal === 0 ? deliver(pid, 0) : deliver(pid, signal as NodeJS.Signals);
+      }) as typeof process.kill);
+
+      let result: Awaited<ReturnType<typeof runManagedShellCommand>>;
+      try {
+        result = await runManagedShellCommand({ cwd: dir, command: script, operationId: "poiesis-test-authority" });
+      } finally {
+        killSpy.mockRestore();
+      }
+
+      expect(result).toMatchObject({ exitCode: 0, stdout: "contained" });
+      expect(groupAddresses).toEqual([]);
+      // And the settlement was real: the escaped descendant is gone, which no
+      // group signal could have achieved.
+      const escapedPid = await waitForPid(pidFile);
+      const startIdentity = startTimeOf(escapedPid);
+      tracked.set(escapedPid, startIdentity);
+      expect(isSameProcess(escapedPid, startIdentity)).toBe(false);
+    },
+    );
+
     it("still cleans a leaked descendant that stays inside the managed group", { timeout: 60_000 }, async () => {
       const dir = await stageDir("poiesis-containment-group-");
       const pidFile = join(dir, "descendant.pid");

@@ -1,15 +1,22 @@
 /**
- * Spec #168 / ticket #170 — managed execution cleanup on every exit.
+ * Spec #168 / ticket #170, extended by ticket #180 — managed execution cleanup
+ * on every exit.
  *
  * `run()` is the single subprocess seam every Poiesis operation goes
  * through, so its settlement contract is what actually bounds Poiesis:
  *
- *   - a command that exits SUCCESSFULLY but leaks a background descendant
- *     still settles, and the descendant is gone;
- *   - the same holds when the leaked descendant ignores SIGTERM, and for a
- *     command that exits non-zero;
- *   - a caller's AbortSignal cancels the run and still cleans the tree,
- *     and an already-aborted signal never spawns anything at all;
+ *   - a command that leaves NOTHING behind settles on every outcome: success,
+ *     non-zero exit, timeout, cancellation;
+ *   - a command that leaks a descendant sets two different contracts, decided
+ *     by whether the group's leader is still provable at the moment the group
+ *     has to be signalled. While it is — a leader that survives the graceful
+ *     signal — the group is signalled and the leak is cleaned, escalating to
+ *     the forced phase when the descendant ignores SIGTERM. Once the leader is
+ *     gone the group id is a free PID that nothing owns any more, so no signal
+ *     is sent and the run reports the leak as an unresolved cleanup rather
+ *     than as a clean finish;
+ *   - a caller's AbortSignal cancels the run, and an already-aborted signal
+ *     never spawns anything at all;
  *   - the managed process group is isolated from the Poiesis process
  *     group, so cleanup can never reach the caller's shell;
  *   - cleanup targets come from the lease alone: an unrelated process with
@@ -107,6 +114,21 @@ function delay(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+/**
+ * Start a run and hand back its outcome already attached.
+ *
+ * Several cases below have to wait for the child to publish a PID before they
+ * can assert anything, and some runs reject within milliseconds of the spawn —
+ * a leaked descendant behind an already-exited parent is refused immediately. A
+ * rejection nobody is listening for yet is an unhandled rejection, which fails
+ * the whole run even when every assertion passes, so the handler is attached
+ * here at the moment the invocation is created.
+ */
+function startRun(...args: Parameters<typeof run>): { outcome: Promise<unknown> } {
+  const invocation = run(...args);
+  return { outcome: invocation.then(() => null, (error: unknown) => error) };
+}
+
 interface LeakyTree {
   dir: string;
   parent: string;
@@ -114,15 +136,21 @@ interface LeakyTree {
 }
 
 /**
- * Stage a parent that spawns `descendant.sh` in the background and then
- * exits with `parentExit`. The descendant holds the inherited stdout/stderr
+ * Stage a parent that spawns `descendant.sh` in the background and then either
+ * exits with `parentExit` or — with `parentStays` — ignores SIGTERM and stays
+ * alive as the group's leader. The descendant holds the inherited stdout/stderr
  * open (so the runner cannot see the command as finished) unless
  * `detachOutput` is set, in which case it closes them and the runner only
  * learns about the leak from the process-group settlement.
+ *
+ * `parentStays` is the switch that decides which cleanup contract a run is
+ * held to: a leader that outlives the graceful signal keeps the group's
+ * authority, and a leader that exits with it does not.
  */
 async function stageLeakyTree(options: {
   resistsTerm?: boolean;
   parentExit?: number;
+  parentStays?: boolean;
   detachOutput?: boolean;
   name?: string;
 }): Promise<LeakyTree> {
@@ -147,7 +175,9 @@ async function stageLeakyTree(options: {
   const parent = join(dir, "parent.sh");
   await writeFile(
     parent,
-    `#!/bin/sh\n"${descendant}" "${pidFile}" &\nexit ${options.parentExit ?? 0}\n`,
+    options.parentStays === true
+      ? `#!/bin/sh\ntrap '' TERM\n"${descendant}" "${pidFile}" &\nwhile :; do sleep 1; done\n`
+      : `#!/bin/sh\n"${descendant}" "${pidFile}" &\nexit ${options.parentExit ?? 0}\n`,
     "utf8",
   );
   await chmod(parent, 0o755);
@@ -188,46 +218,53 @@ async function waitForProcessGroup(pid: number, timeoutMs = 5_000): Promise<numb
 }
 
 describe.skipIf(process.platform === "win32")("managed execution cleanup on success", () => {
-  it("settles a successful command that leaks a background descendant holding the output pipes", { timeout: 30_000 }, async () => {
+  it("reports a leaked descendant it may no longer signal, instead of settling the run as clean", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageLeakyTree({});
-    const invocation = run(parent, [], { cwd: dir });
+    const { outcome } = startRun(parent, [], { cwd: dir });
     const descendantPid = await waitForPid(pidFile);
-    tracked.set(descendantPid, startTimeOf(descendantPid));
+    const descendantStart = startTimeOf(descendantPid);
+    tracked.set(descendantPid, descendantStart);
 
     const startedAt = Date.now();
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0, timedOut: false });
-    const elapsed = Date.now() - startedAt;
-    // Bounded: the leak is cleaned promptly, never by waiting out the
-    // default command timeout.
-    expect(elapsed).toBeLessThan(15_000);
-    expect(isSameProcess(descendantPid, startTimeOf(descendantPid))).toBe(false);
+    // The parent exited, so the group id is a free PID while the descendant
+    // still holds that group. Poiesis has no authority left over it, so the
+    // honest outcome is "a process I spawned is still running", never "clean".
+    await expect(outcome).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST", phase: "before-sigterm", membersEnumerated: false },
+    });
+    expect(Date.now() - startedAt).toBeLessThan(15_000);
+    expect(isSameProcess(descendantPid, descendantStart)).toBe(true);
   });
 
-  it("cleans a leaked descendant that already closed the inherited output pipes", { timeout: 30_000 }, async () => {
+  it("reports the same leak without waiting for the linger window when the pipes are already closed", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageLeakyTree({ detachOutput: true });
-    const invocation = run(parent, [], { cwd: dir });
+    const { outcome } = startRun(parent, [], { cwd: dir });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
 
     const startedAt = Date.now();
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
-    // The pipes closed with the parent, so the leak is only observable
-    // through the process group and must be cleaned without the linger
-    // window.
+    await expect(outcome).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST", membersEnumerated: false },
+    });
+    // The pipes closed with the parent, so the leak is observable immediately
+    // and costs no linger window to report.
     expect(Date.now() - startedAt).toBeLessThan(2_000);
-    expect(isSameProcess(descendantPid, startTime)).toBe(false);
+    expect(isSameProcess(descendantPid, startTime)).toBe(true);
   });
 
-  it("escalates past a TERM-resistant leaked descendant before settling", { timeout: 30_000 }, async () => {
-    const { dir, parent, pidFile } = await stageLeakyTree({ resistsTerm: true });
-    const invocation = run(parent, [], { cwd: dir });
+  it("escalates past a TERM-resistant descendant while the leader is still confirmable", { timeout: 30_000 }, async () => {
+    const { dir, parent, pidFile } = await stageLeakyTree({ parentStays: true, resistsTerm: true, detachOutput: true });
+    const startedAt = Date.now();
+    // The leader ignores SIGTERM and stays the process Poiesis leased, so the
+    // group keeps an owner and the forced phase is allowed to fire.
+    const { outcome } = startRun(parent, [], { cwd: dir, timeoutMs: 250 });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
-
-    const startedAt = Date.now();
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
+    await expect(outcome).resolves.toMatchObject({ code: "COMMAND_TIMEOUT" });
     const elapsed = Date.now() - startedAt;
     // The graceful phase is bounded and the forced phase is what actually
     // removes this descendant, so settlement cannot be immediate.
@@ -236,27 +273,36 @@ describe.skipIf(process.platform === "win32")("managed execution cleanup on succ
     expect(isSameProcess(descendantPid, startTime)).toBe(false);
   });
 
-  it("cleans a leaked descendant of a command that exits non-zero", { timeout: 30_000 }, async () => {
+  it("reports an out-of-reach leak ahead of the command's own non-zero exit", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageLeakyTree({ parentExit: 7 });
-    const invocation = run(parent, [], { cwd: dir });
+    const { outcome } = startRun(parent, [], { cwd: dir });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
 
-    await expect(invocation).rejects.toMatchObject({ code: "COMMAND_FAILED", details: { exitCode: 7 } });
-    expect(isSameProcess(descendantPid, startTime)).toBe(false);
+    // A surviving process outranks the exit code: nothing may report this run
+    // as finished while a process it spawned is still running.
+    await expect(outcome).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST" },
+    });
+    expect(isSameProcess(descendantPid, startTime)).toBe(true);
   });
 });
 
 /**
- * Spec #168 / ticket #170 — the cancellation and timeout paths on a POSIX
- * platform with no readable process table.
+ * Spec #168 / ticket #180 — the fail-closed non-Linux POSIX model.
  *
- * These are the same production paths the Linux suite covers, imported
- * with `process.platform` redefined so the documented group-only identity
- * model is exercised on this host. Without that model the runner would
- * refuse to clean up anything, and a cancelled or timed-out run would leave
- * its whole tree behind.
+ * These are the production paths the Linux suite covers, imported with
+ * `process.platform` redefined so the platform branches that cannot confirm a
+ * process-start identity actually execute on this host.
+ *
+ * The contract there is no longer "clean up on a weaker basis". Group liveness
+ * is an absence fact and never an ownership one, so a runtime that cannot read
+ * `starttime` has no authority over a LIVE group at all: cleanup refuses,
+ * signals nothing, and the refusal outranks the timeout or the cancellation
+ * that triggered it. What still works is what needs no authority — a group that
+ * is already gone.
  */
 describe("non-Linux POSIX timeout and cancellation (platform-mocked)", () => {
   const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")!;
@@ -301,38 +347,51 @@ describe("non-Linux POSIX timeout and cancellation (platform-mocked)", () => {
     vi.resetModules();
   });
 
-  it("times out and still cleans the managed tree", { timeout: 30_000 }, async () => {
+  it("refuses a timed-out run instead of signalling a group it cannot own", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageTermResistantTree();
     const module = await runAsPosix<typeof import("../src/process.js")>("../src/process.js");
     const invocation = module.run(parent, [], { cwd: dir, timeoutMs: 250 });
-    const descendantPid = await waitForPid(pidFile);
-    tracked.set(descendantPid, startTimeOf(descendantPid));
-
-    // The refusal-to-clean failure mode this model exists to prevent: the
-    // timeout must still be the reported outcome, and the tree must
-    // actually be gone rather than left running.
-    const error = await invocation.then(
+    const error = invocation.then(
       () => null,
-      (rejection: { code?: string }) => rejection,
+      (rejection: { code?: string; details?: Record<string, unknown> }) => rejection,
     );
-    expect(error?.code).toBe("COMMAND_TIMEOUT");
-    expect(isSameProcess(descendantPid, startTimeOf(descendantPid))).toBe(false);
+    const descendantPid = await waitForPid(pidFile);
+    const descendantStart = startTimeOf(descendantPid);
+    tracked.set(descendantPid, descendantStart);
+
+    // The refusal is the reported outcome, not the timeout that triggered it:
+    // Poiesis could not stop what it started, so nothing may report this run
+    // as merely timed out.
+    await expect(error).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_REFUSED",
+      details: { reason: "UNSUPPORTED_IDENTITY" },
+    });
+    // Refused means unsignalled: the whole tree is still running.
+    expect(isSameProcess(descendantPid, descendantStart)).toBe(true);
   });
 
-  it("cancels and still cleans the managed tree", { timeout: 30_000 }, async () => {
+  it("refuses a cancelled run for the same reason", { timeout: 30_000 }, async () => {
     const { dir, parent, pidFile } = await stageTermResistantTree();
     const module = await runAsPosix<typeof import("../src/process.js")>("../src/process.js");
     const controller = new AbortController();
     const invocation = module.run(parent, [], { cwd: dir, timeoutMs: 60_000, signal: controller.signal });
+    const error = invocation.then(
+      () => null,
+      (rejection: unknown) => rejection,
+    );
     const descendantPid = await waitForPid(pidFile);
-    tracked.set(descendantPid, startTimeOf(descendantPid));
+    const descendantStart = startTimeOf(descendantPid);
+    tracked.set(descendantPid, descendantStart);
 
     controller.abort();
-    await expect(invocation).rejects.toMatchObject({ code: "COMMAND_CANCELLED" });
-    expect(isSameProcess(descendantPid, startTimeOf(descendantPid))).toBe(false);
+    await expect(error).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_REFUSED",
+      details: { reason: "UNSUPPORTED_IDENTITY" },
+    });
+    expect(isSameProcess(descendantPid, descendantStart)).toBe(true);
   });
 
-  it("cleans a leaked descendant after a successful command", { timeout: 30_000 }, async () => {
+  it("reports an unreachable leak after a successful command", { timeout: 30_000 }, async () => {
     const dir = await mkdtemp(join(tmpdir(), "poiesis-posix-leak-"));
     fixtures.push(dir);
     const descendant = join(dir, "descendant.sh");
@@ -356,11 +415,34 @@ describe("non-Linux POSIX timeout and cancellation (platform-mocked)", () => {
 
     const module = await runAsPosix<typeof import("../src/process.js")>("../src/process.js");
     const invocation = module.run(parent, [], { cwd: dir });
+    const error = invocation.then(
+      () => null,
+      (rejection: unknown) => rejection,
+    );
     const descendantPid = await waitForPid(pidFile);
-    tracked.set(descendantPid, startTimeOf(descendantPid));
+    const descendantStart = startTimeOf(descendantPid);
+    tracked.set(descendantPid, descendantStart);
 
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
-    expect(isSameProcess(descendantPid, startTimeOf(descendantPid))).toBe(false);
+    // The leader is gone and its PID is now only a number, so the group it
+    // names is no longer Poiesis's to signal.
+    await expect(error).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST", phase: "before-sigterm" },
+    });
+    expect(isSameProcess(descendantPid, descendantStart)).toBe(true);
+  });
+
+  it("still settles a command that leaves nothing behind", { timeout: 30_000 }, async () => {
+    const dir = await mkdtemp(join(tmpdir(), "poiesis-posix-clean-"));
+    fixtures.push(dir);
+    const script = join(dir, "clean.sh");
+    await writeFile(script, "#!/bin/sh\nprintf ok\n", "utf8");
+    await chmod(script, 0o755);
+
+    const module = await runAsPosix<typeof import("../src/process.js")>("../src/process.js");
+    // An empty group needs no ownership proof: there is nothing to signal and
+    // nothing to confirm but its absence.
+    await expect(module.run(script, [], { cwd: dir })).resolves.toMatchObject({ exitCode: 0, stdout: "ok" });
   });
 });
 
@@ -370,27 +452,49 @@ describe.skipIf(process.platform === "win32")("managed execution cleanup on canc
     fixtures.push(dir);
     const descendant = join(dir, "descendant.sh");
     const pidFile = join(dir, "descendant.pid");
+    // The parent ignores SIGTERM and stays the group's leader, so the
+    // cancellation reaches a group Poiesis still owns and can escalate over.
     await writeFile(
-      descendant,
-      ["#!/bin/sh", "trap '' TERM", 'printf "%s\\n" "$$" > "$1"', "while :; do sleep 1; done", ""].join("\n"),
+      join(dir, "parent.sh"),
+      `#!/bin/sh\ntrap '' TERM\n"${descendant}" "${pidFile}" &\nwhile :; do sleep 1; done\n`,
       "utf8",
     );
+    await writeFile(descendant, ["#!/bin/sh", "trap '' TERM", 'printf "%s\\n" "$$" > "$1"', "while :; do sleep 1; done", ""].join("\n"), "utf8");
     await chmod(descendant, 0o755);
     const parent = join(dir, "parent.sh");
-    await writeFile(parent, `#!/bin/sh\n"${descendant}" "${pidFile}" &\nsleep 30\n`, "utf8");
     await chmod(parent, 0o755);
 
     const controller = new AbortController();
-    const invocation = run(parent, [], { cwd: dir, timeoutMs: 60_000, signal: controller.signal });
+    const { outcome } = startRun(parent, [], { cwd: dir, timeoutMs: 60_000, signal: controller.signal });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
 
     const startedAt = Date.now();
     controller.abort();
-    await expect(invocation).rejects.toMatchObject({ code: "COMMAND_CANCELLED", exitCode: 130 });
+    await expect(outcome).resolves.toMatchObject({ code: "COMMAND_CANCELLED", exitCode: 130 });
     expect(Date.now() - startedAt).toBeLessThan(15_000);
     expect(isSameProcess(descendantPid, startTime)).toBe(false);
+  });
+
+  it("reports a cancellation whose tree outlived the group's authority", { timeout: 30_000 }, async () => {
+    const { dir, parent, pidFile } = await stageLeakyTree({ resistsTerm: true });
+    const controller = new AbortController();
+    const { outcome } = startRun(parent, [], { cwd: dir, timeoutMs: 60_000, signal: controller.signal });
+    const descendantPid = await waitForPid(pidFile);
+    const startTime = startTimeOf(descendantPid);
+    tracked.set(descendantPid, startTime);
+
+    controller.abort();
+    // The parent exited with the TERM-resistant descendant still holding the
+    // group, so the group id is a free PID before the first signal and nothing
+    // may be sent at all. The cancellation is not the outcome either: a process
+    // Poiesis spawned is still running.
+    await expect(outcome).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST", phase: "before-sigterm", leaderState: "gone" },
+    });
+    expect(isSameProcess(descendantPid, startTime)).toBe(true);
   });
 
   it("never spawns a process when the caller's signal is already aborted", { timeout: 15_000 }, async () => {
@@ -421,9 +525,9 @@ describe.skipIf(process.platform === "win32")("managed execution cleanup on canc
 describe.skipIf(process.platform === "win32")("managed execution isolation and target selection", () => {
   it("runs the managed tree in a process group isolated from the Poiesis process group", { timeout: 30_000 }, async () => {
     // TERM-resistant so the descendant is still observable while the
-    // group settlement's graceful phase runs.
+    // group's settlement runs.
     const { dir, parent, pidFile } = await stageLeakyTree({ detachOutput: true, resistsTerm: true });
-    const invocation = run(parent, [], { cwd: dir });
+    const { outcome } = startRun(parent, [], { cwd: dir });
     const descendantPid = await waitForPid(pidFile);
     tracked.set(descendantPid, startTimeOf(descendantPid));
     const managedGroup = await waitForProcessGroup(descendantPid);
@@ -433,11 +537,16 @@ describe.skipIf(process.platform === "win32")("managed execution isolation and t
     // The managed group is addressed by its own leader's PID and is not
     // reachable through Poiesis's group.
     expect(managedGroup).not.toBe(process.pid);
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
+    // The parent exited with the descendant still holding its group, which is
+    // the honest report: isolation held, ownership did not survive the exit.
+    await expect(outcome).resolves.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { reason: "GROUP_AUTHORITY_LOST" },
+    });
   });
 
   it("never signals an unrelated process that shares the descendant's executable name", { timeout: 30_000 }, async () => {
-    const managed = await stageLeakyTree({ detachOutput: true, name: "same-name" });
+    const managed = await stageLeakyTree({ parentStays: true, detachOutput: true, name: "same-name" });
     // A decoy with byte-identical content, started by the test outside any
     // managed group. Name, command line, and executable all match the
     // managed descendant; only the lease identity differs.
@@ -456,14 +565,15 @@ describe.skipIf(process.platform === "win32")("managed execution isolation and t
     const decoyStart = startTimeOf(decoyPid);
     tracked.set(decoyPid, decoyStart);
 
-    const invocation = run(managed.parent, [], { cwd: managed.dir });
+    // The leader stays provable, so this run really does signal its group.
+    const { outcome } = startRun(managed.parent, [], { cwd: managed.dir, timeoutMs: 250 });
     const descendantPid = await waitForPid(managed.pidFile);
     const descendantStart = startTimeOf(descendantPid);
     tracked.set(descendantPid, descendantStart);
-
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
+    await expect(outcome).resolves.toMatchObject({ code: "COMMAND_TIMEOUT" });
     expect(isSameProcess(descendantPid, descendantStart)).toBe(false);
-    // The same-named process outside the leased group is untouched.
+    // The same-named process outside the leased group is untouched: cleanup
+    // never matched on anything but the lease.
     expect(isSameProcess(decoyPid, decoyStart)).toBe(true);
     decoy.kill("SIGKILL");
   });
@@ -704,7 +814,14 @@ describe.skipIf(process.platform === "win32")("bounded rejection when managed cl
       ok: false,
       error: {
         code: "PROCESS_CLEANUP_UNRESOLVED",
-        details: { survived: [live!.pid], membersEnumerated: true, confirmed: false },
+        // No member list was read, so none is reported: the group is still
+        // there and that is the whole of the evidence.
+        details: {
+          reason: "GROUP_STILL_PRESENT",
+          phase: "confirm",
+          membersEnumerated: false,
+          confirmed: false,
+        },
       },
     });
     // Nothing could be removed, so the process this run spawned is still the
@@ -807,7 +924,9 @@ describe.skipIf(process.platform === "win32")("bounded rejection when managed cl
 
     expect(observed.outcome).toMatchObject({
       ok: false,
-      error: { code: "PROCESS_CLEANUP_UNRESOLVED", details: { confirmed: false } },
+      // The leader is gone and the group it named is still alive: authority
+      // lost, so nothing was signalled after the graceful phase.
+      error: { code: "PROCESS_CLEANUP_UNRESOLVED", details: { reason: "GROUP_AUTHORITY_LOST", confirmed: false } },
     });
     expect(observed.elapsedMs).toBeLessThan(UNRESOLVED_BOUND_MS);
     // Nothing could be removed, so the descendant this run leaked is still the
@@ -831,14 +950,16 @@ describe.skipIf(process.platform === "win32")("bounded rejection when managed cl
     });
   });
 
-  it("still resolves and cleans a leaked descendant after a successful command", { timeout: 30_000 }, async () => {
-    const { dir, parent, pidFile } = await stageLeakyTree({});
-    const invocation = run(parent, [], { cwd: dir });
+  it("still cleans a leaked descendant while its leader stays confirmable", { timeout: 30_000 }, async () => {
+    const { dir, parent, pidFile } = await stageLeakyTree({ parentStays: true, detachOutput: true });
+    const { outcome } = startRun(parent, [], { cwd: dir, timeoutMs: 250 });
     const descendantPid = await waitForPid(pidFile);
     const startTime = startTimeOf(descendantPid);
     tracked.set(descendantPid, startTime);
 
-    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
+    // Nothing about this run is reported as unresolved: the group had an owner
+    // at every signal, so the leak was cleaned like any other.
+    await expect(outcome).resolves.toMatchObject({ code: "COMMAND_TIMEOUT" });
     expect(isSameProcess(descendantPid, startTime)).toBe(false);
   });
 });
