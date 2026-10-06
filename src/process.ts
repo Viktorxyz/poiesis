@@ -318,6 +318,32 @@ export async function run(command: string, args: string[], options: RunOptions):
     };
 
     /**
+     * Release the runtime resources this run owns, so a bounded rejection is
+     * not itself a way to leave Node blocked.
+     *
+     * Only the ends Poiesis opened are closed here. The child is deliberately
+     * NOT signalled, killed, or escalated: a refused or unresolved cleanup
+     * means its identity is unconfirmed, so any further signal — by group or
+     * by the still-held PID — could reach an unrelated process that inherited
+     * it. Holding a handle on a process Poiesis proved it could not touch
+     * would just extend the same unbounded wait the rejection ends.
+     */
+    const releaseOwnedResources = (): void => {
+      for (const stream of [child.stdin, child.stdout, child.stderr]) {
+        try {
+          stream?.destroy();
+        } catch {
+          // Best effort: the run has already settled with the cleanup error.
+        }
+      }
+      try {
+        child.unref();
+      } catch {
+        // The process handle may already be gone.
+      }
+    };
+
+    /**
      * Clean the managed process group exactly once, and only then let the
      * run settle. The POSIX path delegates to the lease settler, which
      * validates process identity before every signal and fails closed with
@@ -352,6 +378,19 @@ export async function run(command: string, args: string[], options: RunOptions):
       // Neither a lease nor Windows: the spawn produced no process, so
       // there is nothing to clean up before settling.
       cleanupComplete = true;
+      // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
+      // fix: it could not prove the target was still the process Poiesis
+      // leased, so nothing was signalled and the child is still running.
+      // There is no `exit` coming to settle on, so waiting for one would turn
+      // a bounded cleanup failure into an unbounded pending run that also
+      // loses the typed cleanup error. Settle now with that original error —
+      // it outranks timeout, cancellation, infrastructure, and exit code
+      // because a process Poiesis spawned may still be running.
+      if (cleanupError !== null && !childExited) {
+        releaseOwnedResources();
+        settle();
+        return;
+      }
       tryFinalize();
     };
 

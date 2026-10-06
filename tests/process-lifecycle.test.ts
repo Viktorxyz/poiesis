@@ -25,6 +25,7 @@
  *
  * Every assertion observes real processes through /proc and kill(2).
  */
+import { getEventListeners } from "node:events";
 import { readFileSync } from "node:fs";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -483,5 +484,293 @@ describe.skipIf(process.platform === "win32")("managed execution isolation and t
     });
     await delay(250);
     expect(await fileExists(pidFile)).toBe(false);
+  });
+});
+
+/**
+ * Spec #168 / ticket #175 — bounded rejection when managed cleanup is
+ * REFUSED or UNRESOLVED while the child is still live.
+ *
+ * Settling after the child's `exit` is the right ordering for every outcome
+ * a CONFIRMED cleanup produces, because the cleanup is what makes the exit
+ * happen. A refused or unresolved cleanup breaks exactly that assumption:
+ * it stopped because it could not prove the target was still the process
+ * Poiesis leased, so no signal was sent, the child kept running, and no
+ * `exit` was coming. Waiting for one left the run pending forever and lost
+ * the typed cleanup error with it.
+ *
+ * These drive the public `run()` seam and force each failure through the
+ * real `settleManagedProcessLease`, never a hand-thrown error:
+ *
+ *   - refusal: the kernel process-start identity cannot be read, so the
+ *     lease is ambiguous and cleanup refuses without signalling at all;
+ *   - unresolved: every signal is undeliverable and the group never empties,
+ *     so settlement cannot confirm that anything terminated.
+ *
+ * In both the child is still live when cleanup gives up, so the run must
+ * still settle, still reject with the ORIGINAL cleanup error ahead of
+ * timeout and cancellation, still signal nothing further, and still leave
+ * Node unblocked.
+ */
+describe.skipIf(process.platform === "win32")("bounded rejection when managed cleanup is refused or unresolved", () => {
+  const REFUSAL_BOUND_MS = 10_000;
+  const UNRESOLVED_BOUND_MS = 15_000;
+
+  type RunOutcome = { readonly ok: true } | { readonly ok: false; readonly error: unknown };
+
+  interface CleanupObservation {
+    /** `null` means the run was still pending when its bound elapsed. */
+    readonly outcome: RunOutcome | null;
+    readonly elapsedMs: number;
+    /** Every PID Poiesis signalled while the run was in flight. */
+    readonly signalsSent: number[];
+    readonly handlesBefore: number;
+    readonly handlesAfter: number;
+  }
+
+  /**
+   * A child that publishes its own PID and then stays alive as a single
+   * process, so a test can prove cleanup never reached it: `exec` replaces
+   * the shell, leaving the published PID and the surviving process identical.
+   */
+  async function stageLiveChild(): Promise<{ dir: string; script: string; pidFile: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "poiesis-refusal-"));
+    fixtures.push(dir);
+    const pidFile = join(dir, "child.pid");
+    const script = join(dir, "live.sh");
+    await writeFile(script, `#!/bin/sh\nprintf '%s\\n' "$$" > "${pidFile}"\nexec sleep 30\n`, "utf8");
+    await chmod(script, 0o755);
+    return { dir, script, pidFile };
+  }
+
+  /** The live child a run left behind, tracked for the suite's own teardown. */
+  async function trackLiveChild(pidFile: string): Promise<{ pid: number; startTime: string | null }> {
+    const pid = await waitForPid(pidFile);
+    const startTime = startTimeOf(pid);
+    tracked.set(pid, startTime);
+    return { pid, startTime };
+  }
+
+  /** Settle an invocation, or report `null` if it is still pending at the bound. */
+  async function settleWithin(invocation: Promise<unknown>, boundMs: number): Promise<RunOutcome | null> {
+    let timer: NodeJS.Timeout | null = null;
+    const stillPending = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), boundMs);
+    });
+    try {
+      return await Promise.race([
+        invocation.then(
+          () => ({ ok: true }) as RunOutcome,
+          (error: unknown) => ({ ok: false, error }) as RunOutcome,
+        ),
+        stillPending,
+      ]);
+    } finally {
+      if (timer !== null) clearTimeout(timer);
+    }
+  }
+
+  /** Runtime handles one managed run owns: the child's pipes and its handle. */
+  function ownedHandleCount(): number {
+    return process
+      .getActiveResourcesInfo()
+      .filter((resource) => resource === "PipeWrap" || resource === "ProcessWrap").length;
+  }
+
+  async function waitForHandlesAtOrBelow(baseline: number, boundMs = 3_000): Promise<void> {
+    const deadline = Date.now() + boundMs;
+    while (ownedHandleCount() > baseline && Date.now() < deadline) await delay(20);
+  }
+
+  /**
+   * Drive one `run()` whose lease validation refuses the cleanup as
+   * ambiguous, and observe what it settled with, how long that took, what
+   * it signalled, and which runtime handles it still held afterwards.
+   */
+  async function runRefusingCleanup(
+    command: string,
+    args: string[],
+    options: Parameters<typeof run>[2],
+    afterStart?: () => Promise<void>,
+  ): Promise<CleanupObservation> {
+    const deliver = process.kill.bind(process);
+    const signalsSent: number[] = [];
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+      if (signal !== 0) signalsSent.push(pid);
+      return signal === 0 ? deliver(pid, 0) : deliver(pid, signal as NodeJS.Signals);
+    }) as typeof process.kill);
+
+    vi.resetModules();
+    vi.doMock("node:fs", async () => {
+      const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+      return {
+        ...actual,
+        readFileSync: ((path: string, ...rest: unknown[]) => {
+          if (typeof path === "string" && /^\/proc\/\d+\/stat$/.test(path)) {
+            throw Object.assign(new Error("denied"), { code: "EACCES" });
+          }
+          return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
+        }) as typeof actual.readFileSync,
+      };
+    });
+
+    try {
+      const module = await vi.importActual<typeof import("../src/process.js")>("../src/process.js");
+      const handlesBefore = ownedHandleCount();
+      const startedAt = Date.now();
+      const invocation = module.run(command, args, options);
+      if (afterStart !== undefined) await afterStart();
+      const outcome = await settleWithin(invocation, REFUSAL_BOUND_MS);
+      return {
+        outcome,
+        elapsedMs: Date.now() - startedAt,
+        signalsSent,
+        handlesBefore,
+        handlesAfter: ownedHandleCount(),
+      };
+    } finally {
+      killSpy.mockRestore();
+      vi.doUnmock("node:fs");
+      vi.resetModules();
+    }
+  }
+
+  /**
+   * Drive one `run()` whose settlement runs to completion but cannot remove
+   * anything: every signal is swallowed and the group answers every liveness
+   * probe, so settlement can only fail closed as unresolved.
+   */
+  async function runWithUndeliverableSignals(
+    command: string,
+    args: string[],
+    options: Parameters<typeof run>[2],
+    afterStart?: () => Promise<void>,
+  ): Promise<{ outcome: RunOutcome | null; elapsedMs: number }> {
+    const probe = process.kill.bind(process);
+    const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
+      if (signal === 0) return pid < 0 ? true : probe(pid, 0);
+      return true;
+    }) as typeof process.kill);
+    try {
+      const startedAt = Date.now();
+      const invocation = run(command, args, options);
+      if (afterStart !== undefined) await afterStart();
+      const outcome = await settleWithin(invocation, UNRESOLVED_BOUND_MS);
+      return { outcome, elapsedMs: Date.now() - startedAt };
+    } finally {
+      killSpy.mockRestore();
+    }
+  }
+
+  it("rejects boundedly with the cleanup error ahead of the timeout that triggered it", { timeout: 30_000 }, async () => {
+    const { dir, script, pidFile } = await stageLiveChild();
+    let live: { pid: number; startTime: string | null } | null = null;
+    const observed = await runRefusingCleanup(script, [], { cwd: dir, timeoutMs: 250 }, async () => {
+      live = await trackLiveChild(pidFile);
+    });
+
+    // Bounded: the run settles inside its own window instead of waiting for
+    // an `exit` the refused cleanup could never cause.
+    expect(observed.outcome).not.toBeNull();
+    expect(observed.elapsedMs).toBeLessThan(REFUSAL_BOUND_MS);
+    // The original typed cleanup error, not the timeout that triggered it.
+    expect(observed.outcome).toMatchObject({
+      ok: false,
+      error: { code: "PROCESS_CLEANUP_REFUSED", details: { reason: "IDENTITY_AMBIGUOUS" } },
+    });
+    // Refused means unconfirmed, so nothing may be signalled: not the group,
+    // not the leader, and not the child afterwards either.
+    expect(observed.signalsSent).toEqual([]);
+    // The child was still live when cleanup gave up, and still is.
+    expect(live).not.toBeNull();
+    expect(isSameProcess(live!.pid, live!.startTime)).toBe(true);
+  });
+
+  it("rejects boundedly with the unresolved error while the child is still live", { timeout: 40_000 }, async () => {
+    const { dir, script, pidFile } = await stageLiveChild();
+    let live: { pid: number; startTime: string | null } | null = null;
+    const observed = await runWithUndeliverableSignals(script, [], { cwd: dir, timeoutMs: 250 }, async () => {
+      live = await trackLiveChild(pidFile);
+    });
+
+    expect(observed.outcome).not.toBeNull();
+    expect(observed.outcome).toMatchObject({
+      ok: false,
+      error: {
+        code: "PROCESS_CLEANUP_UNRESOLVED",
+        details: { survived: [live!.pid], membersEnumerated: true, confirmed: false },
+      },
+    });
+    // Nothing could be removed, so the process this run spawned is still the
+    // same live process — and the run still finished.
+    expect(isSameProcess(live!.pid, live!.startTime)).toBe(true);
+  });
+
+  it("reports a refused cleanup ahead of the caller's cancellation", { timeout: 30_000 }, async () => {
+    const { dir, script, pidFile } = await stageLiveChild();
+    const controller = new AbortController();
+    let live: { pid: number; startTime: string | null } | null = null;
+    const observed = await runRefusingCleanup(
+      script,
+      [],
+      { cwd: dir, timeoutMs: 60_000, signal: controller.signal },
+      async () => {
+        live = await trackLiveChild(pidFile);
+        controller.abort();
+      },
+    );
+
+    expect(observed.outcome).not.toBeNull();
+    expect(observed.outcome).toMatchObject({ ok: false, error: { code: "PROCESS_CLEANUP_REFUSED" } });
+    expect(isSameProcess(live!.pid, live!.startTime)).toBe(true);
+  });
+
+  it("leaves Node unblocked when it rejects for a refused cleanup", { timeout: 30_000 }, async () => {
+    const { dir, script, pidFile } = await stageLiveChild();
+    const controller = new AbortController();
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    let live: { pid: number; startTime: string | null } | null = null;
+    const observed = await runRefusingCleanup(
+      script,
+      [],
+      { cwd: dir, timeoutMs: 250, signal: controller.signal },
+      async () => {
+        live = await trackLiveChild(pidFile);
+      },
+    );
+
+    expect(observed.outcome).toMatchObject({ ok: false, error: { code: "PROCESS_CLEANUP_REFUSED" } });
+    // A bounded rejection must not be how Node stays blocked: the abort
+    // listener is detached and the run holds neither the child's pipes nor
+    // its process handle, even though the child itself is still alive.
+    expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+    expect(isSameProcess(live!.pid, live!.startTime)).toBe(true);
+    await waitForHandlesAtOrBelow(observed.handlesBefore);
+    expect(ownedHandleCount()).toBeLessThanOrEqual(observed.handlesBefore);
+  });
+
+  it("still resolves a normal successful run", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "poiesis-refusal-ok-"));
+    fixtures.push(dir);
+    const script = join(dir, "ok.sh");
+    await writeFile(script, "#!/bin/sh\nprintf ok\n", "utf8");
+    await chmod(script, 0o755);
+    await expect(run(script, [], { cwd: dir })).resolves.toMatchObject({
+      exitCode: 0,
+      stdout: "ok",
+      timedOut: false,
+      signal: null,
+    });
+  });
+
+  it("still resolves and cleans a leaked descendant after a successful command", { timeout: 30_000 }, async () => {
+    const { dir, parent, pidFile } = await stageLeakyTree({});
+    const invocation = run(parent, [], { cwd: dir });
+    const descendantPid = await waitForPid(pidFile);
+    const startTime = startTimeOf(descendantPid);
+    tracked.set(descendantPid, startTime);
+
+    await expect(invocation).resolves.toMatchObject({ exitCode: 0 });
+    expect(isSameProcess(descendantPid, startTime)).toBe(false);
   });
 });
