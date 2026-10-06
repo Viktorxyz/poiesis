@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { verify } from "../src/git.js";
 import * as processModule from "../src/process.js";
-import { createTestRepository, type TestRepository } from "./helpers.js";
+import { createTestRepository, describeManagedExecution, type TestRepository } from "./helpers.js";
 
 const repositories: TestRepository[] = [];
 const fixtures: string[] = [];
@@ -137,7 +137,7 @@ async function waitForPid(path: string, timeoutMs = 2_000): Promise<number> {
   throw new Error(`descendant did not publish a valid PID at ${path}`);
 }
 
-describe("deterministic Verify timeout", () => {
+describeManagedExecution("deterministic Verify timeout", () => {
   it(
     "runs a Verify command longer than the generic process default within the verify bound",
     { timeout: 90000 },
@@ -195,7 +195,7 @@ describe("deterministic Verify timeout", () => {
   );
 });
 
-describe("Verify managed execution lease identity", () => {
+describeManagedExecution("Verify managed execution lease identity", () => {
   it("names the verify operation on the transient managed process lease", { timeout: 30000 }, async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
@@ -221,7 +221,7 @@ describe("Verify managed execution lease identity", () => {
   });
 });
 
-describe("Verify exact-SHA clean-after reporting", () => {
+describeManagedExecution("Verify exact-SHA clean-after reporting", () => {
   it.skipIf(process.platform === "win32")(
     "fails closed with DIRTY_CANDIDATE when a timed-out verify command mutates tracked state",
     { timeout: 30000 },

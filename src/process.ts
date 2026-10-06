@@ -2,6 +2,20 @@ import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { PoiesisError, asPoiesisError } from "./errors.js";
 import {
+  ADMISSION_ARGV0,
+  ADMISSION_CONFIRM_MS,
+  ADMISSION_DRAIN_MS,
+  ADMISSION_LEAF_ENV,
+  ADMISSION_PROLOGUE,
+  isAdmissionConfirmation,
+  provisionContainment,
+  releaseContainment,
+  requireConfirmedAdmission,
+  settleContainment,
+  type ContainmentModel,
+  type ManagedContainmentLease,
+} from "./containment.js";
+import {
   createManagedProcessLease,
   isManagedProcessLeaseLabel,
   settleManagedProcessLease,
@@ -13,7 +27,39 @@ const DEFAULT_TIMEOUT_MS = 30_000;
 export const DEFAULT_VERIFY_TIMEOUT_MS = 10 * 60_000;
 const MAX_TIMEOUT_MS = 30 * 60_000;
 const TASKKILL_TIMEOUT_MS = 5_000;
+/**
+ * Spec #168 / ticket #176 — bounded window the Windows path waits for the exit
+ * it is already holding after every signalling phase has been tried.
+ *
+ * `taskkill` can report success for a tree it never reached, `child.kill` can
+ * be refused, and none of the three phases produces evidence that the child
+ * actually died. The only evidence this runner holds is its own `exit` event,
+ * so after the last phase it waits for that event — and if it never arrives,
+ * the run rejects with a typed cleanup error instead of reporting success, a
+ * timeout, or a cancellation for a process that is still running.
+ */
+const WINDOWS_CLEANUP_CONFIRM_MS = 2_000;
+/**
+ * Spec #168 / ticket #176 — bounded window each Windows signalling phase gets to
+ * produce the child's `exit` before the next one is tried.
+ *
+ * It exists so a phase that REPORTED success cannot end the sequence: `taskkill`
+ * exits 0 for trees it never reached, so success is a claim about the request and
+ * only `exit` is evidence about the process. Short enough that three waits plus
+ * the final confirmation stay far inside any caller's timeout.
+ */
+const WINDOWS_CLEANUP_PHASE_MS = 300;
 const IS_WINDOWS = process.platform === "win32";
+
+/**
+ * Spec #168 / ticket #176 — the admission barrier's shell.
+ *
+ * Only ever used on the contained path, which only exists where strong
+ * containment is available (Linux with a delegated cgroup v2 subtree). A
+ * contained run is never admitted on Windows, so this constant is never reached
+ * there and Windows support is not claimed.
+ */
+const ADMISSION_SHELL = "/bin/sh";
 
 /**
  * Spec #168 / ticket #170 — bounded window a managed command may keep the
@@ -92,6 +138,22 @@ export interface RunOptions {
    * `operationId`.
    */
   workspaceId?: string;
+  /**
+   * Spec #168 / ticket #176 — the containment model this run REQUIRES.
+   *
+   * Omitted (the default, and every direct low-level caller) keeps the
+   * documented process-group contract unchanged: a `detached: true` child that
+   * leads an isolated group, cleaned through its transient identity lease.
+   * That is isolation, not containment, and it is honest only because nothing
+   * in a fixed argv can `setsid` its way out of the boundary Poiesis claims.
+   *
+   * Set it when the caller executes arbitrary command TEXT: the boundary is
+   * provisioned BEFORE the spawn, the child is admitted into it and that
+   * admission is confirmed from the kernel, and settlement uses it. When the
+   * capability does not exist on this host, `run()` rejects with
+   * `PROCESS_CONTAINMENT_UNAVAILABLE` BEFORE spawning anything.
+   */
+  containment?: ContainmentModel;
 }
 
 export interface RunResult {
@@ -115,7 +177,8 @@ interface Capture {
 }
 
 /**
- * Spec #168 / ticket #170 — run one managed subprocess to a settled state.
+ * Spec #168 / ticket #170, extended by ticket #176 — run one managed
+ * subprocess to a settled state.
  *
  * Every exit path — success, non-zero exit, timeout, cancellation, and
  * internal error — settles only AFTER the managed process group has been
@@ -130,6 +193,18 @@ interface Capture {
  * descendant still holds the inherited output the runner waits at most
  * {@link POST_EXIT_GRACE_MS} for it, then settles the group instead of
  * blocking until the command timeout.
+ *
+ * Spec #168 / ticket #176 bounds what that group IS. It is isolation, not
+ * containment: `setsid(2)` and reparenting both leave it. So a caller that
+ * executes arbitrary command TEXT passes `options.containment`, and this
+ * runner then provisions a real kernel boundary before the spawn
+ * (`src/containment.ts`), spawns the child into a Poiesis-owned admission
+ * prologue that admits and confirms ITSELF before any caller text can run,
+ * settles the boundary with `cgroup.kill`, and — when the host has no such
+ * capability, or the admission cannot be confirmed — refuses with a typed
+ * error and nothing is reported contained. A caller that passes no
+ * `containment` keeps the process-group contract unchanged, which is honest
+ * exactly because nothing in a fixed argv can escape it.
  */
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
@@ -146,17 +221,54 @@ export async function run(command: string, args: string[], options: RunOptions):
     throw cancelledError(command, args, "cancelled before the command was spawned");
   }
 
+  // Spec #168 / ticket #176: a caller that requires containment gets the
+  // boundary provisioned BEFORE the process exists. When the host cannot
+  // provide it this throws `PROCESS_CONTAINMENT_UNAVAILABLE` here, with no
+  // process created and nothing to clean — the fail-closed direction.
+  const containment: ManagedContainmentLease | null =
+    options.containment === undefined
+      ? null
+      : provisionContainment({
+          model: options.containment,
+          operationId: leaseIdentity.operationId,
+          remediation:
+            "Run this operation on a host that provides strong containment — Linux with a delegated cgroup v2 subtree exposing cgroup.kill.",
+        });
+
   return await new Promise<RunResult>((resolve, reject) => {
+    // Spec #168 / ticket #176: a contained run is NOT spawned as the command.
+    // It is spawned as the Poiesis-owned admission prologue, which receives the
+    // resolved processor and its resolved argv as positional parameters and
+    // `exec`s them only after it has confirmed its own membership of the leaf.
+    // The leaf travels in the environment, out of band, so it can never appear
+    // in the command's own argv. The child's `command`/`args` here — and hence
+    // the `RunResult` and every observer of this runner — stay the caller's
+    // processor and argv, unchanged.
+    const contained = containment !== null;
+    const spawnEnv = contained ? { ...childEnv, [ADMISSION_LEAF_ENV]: containment!.leaf ?? "" } : childEnv;
     let child: ChildProcess;
     try {
-      child = spawn(command, args, {
-        cwd: options.cwd,
-        env: childEnv,
-        stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
-        killSignal: "SIGTERM",
-        ...(IS_WINDOWS ? {} : { detached: true }),
-      });
+      child = spawn(
+        contained ? ADMISSION_SHELL : command,
+        contained ? ["-c", ADMISSION_PROLOGUE, ADMISSION_ARGV0, command, ...args] : args,
+        {
+          cwd: options.cwd,
+          env: spawnEnv,
+          // The contained child gets a fourth, report-only pipe: the prologue
+          // writes its admission confirmation there and closes it before exec,
+          // so the command never inherits it.
+          stdio: [
+            options.input === undefined ? "ignore" : "pipe",
+            "pipe",
+            "pipe",
+            ...(contained ? ["pipe" as const] : []),
+          ],
+          killSignal: "SIGTERM",
+          ...(IS_WINDOWS ? {} : { detached: true }),
+        },
+      );
     } catch (error) {
+      releaseContainment(containment);
       reject(commandIoError(command, args, error));
       return;
     }
@@ -179,6 +291,8 @@ export async function run(command: string, args: string[], options: RunOptions):
         } catch {
           // Best effort; the process never left Poiesis's hands.
         }
+        releaseChildHandles(child, contained);
+        releaseContainment(containment);
         child.on("error", () => {
           // The lease failure is the reported outcome; swallow the late
           // spawn error so it cannot surface as an unhandled rejection.
@@ -203,7 +317,19 @@ export async function run(command: string, args: string[], options: RunOptions):
     /** True once the managed group was cleaned (or refused). Never earlier. */
     let cleanupComplete = false;
     let cleanupStarted = false;
+    /**
+     * The in-flight cleanup, or `null` before it starts. A path that must
+     * GUARANTEE the boundary was settled before it is released — an admission
+     * refusal — awaits this instead of starting a second cleanup.
+     */
+    let cleanupInFlight: Promise<void> | null = null;
     let settled = false;
+    /**
+     * Spec #168 / ticket #176 — true until the admission gate has a verdict, and
+     * then true again only while a settlement it deferred is being replayed.
+     */
+    let admissionPending = contained;
+    let settlementDeferred = false;
     let lingerTimer: NodeJS.Timeout | null = null;
     let timeoutTimer: NodeJS.Timeout | null = null;
 
@@ -228,11 +354,21 @@ export async function run(command: string, args: string[], options: RunOptions):
 
     const settle = (): void => {
       if (settled) return;
+      // Spec #168 / ticket #176: a contained run may not settle before its
+      // admission verdict exists. Deferring here is what stops a child that
+      // finished without reporting from being reported as a clean exit; the
+      // deferred settlement is resumed by the admission gate below.
+      if (admissionPending) {
+        settlementDeferred = true;
+        return;
+      }
       settled = true;
       clearLingerTimer();
       if (timeoutTimer !== null) clearTimeout(timeoutTimer);
       timeoutTimer = null;
       if (options.signal !== undefined) options.signal.removeEventListener("abort", onCallerAbort);
+      // Exactly one release per settled run, on every outcome.
+      releaseContainment(containment);
 
       const result = buildResult();
       // A refused or unresolved cleanup outranks every other outcome: it
@@ -310,7 +446,7 @@ export async function run(command: string, args: string[], options: RunOptions):
      * both bounds the wait and removes the leak.
      */
     const armLingerTimer = (): void => {
-      if (lingerTimer !== null || cleanupComplete) return;
+      if (lingerTimer !== null || cleanupComplete || cleanupStarted) return;
       lingerTimer = setTimeout(() => {
         lingerTimer = null;
         void beginCleanup();
@@ -329,69 +465,75 @@ export async function run(command: string, args: string[], options: RunOptions):
      * would just extend the same unbounded wait the rejection ends.
      */
     const releaseOwnedResources = (): void => {
-      for (const stream of [child.stdin, child.stdout, child.stderr]) {
-        try {
-          stream?.destroy();
-        } catch {
-          // Best effort: the run has already settled with the cleanup error.
-        }
-      }
-      try {
-        child.unref();
-      } catch {
-        // The process handle may already be gone.
-      }
+      releaseChildHandles(child, contained);
     };
 
     /**
-     * Clean the managed process group exactly once, and only then let the
-     * run settle. The POSIX path delegates to the lease settler, which
-     * validates process identity before every signal and fails closed with
-     * a typed error instead of claiming a cleanup it could not confirm.
+     * Clean the managed containment, then the managed process group, exactly
+     * once, and only then let the run settle.
+     *
+     * Containment comes first and is the stronger boundary: a cgroup leaf
+     * reaches a descendant that `setsid`'d or was reparented out of the group.
+     * The POSIX process-group lease still settles afterwards so the run keeps
+     * its per-PID identity evidence; either phase failing is a cleanup error,
+     * and the first one recorded is the one reported.
+     *
+     * The returned promise is the cleanup itself, so a caller that must know the
+     * boundary is settled gets that fact rather than a second cleanup.
      */
-    const beginCleanup = async (): Promise<void> => {
-      if (cleanupStarted) return;
+    const beginCleanup = (): Promise<void> => {
+      if (cleanupStarted) return cleanupInFlight ?? Promise.resolve();
       cleanupStarted = true;
       clearLingerTimer();
       if (timeoutTimer !== null) {
         clearTimeout(timeoutTimer);
         timeoutTimer = null;
       }
-      if (lease !== null) {
-        try {
-          await settleManagedProcessLease(lease);
-        } catch (error) {
-          cleanupError = asPoiesisError(error);
+      cleanupInFlight = (async (): Promise<void> => {
+        if (containment !== null) {
+          try {
+            await settleContainment(containment);
+          } catch (error) {
+            cleanupError ??= asPoiesisError(error);
+          }
         }
-      } else if (IS_WINDOWS) {
-        // Documented Windows model: no POSIX process groups and no readable
-        // process-start identity, so `taskkill /PID <pid> /T` is the only
-        // way to reach the tree, and it is meaningful ONLY while the PID is
-        // still the process Poiesis spawned. Once the child has exited that
-        // PID has been reaped and may already be recycled, so addressing it
-        // — for a normal completion or for the linger window — could kill an
-        // unrelated process. Nothing is therefore signalled once
-        // `childExited` is set; a normal Windows run is simply already
-        // settled.
-        if (!childExited) await terminateWindowsTree();
-      }
-      // Neither a lease nor Windows: the spawn produced no process, so
-      // there is nothing to clean up before settling.
-      cleanupComplete = true;
-      // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
-      // fix: it could not prove the target was still the process Poiesis
-      // leased, so nothing was signalled and the child is still running.
-      // There is no `exit` coming to settle on, so waiting for one would turn
-      // a bounded cleanup failure into an unbounded pending run that also
-      // loses the typed cleanup error. Settle now with that original error —
-      // it outranks timeout, cancellation, infrastructure, and exit code
-      // because a process Poiesis spawned may still be running.
-      if (cleanupError !== null && !childExited) {
-        releaseOwnedResources();
-        settle();
-        return;
-      }
-      tryFinalize();
+        if (lease !== null) {
+          try {
+            await settleManagedProcessLease(lease);
+          } catch (error) {
+            cleanupError ??= asPoiesisError(error);
+          }
+        } else if (IS_WINDOWS) {
+          // Documented Windows model: no POSIX process groups and no readable
+          // process-start identity, so `taskkill /PID <pid> /T` is the only
+          // way to reach the tree, and it is meaningful ONLY while the PID is
+          // still the process Poiesis spawned. Once the child has exited that
+          // PID has been reaped and may already be recycled, so addressing it
+          // — for a normal completion or for the linger window — could kill an
+          // unrelated process. Nothing is therefore signalled once
+          // `childExited` is set; a normal Windows run is simply already
+          // settled.
+          if (!childExited) await terminateWindowsTree();
+        }
+        // Neither a lease nor Windows: the spawn produced no process, so
+        // there is nothing to clean up before settling.
+        cleanupComplete = true;
+        // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
+        // fix: it could not prove the target was still the process Poiesis
+        // leased, so nothing was signalled and the child is still running.
+        // There is no `exit` coming to settle on, so waiting for one would turn
+        // a bounded cleanup failure into an unbounded pending run that also
+        // loses the typed cleanup error. Settle now with that original error —
+        // it outranks timeout, cancellation, infrastructure, and exit code
+        // because a process Poiesis spawned may still be running.
+        if (cleanupError !== null && !childExited) {
+          releaseOwnedResources();
+          settle();
+          return;
+        }
+        tryFinalize();
+      })();
+      return cleanupInFlight;
     };
 
     const beginTermination = (): void => {
@@ -399,25 +541,54 @@ export async function run(command: string, args: string[], options: RunOptions):
       void beginCleanup();
     };
 
-    /** Windows has no POSIX process groups; `taskkill /T` drives the tree. */
+    /**
+     * Windows has no POSIX process groups, so `taskkill /T` drives the tree.
+     *
+     * Spec #168 / ticket #176: every phase is followed by a bounded wait for the
+     * one piece of evidence this runner actually holds — its own `exit` event —
+     * and escalation never stops early because a phase REPORTED SUCCESS.
+     * `taskkill /T` exits 0 for trees it never reached, so a graceful success is
+     * a claim about the request, not about the process; if the child has not
+     * exited when the claim is made, the forced phase still runs, then
+     * `child.kill`, and only then is the run refused. When nothing confirmed the
+     * exit, the run must say so: signalling success, a timeout, or a cancellation
+     * would describe a settled run while the process Poiesis spawned is still
+     * running.
+     */
     const terminateWindowsTree = async (): Promise<void> => {
       const pid = child.pid;
       if (pid === undefined) return;
       const gracefulSucceeded = await runTaskkill(pid);
-      if (settled) return;
-      // taskkill /T reports completion for the requested tree. If it fails,
-      // force immediately only while the original child handle is still
-      // active; a delayed /PID call after exit could target a reused PID.
-      if (!gracefulSucceeded && !childExited) {
-        const forced = await runTaskkill(pid, true);
-        if (!forced) {
-          try {
-            child.kill("SIGKILL");
-          } catch {
-            // Best effort after both taskkill phases failed.
-          }
+      // A PID is meaningful only while it is still the process Poiesis spawned.
+      // Every escalation below is therefore gated on the child not having
+      // exited, so a reused PID is never addressed.
+      if (await waitForChildExit(WINDOWS_CLEANUP_PHASE_MS)) return;
+      if (settled || childExited) return;
+      // The forced phase is attempted whether or not the graceful one reported
+      // success: exit 0 from `taskkill` is a claim about the request, and the
+      // child is still running.
+      const forcedSucceeded = await runTaskkill(pid, true);
+      if (await waitForChildExit(WINDOWS_CLEANUP_PHASE_MS)) return;
+      if (settled || childExited) return;
+      if (!(gracefulSucceeded || forcedSucceeded)) {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // Best effort after both taskkill phases failed.
         }
       }
+      if (await waitForChildExit(WINDOWS_CLEANUP_CONFIRM_MS)) return;
+      if (settled || childExited) return;
+      cleanupError ??= windowsCleanupUnresolved(command, pid);
+    };
+
+    /** Bounded wait for the exit event this run already holds. */
+    const waitForChildExit = async (windowMs: number): Promise<boolean> => {
+      const deadline = Date.now() + windowMs;
+      while (!childExited && !settled && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      return childExited;
     };
 
     const recordInfrastructureError = (error: Error): void => {
@@ -463,22 +634,105 @@ export async function run(command: string, args: string[], options: RunOptions):
       tryFinalize();
     });
 
+    // Spec #168 / ticket #176: the parent decides admission. The prologue can
+    // only report a confirmation it obtained from the kernel itself, before it
+    // exec'd the command; if that report never arrives, this run is refused
+    // whether the child is still live or already finished. There is no
+    // "it probably made it" branch.
+    if (contained) {
+      void (async (): Promise<void> => {
+        const outcome = await awaitAdmissionConfirmation(child);
+        admissionPending = false;
+        if (!outcome.confirmed) {
+          try {
+            requireConfirmedAdmission(containment!, {
+              confirmed: false,
+              pid: child.pid ?? -1,
+              detail: outcome.detail,
+            });
+          } catch (error) {
+            // A refused admission is a cleanup-class failure, so it keeps the
+            // same priority a refused cleanup has: nothing may report success,
+            // failure, timeout, or cancellation for a run whose containment was
+            // never proven. It is recorded with `??=` for the same reason every
+            // other cleanup error is: the FIRST fact recorded is the one the
+            // operator has to act on, and an earlier failure is not replaced by a
+            // refusal that happened to be detected later.
+            cleanupError ??= asPoiesisError(error);
+            try {
+              child.kill("SIGKILL");
+            } catch {
+              // Best effort; the process never left Poiesis's hands.
+            }
+            // Installed BEFORE the await below: a late spawn error arriving while
+            // the boundary settles would otherwise be an unhandled `error` event.
+            child.on("error", () => {
+              // The refusal is the reported outcome; swallow the late spawn
+              // error so it cannot surface as an unhandled rejection.
+            });
+            // The leaf is already PROVISIONED and the prologue may already be
+            // INSIDE it, so the boundary has to be settled before it can be
+            // released: a leaf the kernel still reports as populated can never
+            // be removed, and releasing one is how a half-admitted leaf leaks.
+            // `beginCleanup` settles it and settles the process-group lease, and
+            // returns the cleanup already running when one is in flight rather
+            // than starting a second.
+            await beginCleanup();
+            releaseOwnedResources();
+            settle();
+            return;
+          }
+        }
+        if (settled) return;
+        // Replay whatever settlement the refusal check deferred.
+        if (settlementDeferred) {
+          settlementDeferred = false;
+          settle();
+          return;
+        }
+        armRunControl();
+      })();
+    } else {
+      armRunControl();
+    }
+
+    /**
+     * The caller's cancellation and the command bound only start once the run
+     * is real: a contained run has its admission verdict first, so an abort or
+     * a timeout can never fire against a process Poiesis has not yet placed.
+     */
+    function armRunControl(): void {
+      if (settled) return;
+      // Spec #168 / ticket #176 — re-read the signal ATOMICALLY with the
+      // subscription below. `run()` checked `aborted` before the spawn, but a
+      // contained run only reaches this point after its admission gate has a
+      // verdict, and the caller may have aborted anywhere in between. Node's
+      // `AbortSignal` does NOT replay `abort` to a listener added after the
+      // signal is already aborted, so installing the listener alone would drop
+      // that cancellation on the floor and let the caller's command text run to
+      // completion — which, for Verify, is a `verified` result and an
+      // authoritative receipt for a run the operator cancelled. Reading the flag
+      // and subscribing here closes that window with the SAME cancellation path
+      // a live signal takes, so the outcome is identical either way.
+      if (options.signal?.aborted === true) {
+        onCallerAbort();
+        return;
+      }
+      options.signal?.addEventListener("abort", onCallerAbort, { once: true });
+      timeoutTimer = setTimeout(() => {
+        timeoutTimer = null;
+        timedOut = true;
+        beginTermination();
+      }, timeoutMs);
+      if (options.input !== undefined && child.stdin !== null) {
+        child.stdin.end(options.input);
+      }
+    }
+
     function onCallerAbort(): void {
       if (settled || cancelled) return;
       cancelled = true;
       beginTermination();
-    }
-
-    options.signal?.addEventListener("abort", onCallerAbort, { once: true });
-
-    timeoutTimer = setTimeout(() => {
-      timeoutTimer = null;
-      timedOut = true;
-      beginTermination();
-    }, timeoutMs);
-
-    if (options.input !== undefined && child.stdin !== null) {
-      child.stdin.end(options.input);
     }
   });
 }
@@ -640,6 +894,171 @@ function cancelledError(command: string, args: string[], reason: string, result?
     stdoutTruncated: result?.stdoutTruncated ?? false,
     stderrTruncated: result?.stderrTruncated ?? false,
   }, CANCELLED_EXIT_CODE);
+}
+
+/**
+ * Spec #168 / ticket #176 — wait for the admission prologue's confirmation.
+ *
+ * The prologue writes one byte to its report pipe only AFTER it has read its own
+ * PID back out of `cgroup.procs`. Every other outcome — the report channel
+ * closing with no byte, a channel error, the child finishing first, or the bound
+ * elapsing — is a refusal with a reason, EXCEPT that a refusal first drains the
+ * channel for {@link ADMISSION_DRAIN_MS}: the prologue writes the byte and then
+ * `exec`s immediately, so `exit` can legitimately be delivered before that byte
+ * has been read, and refusing on the ordering alone would report a real
+ * admission as an unconfirmed one. This function never infers admission from
+ * liveness, from a PID listing sampled later, or from the child exiting
+ * successfully — it only ever accepts a byte the prologue actually wrote.
+ */
+async function awaitAdmissionConfirmation(child: ChildProcess): Promise<{
+  confirmed: boolean;
+  detail: string;
+}> {
+  const report = child.stdio[3];
+  if (report === undefined || report === null) {
+    return { confirmed: false, detail: "the admission report channel was never opened" };
+  }
+  const confirmedDetail = "the prologue confirmed its own kernel membership";
+  const declaredExit = new Promise<{ confirmed: false; detail: string }>((resolve) => {
+    child.once("exit", (code, signal) => {
+      resolve({
+        confirmed: false,
+        detail: `the admission prologue finished without reporting (exit code ${String(code)}, signal ${String(signal)})`,
+      });
+    });
+  });
+  const channelClosed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
+    report.once("error", () => resolve({ confirmed: false, detail: "the admission report channel failed" }));
+    report.once("close", () =>
+      resolve({ confirmed: false, detail: "the admission report channel closed without reporting" }),
+    );
+    report.once("end", () =>
+      resolve({ confirmed: false, detail: "the admission report channel ended without reporting" }),
+    );
+  });
+  const confirmed = new Promise<{ confirmed: true; detail: string }>((resolve) => {
+    report.on("data", (chunk: Buffer | string) => {
+      if (isAdmissionConfirmation(chunk.toString("utf8"))) {
+        resolve({ confirmed: true, detail: confirmedDetail });
+      }
+    });
+  });
+  const elapsed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
+    const timer = setTimeout(
+      () => resolve({ confirmed: false, detail: `no admission confirmation within ${ADMISSION_CONFIRM_MS}ms` }),
+      ADMISSION_CONFIRM_MS,
+    );
+    // The bound must not be what keeps Node alive once the report arrives.
+    timer.unref?.();
+  });
+  const outcome = await Promise.race([confirmed, declaredExit, channelClosed, elapsed]);
+  // The refusal reason stays whatever the gate actually observed; the drain only
+  // gets the chance to convert an ordering artifact into a real verdict.
+  const verdict = outcome.confirmed ? outcome : ((await drainAdmissionReport(report)) ?? outcome);
+  // The report channel is single-use: the prologue closes it before `exec`, so
+  // nothing further is read from it and the command never inherits the pipe.
+  report.removeAllListeners();
+  const drained = report as Partial<NodeJS.ReadableStream> & { resume?: () => void; unref?: () => void };
+  drained.resume?.();
+  drained.unref?.();
+  return verdict;
+}
+
+/**
+ * Spec #168 / ticket #176 — one bounded read of the report channel that the race
+ * above already gave up on.
+ *
+ * Resolves the confirmation the moment a byte carrying it arrives, `null` when the
+ * channel closes, ends, fails, or the bound elapses without one. It is the ONLY
+ * thing standing between "the byte is in flight" and a spurious refusal, and it
+ * cannot create an admission: it accepts the same byte `isAdmissionConfirmation`
+ * accepts and nothing else.
+ */
+function drainAdmissionReport(
+  report: NonNullable<ChildProcess["stdio"][3]>,
+): Promise<{ confirmed: true; detail: string } | null> {
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | null = null;
+    const finish = (outcome: { confirmed: true; detail: string } | null): void => {
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      report.off("data", onData);
+      report.off("close", onDrained);
+      report.off("end", onDrained);
+      report.off("error", onDrained);
+      resolve(outcome);
+    };
+    function onData(chunk: Buffer | string): void {
+      if (isAdmissionConfirmation(chunk.toString("utf8"))) {
+        finish({ confirmed: true, detail: "the prologue confirmed its own kernel membership" });
+      }
+    }
+    function onDrained(): void {
+      finish(null);
+    }
+    report.on("data", onData);
+    report.once("close", onDrained);
+    report.once("end", onDrained);
+    report.once("error", onDrained);
+    // A paused channel with bytes already buffered would otherwise never deliver
+    // them inside the bound.
+    (report as Partial<NodeJS.ReadableStream>).resume?.();
+    timer = setTimeout(() => finish(null), ADMISSION_DRAIN_MS);
+    timer.unref?.();
+  });
+}
+
+/**
+ * Release every runtime handle a failed run owns: the child's own stdio ends,
+ * its process handle, and — for a contained run — the admission report pipe.
+ * Best effort and idempotent: it runs on paths where the outcome has already
+ * been decided, so a throw here would replace a real typed failure with an
+ * unhelpful one.
+ */
+function releaseChildHandles(child: ChildProcess, contained: boolean): void {
+  const streams: ({ destroy?: () => void } | null | undefined)[] = [
+    child.stdin,
+    child.stdout,
+    child.stderr,
+    ...(contained ? [child.stdio[3]] : []),
+  ];
+  for (const stream of streams) {
+    try {
+      stream?.destroy?.();
+    } catch {
+      // Already closed.
+    }
+  }
+  try {
+    child.unref();
+  } catch {
+    // The process handle may already be gone.
+  }
+}
+
+/**
+ * Spec #168 / ticket #176 — the Windows cleanup failure with nothing left to
+ * try. The three signalling phases are named in the details because they are
+ * the whole of what Poiesis attempted, and `platform` is carried so an
+ * operator can tell this apart from the POSIX lease's own unresolved failure.
+ */
+function windowsCleanupUnresolved(command: string, pid: number): PoiesisError {
+  return new PoiesisError(
+    "PROCESS_CLEANUP_UNRESOLVED",
+    `${command} cleanup could not confirm that the process Poiesis spawned (PID ${pid}) exited`,
+    {
+      command,
+      pid,
+      containment: "process-group",
+      // The branch that ran is what the report must name, not whatever the
+      // platform reads as by the time the error is constructed.
+      platform: IS_WINDOWS ? "win32" : process.platform,
+      phases: ["taskkill", "taskkill /F", "child.kill"],
+      confirmed: false,
+    },
+  );
 }
 
 function commandIoError(

@@ -34,7 +34,7 @@ import { checkpoint, publish, resolveTree, workspacePrepare } from "../src/git.j
 import { init, packageVersion } from "../src/maintenance.js";
 import { run } from "../src/process.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
-import { createTestRepository, proofShell, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
+import { createTestRepository, describeManagedExecution, proofShell, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 
 interface FakeUvEnvironment {
   parent: string;
@@ -208,7 +208,7 @@ async function integrateThroughCli(candidate: IntegratedCandidate): Promise<Inte
   return JSON.parse(stdout) as IntegrateEnvelope;
 }
 
-describe("Spec #168 / ticket #174 — post-integration verification is opt-in", () => {
+describeManagedExecution("Spec #168 / ticket #174 — post-integration verification is opt-in", () => {
   let opencode: FakeOpenCodeEnvironment;
   let uv: FakeUvEnvironment;
   const repositories: TestRepository[] = [];

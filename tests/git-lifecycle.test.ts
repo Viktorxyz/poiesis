@@ -20,7 +20,16 @@ import { checkpoint, integrate, publish, resolveTree, verify, workspaceCleanup, 
 import { init } from "../src/maintenance.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
 import { run, type RunResult } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  itManagedExecution,
+  proofShell,
+  publishEvidence,
+  testConfig,
+  type TestRepository,
+  verifiedProof,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 async function candidateTree(repository: TestRepository, sha: string): Promise<string> {
@@ -57,7 +66,7 @@ describe("deterministic Git lifecycle", () => {
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
-  it("isolates dirty foreign work, preserves content through squash, and refuses rewrite attempts", async () => {
+  itManagedExecution("isolates dirty foreign work, preserves content through squash, and refuses rewrite attempts", async () => {
     const repository = await installedTestRepository(repositories);
     await writeFile(join(repository.root, "foreign.txt"), "uncommitted user work\n");
     const workspacePath = join(repository.parent, "workspace");
@@ -178,7 +187,7 @@ describe("deterministic Git lifecycle", () => {
     expect((await run("git", ["ls-remote", "--heads", "origin", "refs/heads/poiesis/spec-1"], { cwd: repository.root })).stdout).toBe("");
   }, 30_000);
 
-  it("rejects Proof from an older same-tree commit without publishing", async () => {
+  itManagedExecution("rejects Proof from an older same-tree commit without publishing", async () => {
     const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
@@ -253,7 +262,7 @@ describe("deterministic Git lifecycle", () => {
     expect(await readFile(join(workspace.path, "dirty.txt"), "utf8")).toBe("keep\n");
   }, 30_000);
 
-  it("rejects a stale integration base", async () => {
+  itManagedExecution("rejects a stale integration base", async () => {
     const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
@@ -310,7 +319,7 @@ describe("deterministic Git lifecycle", () => {
     ).rejects.toMatchObject({ code: "STALE_INTEGRATION_BASE" });
   }, 30_000);
 
-  it("accepts fast-forward republish of the same change branch and refuses divergence", async () => {
+  itManagedExecution("accepts fast-forward republish of the same change branch and refuses divergence", async () => {
     const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,
@@ -401,7 +410,7 @@ describe("deterministic Git lifecycle", () => {
     ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
   }, 30_000);
 
-it("accepts a default-path workspace on a normal branch (poiesis/greeting-command) and the primary checkout stays clean through prepare/cleanup", async () => {
+itManagedExecution("accepts a default-path workspace on a normal branch (poiesis/greeting-command) and the primary checkout stays clean through prepare/cleanup", async () => {
     const repository = await installedTestRepository(repositories);
     // A normal-branch flow exercises the post-install state: `poiesis
     // init` already wrote the `.poiesis/manifest.json` and
@@ -542,7 +551,7 @@ it("accepts a default-path workspace on a normal branch (poiesis/greeting-comman
 // `publish()` flow with the GitHub provider and feed the `gh` responses
 // via the `process.js` mock. Real git operations (push, ls-remote, etc.)
 // continue to use the un-wrapped runner.
-describe("GitHub provider headRepository handling", () => {
+describeManagedExecution("GitHub provider headRepository handling", () => {
   const repositories: TestRepository[] = [];
   // ghResponse.queue holds the queued responses for each `gh` call. They
   // are consumed in order: list → create/edit → list (verify).

@@ -1,11 +1,71 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, it } from "vitest";
+import { resolveContainmentCapability } from "../src/containment.js";
 import { run } from "../src/process.js";
 import { resolveLifecycleAuthority, verify } from "../src/git.js";
 import { resolveLiveVerificationPlan, type VerificationEvidence } from "../src/verification-receipt.js";
 import type { ProofPayload } from "../src/adapters.js";
 import type { PoiesisConfig } from "../src/config.js";
+
+/**
+ * Spec #168 / ticket #176 — whether THIS host can strongly contain a managed
+ * shell command.
+ *
+ * `verify`, `check`, and post-integration commands execute caller-supplied
+ * command TEXT, so they refuse with `PROCESS_CONTAINMENT_UNAVAILABLE` before
+ * spawning anything on a host with no delegated cgroup v2 subtree — Windows,
+ * macOS, and non-delegated Linux. A test that drives one of those paths is
+ * therefore testing the HOST's capability, not the code, and must skip rather
+ * than fail there.
+ *
+ * The corollary is as important: pure resolver, refusal, evidence, and
+ * control-flow assertions must NOT gate on it. Those prove the fail-closed
+ * contract and have to run on every host, including the ones that cannot contain
+ * anything — that is precisely where they carry their weight.
+ */
+export function strongContainmentAvailable(): boolean {
+  return resolveContainmentCapability().available;
+}
+
+/** The per-test options these suites actually pass alongside a gated case. */
+export interface ManagedExecutionOptions {
+  timeout?: number;
+  retry?: number;
+}
+
+/**
+ * The ONE shared capability gate, in its two forms.
+ *
+ * Both read the same predicate, so every skip carries the same reason and no
+ * suite can quietly introduce a second, looser gate. Use `describeManagedExecution`
+ * when every case in a suite needs a real managed command, and
+ * `itManagedExecution` for the individual cases inside a suite whose other cases
+ * are pure.
+ */
+export function describeManagedExecution(name: string, fn: () => void): void {
+  describe.skipIf(!strongContainmentAvailable())(name, fn);
+}
+
+export function itManagedExecution(
+  name: string,
+  fn: () => void | Promise<void>,
+  options?: ManagedExecutionOptions,
+): void;
+export function itManagedExecution(
+  name: string,
+  options: ManagedExecutionOptions,
+  fn: () => void | Promise<void>,
+): void;
+export function itManagedExecution(
+  name: string,
+  fn: () => void | Promise<void>,
+  timeout: number,
+): void;
+export function itManagedExecution(name: string, ...rest: unknown[]): void {
+  (it.skipIf(!strongContainmentAvailable()) as (...args: unknown[]) => void)(name, ...rest);
+}
 
 export interface TestRepository {
   parent: string;

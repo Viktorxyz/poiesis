@@ -10,6 +10,7 @@ import {
 } from "../src/evidence.js";
 import {
   createTestRepository,
+  describeManagedExecution,
   testConfig,
   verifiedProof,
   verificationReference,
@@ -151,7 +152,7 @@ function assertCommonEvidenceContract(
   validatePublishEvidence(result.evidence, expectedSha, expectedTree, expectedBranch, `refs/heads/${expectedBranch}`);
 }
 
-describe("ticket #48 — fixture publish emits candidate-bound evidence", () => {
+describeManagedExecution("ticket #48 — fixture publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence with verified:true for the first publish", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
@@ -222,7 +223,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
   });
 });
 
-describe("ticket #48 — command publish emits candidate-bound evidence", () => {
+describeManagedExecution("ticket #48 — command publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence when the command provider reports verified:true", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
@@ -364,7 +365,7 @@ printf '{"id":"x","url":"https://example.test/pr/x","verified":true,"candidateSh
   });
 });
 
-describe("ticket #48 — publish evidence fails closed", () => {
+describeManagedExecution("ticket #48 — publish evidence fails closed", () => {
   it("rejects Publish with no success evidence when the candidate tree does not match", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(

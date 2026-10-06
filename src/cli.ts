@@ -72,7 +72,7 @@ Usage:
 All commands accept --cwd <path>. Output and errors are structured JSON.
 `;
 
-async function main(argv: string[]): Promise<void> {
+async function main(argv: string[], signal?: AbortSignal): Promise<void> {
   if (argv.length === 0 || argv[0] === "help" || argv.includes("--help") || argv.includes("-h")) {
     process.stdout.write(HELP);
     return;
@@ -105,9 +105,9 @@ async function main(argv: string[]): Promise<void> {
     case "checkpoint":
       return commandCheckpoint(rest);
     case "verify":
-      return commandVerify(rest);
+      return commandVerify(rest, signal);
     case "check":
-      return commandCheck(rest);
+      return commandCheck(rest, signal);
     case "publish":
       return commandPublish(rest);
     case "preview":
@@ -126,6 +126,78 @@ async function main(argv: string[]): Promise<void> {
       return commandRepository(rest);
     default:
       throw new PoiesisError("UNKNOWN_COMMAND", `Unknown command: ${command}`, { command });
+  }
+}
+
+/**
+ * Spec #168 / ticket #176 — the CLI operations that actually consume a
+ * cancellation signal.
+ *
+ * Scoped on purpose. Installing SIGINT/SIGTERM handlers for EVERY subcommand
+ * would silently replace Node's default signal behaviour on `doctor`,
+ * `inspect`, `init`, `tracker`, and the rest: a Ctrl-C that used to terminate
+ * the process immediately would instead start an abort that those operations
+ * never read. Only the two operations that run managed commands and therefore
+ * settle what they started get handlers at all; every other subcommand keeps
+ * the platform default untouched.
+ */
+const CANCELLABLE_COMMANDS = new Set(["verify", "check"]);
+
+/** The signals an operator actually sends to interrupt a Poiesis invocation. */
+const CANCELLABLE_SIGNALS = ["SIGINT", "SIGTERM"] as const;
+
+export interface CliDispatchOptions {
+  /**
+   * A caller-supplied cancellation signal.
+   *
+   * When present it is used verbatim and Poiesis installs NO process-wide
+   * signal handlers: the host process belongs to the caller, and taking over
+   * SIGINT/SIGTERM on its behalf would be exactly the hijack this seam exists
+   * to avoid.
+   */
+  signal?: AbortSignal;
+}
+
+/**
+ * Spec #168 / ticket #176 — the public CLI dispatch, with scoped cancellation.
+ *
+ * One invocation-scoped `AbortController` per dispatch, plus two temporary
+ * `SIGINT`/`SIGTERM` handlers, and ONLY for `verify` and `check`. The first
+ * signal aborts once — `AbortController.abort()` is idempotent and the handler
+ * is guarded besides, so a repeated Ctrl-C cannot start a second cleanup — and
+ * the handlers are removed in `finally`, so a later invocation starts from a
+ * fresh, un-aborted controller and never accumulates listeners.
+ *
+ * The controller reaches the managed command paths, so an interrupted command
+ * settles its managed processes and reports `COMMAND_CANCELLED` (exit code 130)
+ * instead of leaving them behind. A cleanup failure still outranks the
+ * cancellation, because "Poiesis could not confirm it stopped what it started"
+ * is the more important fact.
+ */
+export async function dispatchCli(argv: string[], options: CliDispatchOptions = {}): Promise<void> {
+  const cancellable = CANCELLABLE_COMMANDS.has(argv[0] ?? "");
+  if (options.signal !== undefined) {
+    await main(argv, options.signal);
+    return;
+  }
+  if (!cancellable) {
+    // No handlers: this operation does not consume cancellation, so the
+    // platform default signal behaviour stays exactly as the operator expects.
+    await main(argv);
+    return;
+  }
+  const controller = new AbortController();
+  let aborted = false;
+  const onSignal = (): void => {
+    if (aborted) return;
+    aborted = true;
+    controller.abort();
+  };
+  for (const signal of CANCELLABLE_SIGNALS) process.on(signal, onSignal);
+  try {
+    await main(argv, controller.signal);
+  } finally {
+    for (const signal of CANCELLABLE_SIGNALS) process.off(signal, onSignal);
   }
 }
 
@@ -574,7 +646,7 @@ async function lifecycleAuthority(cwd: string): Promise<LifecycleAuthority> {
  * candidate-authority behaviour of the Verify dispatch can be exercised
  * directly. It is intentionally NOT re-exported by `src/index.ts`.
  */
-export async function commandVerify(args: string[]): Promise<void> {
+export async function commandVerify(args: string[], signal?: AbortSignal): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     cwd: { type: "string" },
@@ -588,6 +660,10 @@ export async function commandVerify(args: string[]): Promise<void> {
       cwd: authority.candidateRoot,
       candidateSha: required(values, "sha"),
       commands,
+      // Spec #168 / ticket #176: the invocation-scoped cancellation from the
+      // public dispatch. It settles the managed commands, so an interrupted
+      // Verify reports `COMMAND_CANCELLED` and issues no receipt.
+      ...(signal === undefined ? {} : { signal }),
     }),
   );
 }
@@ -615,7 +691,7 @@ export async function commandVerify(args: string[]): Promise<void> {
  * Exported as a library seam (same pattern as `commandVerify`); it is
  * intentionally NOT re-exported by `src/index.ts`.
  */
-export async function commandCheck(args: string[]): Promise<void> {
+export async function commandCheck(args: string[], signal?: AbortSignal): Promise<void> {
   const values = options(args, {
     command: { type: "string", multiple: true },
     timeout: { type: "string" },
@@ -640,8 +716,39 @@ export async function commandCheck(args: string[]): Promise<void> {
     ...(values["output-limit"] === undefined ? {} : { outputLimit: boundedInteger(values, "output-limit") }),
     ...(progress === undefined ? {} : { progress }),
     ...(retryReason === undefined ? {} : { retryReason: retryReason as CheckRetryReason }),
+    // Spec #168 / ticket #176: the invocation-scoped cancellation from the
+    // public dispatch. A caller-supplied signal is never overwritten.
+    ...(signal === undefined ? {} : { signal }),
   });
   if (result.outcome !== "passed") {
+    // Spec #168 / ticket #176: an interrupted focused check IS a cancellation,
+    // not a failed check. Reporting it as `FOCUSED_CHECK_FAILED` would tell the
+    // operator their code failed when the truth is that they pressed Ctrl-C, so
+    // the typed cancellation identity and exit code 130 are surfaced — with the
+    // complete bounded result still attached under `details.check`.
+    //
+    // A cleanup failure is NOT rewritten as a cancellation: it outranks the
+    // abort, and the executor already records its code on the evidence, so the
+    // operator is pointed at the real problem.
+    const failed = (result.commands ?? []).find((entry) => entry.status === "failed");
+    if (failed?.failureCode === "COMMAND_CANCELLED") {
+      throw new PoiesisError(
+        "COMMAND_CANCELLED",
+        "Focused check was cancelled by the caller",
+        {
+          check: result,
+          cancelled: true,
+          command: failed.command,
+          exitCode: failed.exitCode,
+          signal: failed.signal,
+          durationMs: failed.durationMs,
+          stdout: failed.stdout,
+          stderr: failed.stderr,
+          stdoutTruncated: failed.stdoutTruncated,
+        },
+        130,
+      );
+    }
     throw new PoiesisError("FOCUSED_CHECK_FAILED", "Focused checks did not pass", {
       check: result,
       migration:
@@ -1167,7 +1274,7 @@ function isMainEntry(argv1: string | undefined, moduleUrl: string): boolean {
 
 const IS_MAIN_MODULE = isMainEntry(process.argv[1], import.meta.url);
 if (IS_MAIN_MODULE) {
-  main(process.argv.slice(2)).catch(writeFailure);
+  dispatchCli(process.argv.slice(2)).catch(writeFailure);
 }
 
 function optionalAbsoluteWorkspacePath(value: string | boolean | string[] | undefined): Record<string, string> {

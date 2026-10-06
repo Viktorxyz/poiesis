@@ -5,7 +5,15 @@ import { checkpoint, integrate, publish, resolveTree, workspaceCleanup, workspac
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
 import { createFixtureDeliveryAdapter } from "../src/adapters.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
+import {
+  createTestRepository,
+  itManagedExecution,
+  proofShell,
+  publishEvidence,
+  testConfig,
+  type TestRepository,
+  verifiedProof,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
@@ -231,7 +239,7 @@ describe("workspace prepare default path", () => {
     expect(markerJson.workspacePath).toBe(workspace.path);
   }, 30_000);
 
-  it("runs a full checkpoint, publish, integrate, and cleanup cycle on the default path", async () => {
+  itManagedExecution("runs a full checkpoint, publish, integrate, and cleanup cycle on the default path", async () => {
     const repository = await installedTestRepository(repositories);
     const workspace = await workspacePrepare({
       cwd: repository.root,

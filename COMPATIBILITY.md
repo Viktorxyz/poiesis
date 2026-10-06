@@ -200,3 +200,32 @@ All external command execution is bounded:
 - `COMMAND_FAILED` on ordinary non-zero exit;
 - `stdoutTruncated`/`stderrTruncated` flags recorded when bound is hit;
 - safe SIGTERM then SIGKILL termination on timeout.
+
+### Strong containment for arbitrary command text
+
+Two execution contracts exist and are not interchangeable.
+
+**Fixed-argv commands** — `git`, `gh`, `uv`, `opencode`, delivery executables, and any direct library caller of `run()` with a vector Poiesis chose — run under a managed process GROUP. That is isolation, not containment: `setsid(2)` creates a new session and process group, and a descendant is reparented when its parent exits, so neither is visible to a group-directed signal afterwards.
+
+**Arbitrary command TEXT** cannot rely on that. Three surfaces execute it, and all three require the same kernel-enforced boundary:
+
+| Surface | Commands it runs |
+| --- | --- |
+| `poiesis verify` | the installation's verification plan, in the exact candidate workspace |
+| `poiesis check` | the explicit `--command` values, in an owned (possibly dirty) candidate workspace |
+| `poiesis integrate` | the configured `postIntegrationCommands`, in a throwaway worktree over the integrated revision |
+
+Each reaches the command processor through the same seam (`/bin/sh -c` on POSIX; a validated absolute `ComSpec` naming `cmd.exe` with `/d /s /c` on Windows), passes the command through byte-identical as the final argv element, and runs inside a boundary provisioned BEFORE the spawn.
+
+| Host | Required capability | Status |
+| --- | --- | --- |
+| Linux, delegated cgroup v2 subtree | a Poiesis-owned leaf exposing `cgroup.kill`, `cgroup.procs`, `cgroup.events` | supported; the leaf is provisioned before the spawn, entered by a Poiesis-owned admission prologue that confirms its own membership before any caller text can run, and settled with `cgroup.kill` confirmed by `cgroup.events` |
+| Linux, no delegated subtree | — | refused before spawning |
+| Windows | a no-breakaway Job Object created by a native launcher before the child is created | refused before spawning; this runtime ships no such launcher |
+| macOS and the other non-Linux POSIX platforms | — | refused before spawning; no portable strong primitive exists |
+
+On a refused host the three surfaces above fail with `PROCESS_CONTAINMENT_UNAVAILABLE`, carrying `details.reason` (`NO_CGROUP_V2`, `NO_DELEGATION`, `NO_CGROUP_KILL`, `PROVISION_FAILED`, `UNSUPPORTED_PLATFORM`), `details.platform`, the missing capability in `details.detail`, and a `details.remediation` naming a Linux host with a delegated cgroup v2 subtree. Nothing is spawned and nothing is reported as verified, so "the plan passed" can never be a statement about a run that never happened.
+
+Post-integration commands are gated by the same rule as the verification plan. A host that cannot contain the candidate's plan cannot contain the integrated revision either; `postIntegrationCommands` is not a weaker surface and does not fall back to `verification.commands`.
+
+When the host does provide the capability but admission cannot be confirmed, the run is refused with `PROCESS_CONTAINMENT_REFUSED`. When the boundary cannot be confirmed settled, it fails with `PROCESS_CLEANUP_UNRESOLVED`. Both outrank success, failure, timeout, and cancellation, because they mean a process Poiesis spawned may still be running.

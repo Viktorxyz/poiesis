@@ -31,7 +31,13 @@ import {
   type ResourcePressureSample,
 } from "../src/focused-check.js";
 import { VERIFICATION_RECEIPT_DIRECTORY } from "../src/verification-receipt.js";
-import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  itManagedExecution,
+  testConfig,
+  type TestRepository,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 const CALM: ResourcePressureSample = {
@@ -97,7 +103,7 @@ async function receiptsExist(): Promise<boolean> {
 }
 
 describe("focused scope (Spec #168 / ticket #172)", () => {
-  it("runs explicit commands in an owned candidate and creates no proof of any kind", async () => {
+  itManagedExecution("runs explicit commands in an owned candidate and creates no proof of any kind", async () => {
     const candidate = await ownedCandidate("clean");
     const result = await executeCheck({
       scope: "focused",
@@ -144,7 +150,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(await receiptsExist()).toBe(false);
   }, 60_000);
 
-  it("runs in a dirty owned workspace and records the dirty state instead of failing", async () => {
+  itManagedExecution("runs in a dirty owned workspace and records the dirty state instead of failing", async () => {
     const candidate = await ownedCandidate("dirty");
     await writeFile(join(candidate.path, "README.md"), "in-progress ticket work\n", "utf8");
     await writeFile(join(candidate.path, "untracked.txt"), "scratch\n", "utf8");
@@ -180,7 +186,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     ).rejects.toMatchObject({ code: "WORKSPACE_OWNERSHIP_UNKNOWN" });
   }, 60_000);
 
-  it("bounds output and reports explicit truncation metadata", async () => {
+  itManagedExecution("bounds output and reports explicit truncation metadata", async () => {
     const candidate = await ownedCandidate("truncation");
     const result = await executeCheck({
       scope: "focused",
@@ -204,7 +210,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(stdout.startsWith("0123456789\n")).toBe(true);
   }, 60_000);
 
-  it("classifies a non-zero exit as a non-zero command failure without throwing or retrying", async () => {
+  itManagedExecution("classifies a non-zero exit as a non-zero command failure without throwing or retrying", async () => {
     const candidate = await ownedCandidate("command-failed");
     const result = await executeCheck({
       scope: "focused",
@@ -224,7 +230,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect((await readFile(join(candidate.path, "attempts.txt"), "utf8")).trim().split("\n")).toHaveLength(1);
   }, 60_000);
 
-  it("classifies a settled process timeout with bounded evidence and reaps the process tree", async () => {
+  itManagedExecution("classifies a settled process timeout with bounded evidence and reaps the process tree", async () => {
     const candidate = await ownedCandidate("timeout");
     const startedAt = Date.now();
     const result = await executeCheck({
@@ -248,7 +254,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(result.commands?.[0]?.durationMs).toBeGreaterThanOrEqual(400);
   }, 60_000);
 
-  it("classifies a timeout under sampled resource pressure as likely load-induced and still failed", async () => {
+  itManagedExecution("classifies a timeout under sampled resource pressure as likely load-induced and still failed", async () => {
     const candidate = await ownedCandidate("load-induced");
     const result = await executeCheck({
       scope: "focused",
@@ -282,7 +288,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(result.commands?.[0]).toMatchObject({ classification: "infrastructure", timeoutState: "not-timed-out" });
   }, 60_000);
 
-  it("returns a stable action fingerprint for unchanged state and a different one after a mutation", async () => {
+  itManagedExecution("returns a stable action fingerprint for unchanged state and a different one after a mutation", async () => {
     const candidate = await ownedCandidate("fingerprint");
     const first = await executeCheck({
       scope: "focused",
@@ -309,7 +315,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(third.actionFingerprint).not.toBe(first.actionFingerprint);
   }, 60_000);
 
-  it("changes the action fingerprint when an already-dirty path's CONTENTS change", async () => {
+  itManagedExecution("changes the action fingerprint when an already-dirty path's CONTENTS change", async () => {
     // Same HEAD, same tree, same dirty flag, same changed-path set — only the
     // bytes of an already-dirty file differ. Reporting that as an unchanged
     // action is exactly the blind-rerun loop this fingerprint exists to end.
@@ -346,7 +352,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect((await run()).actionFingerprint).toBe(first.actionFingerprint);
   }, 60_000);
 
-  it("records bounded Git content digests for dirty paths and never their contents", async () => {
+  itManagedExecution("records bounded Git content digests for dirty paths and never their contents", async () => {
     const candidate = await ownedCandidate("digests");
     const secret = "top-secret-value-4b7c";
     await writeFile(join(candidate.path, "notes.txt"), `contains ${secret}\n`, "utf8");
@@ -369,7 +375,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(JSON.stringify(result)).not.toContain("still tracked and modified");
   }, 60_000);
 
-  it("marks a deleted changed path as absent rather than colliding with other states", async () => {
+  itManagedExecution("marks a deleted changed path as absent rather than colliding with other states", async () => {
     const candidate = await ownedCandidate("digest-deleted");
     await rm(join(candidate.path, "README.md"));
     const deleted = await executeCheck({
@@ -393,7 +399,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
     expect(renamed.actionFingerprint).not.toBe(deleted.actionFingerprint);
   }, 60_000);
 
-  it("emits bounded progress events that carry no command text, output, or environment values", async () => {
+  itManagedExecution("emits bounded progress events that carry no command text, output, or environment values", async () => {
     const candidate = await ownedCandidate("progress");
     const secret = "sekret-value-9f3a";
     const events: CheckProgressEvent[] = [];
@@ -426,7 +432,7 @@ describe("focused scope (Spec #168 / ticket #172)", () => {
   }, 60_000);
 });
 
-describe("proof scope through the same executor (Spec #168 / ticket #172)", () => {
+describeManagedExecution("proof scope through the same executor (Spec #168 / ticket #172)", () => {
   it("issues the exact-candidate verification receipt and stays authoritative", async () => {
     const candidate = await ownedCandidate("proof");
     const result = await executeCheck({
@@ -578,7 +584,7 @@ describe("poiesis check CLI seam (Spec #168 / ticket #172)", () => {
     return { chunks, restore: () => { target.write = original; } };
   }
 
-  it("runs explicit commands and returns a non-authoritative focused result", async () => {
+  itManagedExecution("runs explicit commands and returns a non-authoritative focused result", async () => {
     const candidate = await ownedCandidate("cli-ok");
     await writeFile(join(candidate.path, "README.md"), "in-progress\n", "utf8");
     const { commandCheck } = await import("../src/cli.js");
@@ -608,7 +614,7 @@ describe("poiesis check CLI seam (Spec #168 / ticket #172)", () => {
     expect(payload.result.commands[1]?.stdout).toBe("focused-cli");
   }, 60_000);
 
-  it("fails closed with the classification and the complete bounded evidence", async () => {
+  itManagedExecution("fails closed with the classification and the complete bounded evidence", async () => {
     const candidate = await ownedCandidate("cli-failed");
     const { commandCheck } = await import("../src/cli.js");
 
@@ -637,7 +643,7 @@ describe("poiesis check CLI seam (Spec #168 / ticket #172)", () => {
     });
   }, 60_000);
 
-  it("emits bounded progress lines on stderr only when asked", async () => {
+  itManagedExecution("emits bounded progress lines on stderr only when asked", async () => {
     const candidate = await ownedCandidate("cli-progress");
     const { commandCheck } = await import("../src/cli.js");
 

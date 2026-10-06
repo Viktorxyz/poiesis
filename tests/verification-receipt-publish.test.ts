@@ -30,7 +30,14 @@ import {
   type VerificationReceiptBodyV1,
   type VerificationReceiptV1,
 } from "../src/verification-receipt.js";
-import { createTestRepository, proofShell, testConfig, type TestRepository } from "./helpers.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  itManagedExecution,
+  proofShell,
+  testConfig,
+  type TestRepository,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /** The PRIMARY installation's live verification plan. */
@@ -157,8 +164,8 @@ async function forgeReceipt(
   };
 }
 
-describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", () => {
-  it("publishes with a receipt-backed proof and carries the resolved receipt identity in the evidence", async () => {
+describeManagedExecution("Publish resolves the verification receipt (Spec #168 / ticket #171)", () => {
+  itManagedExecution("publishes with a receipt-backed proof and carries the resolved receipt identity in the evidence", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-publish");
     const verification = await verifyCandidate(candidate);
@@ -196,7 +203,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     expect(remote.stdout).toBe("");
   }, 60_000);
 
-  it("rejects a reference to a receipt that was never written", async () => {
+  itManagedExecution("rejects a reference to a receipt that was never written", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-forged-id");
     const verification = await verifyCandidate(candidate);
@@ -208,7 +215,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_MISSING" });
   }, 60_000);
 
-  it("rejects a reference whose digest does not match the stored receipt", async () => {
+  itManagedExecution("rejects a reference whose digest does not match the stored receipt", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-digest");
     const verification = await verifyCandidate(candidate);
@@ -220,7 +227,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_INVALID" });
   }, 60_000);
 
-  it("rejects a reference bound to a different candidate", async () => {
+  itManagedExecution("rejects a reference bound to a different candidate", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-ref-candidate");
     const verification = await verifyCandidate(candidate);
@@ -232,7 +239,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_CANDIDATE_MISMATCH" });
   }, 60_000);
 
-  it("rejects a receipt produced by a different runtime identity", async () => {
+  itManagedExecution("rejects a receipt produced by a different runtime identity", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-runtime");
     const verification = await verifyCandidate(candidate);
@@ -245,7 +252,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt produced by a different installation identity", async () => {
+  itManagedExecution("rejects a receipt produced by a different installation identity", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-install");
     const verification = await verifyCandidate(candidate);
@@ -257,7 +264,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt produced by a different workspace ownership identity", async () => {
+  itManagedExecution("rejects a receipt produced by a different workspace ownership identity", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-owner");
     const verification = await verifyCandidate(candidate);
@@ -269,7 +276,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt bound to another workspace directory", async () => {
+  itManagedExecution("rejects a receipt bound to another workspace directory", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-workspace");
     const verification = await verifyCandidate(candidate);
@@ -281,7 +288,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt bound to another candidate SHA", async () => {
+  itManagedExecution("rejects a receipt bound to another candidate SHA", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-sha");
     const verification = await verifyCandidate(candidate);
@@ -293,7 +300,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt bound to another candidate tree", async () => {
+  itManagedExecution("rejects a receipt bound to another candidate tree", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-tree");
     const verification = await verifyCandidate(candidate);
@@ -305,7 +312,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt produced by a weaker plan than the installation's live plan", async () => {
+  itManagedExecution("rejects a receipt produced by a weaker plan than the installation's live plan", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-plan");
     // A real Verify, real commands, real receipt — just not the live plan.
@@ -317,7 +324,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt whose stored plan records do not match its own plan", async () => {
+  itManagedExecution("rejects a receipt whose stored plan records do not match its own plan", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-incomplete-commands");
     const verification = await verifyCandidate(candidate);
@@ -331,7 +338,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     });
   }, 60_000);
 
-  it("rejects a receipt that records a failed verification", async () => {
+  itManagedExecution("rejects a receipt that records a failed verification", async () => {
     // The live plan itself fails, so the receipt is plan-complete and only the
     // OUTCOME separates it from a proof-worthy receipt.
     const failingPlan = ["test -f README.md", "test -f absent-file.txt"];
@@ -361,7 +368,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
     );
   }, 60_000);
 
-  it("still requires the candidate-bound reviews after the receipt is resolved", async () => {
+  itManagedExecution("still requires the candidate-bound reviews after the receipt is resolved", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-reviews");
     const verification = await verifyCandidate(candidate);
@@ -386,7 +393,7 @@ describe("Publish resolves the verification receipt (Spec #168 / ticket #171)", 
   }, 60_000);
 });
 
-describe("Preview validates forwarded Publish evidence (Spec #168 / ticket #171)", () => {
+describeManagedExecution("Preview validates forwarded Publish evidence (Spec #168 / ticket #171)", () => {
   async function publishCandidate(repository: TestRepository, candidate: Candidate) {
     const verification = await verifyCandidate(candidate);
     const published = await publish(publishOptions(repository, candidate, proofFor(candidate, verification)));

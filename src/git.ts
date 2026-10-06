@@ -4,6 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "nod
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
 import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
+import { runManagedShellCommand } from "./managed-shell.js";
 import { exists } from "./fs.js";
 import { poiesisPath, resolveGitRoot } from "./paths.js";
 import { loadManifest, type Manifest } from "./manifest.js";
@@ -138,6 +139,16 @@ export interface VerifyOptions {
   timeoutMs?: number;
   outputLimit?: number;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Spec #168 / ticket #176 — the caller's cancellation intent.
+   *
+   * The CLI dispatch owns one invocation-scoped controller and passes it here,
+   * so an operator's SIGINT/SIGTERM settles the managed commands instead of
+   * cutting the process off. A library caller may supply its own signal, or
+   * none at all: nothing is installed on its behalf and its own cancellation
+   * stays exactly as it declared it.
+   */
+  signal?: AbortSignal;
 }
 
 export interface VerifyCommandResult {
@@ -679,7 +690,12 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   // has no installation identity to bind and therefore issues no receipt.
   let verification: VerificationEvidence | null = null;
   let receiptFailure: unknown = null;
-  if (authority !== null) {
+  // Spec #168 / ticket #176: a cancelled Verify did not complete the plan, so
+  // it must not mint an authoritative receipt. A receipt is Publish's proof
+  // that the exact candidate was verified; one issued for a plan that was cut
+  // short would say something the run never established. The cancellation is
+  // therefore the reported outcome, and nothing is persisted for it.
+  if (authority !== null && !outcome.cancelled) {
     try {
       verification = verificationEvidenceFrom(
         await createVerificationReceipt({
@@ -727,6 +743,11 @@ interface VerificationOutcome {
   };
   /** The deterministic failure of a completed run, or `null` when it passed. */
   failure: unknown | null;
+  /**
+   * Spec #168 / ticket #176 — the run ended because the caller cancelled it,
+   * so the plan did not complete and no receipt may be issued for it.
+   */
+  cancelled: boolean;
 }
 
 /**
@@ -770,8 +791,13 @@ async function runVerification(
     const commandStartedAtMs = Date.now();
     let result: RunResult;
     try {
-      result = await run("/bin/sh", ["-c", command], {
+      // Spec #168 / ticket #176: the plan runs through the one managed
+      // command-processor + strong-containment seam shared with focused checks,
+      // so a verification command can never drift onto a different interpreter
+      // or run outside the boundary Poiesis claims for arbitrary command text.
+      result = await runManagedShellCommand({
         cwd: root,
+        command,
         allowFailure: true,
         timeoutMs,
         // Spec #168 / ticket #170: verification commands run under a
@@ -783,6 +809,7 @@ async function runVerification(
         operationId: "poiesis-verify",
         ...(workspaceOwnershipId === null ? {} : { workspaceId: workspaceOwnershipId }),
         ...(options.env === undefined ? {} : { env: options.env }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
       runError = error;
@@ -859,6 +886,15 @@ async function runVerification(
   };
 
   let failure: unknown | null = null;
+  // Spec #168 / ticket #176: a Verify is cancelled when it did not complete AND
+  // the caller declared cancellation. Both facts are needed: the runner's own
+  // `COMMAND_CANCELLED` proves it for a plain cancellation, but a cleanup
+  // failure outranks that rejection and would otherwise hide a cancelled,
+  // incomplete run behind a receipt it must never get.
+  const callerCancelled = options.signal?.aborted === true;
+  const runCancelled =
+    runError instanceof PoiesisError && runError.code === "COMMAND_CANCELLED" && runError.exitCode === 130;
+  const cancelled = !verified && (callerCancelled || runCancelled);
   if (dirtyStatus !== null) {
     failure = new PoiesisError(
       "DIRTY_CANDIDATE",
@@ -883,6 +919,7 @@ async function runVerification(
     result: { candidateSha, cleanBefore: true, cleanAfter: true, commands: results, verification: null },
     execution,
     failure,
+    cancelled,
   };
 }
 

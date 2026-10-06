@@ -46,7 +46,7 @@ import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js
 import { readUtf8 } from "../src/fs.js";
 import { run } from "../src/process.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
-import { createTestRepository, proofShell, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
+import { createTestRepository, describeManagedExecution, proofShell, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 
 interface FakeUvEnvironment {
   parent: string;
@@ -131,7 +131,7 @@ function workerBash(manifest: Manifest): Record<string, string> {
   return (patch.installed as { permission: { bash: Record<string, string> } }).permission.bash;
 }
 
-describe("Spec #168 / ticket #174 — end-to-end composition of the authoritative flow", () => {
+describeManagedExecution("Spec #168 / ticket #174 — end-to-end composition of the authoritative flow", () => {
   let opencode: FakeOpenCodeEnvironment;
   let uv: FakeUvEnvironment;
   const repositories: TestRepository[] = [];

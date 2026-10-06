@@ -143,6 +143,76 @@ every version-qualified and `@latest` `dlx` variant. The script is
 inert after `uninstall` — it reports that the project is not installed,
 which is also how you reinstall.
 
+### Command execution, containment, and cancellation
+
+Poiesis uses two distinct process-execution contracts, and it does not blur
+them.
+
+**Fixed-argv commands** (`git`, `gh`, `uv`, `opencode`, delivery executables)
+run under a managed process GROUP: each child is spawned `detached`, gets a
+transient in-memory identity lease, and is settled through that lease alone.
+That is isolation, not containment — and it is honest here precisely because
+nothing in a Poiesis-chosen argv can `setsid` its way out of the group.
+
+**Command TEXT** can do exactly that. Three surfaces run it: `poiesis verify`'s
+plan, `poiesis check`'s explicit commands, and the configured
+`postIntegrationCommands` that `poiesis integrate` runs against the integrated
+revision. All three go through one shared command-processor seam and are placed
+in a kernel boundary before any of their text runs:
+
+| | |
+| --- | --- |
+| Processor (POSIX) | `/bin/sh` with `["-c", <the exact command>]` |
+| Processor (Windows) | a validated absolute `ComSpec` naming `cmd.exe`, with `["/d", "/s", "/c", <the exact command>]` |
+| Admission barrier (Linux) | a Poiesis-owned prologue that moves ITSELF into the provisioned cgroup v2 leaf and confirms its membership before it `exec`s the processor |
+| Containment (Linux) | that delegated cgroup v2 leaf, provisioned BEFORE the spawn, settled with `cgroup.kill` and confirmed by `cgroup.events` |
+| Containment (Windows) | requires a no-breakaway Job Object from a native launcher, which this runtime does not ship |
+| Containment (macOS / other POSIX) | no portable primitive exists |
+
+What Poiesis **does** claim:
+
+- the leaf exists before the process is created;
+- the managed child is a Poiesis-owned prologue, not the command. It admits and
+  confirms *itself* out of band (the leaf travels in the environment, never in
+  the argv) and only then `exec`s the already-resolved processor with the
+  already-resolved argv — so **no caller command text can execute before
+  admission is confirmed**, and that ordering is enforced by the prologue's own
+  control flow rather than by a parent-side write racing the child's `execve`;
+- the caller command is passed through verbatim: byte-identical as the final
+  argv element, never interpolated into the prologue;
+- the parent refuses the run if the confirmation never arrives — there is no
+  "it probably made it" branch, for a live child or a finished one;
+- every process the command creates after admission inherits the leaf, because
+  cgroup membership survives `fork`, `setsid(2)`, and reparenting;
+- settlement fails closed unless the kernel itself reports the leaf empty.
+
+What Poiesis **does not** claim: that it detects an escape. It never polls for
+one, never matches on a process name, port, user, or age, and never scans the
+system.
+
+On a host with no strong boundary — Windows, macOS, or Linux without a
+delegated cgroup v2 subtree exposing `cgroup.kill` — `verify`, `check`, and
+`postIntegrationCommands` all refuse before spawning anything, with
+`PROCESS_CONTAINMENT_UNAVAILABLE` naming the capability that is missing and the
+remediation: run the operation on a Linux host with a delegated cgroup v2
+subtree. Nothing runs and nothing is reported as verified. On Windows the
+missing primitive is a no-breakaway Job Object, which needs a native launcher
+this runtime does not ship; on macOS and the other POSIX platforms no portable
+strong primitive exists at all. Use the library `run()` seam with a fixed argv
+for work that does not need arbitrary command text on such a host.
+
+`SIGINT` / `SIGTERM` cancel the two operations that actually consume a signal —
+`poiesis verify` and `poiesis check`. One AbortController per invocation,
+temporary handlers removed in `finally`, the first signal aborts once. Every
+other subcommand keeps the platform default signal behaviour untouched. The
+managed commands then settle: `verify` reports `COMMAND_CANCELLED` (exit code
+130) and issues no verification receipt, and `check` reports `COMMAND_CANCELLED`
+with the complete bounded result attached under `details.check`. A cleanup
+failure always outranks the cancellation — "Poiesis could not confirm it stopped
+what it started" is the fact you have to act on. A library caller that supplies
+its own `AbortSignal` keeps it, and Poiesis installs no process-wide handlers on
+its behalf.
+
 ### Updating the managed config
 
 `.poiesis/config.jsonc` is a managed surface — Poiesis generated it from a
@@ -358,6 +428,7 @@ Use this prompt when the human/operator wants a single agent to stand up the who
 - History rewriting is refused: `publish` only accepts non-forcing fast-forward updates of the Poiesis-owned remote change branch.
 - Production promotion requires separate candidate-bound Author authorization plus the operation-produced Staging receipt and the verified canonical Integration evidence.
 - Fixture tracker and delivery adapters exist only for disposable integration tests and bootstrap dogfood; they are not supported production infrastructure.
+- Command cleanup never claims more than it proved: an unresolved or refused cleanup rejects with a typed error ahead of success, failure, timeout, and cancellation, and a command that Poiesis cannot contain is refused before it is created.
 
 ## Development
 

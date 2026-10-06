@@ -36,7 +36,13 @@ import {
   verificationReceiptPath,
   type VerificationReceiptV1,
 } from "../src/verification-receipt.js";
-import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  itManagedExecution,
+  testConfig,
+  type TestRepository,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /** The PRIMARY installation's live verification plan. */
@@ -96,7 +102,7 @@ async function acceptedCandidate(repository: TestRepository, specId: string): Pr
   };
 }
 
-describe("proof-scope Verify issues a runtime-owned receipt (Spec #168 / ticket #171)", () => {
+describeManagedExecution("proof-scope Verify issues a runtime-owned receipt (Spec #168 / ticket #171)", () => {
   it("persists the receipt under the shared Git common directory with restrictive permissions", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-storage");
@@ -314,7 +320,7 @@ describe("proof-scope Verify issues a runtime-owned receipt (Spec #168 / ticket 
 });
 
 describe("non-project-bound Verify compatibility (Spec #168 / tickets #169 / #171)", () => {
-  it("still verifies a repository that never installed Poiesis and issues no receipt", async () => {
+  itManagedExecution("still verifies a repository that never installed Poiesis and issues no receipt", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
 

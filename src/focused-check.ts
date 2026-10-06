@@ -32,13 +32,19 @@
  * `proof` keeps `verify`'s own compatibility surface (a repository that
  * never installed Poiesis stays a valid non-project-bound Verify surface).
  *
- * Non-goals, enforced structurally rather than by convention:
+* Non-goals, enforced structurally rather than by convention:
  *   - no automatic retry. Every command runs at most once per invocation and
- *     the loop stops at the first failure; a repeat decision belongs to the
- *     orchestrator, which now has the fingerprint to make it honestly;
+ *     the loop stops at the first failure; a repeat decision belongs to
+ *     the orchestrator, which now has the fingerprint to make it honestly;
  *   - no daemon, no durable history, no telemetry, no second engine. The
  *     progress sink is invoked in-process and its events are discarded when
  *     the call returns.
+ *
+ * Spec #168 / ticket #176: a focused command is caller-supplied command TEXT,
+ * so it runs through `runManagedShellCommand` — the same platform-aware command
+ * processor and the same kernel containment boundary Verify uses. There is no
+ * second interpreter and no weaker boundary on this surface, and a host that
+ * provides neither fails before a process exists.
  *
  * Agent reachability (resolved by ticket #173): `poiesis check` is reachable
  * by the PRIMARY agent through its exact-version `pnpm dlx poiesis-cli@<version>
@@ -68,7 +74,8 @@ import {
   type VerifyResult,
   type WorktreePathDigest,
 } from "./git.js";
-import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
+import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, type RunResult } from "./process.js";
+import { runManagedShellCommand } from "./managed-shell.js";
 import type { VerificationEvidence } from "./verification-receipt.js";
 
 export type CheckScope = "focused" | "proof";
@@ -497,6 +504,17 @@ export interface FocusedCommandEvidence {
   command: string;
   status: "passed" | "failed";
   classification: CheckClassification;
+  /**
+   * Spec #168 / ticket #176 — the typed code the managed runner rejected with,
+   * or `null` for a command that settled.
+   *
+   * The classification vocabulary deliberately stays closed, so a cancellation
+   * or a cleanup failure lands in `infrastructure` like every other
+   * unattributable rejection. This field is what makes the actual cause
+   * visible without widening that vocabulary: an orchestrator can tell
+   * `COMMAND_CANCELLED` from `PROCESS_CONTAINMENT_UNAVAILABLE` here.
+   */
+  failureCode: string | null;
   exitCode: number | null;
   signal: string | null;
   durationMs: number;
@@ -794,8 +812,13 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
   let result: RunResult | null = null;
   let failure: PoiesisError | null = null;
   try {
-    result = await run("/bin/sh", ["-c", input.command], {
+    // Spec #168 / ticket #176: the same managed command-processor and
+    // strong-containment seam Verify uses, so a focused command is interpreted
+    // by the same validated processor and runs inside the same boundary. There
+    // is no second interpreter and no weaker containment on this surface.
+    result = await runManagedShellCommand({
       cwd: input.root,
+      command: input.command,
       allowFailure: true,
       timeoutMs: input.timeoutMs,
       // #170: the transient managed lease names this operation and, when the
@@ -847,6 +870,7 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
           dirtyCandidate: false,
           pressure,
         }),
+    failureCode: failure?.code ?? null,
     exitCode,
     signal,
     durationMs,

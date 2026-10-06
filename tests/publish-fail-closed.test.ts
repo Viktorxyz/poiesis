@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { publish, resolveTree, workspacePrepare, checkpoint } from "../src/git.js";
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
-import { createTestRepository, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
+import { createTestRepository, itManagedExecution, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 /**
@@ -225,7 +225,7 @@ describe("publish fail-closed invariants", () => {
     ).rejects.toMatchObject({ code: "PROOF_REVIEW_FAILED" });
   });
 
-  it("succeeds once the canonical identity-bound proof is supplied", async () => {
+  itManagedExecution("succeeds once the canonical identity-bound proof is supplied", async () => {
     const repository = await installedTestRepository();
     const workspace = await workspacePrepare({
       cwd: repository.root,

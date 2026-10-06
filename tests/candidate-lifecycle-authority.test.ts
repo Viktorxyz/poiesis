@@ -40,7 +40,15 @@ import { serializeConfig } from "../src/config.js";
 import { loadManifest } from "../src/manifest.js";
 import { manifestDigest, removeOwnershipReceipt } from "../src/receipt.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository, verifiedProof } from "./helpers.js";
+import {
+  createTestRepository,
+  itManagedExecution,
+  proofShell,
+  publishEvidence,
+  testConfig,
+  type TestRepository,
+  verifiedProof,
+} from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 const repositories: TestRepository[] = [];
@@ -173,7 +181,7 @@ describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
     expect(authority.manifest.poiesisVersion).not.toBe("stale");
   }, 60_000);
 
-  it("verify executes against the exact candidate workspace while the authority comes from the primary installation", async () => {
+  itManagedExecution("verify executes against the exact candidate workspace while the authority comes from the primary installation", async () => {
     const repository = await installedRepository();
     const candidate = await ownedCandidateWithStaleGeneratedConfig(repository, "spec-verify");
 
@@ -189,7 +197,7 @@ describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
     expect(result.commands[1]?.exitCode).toBe(0);
   }, 60_000);
 
-  it("delivery operations from an owned candidate use the primary installation authority", async () => {
+  itManagedExecution("delivery operations from an owned candidate use the primary installation authority", async () => {
     const repository = await installedRepository();
     const candidate = await ownedCandidateWithStaleGeneratedConfig(repository, "spec-delivery");
     await publishCandidate(repository, candidate);
@@ -294,7 +302,7 @@ describe("CLI verify resolves the primary installation authority", () => {
     return { chunks, restore: () => { process.stdout.write = original; } };
   }
 
-  it("runs the PRIMARY verification commands for an owned candidate whose generated config is stale and candidate-tracked", async () => {
+  itManagedExecution("runs the PRIMARY verification commands for an owned candidate whose generated config is stale and candidate-tracked", async () => {
     const repository = await installedRepository();
     const candidate = await ownedCandidateWithStaleGeneratedConfig(repository, "spec-cli-verify");
     const { commandVerify } = await import("../src/cli.js");
