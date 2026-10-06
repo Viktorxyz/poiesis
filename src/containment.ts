@@ -213,6 +213,16 @@ function available(model: ContainmentModel, detail: string, parent: string | nul
  *
  * This is a REPORT, never a fallback: callers that require strong containment
  * either get `available: true` or a typed refusal before anything is spawned.
+ *
+ * Spec #168 / ticket #177: on the strong model the verdict is EARNED, not
+ * inferred. Where a hierarchy exists, the report still has to be able to create
+ * a leaf under it and find `cgroup.kill`, `cgroup.procs`, and `cgroup.events`
+ * there, and it proves exactly that on a transient probe leaf it removes again
+ * (see {@link probeProvisionable}). A readable `cgroup.controllers`, a resolvable
+ * path, and a directory are necessary but not sufficient, and reporting
+ * `available: true` without them would send every managed run on this host into
+ * a pre-spawn refusal it was told would succeed — or, worse, into a run that
+ * discovers the boundary cannot be provisioned only after a process exists.
  */
 export function resolveContainmentCapability(
   model: ContainmentModel = STRONG_CONTAINMENT_MODEL,
@@ -275,11 +285,92 @@ export function resolveContainmentCapability(
       `Poiesis cannot reach its own cgroup path ${parent} (${(error as NodeJS.ErrnoException).code ?? "unknown"}), so no delegated subtree is usable.`,
     );
   }
-  return available(
-    model,
-    `A delegated cgroup v2 subtree is available at ${parent}; managed leaves can be created, entered, killed, and confirmed empty there.`,
-    parent,
-  );
+  // Spec #168 / ticket #177: a readable hierarchy is not a usable one. The
+  // prerequisites that actually decide whether a managed run can be contained
+  // are the ones real provisioning performs — creating a leaf under the
+  // delegated parent and finding `cgroup.kill`, `cgroup.procs`, and
+  // `cgroup.events` in it — so the report PERFORMS them on a throwaway probe
+  // instead of asserting them from the shape of the hierarchy. A parent that
+  // cannot be written, or a kernel that exposes no atomic `cgroup.kill`, is
+  // reported unavailable here, before any process is spawned.
+  return probeProvisionable(model, parent);
+}
+
+/**
+ * Spec #168 / ticket #177 — the controls a managed leaf MUST expose.
+ *
+ * `cgroup.kill` is the atomic primitive cleanup depends on; without it, cleanup
+ * could only enumerate and signal members, which a fork between read and signal
+ * defeats. `cgroup.procs` is what admission confirms itself against, and
+ * `cgroup.events` is the authoritative emptiness fact settlement refuses to
+ * trade for anything weaker.
+ */
+const REQUIRED_LEAF_CONTROLS = ["cgroup.kill", "cgroup.procs", "cgroup.events"] as const;
+
+/**
+ * Spec #168 / ticket #177 — prove the provisioning prerequisites by doing them
+ * once, on a leaf that is removed again before this returns.
+ *
+ * Properties this deliberately has:
+ *
+ *   - FAITHFUL. It performs exactly what `provisionContainment` performs:
+ *     `mkdir` a leaf under the delegated parent, then require the three
+ *     controls. Nothing about the project, its files, or its state is read or
+ *     written, and nothing durable is created: the probe lives only in the
+ *     kernel's own cgroup tree and is `rmdir`'d in a `finally`, so even the
+ *     refusal path leaves no residue.
+ *   - BOUNDED. Every step is one synchronous local syscall — no polling, no
+ *     interval timer, no subprocess, no network — so the probe cannot itself
+ *     become an unbounded wait.
+ *   - RACE-SAFE. The probe leaf name carries this process's PID and a monotonic
+ *     counter, so two concurrent probes never collide on one directory and a
+ *     probe can never address, read, or remove another one's leaf. `mkdir`
+ *     itself is the atomic test: an existing name would be `EEXIST`, never a
+ *     silently shared directory.
+ *
+ * Real provisioning STILL revalidates every one of these facts for the leaf it
+ * actually provisions. The probe answers "can this host do it at all", never
+ * "this particular leaf is good", so the report can be a few microseconds stale
+ * without ever becoming a promise.
+ */
+function probeProvisionable(model: ContainmentModel, parent: string): ContainmentCapability {
+  leafCounter += 1;
+  const probe = join(parent, leafName("capability-probe"));
+  try {
+    mkdirSync(probe, { mode: 0o700 });
+  } catch (error) {
+    return unavailable(
+      model,
+      "PROVISION_FAILED",
+      `A managed cgroup leaf could not be created under the delegated subtree at ${parent} (${
+        (error as NodeJS.ErrnoException).code ?? "unknown"
+      }), so this runtime cannot provision strong containment here.`,
+      parent,
+    );
+  }
+  try {
+    for (const required of REQUIRED_LEAF_CONTROLS) {
+      if (existsSync(join(probe, required))) continue;
+      return unavailable(
+        model,
+        "NO_CGROUP_KILL",
+        `A leaf created under the delegated subtree at ${parent} exposes no ${required}, so managed leaves there can neither be confirmed nor settled.`,
+        parent,
+      );
+    }
+    return available(
+      model,
+      `A delegated cgroup v2 subtree is available at ${parent}; managed leaves can be created, entered, killed, and confirmed empty there.`,
+      parent,
+    );
+  } finally {
+    try {
+      rmdirSync(probe);
+    } catch {
+      // The probe is empty by construction, so this can only mean the kernel
+      // already reclaimed it. Never let cleanup change the reported verdict.
+    }
+  }
 }
 
 /**
@@ -333,10 +424,12 @@ export function provisionContainment(input: {
     );
   }
 
-  // `cgroup.kill` is the atomic primitive. Without it, cleanup could only
-  // enumerate and signal members, which a fork between read and signal defeats,
-  // so the leaf is not strong containment and the run must not start.
-  for (const required of ["cgroup.kill", "cgroup.procs", "cgroup.events"]) {
+  // Spec #168 / ticket #177: the capability report now PROVES these
+  // prerequisites on a throwaway probe leaf rather than asserting them, but the
+  // probe answers only "can this host do it at all". The leaf this run actually
+  // provisions is revalidated here, control by control, so a report that is even
+  // a few microseconds stale can never become a promise about it.
+  for (const required of REQUIRED_LEAF_CONTROLS) {
     if (existsSync(join(leaf, required))) continue;
     rmdirSync(leaf);
     throw containmentUnavailableError(

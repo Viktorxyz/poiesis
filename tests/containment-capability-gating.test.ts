@@ -21,11 +21,20 @@
  * show the gate reporting "unavailable" (so the gated suites skip) while the
  * pure assertions still produce their own typed outcomes.
  */
+import { readdirSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createTestRepository, strongContainmentAvailable } from "./helpers.js";
+import { resolveContainmentCapability, type ContainmentCapability } from "../src/containment.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  strongContainmentAvailable,
+} from "./helpers.js";
+
+/** The prefix every transient capability probe carries, so residue is detectable. */
+const PROBE_PREFIX = "poiesis-capability-probe-";
 
 /**
  * Make THIS host look like one with no delegated cgroup v2 subtree.
@@ -65,6 +74,97 @@ async function scratch(): Promise<string> {
   return dir;
 }
 
+/**
+ * Spec #168 / ticket #177 — answer the capability report's filesystem questions
+ * from a script instead of from this host, so the probe's own decisions are what
+ * is under test.
+ *
+ * `mkdir`/`rmdir` under the cgroup root are SIMULATED and recorded rather than
+ * performed: a host without a delegated subtree must be able to observe the
+ * refusal paths too, and it must be able to do so without this test creating a
+ * real directory on whatever host it happens to run on. Everything else passes
+ * through to the real `node:fs`.
+ */
+interface ProbeRecord {
+  readonly created: string[];
+  readonly removed: string[];
+}
+
+async function withCgroupFilesystem<T>(
+  overrides: {
+    unified?: string | null;
+    controllers?: boolean;
+    mkdir?: "deny";
+    hideControl?: string | null;
+  },
+  run: (probe: ProbeRecord) => Promise<T>,
+): Promise<T> {
+  const probe: ProbeRecord = { created: [], removed: [] };
+  vi.resetModules();
+  vi.doMock("node:fs", async () => {
+    const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const underCgroupRoot = (path: unknown): path is string =>
+      typeof path === "string" && path.startsWith("/sys/fs/cgroup/");
+    return {
+      ...actual,
+      existsSync: ((path: string, ...rest: unknown[]) => {
+        if (overrides.controllers !== undefined && path === "/sys/fs/cgroup/cgroup.controllers") {
+          return overrides.controllers;
+        }
+        if (overrides.hideControl != null && underCgroupRoot(path) && path.endsWith(`/${overrides.hideControl}`)) {
+          return false;
+        }
+        // A SIMULATED leaf: because `mkdir` below creates nothing on disk, the
+        // controls of a leaf it did create have to be answered here, or every
+        // probe would look like it found none of them.
+        if (underCgroupRoot(path)) {
+          const leaf = path.slice(0, path.lastIndexOf("/"));
+          if (probe.created.includes(leaf)) return true;
+        }
+        return Reflect.apply(actual.existsSync, undefined, [path, ...rest]) as boolean;
+      }) as typeof actual.existsSync,
+      statSync: ((path: string, ...rest: unknown[]) => {
+        if (path === "/sys/fs/cgroup") {
+          return { isDirectory: () => true } as unknown as ReturnType<typeof actual.statSync>;
+        }
+        return Reflect.apply(actual.statSync, undefined, [path, ...rest]) as ReturnType<typeof actual.statSync>;
+      }) as typeof actual.statSync,
+      readFileSync: ((path: string, ...rest: unknown[]) => {
+        if (path === "/proc/self/cgroup") {
+          if (overrides.unified === null) {
+            throw Object.assign(new Error("no unified cgroup v2 line"), { code: "ENOENT" });
+          }
+          return overrides.unified ?? "0::/\n";
+        }
+        return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
+      }) as typeof actual.readFileSync,
+      mkdirSync: ((path: string, ...rest: unknown[]) => {
+        if (underCgroupRoot(path)) {
+          probe.created.push(path);
+          if (overrides.mkdir === "deny") {
+            throw Object.assign(new Error("read-only file system"), { code: "EROFS" });
+          }
+          return undefined;
+        }
+        return Reflect.apply(actual.mkdirSync, undefined, [path, ...rest]) as unknown;
+      }) as typeof actual.mkdirSync,
+      rmdirSync: ((path: string, ...rest: unknown[]) => {
+        if (underCgroupRoot(path)) {
+          probe.removed.push(path);
+          return undefined;
+        }
+        return Reflect.apply(actual.rmdirSync, undefined, [path, ...rest]) as unknown;
+      }) as typeof actual.rmdirSync,
+    };
+  });
+  try {
+    return await run(probe);
+  } finally {
+    vi.doUnmock("node:fs");
+    vi.resetModules();
+  }
+}
+
 afterEach(async () => {
   vi.doUnmock("node:fs");
   vi.resetModules();
@@ -72,11 +172,25 @@ afterEach(async () => {
 });
 
 describe("the shared gate reports the host capability (Spec #168 / ticket #176)", () => {
-  it("is true on a host that can strongly contain a managed command", () => {
-    // Whatever this host is, the gate must equal the capability report exactly:
-    // a gate that disagrees with the code it protects would either hide a real
-    // failure or skip a suite that could have run.
-    expect(strongContainmentAvailable()).toBe(true);
+  it("equals the capability report exactly, on whatever host this is", () => {
+    // Spec #168 / ticket #177: the gate is not allowed to have an opinion of
+    // its own. A gate that hard-codes an answer would either skip a suite that
+    // could have run or — far worse — run a suite on a host that cannot contain
+    // anything, reporting the HOST's missing capability as a code regression.
+    // Whatever this host is, the gate is exactly what the code it protects
+    // reports.
+    expect(strongContainmentAvailable()).toBe(resolveContainmentCapability().available);
+  });
+
+  it("reports whatever the report says, and gates managed execution on it", async () => {
+    // The two consequences of the equality above, stated as observable
+    // behaviour rather than restated as an implementation: on this host the
+    // gate is whatever the report says, and every managed-execution suite in the
+    // repository is declared through that one predicate.
+    const capability: ContainmentCapability = resolveContainmentCapability();
+    expect(strongContainmentAvailable()).toBe(capability.available);
+    expect(capability.available).toBe(capability.reason === null);
+    expect(capability.model).toBe("cgroup-v2");
   });
 
   it("is false on a host with no delegated cgroup v2 subtree, so gated suites skip", async () => {
@@ -196,6 +310,134 @@ describe("execution-dependent paths refuse on a capability-unavailable host (Spe
     // command ran, and nothing reported a pass or a proof of any kind.
     expect(observed.result).toBeNull();
     expect((observed.error as { code?: string } | null)?.code).toBeDefined();
+  });
+});
+
+describe("the capability report earns its verdict (Spec #168 / ticket #177)", () => {
+  // These answer the report from a scripted cgroup filesystem, so they describe
+  // the probe's decisions rather than this host's kernel — and they therefore
+  // say the same thing on every host.
+  it("reports unavailable when a managed leaf cannot be CREATED under a readable hierarchy", async () => {
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true, mkdir: "deny" },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        return { capability: containment.resolveContainmentCapability(), probe };
+      },
+    );
+
+    // A readable `cgroup.controllers`, a resolvable path, and a directory are
+    // necessary but NOT sufficient: this parent cannot host a managed leaf, so
+    // every managed run on this host would refuse inside `provisionContainment`
+    // after the report had promised it would work.
+    expect(observed.capability).toMatchObject({
+      model: "cgroup-v2",
+      available: false,
+      reason: "PROVISION_FAILED",
+    });
+    expect(observed.capability.detail).toContain("EROFS");
+    // It really did try: the answer came from performing the provisioning step
+    // on a leaf of its own, not from reading the hierarchy.
+    expect(observed.probe.created).toHaveLength(1);
+    expect(observed.probe.created[0]).toContain(PROBE_PREFIX);
+  });
+
+  it("reports unavailable when the leaf it created exposes no cgroup.kill", async () => {
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true, hideControl: "cgroup.kill" },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        return { capability: containment.resolveContainmentCapability(), probe };
+      },
+    );
+
+    expect(observed.capability).toMatchObject({
+      model: "cgroup-v2",
+      available: false,
+      reason: "NO_CGROUP_KILL",
+    });
+    expect(observed.capability.detail).toContain("cgroup.kill");
+    // The refusal path removes its probe too, so a host that answers "no" is
+    // not left holding a directory it just said it cannot use.
+    expect(observed.probe.removed).toEqual(observed.probe.created);
+    expect(observed.probe.removed[0]).toContain(PROBE_PREFIX);
+  });
+
+  it.each(["cgroup.procs", "cgroup.events"])("reports unavailable when a leaf exposes no %s", async (control) => {
+    // Every required control is checked, not just the one settlement happens to
+    // read: `cgroup.procs` is what admission confirms itself against and
+    // `cgroup.events` is what settlement refuses to trade for anything weaker,
+    // so a host missing either cannot host a managed leaf either.
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true, hideControl: control },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        return { capability: containment.resolveContainmentCapability(), probe };
+      },
+    );
+
+    expect(observed.capability).toMatchObject({ available: false, reason: "NO_CGROUP_KILL" });
+    expect(observed.capability.detail).toContain(control);
+    expect(observed.probe.removed).toEqual(observed.probe.created);
+  });
+
+  it("reports available, and still removes the probe, when every prerequisite holds", async () => {
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        return { capability: containment.resolveContainmentCapability(), probe };
+      },
+    );
+
+    expect(observed.capability).toMatchObject({ model: "cgroup-v2", available: true, reason: null });
+    expect(observed.probe.created).toHaveLength(1);
+    expect(observed.probe.removed).toEqual(observed.probe.created);
+  });
+
+  it("gives two probes distinct leaf names, so concurrent probes cannot collide", async () => {
+    // `mkdir` is the atomic test: a shared name would be `EEXIST`, never a
+    // silently shared directory. The name therefore carries this process's PID
+    // and a monotonic counter, and two calls never repeat one.
+    const observed = await withCgroupFilesystem(
+      { unified: "0::/\n", controllers: true },
+      async (probe) => {
+        const containment = await import("../src/containment.js");
+        containment.resolveContainmentCapability();
+        containment.resolveContainmentCapability();
+        return probe;
+      },
+    );
+
+    expect(observed.created).toHaveLength(2);
+    expect(new Set(observed.created).size).toBe(2);
+  });
+
+  it("still reports unavailable before touching the hierarchy when there is no unified cgroup v2 at all", async () => {
+    // The probe is only reached once a real hierarchy exists; the cheaper
+    // refusals stay refusals.
+    const observed = await withCgroupFilesystem({ unified: null }, async (probe) => {
+      const containment = await import("../src/containment.js");
+      return { capability: containment.resolveContainmentCapability(), probe };
+    });
+
+    expect(observed.capability).toMatchObject({ available: false, reason: "NO_CGROUP_V2" });
+    expect(observed.probe.created).toEqual([]);
+  });
+});
+
+describeManagedExecution("capability probing leaves no residue (Spec #168 / ticket #177)", () => {
+  it("removes its own probe leaf from the delegated subtree", () => {
+    const capability = resolveContainmentCapability();
+    expect(capability.available).toBe(true);
+    expect(capability.parent).not.toBeNull();
+
+    // The probe is transient: it lives only in the kernel's cgroup tree and is
+    // removed again before the report returns, so a probe can never accumulate
+    // under the delegated parent or become something a managed run inherits.
+    resolveContainmentCapability();
+    const residue = readdirSync(capability.parent!).filter((entry) => entry.startsWith(PROBE_PREFIX)).sort();
+    expect(residue).toEqual([]);
   });
 });
 

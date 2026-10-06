@@ -498,6 +498,23 @@ export interface CheckStateFingerprint {
   pathDigestsTruncated: boolean;
 }
 
+/**
+ * Spec #168 / ticket #177 — the bounded, typed cause of one rejected command.
+ *
+ * Read field by field out of the runner's own rejection details, so a
+ * caller-shaped value is never trusted wholesale: an absent or non-string field
+ * becomes `null` evidence rather than a fabricated one. Only the four fields
+ * that make a containment refusal actionable are carried, and none of them is
+ * unbounded output.
+ */
+export interface FocusedFailureCause {
+  readonly containment: string | null;
+  readonly platform: string | null;
+  readonly reason: string | null;
+  readonly detail: string | null;
+  readonly remediation: string | null;
+}
+
 /** One focused command's complete bounded evidence. */
 export interface FocusedCommandEvidence {
   index: number;
@@ -515,6 +532,21 @@ export interface FocusedCommandEvidence {
    * `COMMAND_CANCELLED` from `PROCESS_CONTAINMENT_UNAVAILABLE` here.
    */
   failureCode: string | null;
+  /**
+   * Spec #168 / ticket #177 — the bounded CAUSE of a rejection that never
+   * produced a result.
+   *
+   * `failureCode` names which refusal happened; this says why, in the
+   * runtime's own words, so the public surface can rethrow an actionable
+   * `PROCESS_CONTAINMENT_UNAVAILABLE` or `PROCESS_CONTAINMENT_REFUSED` with
+   * its `reason`, `platform`, `detail`, and `remediation` intact instead of
+   * collapsing it into a generic failed check that names none of them.
+   *
+   * Every field is a Poiesis-owned string or `null`, so nothing caller-supplied
+   * — no command text, no output, no path beyond the ones the refusal itself
+   * already reports — can reach it.
+   */
+  failureCause: FocusedFailureCause | null;
   exitCode: number | null;
   signal: string | null;
   durationMs: number;
@@ -871,6 +903,7 @@ async function runFocusedCommand(input: FocusedCommandInput): Promise<FocusedCom
           pressure,
         }),
     failureCode: failure?.code ?? null,
+    failureCause: failure === null ? null : readFailureCause(failure.details),
     exitCode,
     signal,
     durationMs,
@@ -889,6 +922,31 @@ function rawString(details: Record<string, unknown>, key: string, fallback: stri
   const value = details[key];
   if (typeof value === "string") return value;
   return fallback ?? "";
+}
+
+/**
+ * Spec #168 / ticket #177 — project the runner's own refusal details into the
+ * bounded cause a focused record carries.
+ *
+ * `null` for the whole record when the rejection carried none of these strings,
+ * which is the common case (a cancellation or a cleanup failure says nothing
+ * about the containment capability) and keeps the field from implying a
+ * containment story that was never told.
+ */
+function readFailureCause(details: Record<string, unknown>): FocusedFailureCause | null {
+  const cause: Record<string, string> = {};
+  for (const key of ["containment", "platform", "reason", "detail", "remediation"] as const) {
+    const value = details[key];
+    if (typeof value === "string" && value.length > 0) cause[key] = value;
+  }
+  if (Object.keys(cause).length === 0) return null;
+  return {
+    containment: cause.containment ?? null,
+    platform: cause.platform ?? null,
+    reason: cause.reason ?? null,
+    detail: cause.detail ?? null,
+    remediation: cause.remediation ?? null,
+  };
 }
 
 /**

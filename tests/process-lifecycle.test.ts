@@ -645,18 +645,24 @@ describe.skipIf(process.platform === "win32")("bounded rejection when managed cl
     args: string[],
     options: Parameters<typeof run>[2],
     afterStart?: () => Promise<void>,
-  ): Promise<{ outcome: RunOutcome | null; elapsedMs: number }> {
+  ): Promise<{
+    outcome: RunOutcome | null;
+    elapsedMs: number;
+    handlesBefore: number;
+    handlesAfter: number;
+  }> {
     const probe = process.kill.bind(process);
     const killSpy = vi.spyOn(process, "kill").mockImplementation(((pid: number, signal?: string | number) => {
       if (signal === 0) return pid < 0 ? true : probe(pid, 0);
       return true;
     }) as typeof process.kill);
     try {
+      const handlesBefore = ownedHandleCount();
       const startedAt = Date.now();
       const invocation = run(command, args, options);
       if (afterStart !== undefined) await afterStart();
       const outcome = await settleWithin(invocation, UNRESOLVED_BOUND_MS);
-      return { outcome, elapsedMs: Date.now() - startedAt };
+      return { outcome, elapsedMs: Date.now() - startedAt, handlesBefore, handlesAfter: ownedHandleCount() };
     } finally {
       killSpy.mockRestore();
     }
@@ -745,6 +751,68 @@ describe.skipIf(process.platform === "win32")("bounded rejection when managed cl
     // its process handle, even though the child itself is still alive.
     expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
     expect(isSameProcess(live!.pid, live!.startTime)).toBe(true);
+    await waitForHandlesAtOrBelow(observed.handlesBefore);
+    expect(ownedHandleCount()).toBeLessThanOrEqual(observed.handlesBefore);
+  });
+
+  /**
+   * Spec #168 / ticket #177 — the leader is GONE and the cleanup still refuses,
+   * which is the case that used to leave the runtime holding the descendant's
+   * pipes.
+   *
+   * `childExited` and "cleanup failed" are independent facts. A leader that has
+   * exited can still have left a descendant holding the inherited stdout and
+   * stderr, and those two open pipes are precisely what keeps a Node process
+   * alive after a run that has already given up. Releasing runtime-owned
+   * handles used to be conditioned on the child still being live, so exactly
+   * this shape settled with its cleanup error while still holding them.
+   */
+  it("releases the pipes a leaked descendant still holds when cleanup is refused after the leader exited", { timeout: 40_000 }, async () => {
+    // No `detachOutput`: the descendant inherits and keeps both pipes open, so
+    // the run cannot see the command as finished and settles the group through
+    // the linger window instead.
+    const { dir, parent, pidFile } = await stageLeakyTree({});
+    const observed = await runRefusingCleanup(parent, [], { cwd: dir, timeoutMs: 60_000 });
+
+    const descendantPid = await waitForPid(pidFile);
+    const startTime = startTimeOf(descendantPid);
+    tracked.set(descendantPid, startTime);
+
+    // Bounded, and typed: the leader exiting changes neither the refusal nor
+    // the requirement that the run settles instead of waiting for an `exit` no
+    // further signal can cause.
+    expect(observed.outcome).not.toBeNull();
+    expect(observed.elapsedMs).toBeLessThan(REFUSAL_BOUND_MS);
+    expect(observed.outcome).toMatchObject({
+      ok: false,
+      error: { code: "PROCESS_CLEANUP_REFUSED", details: { reason: "IDENTITY_AMBIGUOUS" } },
+    });
+    // Refused is still unconfirmed, so nothing was signalled — and the
+    // surviving descendant is exactly why that is the honest outcome.
+    expect(observed.signalsSent).toEqual([]);
+    expect(isSameProcess(descendantPid, startTime)).toBe(true);
+    // The regression: the pipes the descendant still holds do not outlive the
+    // rejection as runtime handles.
+    await waitForHandlesAtOrBelow(observed.handlesBefore);
+    expect(ownedHandleCount()).toBeLessThanOrEqual(observed.handlesBefore);
+  });
+
+  it("releases those same handles when the leader's cleanup is UNRESOLVED instead", { timeout: 40_000 }, async () => {
+    const { dir, parent, pidFile } = await stageLeakyTree({});
+    const observed = await runWithUndeliverableSignals(parent, [], { cwd: dir, timeoutMs: 60_000 });
+
+    const descendantPid = await waitForPid(pidFile);
+    const startTime = startTimeOf(descendantPid);
+    tracked.set(descendantPid, startTime);
+
+    expect(observed.outcome).toMatchObject({
+      ok: false,
+      error: { code: "PROCESS_CLEANUP_UNRESOLVED", details: { confirmed: false } },
+    });
+    expect(observed.elapsedMs).toBeLessThan(UNRESOLVED_BOUND_MS);
+    // Nothing could be removed, so the descendant this run leaked is still the
+    // same live process — and the run still finished and let go of its handles.
+    expect(isSameProcess(descendantPid, startTime)).toBe(true);
     await waitForHandlesAtOrBelow(observed.handlesBefore);
     expect(ownedHandleCount()).toBeLessThanOrEqual(observed.handlesBefore);
   });

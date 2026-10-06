@@ -314,6 +314,18 @@ export async function run(command: string, args: string[], options: RunOptions):
     let timedOut = false;
     let cancelled = false;
     let cleanupError: PoiesisError | null = null;
+    /**
+     * Spec #168 / ticket #177 — an admission refusal, kept SEPARATE from
+     * {@link cleanupError}.
+     *
+     * Both mean "nothing may report a settled run", but they are not the same
+     * fact and neither may hide the other. A cleanup failure recorded after a
+     * refusal means a member of a boundary Poiesis owned may still be running,
+     * which is the stronger claim and therefore the one reported; the refusal
+     * is carried forward on that error as context instead of being dropped, and
+     * is reported on its own whenever cleanup could confirm the boundary.
+     */
+    let containmentRefusal: PoiesisError | null = null;
     /** True once the managed group was cleaned (or refused). Never earlier. */
     let cleanupComplete = false;
     let cleanupStarted = false;
@@ -374,8 +386,17 @@ export async function run(command: string, args: string[], options: RunOptions):
       // A refused or unresolved cleanup outranks every other outcome: it
       // means a process Poiesis spawned may still be running, so the run
       // must not report success, failure, or cancellation as settled.
-      if (cleanupError !== null) {
-        reject(cleanupError);
+      //
+      // Spec #168 / ticket #177: an unconfirmed admission is the same class of
+      // fact — nothing may report success, failure, timeout, or cancellation
+      // for a run whose containment was never proven — so it shares that slot.
+      // A cleanup failure recorded after the refusal still wins: "Poiesis could
+      // not confirm it stopped what it started" is the surviving-process fact an
+      // operator has to act on, and the refusal travels with it as context
+      // rather than being dropped or masking it.
+      const refusal = cleanupError ?? containmentRefusal;
+      if (refusal !== null) {
+        reject(withContainmentRefusalContext(refusal, containmentRefusal));
         return;
       }
       if (cancelled) {
@@ -457,12 +478,15 @@ export async function run(command: string, args: string[], options: RunOptions):
      * Release the runtime resources this run owns, so a bounded rejection is
      * not itself a way to leave Node blocked.
      *
-     * Only the ends Poiesis opened are closed here. The child is deliberately
-     * NOT signalled, killed, or escalated: a refused or unresolved cleanup
-     * means its identity is unconfirmed, so any further signal — by group or
-     * by the still-held PID — could reach an unrelated process that inherited
-     * it. Holding a handle on a process Poiesis proved it could not touch
-     * would just extend the same unbounded wait the rejection ends.
+     * Only the ends Poiesis opened are closed here, and this happens on EVERY
+     * cleanup error — including one recorded after the child exited, because an
+     * inherited pipe still open on a leaked descendant is exactly the handle
+     * that would keep Node blocked. The child is deliberately NOT signalled,
+     * killed, or escalated: a refused or unresolved cleanup means its identity
+     * is unconfirmed, so any further signal — by group or by the still-held PID
+     * — could reach an unrelated process that inherited it. Holding a handle on
+     * a process Poiesis proved it could not touch would just extend the same
+     * unbounded wait the rejection ends.
      */
     const releaseOwnedResources = (): void => {
       releaseChildHandles(child, contained);
@@ -518,6 +542,19 @@ export async function run(command: string, args: string[], options: RunOptions):
         // Neither a lease nor Windows: the spawn produced no process, so
         // there is nothing to clean up before settling.
         cleanupComplete = true;
+        // Spec #168 / ticket #177: EVERY cleanup error releases the runtime
+        // handles this run owns before it settles or rejects — no longer only
+        // the case where the child was still live. The two are independent: a
+        // leader that already exited can still leave a DESCENDANT holding the
+        // inherited stdout/stderr, and those open pipes are precisely what
+        // would keep Node blocked after a run that has already given up. A
+        // bounded rejection must not be a way to leave the runtime holding
+        // handles for a process Poiesis can no longer reach.
+        if (cleanupError !== null) {
+          releaseOwnedResources();
+          settle();
+          return;
+        }
         // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
         // fix: it could not prove the target was still the process Poiesis
         // leased, so nothing was signalled and the child is still running.
@@ -526,11 +563,6 @@ export async function run(command: string, args: string[], options: RunOptions):
         // loses the typed cleanup error. Settle now with that original error —
         // it outranks timeout, cancellation, infrastructure, and exit code
         // because a process Poiesis spawned may still be running.
-        if (cleanupError !== null && !childExited) {
-          releaseOwnedResources();
-          settle();
-          return;
-        }
         tryFinalize();
       })();
       return cleanupInFlight;
@@ -549,33 +581,41 @@ export async function run(command: string, args: string[], options: RunOptions):
      * and escalation never stops early because a phase REPORTED SUCCESS.
      * `taskkill /T` exits 0 for trees it never reached, so a graceful success is
      * a claim about the request, not about the process; if the child has not
-     * exited when the claim is made, the forced phase still runs, then
-     * `child.kill`, and only then is the run refused. When nothing confirmed the
-     * exit, the run must say so: signalling success, a timeout, or a cancellation
-     * would describe a settled run while the process Poiesis spawned is still
-     * running.
+     * exited when the claim is made, the forced phase still runs, and so does
+     * the `child.kill` this runner already holds a handle for. Only then is the
+     * run refused, and it says exactly that: signalling success, a timeout, or a
+     * cancellation would describe a settled run while the process Poiesis
+     * spawned is still running.
+     *
+     * Spec #168 / ticket #177: `child.kill` is no longer conditioned on what
+     * `taskkill` reported. Both taskkill phases reporting success is evidence
+     * about two REQUESTS, and the only evidence about the process is still the
+     * absence of an `exit`, so the escalation that costs nothing but a bounded
+     * wait is always taken. Every PID-directed step is gated on the child not
+     * having exited: once that PID has been reaped it may already be recycled,
+     * and addressing it — for a normal completion, for the linger window, or
+     * for this cleanup — could kill an unrelated process.
      */
     const terminateWindowsTree = async (): Promise<void> => {
       const pid = child.pid;
-      if (pid === undefined) return;
-      const gracefulSucceeded = await runTaskkill(pid);
-      // A PID is meaningful only while it is still the process Poiesis spawned.
-      // Every escalation below is therefore gated on the child not having
-      // exited, so a reused PID is never addressed.
+      if (pid === undefined || settled || childExited) return;
+      await runTaskkill(pid);
       if (await waitForChildExit(WINDOWS_CLEANUP_PHASE_MS)) return;
       if (settled || childExited) return;
       // The forced phase is attempted whether or not the graceful one reported
       // success: exit 0 from `taskkill` is a claim about the request, and the
       // child is still running.
-      const forcedSucceeded = await runTaskkill(pid, true);
+      await runTaskkill(pid, true);
       if (await waitForChildExit(WINDOWS_CLEANUP_PHASE_MS)) return;
       if (settled || childExited) return;
-      if (!(gracefulSucceeded || forcedSucceeded)) {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          // Best effort after both taskkill phases failed.
-        }
+      // The last phase is the handle this runner still holds, so it is eligible
+      // for exactly as long as the child has not exited — and eligible
+      // regardless of what either taskkill claimed.
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Best effort: the handle may have gone already. Whether it worked is
+        // decided below by the one observation this runner can actually make.
       }
       if (await waitForChildExit(WINDOWS_CLEANUP_CONFIRM_MS)) return;
       if (settled || childExited) return;
@@ -654,15 +694,21 @@ export async function run(command: string, args: string[], options: RunOptions):
             // A refused admission is a cleanup-class failure, so it keeps the
             // same priority a refused cleanup has: nothing may report success,
             // failure, timeout, or cancellation for a run whose containment was
-            // never proven. It is recorded with `??=` for the same reason every
-            // other cleanup error is: the FIRST fact recorded is the one the
-            // operator has to act on, and an earlier failure is not replaced by a
-            // refusal that happened to be detected later.
-            cleanupError ??= asPoiesisError(error);
-            try {
-              child.kill("SIGKILL");
-            } catch {
-              // Best effort; the process never left Poiesis's hands.
+            // never proven. It is held in its OWN slot rather than folded into
+            // `cleanupError` (see `containmentRefusal`): a settlement failure
+            // recorded below it is the stronger surviving-process fact, and
+            // folding the refusal in first would let it hide that failure
+            // entirely.
+            containmentRefusal = asPoiesisError(error);
+            // Spec #168 / ticket #177: never signal a PID that has been
+            // reaped. A refusal whose child already exited is exactly the case
+            // where `child.kill` would address whatever inherited the PID.
+            if (!childExited) {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // Best effort; the process never left Poiesis's hands.
+              }
             }
             // Installed BEFORE the await below: a late spawn error arriving while
             // the boundary settles would otherwise be an unhandled `error` event.
@@ -1036,6 +1082,30 @@ function releaseChildHandles(child: ChildProcess, contained: boolean): void {
   } catch {
     // The process handle may already be gone.
   }
+}
+
+/**
+ * Spec #168 / ticket #177 — carry an admission refusal forward as bounded
+ * context on the error that IS reported.
+ *
+ * When cleanup could confirm the boundary, the refusal is reported on its own
+ * and nothing is added. When cleanup could NOT confirm it, the cleanup failure
+ * is the stronger claim — a member of a boundary Poiesis owned may still be
+ * running — and it is reported with the refusal attached, so the operator still
+ * learns that admission was never confirmed without either fact hiding the
+ * other. Only bounded, Poiesis-owned strings are copied; the refusal's own
+ * details stay where they are.
+ */
+function withContainmentRefusalContext(failure: PoiesisError, refusal: PoiesisError | null): PoiesisError {
+  if (refusal === null || failure.code === refusal.code) return failure;
+  if (failure.details.containmentRefusal !== undefined) return failure;
+  const detail = refusal.details;
+  failure.details.containmentRefusal = {
+    code: refusal.code,
+    ...(typeof detail.reason === "string" ? { reason: detail.reason } : {}),
+    ...(typeof detail.detail === "string" ? { detail: detail.detail } : {}),
+  };
+  return failure;
 }
 
 /**

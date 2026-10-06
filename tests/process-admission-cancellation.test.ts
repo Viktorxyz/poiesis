@@ -344,9 +344,35 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
     expect(admission.kills).not.toHaveLength(0);
   });
 
-  it("keeps the refusal as the reported outcome when the refusal's own cleanup fails", { timeout: 60_000 }, async () => {
+  it("never signals a PID that was already reaped when the admission is refused", { timeout: 60_000 }, async () => {
     const probe = newProbe();
-    probe.settleFails = true;
+    mockContainment(probe);
+    // The prologue finished without ever reporting — the case where the child
+    // is ALREADY gone by the time the refusal is decided. Signalling it here
+    // would address whatever inherited that PID, which is the one thing the
+    // admission barrier must never do.
+    const admission = scriptAdmissionChild(({ child, report }) => {
+      child.emit("exit", 0, null);
+      report.end();
+    });
+
+    const managed = await import("../src/managed-shell.js");
+    const startedAt = Date.now();
+    await expect(
+      managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" }),
+    ).rejects.toMatchObject({
+      code: "PROCESS_CONTAINMENT_REFUSED",
+      details: { reason: "ADMISSION_UNCONFIRMED", confirmed: false },
+    });
+    expect(Date.now() - startedAt).toBeLessThan(ADMISSION_BOUND_MS);
+    expect(admission.kills).toEqual([]);
+    // The refusal still settles the boundary it provisioned.
+    expect(probe.settled).toEqual([FAKE_LEAF]);
+    expect(probe.released).toEqual([FAKE_LEAF]);
+  });
+
+  it("keeps the refusal as the reported outcome when the refusal's own cleanup confirms the boundary", { timeout: 60_000 }, async () => {
+    const probe = newProbe();
     mockContainment(probe);
     scriptAdmissionChild(({ report }) => {
       report.end();
@@ -357,5 +383,48 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
       managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" }),
     ).rejects.toMatchObject({ code: "PROCESS_CONTAINMENT_REFUSED" });
     expect(probe.settled).toEqual([FAKE_LEAF]);
+  });
+
+  /**
+   * Spec #168 / ticket #177 — when the boundary Poiesis OWNED cannot be
+   * confirmed empty, that failure is the reported outcome.
+   *
+   * The refusal explains why the boundary was in play; the settlement failure
+   * says a member of it may still be running. The second is the surviving-process
+   * fact an operator has to act on, so it is reported — with the refusal
+   * carried forward as context rather than dropped, so neither fact hides the
+   * other.
+   */
+  it("lets an unresolved settlement dominate the refusal without masking it", { timeout: 60_000 }, async () => {
+    const probe = newProbe();
+    probe.settleFails = true;
+    mockContainment(probe);
+    scriptAdmissionChild(({ report }) => {
+      report.end();
+    });
+
+    const managed = await import("../src/managed-shell.js");
+    let error: unknown = null;
+    try {
+      await managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" });
+    } catch (thrown) {
+      error = thrown;
+    }
+
+    expect(error).toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: { confirmed: false },
+    });
+    const details = (error as { details: Record<string, unknown> }).details;
+    // The refusal is preserved as bounded context, not as the outcome.
+    expect(details.containmentRefusal).toMatchObject({
+      code: "PROCESS_CONTAINMENT_REFUSED",
+      reason: "ADMISSION_UNCONFIRMED",
+    });
+    // And the surviving-process evidence the cleanup error itself carries is
+    // untouched by the refusal being present.
+    expect(details.populated).toBe(true);
+    expect(probe.settled).toEqual([FAKE_LEAF]);
+    expect(probe.released).toEqual([FAKE_LEAF]);
   });
 });

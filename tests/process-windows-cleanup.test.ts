@@ -81,8 +81,9 @@ async function runAsWindows(
     forceTerminateOnForcedTaskkill?: boolean;
     forceTerminateOnGracefulTaskkill?: boolean;
   },
-): Promise<{ taskkillCalls: string[][]; run: () => Promise<never> }> {
+): Promise<{ taskkillCalls: string[][]; childKillCalls: () => number; run: () => Promise<never> }> {
   const taskkillCalls: string[][] = [];
+  const observed = { childKillCalls: 0 };
   vi.resetModules();
   vi.doMock("node:child_process", async () => {
     const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
@@ -91,8 +92,23 @@ async function runAsWindows(
       spawn: ((...spawnArgs: unknown[]) => {
         if (spawnArgs[0] !== "taskkill") {
           const child = Reflect.apply(actual.spawn, undefined, spawnArgs) as ChildProcess;
+          // The last escalation phase is COUNTED either way, so a test can prove
+          // it was reached exactly once — and not reached at all once the child
+          // has already exited.
           if (script.neutralizeChildKill) {
-            Object.defineProperty(child, "kill", { configurable: true, value: () => false });
+            Object.defineProperty(child, "kill", {
+              configurable: true,
+              value: () => {
+                observed.childKillCalls += 1;
+                return false;
+              },
+            });
+          } else {
+            const deliver = child.kill.bind(child);
+            child.kill = ((signal?: NodeJS.Signals) => {
+              observed.childKillCalls += 1;
+              return deliver(signal);
+            }) as ChildProcess["kill"];
           }
           return child;
         }
@@ -122,6 +138,9 @@ async function runAsWindows(
   Object.defineProperty(process, "platform", ORIGINAL_PLATFORM);
   return {
     taskkillCalls,
+    // A read, not a snapshot: destructuring a getter would freeze the count at
+    // zero, before the run has reached its escalation at all.
+    childKillCalls: () => observed.childKillCalls,
     run: () => mocked.run(process.execPath, args, options) as Promise<never>,
   };
 }
@@ -323,7 +342,7 @@ describe("Windows escalation does not trust a reported success (Spec #168 / tick
 
   it("does not address the PID again once the graceful taskkill really did end the child", { timeout: 60_000 }, async () => {
     const dir = await scratch("poiesis-win-no-second-pid-");
-    const { taskkillCalls, run: invoke } = await runAsWindows(
+    const { taskkillCalls, childKillCalls, run: invoke } = await runAsWindows(
       LIVE_CHILD,
       { cwd: dir, timeoutMs: 250 },
       {
@@ -338,5 +357,66 @@ describe("Windows escalation does not trust a reported success (Spec #168 / tick
     // The PID has been reaped. A second `/PID` call would be addressing whatever
     // inherited it, which is the one thing the Windows path must never do.
     expect(taskkillCalls).toEqual([["/PID", expect.any(String), "/T"]]);
+    // Same rule for the phase that needs no PID: once the child has exited, the
+    // escalation must not reach `child.kill` either.
+    expect(childKillCalls()).toBe(0);
+  });
+
+  /**
+   * Spec #168 / ticket #177 — escalation no longer stops on a reported success.
+   *
+   * Both `taskkill` phases exiting 0 is evidence about two REQUESTS, and the
+   * only evidence this runner holds about the PROCESS is that its `exit` event
+   * never arrived. So the `child.kill` it still holds a handle for is attempted
+   * regardless of what `taskkill` claimed, followed by the same bounded
+   * confirmation every other phase gets, and only then the unresolved refusal.
+   */
+  it("attempts child.kill after two taskkill phases that both reported success", { timeout: 60_000 }, async () => {
+    const dir = await scratch("poiesis-win-kill-after-success-");
+    const { taskkillCalls, childKillCalls, run: invoke } = await runAsWindows(
+      LIVE_CHILD,
+      { cwd: dir, timeoutMs: 250 },
+      { gracefulTaskkillExit: 0, forcedTaskkillExit: 0, neutralizeChildKill: true },
+    );
+
+    const startedAt = Date.now();
+    await expect(invoke()).rejects.toMatchObject({
+      code: "PROCESS_CLEANUP_UNRESOLVED",
+      details: {
+        confirmed: false,
+        containment: "process-group",
+        platform: "win32",
+        // The report names exactly what was attempted, and every phase of it
+        // really was attempted.
+        phases: ["taskkill", "taskkill /F", "child.kill"],
+      },
+    });
+    expect(Date.now() - startedAt).toBeLessThan(UNRESOLVED_BOUND_MS);
+    expect(taskkillCalls).toEqual([
+      ["/PID", expect.any(String), "/T"],
+      ["/PID", expect.any(String), "/T", "/F"],
+    ]);
+    expect(childKillCalls()).toBeGreaterThan(0);
+  });
+
+  /**
+   * The same sequence, but the third phase DOES work: the run reports the
+   * timeout that triggered the cleanup, never a cleanup error, and never a
+   * success for a process it had to force.
+   */
+  it("reports the triggering timeout when child.kill is what finally ends the child", { timeout: 60_000 }, async () => {
+    const dir = await scratch("poiesis-win-kill-works-");
+    const { taskkillCalls, childKillCalls, run: invoke } = await runAsWindows(
+      LIVE_CHILD,
+      { cwd: dir, timeoutMs: 250 },
+      { gracefulTaskkillExit: 0, forcedTaskkillExit: 0, neutralizeChildKill: false },
+    );
+
+    // `child.kill` is the real `ChildProcess.kill` here, so the last phase
+    // terminates the tree and the bounded confirmation observes the exit.
+    await expect(invoke()).rejects.toMatchObject({ code: "COMMAND_TIMEOUT" });
+    expect(taskkillCalls).toHaveLength(2);
+    // Exactly once: no retry, and no further PID-directed step afterwards.
+    expect(childKillCalls()).toBe(1);
   });
 });

@@ -18,8 +18,11 @@
  * before the result is returned.
  */
 import { readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import type { ChildProcess } from "node:child_process";
 import { isAbsolute, join, resolve } from "node:path";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { workspacePrepare, type WorkspaceIdentity } from "../src/git.js";
 import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
@@ -709,4 +712,199 @@ describe("poiesis check CLI seam (Spec #168 / ticket #172)", () => {
       code: "WORKSPACE_OWNERSHIP_UNKNOWN",
     });
   }, 60_000);
+});
+
+/**
+ * Spec #168 / ticket #177 — a containment refusal is not a failed check.
+ *
+ * `poiesis check` executes caller-supplied command TEXT, which is the surface
+ * that requires strong process containment, and it refuses on a host that
+ * cannot provide it: before any process exists for the unavailable case, and
+ * without ever running the caller's command for the refused case.
+ *
+ * Neither refusal is "your code failed". Collapsing either into
+ * `FOCUSED_CHECK_FAILED` would tell the operator to edit their code for a host
+ * limitation, and the `migration` line that failure carries points at
+ * `poiesis verify` — which executes managed command text through the SAME
+ * boundary and refuses identically. So this surface rethrows each refusal with
+ * its own code and its own `reason`/`platform`/`detail`/`remediation`, with the
+ * bounded check evidence attached.
+ *
+ * Both assertions are pure control flow over the public `commandCheck` seam and
+ * mock the kernel boundary rather than requiring one, so they run on every host
+ * — including the hosts whose real answer is "no".
+ */
+describe("an actionable containment refusal survives the focused surface (Spec #168 / ticket #177)", () => {
+  /** One flattened argv per spawn attempt, so "no command ran" is observable. */
+  let spawns: string[] = [];
+
+  async function dispatchWithMockedKernel(
+    prepare: () => void,
+    argv: string[],
+  ): Promise<{ error: unknown; spawns: string[] }> {
+    vi.resetModules();
+    spawns = [];
+    prepare();
+    try {
+      const { commandCheck } = await import("../src/cli.js");
+      let error: unknown = null;
+      try {
+        await commandCheck(argv);
+      } catch (thrown) {
+        error = thrown;
+      }
+      return { error, spawns };
+    } finally {
+      vi.doUnmock("node:fs");
+      vi.doUnmock("node:child_process");
+      vi.doUnmock("../src/containment.js");
+      vi.resetModules();
+    }
+  }
+
+  /** Record every spawn the surface attempts, so "no command ran" is observable. */
+  function recordSpawns(): void {
+    vi.doMock("node:child_process", async () => {
+      const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+      return {
+        ...actual,
+        spawn: ((...args: unknown[]) => {
+          spawns.push([String(args[0]), ...(args[1] as string[]).map((arg) => String(arg))].join(" "));
+          return Reflect.apply(actual.spawn, undefined, args) as never;
+        }) as typeof actual.spawn,
+      };
+    });
+  }
+
+  it("rethrows a pre-spawn PROCESS_CONTAINMENT_UNAVAILABLE with its own reason and remediation", { timeout: 60_000 }, async () => {
+    const candidate = await ownedCandidate("cli-unavailable");
+    const marker = "poiesis-must-not-run-marker";
+    const observed = await dispatchWithMockedKernel(
+      () => {
+        recordSpawns();
+        vi.doMock("node:fs", async () => {
+          const actual = await vi.importActual<typeof import("node:fs")>("node:fs");
+          return {
+            ...actual,
+            readFileSync: ((path: string, ...rest: unknown[]) => {
+              if (path === "/proc/self/cgroup") {
+                throw Object.assign(new Error("no delegated cgroup v2 subtree on this host"), { code: "EACCES" });
+              }
+              return Reflect.apply(actual.readFileSync, undefined, [path, ...rest]) as string;
+            }) as typeof actual.readFileSync,
+          };
+        });
+      },
+      ["--command", `printf %s ${marker}`, "--ownership-id", candidate.ownershipId, "--cwd", candidate.path],
+    );
+
+    expect(observed.error).toMatchObject({
+      code: "PROCESS_CONTAINMENT_UNAVAILABLE",
+      details: {
+        containment: "cgroup-v2",
+        reason: "NO_CGROUP_V2",
+        platform: expect.any(String),
+        remediation: expect.stringContaining("strong containment"),
+        command: `printf %s ${marker}`,
+        commandIndex: 0,
+        // The bounded evidence is still attached: this is not a failure with no
+        // record of what was attempted, against which state.
+        check: {
+          scope: "focused",
+          authoritative: false,
+          outcome: "failed",
+          verification: null,
+          proof: null,
+          commands: [{ index: 0, status: "failed", failureCode: "PROCESS_CONTAINMENT_UNAVAILABLE" }],
+        },
+      },
+    });
+    // Not the generic failed check, and not advice to escalate to a surface
+    // that requires the very capability this host is missing.
+    const error = observed.error as { details: Record<string, unknown>; message: string };
+    expect(error.details.migration).toBeUndefined();
+    expect(error.message).not.toContain("poiesis verify");
+    // Pre-spawn: the refusal precedes the process, so the command never ran.
+    expect(observed.spawns.filter((argv) => argv.includes(marker))).toEqual([]);
+  });
+
+  it("rethrows a PROCESS_CONTAINMENT_REFUSED with the admission reason, without running the command", { timeout: 60_000 }, async () => {
+    const candidate = await ownedCandidate("cli-refused");
+    const marker = "poiesis-must-not-run-marker";
+    const leaf = "/poiesis-executor-fake-cgroup-leaf";
+    const observed = await dispatchWithMockedKernel(
+      () => {
+        // The kernel boundary is scripted; the admission report format, the
+        // confirmation predicate, and the refusal itself stay real.
+        vi.doMock("../src/containment.js", async () => {
+          const actual = await vi.importActual<typeof import("../src/containment.js")>("../src/containment.js");
+          return {
+            ...actual,
+            provisionContainment: (input: { model: string; operationId: string }) => ({
+              model: input.model,
+              operationId: input.operationId,
+              leaf,
+            }),
+            settleContainment: async (leased: { model: string; leaf: string | null }) => ({
+              model: leased.model,
+              leaf: leased.leaf,
+              survived: [],
+              confirmed: true,
+            }),
+            releaseContainment: () => undefined,
+          };
+        });
+        // A prologue that never reports and never exits: the exact shape of a
+        // child Poiesis cannot place inside the boundary it provisioned.
+        vi.doMock("node:child_process", async () => {
+          const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
+          return {
+            ...actual,
+            spawn: ((command: string, ...rest: unknown[]) => {
+              const argv = (rest[0] as string[]) ?? [];
+              spawns.push([command, ...argv].join(" "));
+              if (command !== "/bin/sh" || !argv.includes("poiesis-admission")) {
+                return Reflect.apply(actual.spawn, undefined, [command, ...rest]) as never;
+              }
+              const fake = new EventEmitter() as ChildProcess;
+              const report = new PassThrough();
+              Object.assign(fake, {
+                pid: undefined,
+                stdin: null,
+                stdout: null,
+                stderr: null,
+                stdio: [null, null, null, report],
+                kill: () => true,
+                unref: () => fake,
+              });
+              setTimeout(() => report.end(), 20);
+              return fake;
+            }) as typeof actual.spawn,
+          };
+        });
+      },
+      ["--command", `printf %s ${marker}`, "--ownership-id", candidate.ownershipId, "--cwd", candidate.path],
+    );
+
+    expect(observed.error).toMatchObject({
+      code: "PROCESS_CONTAINMENT_REFUSED",
+      details: {
+        containment: "cgroup-v2",
+        reason: "ADMISSION_UNCONFIRMED",
+        detail: expect.stringContaining("without reporting"),
+        check: {
+          scope: "focused",
+          outcome: "failed",
+          commands: [{ index: 0, status: "failed", failureCode: "PROCESS_CONTAINMENT_REFUSED" }],
+        },
+      },
+    });
+    // Exactly one managed spawn: the Poiesis-owned prologue. The caller's
+    // command was never `exec`'d, because nothing may run before admission is
+    // confirmed.
+    expect(observed.spawns.filter((argv) => argv.includes("poiesis-admission"))).toHaveLength(1);
+    const details = (observed.error as { details: Record<string, unknown> }).details;
+    expect(details.migration).toBeUndefined();
+    expect(details.remediation).toBeUndefined();
+  });
 });

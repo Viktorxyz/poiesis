@@ -28,7 +28,10 @@ import { cleanupOpenCodeSession } from "./session.js";
 import {
   createStderrCheckProgress,
   executeCheck,
+  type CheckResult,
   type CheckRetryReason,
+  type FocusedCommandEvidence,
+  type FocusedFailureCause,
 } from "./focused-check.js";
 import { PoiesisError } from "./errors.js";
 import type { IntegrationEvidence, ProductionAuthorization, ProofEvidence, PublishEvidence, StagingEvidence } from "./evidence.js";
@@ -688,6 +691,13 @@ export async function commandVerify(args: string[], signal?: AbortSignal): Promi
  * `details.check`, so the structured failure envelope the CLI already
  * promises still reaches the caller with the evidence attached.
  *
+ * Spec #168 / ticket #177: the two exceptions to that are the containment
+ * refusals, which are rethrown with their own code and their own
+ * `reason`/`platform`/`detail`/`remediation` intact. A refusal is this host
+ * declining to run managed command text at all, so it is neither a pass nor a
+ * failing command, and pointing the operator at Verify — which needs the same
+ * capability — would only send them somewhere that refuses identically.
+ *
  * Exported as a library seam (same pattern as `commandVerify`); it is
  * intentionally NOT re-exported by `src/index.ts`.
  */
@@ -749,6 +759,15 @@ export async function commandCheck(args: string[], signal?: AbortSignal): Promis
         130,
       );
     }
+    // Spec #168 / ticket #177: a containment refusal is not a failed check. It
+    // is this host declining to execute managed command text at all, and the
+    // operator's next action is a host — not an edit. Collapsing it into
+    // `FOCUSED_CHECK_FAILED` would tell them their code failed, and the
+    // `migration` line below would send them to `poiesis verify`, which
+    // requires the SAME capability and would refuse in exactly the same way.
+    if (failed !== undefined && isActionableContainmentRefusal(failed.failureCode)) {
+      throw containmentRefusal(failed, result);
+    }
     throw new PoiesisError("FOCUSED_CHECK_FAILED", "Focused checks did not pass", {
       check: result,
       migration:
@@ -756,6 +775,65 @@ export async function commandCheck(args: string[], signal?: AbortSignal): Promis
     });
   }
   writeSuccess("check", result);
+}
+
+/**
+ * Spec #168 / ticket #177 — the two containment refusals a focused check must
+ * pass through with their own identity intact.
+ *
+ * Both are typed, actionable, and produced by the one module that owns the
+ * capability decision, so this surface has nothing new to decide: it only
+ * refuses to overwrite them with a generic classification.
+ */
+function isActionableContainmentRefusal(code: string | null): boolean {
+  return code === "PROCESS_CONTAINMENT_UNAVAILABLE" || code === "PROCESS_CONTAINMENT_REFUSED";
+}
+
+/**
+ * Spec #168 / ticket #177 — rethrow the runner's own containment refusal, with
+ * the bounded check evidence attached.
+ *
+ * The code, the reason, the platform, the detail, and the runtime's own
+ * remediation are carried through verbatim, so the operator is told which
+ * primitive is missing and what to do about it. Deliberately ABSENT is the
+ * `migration` advice attached to a genuine `FOCUSED_CHECK_FAILED`: escalating
+ * to `poiesis verify` is not a workaround here, because Verify executes managed
+ * command text through the same boundary and would refuse identically.
+ */
+function containmentRefusal(failed: FocusedCommandEvidence, result: CheckResult): PoiesisError {
+  const cause = failed.failureCause;
+  const detail = cause?.detail ?? "this runtime could not establish strong process containment for managed command text.";
+  return new PoiesisError(
+    failed.failureCode ?? "PROCESS_CONTAINMENT_UNAVAILABLE",
+    `Focused check did not run: managed command text requires strong process containment, which this runtime cannot provide: ${detail}`,
+    {
+      check: result,
+      // Bounded evidence about the command that never started, so the
+      // fingerprint still identifies what was attempted and what state it was
+      // attempted against.
+      command: failed.command,
+      commandIndex: failed.index,
+      classification: result.classification,
+      exitCode: failed.exitCode,
+      durationMs: failed.durationMs,
+      stdoutTruncated: failed.stdoutTruncated,
+      stderrTruncated: failed.stderrTruncated,
+      ...causeDetails(cause),
+    },
+  );
+}
+
+/** Carry the refusal's own bounded strings through, omitting the ones it has none of. */
+function causeDetails(cause: FocusedFailureCause | null): Record<string, unknown> {
+  if (cause === null) return {};
+  return {
+    cause: { ...cause },
+    ...(cause.containment === null ? {} : { containment: cause.containment }),
+    ...(cause.platform === null ? {} : { platform: cause.platform }),
+    ...(cause.reason === null ? {} : { reason: cause.reason }),
+    ...(cause.detail === null ? {} : { detail: cause.detail }),
+    ...(cause.remediation === null ? {} : { remediation: cause.remediation }),
+  };
 }
 
 /**
