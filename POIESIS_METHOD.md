@@ -188,6 +188,21 @@ A closed accepted ticket is not reopened later. New later findings become new co
 
 Never retry the same action without new evidence, a material state change, or a higher escalation level.
 
+### Correction and delta review
+
+Poiesis dispatches every grouped blocker from the current Review in one message, never one finding at a time, and the Worker answers the whole group exhaustively in one correction. Drip-feeding is not economy: it turns one correction into repeated cycles against the same candidate.
+
+The correction is one delta review, scoped to:
+- the original grouped blockers;
+- the exact diff of the correction;
+- the affected callers and direct regressions of the changed surface.
+
+The delta review judges that scope. It does not re-open the candidate wholesale and it does not widen into unrelated areas.
+
+One correction plus one delta review is the default. Further candidate-caused work starts only after a bounded Poiesis reassessment, and only for what that reassessment authorizes.
+
+A closed area reopens only on new concrete evidence: a new reachable defect, never a re-reading of an area already closed without new evidence.
+
 ## 9. Replan
 
 Replan only when evidence invalidates the current design.
@@ -213,9 +228,10 @@ After all current implementation tickets are accepted, identify the exact clean 
 
 Run whole-change Proof in this order:
 
-1. deterministic Verify;
-2. fresh reasoning Spec Review;
-3. fresh reasoning Standards Review.
+1. non-authoritative combined semantic preflight;
+2. deterministic Verify;
+3. fresh reasoning Spec Review;
+4. fresh reasoning Standards Review.
 
 The configured full verification plan runs once, here, against the exact candidate. It is not an intermediate Realize check: each ticket is proved by its own relevant focused checks, whose evidence is local and non-authoritative, and whole-change authoritative verification belongs to this step alone. Running the configured plan again for the same unchanged candidate is a repeat and needs new evidence, a material state change, or a higher escalation level, exactly like any other repeated action.
 
@@ -230,6 +246,30 @@ The exact candidate identity that flows from Prove into Publish and Preview is o
 Every required field must be present for the same clean candidate. Publish and Preview both consume that exact proof and refuse to operate without it.
 
 Reviewers may use **Repository Intelligence** as bounded discovery evidence (callers, impact radius, cross-module dependencies), but the exact candidate source remains authoritative. Repository Intelligence is not part of Proof identity; graph hashes and cache state must never appear in `candidateSha`, `candidateTree`, `verified`, `specReview`, `standardsReview`, or any Publish / Preview / Integration evidence field.
+
+### Preflight
+
+Before deterministic Verify, Poiesis runs one combined semantic preflight over the exact candidate: a single bounded reading pass that triages the candidate against the current Spec, the current standards, and the Proof identity contract.
+
+Preflight is descriptive and non-authoritative. It produces no verification receipt, no Proof field, and no lifecycle evidence; it never runs the configured full verification plan; and it never substitutes for Verify or for the two final reviews. The configured full verification plan still runs once, here. The two fresh, separate, identity-bound Spec and Standards Reviews still run after Verify and are never merged into preflight or into each other.
+
+Preflight is a descriptive step on the existing Prove path. It adds no new lifecycle phase and no new state machine, and it never gates Realize.
+
+A preflight finding blocks only when all four criteria hold:
+- it is concrete and reachable in the exact candidate;
+- it is an explicit violation of the current Spec or of a consequential standard;
+- it materially affects correctness, security, reliability, or the Proof identity;
+- it is caused by the candidate, or it is a proven remaining authorized obligation of the current Spec.
+
+A pre-existing unrelated hardening opportunity, an optional preference, and a hypothetical risk are Concerns or future Specs, never blockers.
+
+### Realization ledger
+
+Poiesis records exactly one disposition per finding: `accepted`, `rejected`, `non-blocking`, or `resolved`. A pre-existing unrelated hardening opportunity, an optional preference, and a hypothetical risk are recorded as `non-blocking` or `rejected`, never as `accepted` blockers.
+
+The dispositions form the frozen realization ledger. The ledger lives only in parent tracker comments and in dispatch context; it is never a repository file, a database entry, a cache entry, or a runtime field. A later snapshot supersedes an earlier one, and the ledger frozen for the Proof in flight is the ledger each final review receives.
+
+Material architecture expansion, platform-capability expansion, and product-policy expansion found in preflight returns to Authorize before implementation, exactly like Realize-time expansion.
 
 ### Verify
 

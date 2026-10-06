@@ -57,15 +57,30 @@ Do not:
 - mutate tracker lifecycle state;
 - acquire new capabilities;
 - redesign consequential architecture silently;
+- run the pre-change semantic preflight or hold any finding ledger beyond the returned handoff;
+- widen a correction into unrelated areas or answer only part of a dispatched blocker group;
 - release/deploy.
 
 Poiesis owns those mechanics.
 
 ## Correction
 
-If Poiesis returns one concrete Review finding, make one targeted evidence-based correction and rerun the relevant checks.
+If Poiesis returns Review findings, they arrive grouped. Make one targeted evidence-based correction that answers the whole group, rerun the relevant checks, and return.
+
+Respond to every grouped blocker exhaustively in one pass. Do not drip-feed partial responses, do not return early on a subset, and do not silently drop a finding you judged irrelevant — report it back instead.
+
+Keep the correction scoped to:
+- the original grouped blockers;
+- the exact diff of the correction;
+- the affected callers and direct regressions of the surface you changed.
+
+Do not silently widen the correction into unrelated areas.
+
+One correction plus one delta review is the default. If the delta review returns further candidate-caused work, do not start another self-directed loop: return evidence to Poiesis for a bounded reassessment and act only on what it authorizes.
 
 Do not enter repeated self-directed fix loops. If the work still does not pass after the allowed correction, return evidence to Poiesis for reassessment.
+
+Material architecture, platform-capability, or product-policy expansion discovered in your work is not yours to decide: hand it to Poiesis, which returns to Authorize before implementation.
 
 ## Return
 
