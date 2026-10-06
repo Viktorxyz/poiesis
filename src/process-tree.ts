@@ -231,6 +231,27 @@ interface ProcessIdentity {
   readonly startIdentity: string;
 }
 
+/**
+ * Spec #168 / ticket #182 — read the kernel identity of a PID NOW.
+ *
+ * This is the same single-entry process-table read
+ * {@link validateManagedProcessLease} uses, exposed for the one caller that needs
+ * the fact before it has a lease: the startup protocol compares what a child
+ * REPORTED about itself against what the kernel says about that PID at this
+ * instant, and refuses the run when the two disagree. It returns `null` for
+ * anything it cannot confirm — no entry, a terminated task, an unreadable line,
+ * or a platform with no readable process table — because "could not read it" and
+ * "read it" must not look alike here any more than they do in a lease.
+ *
+ * Nothing about the leased leader is cached: the PID a process-start identity
+ * protects is reusable the moment its holder exits, so a value read earlier is a
+ * value about a process that may no longer exist.
+ */
+export function readManagedProcessIdentity(pid: number): ProcessIdentity | null {
+  const probe = probeProcessIdentity(pid);
+  return probe.state === "live" ? probe.identity : null;
+}
+
 type ProcessIdentityProbe =
   | { readonly state: "live"; readonly identity: ProcessIdentity }
   /** No process-table entry, or an entry in a terminal task state. */

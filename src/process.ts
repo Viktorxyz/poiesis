@@ -7,18 +7,27 @@ import {
   ADMISSION_DRAIN_MS,
   ADMISSION_LEAF_ENV,
   ADMISSION_PROLOGUE,
-  isAdmissionConfirmation,
+  ADMISSION_TOKEN_ENV,
+  EXECUTION_TOKEN_ENV,
+  encodeReleasePayload,
+  mintStartupTokens,
+  parseStartupReport,
   provisionContainment,
   releaseContainment,
   requireConfirmedAdmission,
+  requireValidatedStartupIdentity,
   settleContainment,
   type ContainmentModel,
   type ManagedContainmentLease,
+  type StartupIdentity,
+  type StartupReportKind,
 } from "./containment.js";
 import {
   createManagedProcessLease,
   isManagedProcessLeaseLabel,
+  readManagedProcessIdentity,
   settleManagedProcessLease,
+  validateManagedProcessLease,
   type ManagedProcessLease,
 } from "./process-tree.js";
 
@@ -52,6 +61,20 @@ const WINDOWS_CLEANUP_PHASE_MS = 300;
 const IS_WINDOWS = process.platform === "win32";
 
 /**
+ * Spec #168 / ticket #182 — bounded window a refused startup waits for the child's
+ * OWN exit before it reports what happened.
+ *
+ * A refusal that happens before a lease exists has no authority to signal
+ * anything: no PID signal, because the identity was never confirmed, and no group
+ * signal, because no group was ever leased. Revoking the gate is the only thing
+ * this runner may do, and it works only because a pre-`exec` prologue exits when
+ * its control channel closes. So the proof that it did is the `exit` event this
+ * runner already holds — and if that event never arrives, Poiesis says a process
+ * it spawned may still be running instead of reporting a settled refusal.
+ */
+const PRE_EXEC_EXIT_MS = 2_000;
+
+/**
  * Spec #168 / ticket #176 — the admission barrier's shell.
  *
  * Only ever used on the contained path, which only exists where strong
@@ -73,6 +96,14 @@ const POST_EXIT_GRACE_MS = 2_000;
 
 /** Conventional exit status for a command cancelled by SIGINT-equivalent. */
 const CANCELLED_EXIT_CODE = 130;
+
+/**
+ * Spec #168 / ticket #182 — how far the two-phase startup got. It is the only
+ * input to "what may cleanup do", because each phase earns a different authority:
+ * a confirmed identity may address a group, and a confirmed admission makes the
+ * cgroup the sole authority.
+ */
+type StartupAuthority = "pre-lease" | "leased" | "admitted";
 
 /**
  * Transient fallback workspace label for callers that do not name a
@@ -206,13 +237,38 @@ interface Capture {
  * containment: `setsid(2)` and reparenting both leave it. So a caller that
  * executes arbitrary command TEXT passes `options.containment`, and this
  * runner then provisions a real kernel boundary before the spawn
- * (`src/containment.ts`), spawns the child into a Poiesis-owned admission
- * prologue that admits and confirms ITSELF before any caller text can run,
- * settles the boundary with `cgroup.kill`, and — when the host has no such
- * capability, or the admission cannot be confirmed — refuses with a typed
- * error and nothing is reported contained. A caller that passes no
+ * (`src/containment.ts`) and starts the child through the TWO-PHASE startup
+ * protocol in that module, settles the boundary with `cgroup.kill`, and — when
+ * the host has no such capability, or the startup cannot be confirmed — refuses
+ * with a typed error and nothing is reported contained. A caller that passes no
  * `containment` keeps the process-group contract unchanged, which is honest
  * exactly because nothing in a fixed argv can escape it.
+ *
+ * Spec #168 / ticket #182 — what the two-phase protocol is for, and why cleanup
+ * is decided by the phase a run reached:
+ *
+ *   1. the Poiesis-owned prologue reports its own kernel PID, process-group id,
+ *      and process-start identity, and WAITS. It is spawned with no caller text
+ *      in its argv at all;
+ *   2. this runner checks that report against `child.pid` and against a fresh
+ *      kernel read (`readManagedProcessIdentity`), leases the identity as a LIVE
+ *      validated lease, and only then sends the admission token;
+ *   3. the prologue admits itself into the provisioned leaf, confirms that
+ *      membership is bound to the SAME identity, reports that, and waits for a
+ *      DISTINCT execution token;
+ *   4. this runner binds the admitted report to the leased identity, releases the
+ *      caller's exact argv, and only then arms stdin, the command timeout, and
+ *      cancellation.
+ *
+ * Cleanup authority follows from how far that got. Before a validated lease
+ * there is no authority to signal anything, so the gate is REVOKED (a pre-`exec`
+ * prologue exits when its channel closes), the leaf is settled, and the child's
+ * own linked exit is required — no proof of it is `PROCESS_CLEANUP_UNRESOLVED`.
+ * After a validated lease but before a confirmed admission the group is settled
+ * through the lease AND the leaf is settled independently, because an empty leaf
+ * cannot prove anything about a leader that may never have entered it. After a
+ * confirmed admission the cgroup is the authority and no group signal runs at
+ * all.
  */
 export async function run(command: string, args: string[], options: RunOptions): Promise<RunResult> {
   const timeoutMs = normalizeTimeout(options.timeoutMs);
@@ -244,29 +300,44 @@ export async function run(command: string, args: string[], options: RunOptions):
         });
 
   return await new Promise<RunResult>((resolve, reject) => {
-    // Spec #168 / ticket #176: a contained run is NOT spawned as the command.
-    // It is spawned as the Poiesis-owned admission prologue, which receives the
-    // resolved processor and its resolved argv as positional parameters and
-    // `exec`s them only after it has confirmed its own membership of the leaf.
-    // The leaf travels in the environment, out of band, so it can never appear
-    // in the command's own argv. The child's `command`/`args` here — and hence
-    // the `RunResult` and every observer of this runner — stay the caller's
-    // processor and argv, unchanged.
+    // Spec #168 / ticket #182: a contained run is NOT spawned as the command, and
+    // it is not spawned carrying the command either. It is spawned as the
+    // Poiesis-owned startup prologue with Poiesis-owned argv only; the caller's
+    // processor and argv are held here until the prologue has been admitted and
+    // the parent has bound that admission to a live validated lease. The leaf and
+    // both gate tokens travel in the environment, out of band, so none of them can
+    // ever appear in the command's own argv.
     const contained = containment !== null;
-    const spawnEnv = contained ? { ...childEnv, [ADMISSION_LEAF_ENV]: containment!.leaf ?? "" } : childEnv;
+    const startup = contained ? mintStartupTokens() : null;
+    const spawnEnv = contained
+      ? {
+          ...childEnv,
+          [ADMISSION_LEAF_ENV]: containment!.leaf ?? "",
+          [ADMISSION_TOKEN_ENV]: startup!.admissionToken,
+          [EXECUTION_TOKEN_ENV]: startup!.executionToken,
+        }
+      : childEnv;
     let child: ChildProcess;
     try {
       child = spawn(
         contained ? ADMISSION_SHELL : command,
-        contained ? ["-c", ADMISSION_PROLOGUE, ADMISSION_ARGV0, command, ...args] : args,
+        contained ? ["-c", ADMISSION_PROLOGUE, ADMISSION_ARGV0] : args,
         {
           cwd: options.cwd,
           env: spawnEnv,
-          // The contained child gets a fourth, report-only pipe: the prologue
-          // writes its admission confirmation there and closes it before exec,
-          // so the command never inherits it.
+          // The contained child's stdin is Poiesis's own gate: the admission
+          // token, the execution token, and the released argv all travel through
+          // it, and the caller-supplied input is written to it only after
+          // authority exists. It is a pipe even when the caller supplied no
+          // input — the protocol needs a parent→child channel, and for any fd
+          // above 0 Node gives the parent the reading end. An uncontained caller
+          // keeps the documented stdio shape exactly.
+          //
+          // The contained child also gets a fourth, report-only pipe: the
+          // prologue writes its identity and admitted reports there and closes
+          // it before exec, so the command never inherits it.
           stdio: [
-            options.input === undefined ? "ignore" : "pipe",
+            contained ? "pipe" : options.input === undefined ? "ignore" : "pipe",
             "pipe",
             "pipe",
             ...(contained ? ["pipe" as const] : []),
@@ -285,8 +356,13 @@ export async function run(command: string, args: string[], options: RunOptions):
     // process groups, so its tree cleanup runs through taskkill instead.
     // A spawn that produced no PID has no process to lease: the `error`
     // event settles it as COMMAND_IO_ERROR.
+    //
+    // Spec #168 / ticket #182: a contained run does NOT lease at spawn time. Its
+    // lease is established only after the prologue's identity report has been
+    // checked against the kernel, so a lease can never exist for a process whose
+    // identity this run never confirmed.
     let lease: ManagedProcessLease | null = null;
-    if (!IS_WINDOWS && child.pid !== undefined) {
+    if (!IS_WINDOWS && !contained && child.pid !== undefined) {
       try {
         lease = createManagedProcessLease({
           operationId: leaseIdentity.operationId,
@@ -352,6 +428,92 @@ export async function run(command: string, args: string[], options: RunOptions):
     let settlementDeferred = false;
     let lingerTimer: NodeJS.Timeout | null = null;
     let timeoutTimer: NodeJS.Timeout | null = null;
+    /**
+     * Spec #168 / ticket #182 — how much authority this run has earned, which is
+     * the only thing that decides what cleanup may do.
+     *
+     *   `pre-lease` — nothing about the child has been confirmed. No PID may be
+     *     signalled and no group may be addressed; the gate is revoked and the
+     *     child's own exit is the only acceptable proof.
+     *   `leased` — the identity was confirmed against the kernel and leased, but
+     *     the admission is not confirmed. The group is Poiesis's to settle, and
+     *     the leaf still has to be settled on its own.
+     *   `admitted` — the prologue confirmed membership bound to that identity. The
+     *     cgroup is the authority and no group settlement runs at all.
+     */
+    let startupAuthority: StartupAuthority = contained ? "pre-lease" : "admitted";
+    /** The identity the first phase leased, or `null` while none exists. */
+    let leasedIdentity: StartupIdentity | null = null;
+    /**
+     * Spec #168 / ticket #182 — the live report reader, while a gate is waiting.
+     * A cancellation reaches it through {@link unwindStartupGate} so a revoked
+     * gate ends its bound instead of being waited out.
+     */
+    let startupReader: StartupReportReader | null = null;
+
+    /**
+     * Spec #168 / ticket #182 — revoke Poiesis's own control channel.
+     *
+     * Closing the gate is the only thing this runner may do to a child it cannot
+     * identify, and it is deliberately the FIRST thing a refused or cancelled
+     * startup does: a prologue that is still waiting for authority exits when
+     * its channel closes, which is what turns "Poiesis has no authority here"
+     * into a process that is actually gone instead of one that has to be killed
+     * by a number Poiesis may not trust.
+     *
+     * The caller's own stdin is that channel, so revoking also drops any input
+     * the caller had queued for a command that will never be released. That is
+     * the point: after a revocation there is nothing left to hand it.
+     */
+    const revokeStartupControl = (): void => {
+      try {
+        child.stdin?.destroy();
+      } catch {
+        // Already closed, already revoked, or never opened.
+      }
+    };
+
+    /**
+     * Spec #168 / ticket #182 — release the caller's exact processor argv.
+     *
+     * Only ever called once authority exists: a validated lease AND a confirmed
+     * admission bound to that lease. The frames are exact (see
+     * `encodeReleasePayload`), so what the processor `exec`s is byte-identical to
+     * what the caller passed, and the count the parent sends first means the
+     * prologue consumes exactly these frames and never a byte of the caller's own
+     * stdin.
+     */
+    const releaseCallerArgv = (): void => {
+      const gate = child.stdin;
+      if (gate === null) {
+        throw new PoiesisError(
+          "PROCESS_CONTAINMENT_REFUSED",
+          `Managed command ${child.pid ?? -1} was admitted but the release channel was never opened`,
+          {
+            containment: containment?.model ?? "cgroup-v2",
+            pid: child.pid ?? -1,
+            reason: "ADMISSION_UNCONFIRMED",
+            detail: "the startup control channel was never opened",
+            confirmed: false,
+          },
+        );
+      }
+      // The execution token is a DISTINCT frame, sent only now — after the
+      // admission was confirmed for the leased identity — and immediately
+      // followed by the argv it authorises.
+      try {
+        child.stdin?.write(`E ${startup!.executionToken}\n`);
+      } catch {
+        // Refused by the pipe; the child is gone or closing, and nothing runs.
+      }
+      gate.write(encodeReleasePayload([command, ...args]));
+      if (options.input === undefined) {
+        // Nothing more will be written on this channel, so the command the
+        // prologue `exec`s reads an immediate EOF exactly as it would have read
+        // the ignored stdin of an uncontained run.
+        gate.end();
+      }
+    };
 
     const buildResult = (): RunResult => ({
       command,
@@ -387,6 +549,10 @@ export async function run(command: string, args: string[], options: RunOptions):
       if (timeoutTimer !== null) clearTimeout(timeoutTimer);
       timeoutTimer = null;
       if (options.signal !== undefined) options.signal.removeEventListener("abort", onCallerAbort);
+      // The gate-phase listener is the same cancellation, observed earlier; it is
+      // detached by the startup protocol itself, and again here so a settled run
+      // never leaves one attached.
+      detachGateAbortListener();
       // Exactly one release per settled run, on every outcome.
       releaseContainment(containment);
 
@@ -455,6 +621,15 @@ export async function run(command: string, args: string[], options: RunOptions):
 
     const tryFinalize = (): void => {
       if (settled || !childExited) return;
+      // Spec #168 / ticket #182: a contained run has no startup verdict yet, and
+      // cleanup before one is not merely early — it would REVOKE the gate of a
+      // startup that is still in progress and settle the run on a fact the
+      // protocol has not established. The decision is deferred instead, and the
+      // gate replays it as soon as it has a verdict.
+      if (admissionPending) {
+        settlementDeferred = true;
+        return;
+      }
       // Once the managed group is settled, no further output can arrive: an
       // open pipe is a leaked descendant's doing, not a reason to keep
       // waiting.
@@ -501,6 +676,51 @@ export async function run(command: string, args: string[], options: RunOptions):
     };
 
     /**
+     * Spec #168 / ticket #182 — settle a CONTAINED run, and only the authority the
+     * startup actually earned may be used.
+     *
+     * The gate is revoked FIRST on every path where the prologue might still be
+     * pre-`exec`, so a child Poiesis may not signal can still be made to leave by
+     * closing the channel it is waiting on. Then, and only then:
+     *
+     *   `pre-lease` — the leaf is settled, and the child's own linked exit is
+     *     required. No PID signal is sent, because no identity was confirmed, and
+     *     no group signal is sent, because no group was leased. An EMPTY leaf is
+     *     not proof of anything here: the child may never have entered it, which
+     *     is exactly why the linked exit, and not the emptiness, is what this
+     *     phase waits for. No proof is `PROCESS_CLEANUP_UNRESOLVED`.
+     *   `leased` — the leaf is settled AND the leased group is settled, and the
+     *     two are independent. The child may be inside the leaf, outside it, or
+     *     between the two; an empty leaf cannot prove that a leader outside it
+     *     stopped, and the group settlement can only be driven because the lease
+     *     re-confirms the leader's identity before every signal it sends.
+     *   `admitted` — the cgroup is the authority and no group settlement runs,
+     *     which is the same conclusion an unrefused contained run rests on.
+     */
+    const settleContainedRun = async (): Promise<void> => {
+      if (startupAuthority !== "admitted") revokeStartupControl();
+      try {
+        await settleContainment(containment!);
+      } catch (error) {
+        cleanupError ??= asPoiesisError(error);
+      }
+      if (startupAuthority === "admitted") return;
+      if (startupAuthority === "pre-lease") {
+        if (childExited || (await waitForChildExit(PRE_EXEC_EXIT_MS))) return;
+        cleanupError ??= preExecStartupUnresolved(command, child.pid ?? -1);
+        return;
+      }
+      // `leased`: the group is Poiesis's to settle, and it is settled through the
+      // lease — the only module that may signal a POSIX process group.
+      if (lease === null) return;
+      try {
+        await settleManagedProcessLease(lease);
+      } catch (error) {
+        cleanupError ??= asPoiesisError(error);
+      }
+    };
+
+    /**
      * Clean the managed containment, then the managed process group, exactly
      * once, and only then let the run settle.
      *
@@ -512,6 +732,10 @@ export async function run(command: string, args: string[], options: RunOptions):
      * anyway would only re-derive a weaker authority: group liveness proves
      * absence, never ownership. So a run whose containment settled cleanly skips
      * the group phase entirely.
+     *
+     * Spec #168 / ticket #182 sharpens that for a contained run: which phase it
+     * settles in is decided by the startup authority, not by the emptiness of the
+     * leaf (see {@link settleContainedRun}).
      *
      * The group phase still runs — and is still the only phase — when there was
      * no containment, when containment could not confirm the leaf is empty, and
@@ -530,14 +754,10 @@ export async function run(command: string, args: string[], options: RunOptions):
         timeoutTimer = null;
       }
       cleanupInFlight = (async (): Promise<void> => {
-        let containmentConfirmed = false;
-        if (containment !== null) {
-          try {
-            const boundary = await settleContainment(containment);
-            containmentConfirmed = boundary.confirmed;
-          } catch (error) {
-            cleanupError ??= asPoiesisError(error);
-          }
+        if (contained) {
+          await settleContainedRun();
+          finishCleanup();
+          return;
         }
         if (lease === null) {
           // Documented Windows model: no POSIX process groups and no readable
@@ -550,40 +770,48 @@ export async function run(command: string, args: string[], options: RunOptions):
           // `childExited` is set; a normal Windows run is simply already
           // settled.
           if (IS_WINDOWS && !childExited) await terminateWindowsTree();
-        } else if (!containmentConfirmed) {
+        } else {
           try {
             await settleManagedProcessLease(lease);
           } catch (error) {
             cleanupError ??= asPoiesisError(error);
           }
         }
-        // Neither a lease nor Windows: the spawn produced no process, so
-        // there is nothing to clean up before settling.
-        cleanupComplete = true;
-        // Spec #168 / ticket #177: EVERY cleanup error releases the runtime
-        // handles this run owns before it settles or rejects — no longer only
-        // the case where the child was still live. The two are independent: a
-        // leader that already exited can still leave a DESCENDANT holding the
-        // inherited stdout/stderr, and those open pipes are precisely what
-        // would keep Node blocked after a run that has already given up. A
-        // bounded rejection must not be a way to leave the runtime holding
-        // handles for a process Poiesis can no longer reach.
-        if (cleanupError !== null) {
-          releaseOwnedResources();
-          settle();
-          return;
-        }
-        // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
-        // fix: it could not prove the target was still the process Poiesis
-        // leased, so nothing was signalled and the child is still running.
-        // There is no `exit` coming to settle on, so waiting for one would turn
-        // a bounded cleanup failure into an unbounded pending run that also
-        // loses the typed cleanup error. Settle now with that original error —
-        // it outranks timeout, cancellation, infrastructure, and exit code
-        // because a process Poiesis spawned may still be running.
-        tryFinalize();
+        finishCleanup();
       })();
       return cleanupInFlight;
+    };
+
+    /**
+     * The tail every cleanup shares: release the runtime handles this run owns
+     * when it could not confirm what it stopped, then settle or finalize.
+     */
+    const finishCleanup = (): void => {
+      // Every phase has now been attempted. Nothing further is signalled, and a
+      // run whose cleanup could not be confirmed may not report success.
+      cleanupComplete = true;
+      // Spec #168 / ticket #177: EVERY cleanup error releases the runtime
+      // handles this run owns before it settles or rejects — no longer only
+      // the case where the child was still live. The two are independent: a
+      // leader that already exited can still leave a DESCENDANT holding the
+      // inherited stdout/stderr, and those open pipes are precisely what
+      // would keep Node blocked after a run that has already given up. A
+      // bounded rejection must not be a way to leave the runtime holding
+      // handles for a process Poiesis can no longer reach.
+      if (cleanupError !== null) {
+        releaseOwnedResources();
+        settle();
+        return;
+      }
+      // A REFUSED or UNRESOLVED cleanup stopped for the one reason it cannot
+      // fix: it could not prove the target was still the process Poiesis
+      // leased, so nothing was signalled and the child is still running.
+      // There is no `exit` coming to settle on, so waiting for one would turn
+      // a bounded cleanup failure into an unbounded pending run that also
+      // loses the typed cleanup error. Settle now with that original error —
+      // it outranks timeout, cancellation, infrastructure, and exit code
+      // because a process Poiesis spawned may still be running.
+      tryFinalize();
     };
 
     const beginTermination = (): void => {
@@ -692,66 +920,125 @@ export async function run(command: string, args: string[], options: RunOptions):
       tryFinalize();
     });
 
-    // Spec #168 / ticket #176: the parent decides admission. The prologue can
-    // only report a confirmation it obtained from the kernel itself, before it
-    // exec'd the command; if that report never arrives, this run is refused
-    // whether the child is still live or already finished. There is no
-    // "it probably made it" branch.
+    // Spec #168 / ticket #182: the parent conducts BOTH startup phases and
+    // decides both. Nothing here infers admission from liveness, from a PID
+    // listing sampled later, or from the child exiting successfully: a phase
+    // passes only on a report the prologue actually wrote, and every report has
+    // to agree with what the kernel says about the process at that instant.
     if (contained) {
+      armGateAbortListener();
       void (async (): Promise<void> => {
-        const outcome = await awaitAdmissionConfirmation(child);
-        admissionPending = false;
-        if (!outcome.confirmed) {
-          try {
-            requireConfirmedAdmission(containment!, {
-              confirmed: false,
-              pid: child.pid ?? -1,
-              detail: outcome.detail,
+        const reader = createStartupReportReader(child.stdio[3], child);
+        startupReader = reader;
+        try {
+          // Phase 1 — the identity report. No lease, no token, no caller text
+          // may exist until the report agrees with `child.pid` AND with a fresh
+          // kernel read of that PID's group and start identity.
+          const reported = await reader.awaitReport("identity");
+          const pid = child.pid ?? -1;
+          const leasedReport = reportedIdentityOf(reported);
+          requireValidatedStartupIdentity(containment!, {
+            pid,
+            reported: leasedReport,
+            fresh: readManagedProcessIdentity(pid),
+            detail: reportFailureDetail(reported),
+          });
+          const leased = createManagedProcessLease({
+            operationId: leaseIdentity.operationId,
+            workspaceId: leaseIdentity.workspaceId,
+            pid,
+            processGroupId: leasedReport?.processGroupId ?? pid,
+          });
+          const validation = validateManagedProcessLease(leased);
+          if (!validation.accepted || !validation.verified || validation.state !== "live") {
+            // The lease exists but Poiesis could not prove the process at that PID
+            // is the one it started, so nothing derived from it may be acted on.
+            requireValidatedStartupIdentity(containment!, {
+              pid,
+              reported: null,
+              fresh: null,
+              detail: validation.accepted
+                ? `the lease could not be re-confirmed live for PID ${pid}`
+                : validation.detail,
             });
-          } catch (error) {
-            // A refused admission is a cleanup-class failure, so it keeps the
-            // same priority a refused cleanup has: nothing may report success,
-            // failure, timeout, or cancellation for a run whose containment was
-            // never proven. It is held in its OWN slot rather than folded into
-            // `cleanupError` (see `containmentRefusal`): a settlement failure
-            // recorded below it is the stronger surviving-process fact, and
-            // folding the refusal in first would let it hide that failure
-            // entirely.
-            containmentRefusal = asPoiesisError(error);
-            // Spec #168 / ticket #177: never signal a PID that has been
-            // reaped. A refusal whose child already exited is exactly the case
-            // where `child.kill` would address whatever inherited the PID.
-            if (!childExited) {
-              try {
-                child.kill("SIGKILL");
-              } catch {
-                // Best effort; the process never left Poiesis's hands.
-              }
-            }
-            // Installed BEFORE the await below: a late spawn error arriving while
-            // the boundary settles would otherwise be an unhandled `error` event.
-            child.on("error", () => {
-              // The refusal is the reported outcome; swallow the late spawn
-              // error so it cannot surface as an unhandled rejection.
-            });
-            // The leaf is already PROVISIONED and the prologue may already be
-            // INSIDE it, so the boundary has to be settled before it can be
-            // released: a leaf the kernel still reports as populated can never
-            // be removed, and releasing one is how a half-admitted leaf leaks.
-            // `beginCleanup` settles it and settles the process-group lease, and
-            // returns the cleanup already running when one is in flight rather
-            // than starting a second.
+          }
+          lease = leased;
+          leasedIdentity = leasedReport;
+          startupAuthority = "leased";
+          sendStartupGate(`A ${startup!.admissionToken}`);
+
+          // Phase 2 — the admission, bound to the identity just leased.
+          const admitted = await reader.awaitReport("admitted");
+          requireConfirmedAdmission(containment!, {
+            confirmed: admitted.confirmed,
+            pid,
+            detail: reportFailureDetail(admitted),
+            identity: reportedIdentityOf(admitted),
+            expected: leasedIdentity,
+          });
+          startupAuthority = "admitted";
+          releaseCallerArgv();
+          admissionPending = false;
+        } catch (error) {
+          // The startup verdict exists in either form — a refusal, or a
+          // cancellation that revoked the protocol — so nothing may defer
+          // settlement waiting for one that will never arrive.
+          admissionPending = false;
+          if (cancelled) {
+            // The caller revoked the run while the protocol still held it. There
+            // is no startup verdict to report — the caller asked for it to stop —
+            // so cleanup runs through whatever authority the protocol had earned
+            // and the cancellation is the outcome, unless cleanup cannot confirm
+            // what it stopped.
             await beginCleanup();
-            releaseOwnedResources();
             settle();
             return;
           }
+          // A refused startup is a cleanup-class failure, so it keeps the same
+          // priority a refused cleanup has: nothing may report success, failure,
+          // timeout, or cancellation for a run whose startup was never proven. It
+          // is held in its OWN slot rather than folded into `cleanupError` (see
+          // `containmentRefusal`): a settlement failure recorded below it is the
+          // stronger surviving-process fact, and folding the refusal in first
+          // would let it hide that failure entirely.
+          containmentRefusal = asPoiesisError(error);
+          // Spec #168 / ticket #182: NOTHING is signalled here. A raw
+          // `child.kill` would address a PID whose identity this run may never
+          // have confirmed, and a raw group signal would address a group no lease
+          // owns. The gate is revoked instead, which is what a pre-`exec` prologue
+          // exits on, and `beginCleanup` then settles only with the authority the
+          // startup earned — leaf-only plus a required linked exit before a lease
+          // existed, leaf and leased group after one did.
+          //
+          // Installed BEFORE the await below: a late spawn error arriving while
+          // the boundary settles would otherwise be an unhandled `error` event.
+          child.on("error", () => {
+            // The refusal is the reported outcome; swallow the late spawn
+            // error so it cannot surface as an unhandled rejection.
+          });
+          // The leaf is already PROVISIONED and the prologue may already be
+          // INSIDE it, so the boundary has to be settled before it can be
+          // released: a leaf the kernel still reports as populated can never
+          // be removed, and releasing one is how a half-admitted leaf leaks.
+          await beginCleanup();
+          releaseOwnedResources();
+          settle();
+          return;
+        } finally {
+          // The report channel has had its verdict; nothing else reads it, and
+          // the prologue closes it before `exec`.
+          reader.retire();
+          startupReader = null;
+          detachGateAbortListener();
         }
         if (settled) return;
-        // Replay whatever settlement the refusal check deferred.
+        // Replay whatever finalization the pending startup decision deferred.
+        // It is `tryFinalize` rather than `settle()` because the cleanup that
+        // finalization owes has still not run — the gate only decides WHEN, never
+        // WHETHER.
         if (settlementDeferred) {
           settlementDeferred = false;
-          settle();
+          tryFinalize();
           return;
         }
         armRunControl();
@@ -761,23 +1048,70 @@ export async function run(command: string, args: string[], options: RunOptions):
     }
 
     /**
+     * Send one gate frame to the child.
+     *
+     * A failed write is not reported here: the child is gone or the channel is
+     * closed, which the gate itself reports as a refusal, and the caller text it
+     * would have carried cannot run either way. What matters — that the frame is
+     * never written before its authority exists — is a property of the protocol
+     * above, not of this write.
+     */
+    function sendStartupGate(frame: string): void {
+      try {
+        child.stdin?.write(`${frame}\n`);
+      } catch {
+        // Refused by the pipe; the phase that follows decides the outcome.
+      }
+    }
+
+    /**
+     * Spec #168 / ticket #182 — the cancellation that arrives DURING a gate.
+     *
+     * The command timeout and the caller's stdin deliberately stay unarmed until
+     * authority exists, but a cancellation is not something Poiesis may sit on:
+     * it records the cancellation, revokes the gate immediately — so no caller
+     * text can be released after the caller asked for it to stop — and unwinds
+     * the pending gate so cleanup does not wait out a bound the caller has
+     * already ended.
+     */
+    function onGateAbort(): void {
+      if (settled || cancelled) return;
+      cancelled = true;
+      revokeStartupControl();
+      unwindStartupGate();
+    }
+
+    function unwindStartupGate(): void {
+      startupReader?.unwind();
+    }
+
+    function armGateAbortListener(): void {
+      if (options.signal === undefined || options.signal.aborted) return;
+      options.signal.addEventListener("abort", onGateAbort, { once: true });
+    }
+
+    function detachGateAbortListener(): void {
+      options.signal?.removeEventListener("abort", onGateAbort);
+    }
+
+    /**
      * The caller's cancellation and the command bound only start once the run
-     * is real: a contained run has its admission verdict first, so an abort or
-     * a timeout can never fire against a process Poiesis has not yet placed.
+     * is real: a contained run has a startup verdict first, so an abort or a
+     * timeout can never fire against a process Poiesis has not yet placed.
      */
     function armRunControl(): void {
       if (settled) return;
       // Spec #168 / ticket #176 — re-read the signal ATOMICALLY with the
       // subscription below. `run()` checked `aborted` before the spawn, but a
-      // contained run only reaches this point after its admission gate has a
-      // verdict, and the caller may have aborted anywhere in between. Node's
-      // `AbortSignal` does NOT replay `abort` to a listener added after the
-      // signal is already aborted, so installing the listener alone would drop
-      // that cancellation on the floor and let the caller's command text run to
-      // completion — which, for Verify, is a `verified` result and an
-      // authoritative receipt for a run the operator cancelled. Reading the flag
-      // and subscribing here closes that window with the SAME cancellation path
-      // a live signal takes, so the outcome is identical either way.
+      // contained run only reaches this point after both startup phases, and the
+      // caller may have aborted anywhere in between. Node's `AbortSignal` does NOT
+      // replay `abort` to a listener added after the signal is already aborted, so
+      // installing the listener alone would drop that cancellation on the floor
+      // and let the caller's command text run to completion — which, for Verify,
+      // is a `verified` result and an authoritative receipt for a run the
+      // operator cancelled. Reading the flag and subscribing here closes that
+      // window with the SAME cancellation path a live signal takes, so the
+      // outcome is identical either way.
       if (options.signal?.aborted === true) {
         onCallerAbort();
         return;
@@ -961,155 +1295,229 @@ function cancelledError(command: string, args: string[], reason: string, result?
 }
 
 /**
- * Spec #168 / ticket #176 — wait for the admission prologue's confirmation.
+ * Spec #168 / ticket #182 — ONE reader for the startup report channel, shared by
+ * both phases.
  *
- * The prologue writes one byte to its report pipe only AFTER it has read its own
- * PID back out of `cgroup.procs`. Every other outcome — the report channel
- * closing with no byte, a channel error, the child finishing first, or the bound
- * elapsing — is a refusal with a reason, EXCEPT that a refusal first drains the
- * channel for {@link ADMISSION_DRAIN_MS}: the prologue writes the byte and then
- * `exec`s immediately, so `exit` can legitimately be delivered before that byte
- * has been read, and refusing on the ordering alone would report a real
- * admission as an unconfirmed one. This function never infers admission from
- * liveness, from a PID listing sampled later, or from the child exiting
- * successfully — it only ever accepts a byte the prologue actually wrote.
+ * The two phases read the same pipe in order, so the reader holds complete lines
+ * as they arrive rather than subscribing and unsubscribing per phase. That is not
+ * an optimisation: the parent sends the admission token itself, so the prologue's
+ * admitted report can be written while this runner is between phases, and a
+ * reader that only listened during its own phase would drop exactly that line and
+ * refuse a run it had admitted.
+ *
+ * A line is only accepted when it parses AND is the report the waiting phase
+ * asked for. A malformed line, or a report for the wrong phase, is a refusal with
+ * that fact named — this is the boundary between a Poiesis-owned shell and a
+ * parent about to act on what it says, so nothing here guesses at what was meant.
  */
-async function awaitAdmissionConfirmation(child: ChildProcess): Promise<{
-  confirmed: boolean;
-  detail: string;
-}> {
-  const report = child.stdio[3];
-  if (report === undefined || report === null) {
-    return { confirmed: false, detail: "the admission report channel was never opened" };
-  }
-  const confirmedDetail = "the prologue confirmed its own kernel membership";
-  // Spec #168 / ticket #178: every listener this gate installs is held BY
-  // REFERENCE so the decision can be retired exactly — its own listeners, and
-  // nothing else on the channel.
-  let onConfirmation: ((chunk: Buffer | string) => void) | undefined;
-  let onChannelFailure: (() => void) | undefined;
-  let onChannelClosed: (() => void) | undefined;
-  let onChannelEnded: (() => void) | undefined;
-  let onDeclaredExit: ((code: number | null, signal: NodeJS.Signals | null) => void) | undefined;
-  const declaredExit = new Promise<{ confirmed: false; detail: string }>((resolve) => {
-    onDeclaredExit = (code, signal): void => {
-      resolve({
-        confirmed: false,
-        detail: `the admission prologue finished without reporting (exit code ${String(code)}, signal ${String(signal)})`,
-      });
-    };
-    child.once("exit", onDeclaredExit);
-  });
-  const channelClosed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
-    onChannelFailure = (): void => resolve({ confirmed: false, detail: "the admission report channel failed" });
-    onChannelClosed = (): void =>
-      resolve({ confirmed: false, detail: "the admission report channel closed without reporting" });
-    onChannelEnded = (): void =>
-      resolve({ confirmed: false, detail: "the admission report channel ended without reporting" });
-    report.once("error", onChannelFailure);
-    report.once("close", onChannelClosed);
-    report.once("end", onChannelEnded);
-  });
-  const confirmed = new Promise<{ confirmed: true; detail: string }>((resolve) => {
-    onConfirmation = (chunk: Buffer | string): void => {
-      if (isAdmissionConfirmation(chunk.toString("utf8"))) {
-        resolve({ confirmed: true, detail: confirmedDetail });
-      }
-    };
-    report.on("data", onConfirmation);
-  });
-  const elapsed = new Promise<{ confirmed: false; detail: string }>((resolve) => {
-    const timer = setTimeout(
-      () => resolve({ confirmed: false, detail: `no admission confirmation within ${ADMISSION_CONFIRM_MS}ms` }),
-      ADMISSION_CONFIRM_MS,
-    );
-    // The bound must not be what keeps Node alive once the report arrives.
-    timer.unref?.();
-  });
-  const outcome = await Promise.race([confirmed, declaredExit, channelClosed, elapsed]);
-  // The refusal reason stays whatever the gate actually observed; the drain only
-  // gets the chance to convert an ordering artifact into a real verdict.
-  const verdict = outcome.confirmed ? outcome : ((await drainAdmissionReport(report)) ?? outcome);
-  // Spec #168 / ticket #178: the decision is over, so the listeners THIS gate
-  // installed are removed — by reference, not with `removeAllListeners()`, which
-  // would also detach anything else the channel's owner put on it. What is
-  // deliberately retained is an error sink: the channel can still be open (the
-  // prologue `exec`s with fd3 closed but a descendant may hold it), and resuming
-  // a still-open stream with no `error` listener turns one late stream error
-  // into an unhandled `error` event, which crashes the process over a run that
-  // has already reported its outcome. The sink swallows nothing that is
-  // reported: it only keeps a post-decision stream failure from being fatal.
-  report.off("data", onConfirmation!);
-  report.off("error", onChannelFailure!);
-  report.off("close", onChannelClosed!);
-  report.off("end", onChannelEnded!);
-  child.off("exit", onDeclaredExit!);
-  report.on("error", onSettledChannelError);
-  const drained = report as Partial<NodeJS.ReadableStream> & { resume?: () => void; unref?: () => void };
-  drained.resume?.();
-  drained.unref?.();
-  return verdict;
+interface StartupReportReader {
+  /**
+   * Wait for one report of `kind`, bounded, with the ordered drain. Resolves
+   * `{ confirmed: false, detail }` for every outcome that is not that report.
+   */
+  awaitReport(kind: StartupReportKind): Promise<
+    { confirmed: true; identity: StartupIdentity } | { confirmed: false; detail: string }
+  >;
+  /** End the current bound early, because Poiesis revoked the protocol itself. */
+  unwind(): void;
+  /** Retire this reader's own listeners, leaving a single error sink behind. */
+  retire(): void;
+}
+
+/** What one startup gate observed. */
+type StartupGateOutcome =
+  | { readonly confirmed: true; readonly identity: StartupIdentity }
+  | { readonly confirmed: false; readonly detail: string };
+
+/** The reported identity, or `null` when the gate observed no usable report. */
+function reportedIdentityOf(outcome: StartupGateOutcome): StartupIdentity | null {
+  return outcome.confirmed ? outcome.identity : null;
 }
 
 /**
- * Spec #168 / ticket #178 — the retained no-op error sink for an admission
- * report channel whose decision is already reported.
+ * What the gate observed, as a detail string. A gate that did get its report has
+ * no failure to report, and the refusals that consult this only read it when
+ * there is no report to compare.
+ */
+function reportFailureDetail(outcome: StartupGateOutcome): string {
+  return outcome.confirmed ? "the prologue reported the identity this run was waiting for" : outcome.detail;
+}
+
+function createStartupReportReader(
+  report: ChildProcess["stdio"][3],
+  child: ChildProcess,
+): StartupReportReader {
+  const unavailable = (detail: string): { confirmed: false; detail: string } => ({ confirmed: false, detail });
+  if (report === undefined || report === null) {
+    return {
+      awaitReport: async () => unavailable("the startup report channel was never opened"),
+      unwind: () => undefined,
+      retire: () => undefined,
+    };
+  }
+
+  interface PendingReport {
+    kind: StartupReportKind;
+    resolve: (outcome: StartupGateOutcome) => void;
+    timer: NodeJS.Timeout;
+  }
+
+  let buffered = "";
+  const lines: string[] = [];
+  let pending: PendingReport | null = null;
+
+  const decide = (
+    outcome: { confirmed: true; identity: StartupIdentity } | { confirmed: false; detail: string },
+  ): void => {
+    const waiting = pending;
+    if (waiting === null) return;
+    pending = null;
+    clearTimeout(waiting.timer);
+    waiting.resolve(outcome);
+  };
+
+  const inspect = (): void => {
+    if (pending === null || lines.length === 0) return;
+    const line = lines.shift()!;
+    const parsed = parseStartupReport(line);
+    if (parsed === null) {
+      decide(unavailable(`the startup report channel carried a malformed report: ${bounded(line, 120)}`));
+      return;
+    }
+    if (parsed.kind !== pending.kind) {
+      decide(
+        unavailable(
+          `the startup report channel reported a ${parsed.kind} report where a ${pending.kind} report was required`,
+        ),
+      );
+      return;
+    }
+    decide({ confirmed: true, identity: parsed.identity });
+  };
+
+  // Spec #168 / ticket #178: every listener is held BY REFERENCE so the decision
+  // can be retired exactly — this reader's own listeners, and nothing else on the
+  // channel.
+  const onChunk = (chunk: Buffer | string): void => {
+    buffered += chunk.toString("utf8");
+    let newline = buffered.indexOf("\n");
+    while (newline !== -1) {
+      lines.push(buffered.slice(0, newline));
+      buffered = buffered.slice(newline + 1);
+      newline = buffered.indexOf("\n");
+    }
+    inspect();
+  };
+  const onChannelFailure = (): void => decide(unavailable("the startup report channel failed"));
+  const onChannelEnded = (): void => decide(unavailable("the startup report channel ended without reporting"));
+  const onChannelClosed = (): void => decide(unavailable("the startup report channel closed without reporting"));
+  const onDeclaredExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+    decide(
+      unavailable(
+        `the startup prologue finished without reporting (exit code ${String(code)}, signal ${String(signal)})`,
+      ),
+    );
+  report.on("data", onChunk);
+  report.on("error", onChannelFailure);
+  report.on("end", onChannelEnded);
+  report.on("close", onChannelClosed);
+  child.on("exit", onDeclaredExit);
+
+  const awaitKind = (
+    kind: StartupReportKind,
+    windowMs: number,
+  ): Promise<StartupGateOutcome> => {
+    return new Promise((resolve) => {
+      const timer = setTimeout(
+        () => {
+          if (pending === null) return;
+          pending = null;
+          resolve(unavailable(`no ${kind} startup report within ${windowMs}ms`));
+        },
+        windowMs,
+      );
+      // The bound must not be what keeps Node alive once the report arrives.
+      timer.unref?.();
+      pending = { kind, resolve, timer };
+      inspect();
+    });
+  };
+
+  return {
+    async awaitReport(kind) {
+      const outcome = await awaitKind(kind, ADMISSION_CONFIRM_MS);
+      if (outcome.confirmed) return outcome;
+      const drained = await awaitKind(kind, ADMISSION_DRAIN_MS);
+      // The drain only gets the chance to convert an ordering artifact into a
+      // real verdict; it can never create one, and it is a bound, not a wait.
+      // When it does not, the FIRST observation stays the reported reason: a
+      // closed channel explains the refusal better than an elapsed bound does.
+      return drained.confirmed ? drained : outcome;
+    },
+    unwind() {
+      decide(unavailable("Poiesis revoked the startup protocol before the report arrived"));
+    },
+    retire() {
+      // A gate still waiting when the protocol ends must be decided, not
+      // dropped: a promise nobody resolves is a run nobody settles.
+      decide(unavailable("the startup protocol ended before this report arrived"));
+      report.off("data", onChunk);
+      report.off("error", onChannelFailure);
+      report.off("end", onChannelEnded);
+      report.off("close", onChannelClosed);
+      child.off("exit", onDeclaredExit);
+      // Deliberately retained: the channel can still be open (the prologue
+      // `exec`s with fd3 closed, but a descendant may hold it), and a late stream
+      // failure with no listener is an unhandled `error` event — fatal over a run
+      // that has already reported its outcome.
+      report.on("error", onSettledChannelError);
+      const drained = report as Partial<NodeJS.ReadableStream> & { resume?: () => void; unref?: () => void };
+      drained.resume?.();
+      drained.unref?.();
+    },
+  };
+}
+
+/**
+ * Spec #168 / ticket #178 — the retained no-op error sink for a startup report
+ * channel whose decision is already reported.
  *
- * ONE shared function, so re-attaching it is idempotent (a channel holds at
- * most one listener per function) and repeated ownership of one channel can
- * never accumulate sinks.
+ * ONE shared function, so re-attaching it is idempotent (a channel holds at most
+ * one listener per function) and repeated ownership of one channel can never
+ * accumulate sinks.
  */
 function onSettledChannelError(): void {
-  // The admission verdict is already reported. A late stream failure on a
-  // channel nothing reads any more is not a new fact about this run.
+  // The startup verdict is already reported. A late stream failure on a channel
+  // nothing reads any more is not a new fact about this run.
 }
 
 /**
- * Spec #168 / ticket #176 — one bounded read of the report channel that the race
- * above already gave up on.
+ * Spec #168 / ticket #182 — the typed failure for a startup that stopped before a
+ * lease existed and whose child never exited.
  *
- * Resolves the confirmation the moment a byte carrying it arrives, `null` when the
- * channel closes, ends, fails, or the bound elapses without one. It is the ONLY
- * thing standing between "the byte is in flight" and a spurious refusal, and it
- * cannot create an admission: it accepts the same byte `isAdmissionConfirmation`
- * accepts and nothing else.
+ * It says exactly what happened and, just as importantly, what was NOT done: no
+ * signal was sent, because no identity was ever confirmed to send one to. The
+ * startup refusal that caused it travels on as bounded context, so an operator
+ * learns both the reason the startup stopped and the fact that a process Poiesis
+ * spawned may still be running.
  */
-function drainAdmissionReport(
-  report: NonNullable<ChildProcess["stdio"][3]>,
-): Promise<{ confirmed: true; detail: string } | null> {
-  return new Promise((resolve) => {
-    let timer: NodeJS.Timeout | null = null;
-    const finish = (outcome: { confirmed: true; detail: string } | null): void => {
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      report.off("data", onData);
-      report.off("close", onDrained);
-      report.off("end", onDrained);
-      report.off("error", onDrained);
-      resolve(outcome);
-    };
-    function onData(chunk: Buffer | string): void {
-      if (isAdmissionConfirmation(chunk.toString("utf8"))) {
-        finish({ confirmed: true, detail: "the prologue confirmed its own kernel membership" });
-      }
-    }
-    function onDrained(): void {
-      finish(null);
-    }
-    report.on("data", onData);
-    report.once("close", onDrained);
-    report.once("end", onDrained);
-    report.once("error", onDrained);
-    // A paused channel with bytes already buffered would otherwise never deliver
-    // them inside the bound.
-    (report as Partial<NodeJS.ReadableStream>).resume?.();
-    timer = setTimeout(() => finish(null), ADMISSION_DRAIN_MS);
-    timer.unref?.();
-  });
+function preExecStartupUnresolved(command: string, pid: number): PoiesisError {
+  return new PoiesisError(
+    "PROCESS_CLEANUP_UNRESOLVED",
+    `${command} startup could not confirm that the process Poiesis spawned (PID ${pid}) exited before its admission was settled, and Poiesis had no confirmed identity to signal it with`,
+    {
+      command,
+      pid,
+      containment: "cgroup-v2",
+      reason: "STARTUP_EXIT_UNCONFIRMED",
+      phase: "startup",
+      startupAuthority: "pre-lease",
+      signalsSent: [],
+      membersEnumerated: false,
+      confirmed: false,
+    },
+  );
 }
-
 /**
  * Release every runtime handle a failed run owns: the child's own stdio ends,
  * its process handle, and — for a contained run — the admission report pipe.

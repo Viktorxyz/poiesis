@@ -237,7 +237,7 @@ Each reaches the command processor through the same seam (`/bin/sh -c` on POSIX;
 
 | Host | Required capability | Status |
 | --- | --- | --- |
-| Linux, delegated cgroup v2 subtree | a Poiesis-owned leaf exposing `cgroup.kill`, `cgroup.procs`, `cgroup.events` | supported; the leaf is provisioned before the spawn, entered by a Poiesis-owned admission prologue that confirms its own membership before any caller text can run, and settled with `cgroup.kill` confirmed by `cgroup.events` |
+| Linux, delegated cgroup v2 subtree | a Poiesis-owned leaf exposing `cgroup.kill`, `cgroup.procs`, `cgroup.events` | supported; the leaf is provisioned before the spawn and entered through a Poiesis-owned two-phase startup — the child reports its kernel identity, is admitted and confirms that membership against the same identity, and only then runs the caller's argv — settled with `cgroup.kill` confirmed by `cgroup.events` |
 | Linux, no delegated subtree | — | refused before spawning |
 | Windows | a no-breakaway Job Object created by a native launcher before the child is created | refused before spawning; this runtime ships no such launcher |
 | macOS and the other non-Linux POSIX platforms | — | refused before spawning; no portable strong primitive exists |
@@ -246,7 +246,7 @@ On a refused host the three surfaces above fail with `PROCESS_CONTAINMENT_UNAVAI
 
 Post-integration commands are gated by the same rule as the verification plan. A host that cannot contain the candidate's plan cannot contain the integrated revision either; `postIntegrationCommands` is not a weaker surface and does not fall back to `verification.commands`.
 
-When the host does provide the capability but admission cannot be confirmed, the run is refused with `PROCESS_CONTAINMENT_REFUSED`. When the boundary cannot be confirmed settled, it fails with `PROCESS_CLEANUP_UNRESOLVED`. Both outrank success, failure, timeout, and cancellation, because they mean a process Poiesis spawned may still be running.
+When the host does provide the capability but the startup cannot be confirmed, the run is refused with `PROCESS_CONTAINMENT_REFUSED`, carrying `details.reason` — `STARTUP_IDENTITY_UNCONFIRMED` when the child's reported kernel identity is missing, malformed, or disagrees with a fresh kernel read of that PID, and `ADMISSION_UNCONFIRMED` when the admission itself is missing or is not bound to the identity Poiesis leased. When the boundary cannot be confirmed settled, it fails with `PROCESS_CLEANUP_UNRESOLVED`; a startup refused before a lease existed additionally requires the child's own linked exit and reports `details.reason: STARTUP_EXIT_UNCONFIRMED` when that proof never arrives. Both outrank success, failure, timeout, and cancellation, because they mean a process Poiesis spawned may still be running.
 
 ### Command-processor availability
 

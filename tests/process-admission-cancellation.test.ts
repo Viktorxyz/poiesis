@@ -28,6 +28,14 @@ import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import type { ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { formatStartupReport } from "../src/containment.js";
+import {
+  exitOnGate,
+  scriptStartupChild,
+  scriptedIdentity,
+  startupExit,
+  type ScriptedStartup,
+} from "./startup-harness.js";
 
 const FAKE_LEAF = "/poiesis-fake-cgroup-leaf";
 /** A leaf path no kernel can read, so `populated` can never be confirmed. */
@@ -99,55 +107,8 @@ function mockContainment(probe: ContainmentProbe, order?: string[]): void {
   });
 }
 
-interface ScriptedAdmission {
-  child: ChildProcess;
-  report: PassThrough;
-  /** Signals the runner sent to the child, so a test can prove it sent none. */
-  kills: (NodeJS.Signals | undefined)[];
-}
-
-/**
- * A child that never executes anything: the test scripts the admission window
- * itself, so the verdict is decided by the test rather than by a scheduler race.
- *
- * It has no PID on purpose. The runner therefore holds no process-group lease and
- * cannot signal a real process from a unit test.
- *
- * `drive` runs on the `setImmediate` scheduled by the mocked `spawn`, which is
- * after the runner has attached every listener: that is the real window between
- * the spawn and `armRunControl`.
- */
-function scriptAdmissionChild(drive: (admission: ScriptedAdmission) => void): ScriptedAdmission {
-  const kills: (NodeJS.Signals | undefined)[] = [];
-  const child = new EventEmitter() as ChildProcess;
-  const report = new PassThrough();
-  Object.assign(child, {
-    pid: undefined,
-    stdin: null,
-    stdout: null,
-    stderr: null,
-    stdio: [null, null, null, report],
-  });
-  child.kill = ((signal?: NodeJS.Signals) => {
-    kills.push(signal);
-    setImmediate(() => child.emit("exit", null, "SIGKILL"));
-    return true;
-  }) as ChildProcess["kill"];
-  child.unref = () => child;
-  const admission: ScriptedAdmission = { child, report, kills };
-
-  vi.doMock("node:child_process", async () => {
-    const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
-    return {
-      ...actual,
-      spawn: (() => {
-        setImmediate(() => drive(admission));
-        return child;
-      }) as typeof actual.spawn,
-    };
-  });
-  return admission;
-}
+/** The scripted child is the shared startup harness (tests/startup-harness.ts). */
+type ScriptedAdmission = ScriptedStartup;
 
 async function settleWithin(
   invocation: Promise<unknown>,
@@ -187,13 +148,12 @@ describe("cancellation during admission is not lost (Spec #168 / ticket #176)", 
     const probe = newProbe();
     mockContainment(probe);
     const controller = new AbortController();
-    const admission = scriptAdmissionChild(({ report }) => {
-      // The abort lands inside the admission window: the boundary is provisioned
-      // and the prologue spawned, but no verdict has been reported yet.
-      controller.abort();
-      report.write("a");
-    });
-    // Settling the boundary is what kills an admitted member in the real path.
+    // The abort lands one turn after the spawn: the boundary is provisioned, the
+    // prologue is live, and neither startup phase has a verdict yet.
+    const admission = scriptStartupChild({ onSpawn: () => controller.abort() });
+    // A revoked pre-`exec` prologue exits on its own, and settling the boundary is
+    // what makes the run's own cleanup reach that exit.
+    exitOnGate(admission);
     probe.onSettle = () => admission.child.emit("exit", null, "SIGKILL");
 
     const managed = await import("../src/managed-shell.js");
@@ -227,10 +187,8 @@ describe("cancellation during admission is not lost (Spec #168 / ticket #176)", 
     const probe = newProbe();
     mockContainment(probe);
     const controller = new AbortController();
-    const admission = scriptAdmissionChild(({ report }) => {
-      controller.abort();
-      report.write("a");
-    });
+    const admission = scriptStartupChild({ onSpawn: () => controller.abort() });
+    exitOnGate(admission);
     probe.onSettle = () => admission.child.emit("exit", null, "SIGKILL");
 
     const managed = await import("../src/managed-shell.js");
@@ -255,10 +213,8 @@ describe("cancellation during admission is not lost (Spec #168 / ticket #176)", 
     probe.settleFails = true;
     mockContainment(probe);
     const controller = new AbortController();
-    scriptAdmissionChild(({ report }) => {
-      controller.abort();
-      report.write("a");
-    });
+    const admission = scriptStartupChild({ onSpawn: () => controller.abort() });
+    exitOnGate(admission);
 
     const managed = await import("../src/managed-shell.js");
     const outcome = await settleWithin(
@@ -277,13 +233,16 @@ describe("admission confirmation survives a late report (Spec #168 / ticket #176
   it("accepts a confirmation delivered after the child exit event", { timeout: 60_000 }, async () => {
     const probe = newProbe();
     mockContainment(probe);
-    // Node can deliver `exit` before the report byte written just before it has
-    // been read off fd3. Refusing here would report a real admission as an
-    // unconfirmed one, so the report channel is drained for a bounded window
-    // before the run is refused.
-    scriptAdmissionChild(({ child, report }) => {
-      child.emit("exit", 0, null);
-      setTimeout(() => report.write("a"), 20);
+    // Node can deliver `exit` before the admitted report written just before it
+    // has been read off the report channel. Refusing here would report a real
+    // admission as an unconfirmed one, so the channel is drained for a bounded
+    // window before the run is refused.
+    const admission = scriptStartupChild({ report: scriptedIdentity() });
+    admission.report.on("data", () => {
+      setTimeout(() => {
+        admission.child.emit("exit", 0, null);
+        setTimeout(() => admission.report.write(`${formatStartupReport("admitted", scriptedIdentity())}\n`), 20);
+      }, 0);
     });
 
     const managed = await import("../src/managed-shell.js");
@@ -299,11 +258,11 @@ describe("admission confirmation survives a late report (Spec #168 / ticket #176
   it("still refuses when the report never arrives, after a bounded drain", { timeout: 60_000 }, async () => {
     const probe = newProbe();
     mockContainment(probe);
-    // The channel closes with no byte: nothing was confirmed, and draining the
-    // channel must not turn that into an admission.
-    scriptAdmissionChild(({ report }) => {
-      report.end();
-    });
+    // The channel closes with no report: nothing was confirmed, and draining the
+    // channel must not turn that into a startup identity.
+    const admission = scriptStartupChild();
+    admission.report.end();
+    exitOnGate(admission);
 
     const managed = await import("../src/managed-shell.js");
     const startedAt = Date.now();
@@ -311,7 +270,7 @@ describe("admission confirmation survives a late report (Spec #168 / ticket #176
       managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" }),
     ).rejects.toMatchObject({
       code: "PROCESS_CONTAINMENT_REFUSED",
-      details: { reason: "ADMISSION_UNCONFIRMED", confirmed: false },
+      details: { reason: "STARTUP_IDENTITY_UNCONFIRMED", confirmed: false },
     });
     expect(Date.now() - startedAt).toBeLessThan(ADMISSION_BOUND_MS);
     expect(probe.settled).toEqual([FAKE_LEAF]);
@@ -339,9 +298,10 @@ describe("a settled admission channel keeps an error sink (Spec #168 / ticket #1
   it("retires its own listeners and survives a late stream error", { timeout: 60_000 }, async () => {
     const probe = newProbe();
     mockContainment(probe);
-    const admission = scriptAdmissionChild(({ child, report }) => {
-      report.write("a");
-      setTimeout(() => child.emit("exit", 0, null), 20);
+    const admission = scriptStartupChild({ report: scriptedIdentity(), admitted: scriptedIdentity() });
+    admission.gate.on("data", (chunk: Buffer) => {
+      if (!chunk.toString("utf8").startsWith("E ")) return;
+      setTimeout(() => startupExit(admission), 20);
     });
 
     const managed = await import("../src/managed-shell.js");
@@ -385,9 +345,9 @@ describe("a settled admission channel keeps an error sink (Spec #168 / ticket #1
     mockContainment(probe);
     // The channel closes with no confirmation: the verdict is a refusal, and the
     // refusal's own settle/release sequence runs afterwards.
-    const admission = scriptAdmissionChild(({ report }) => {
-      report.end();
-    });
+    const admission = scriptStartupChild();
+    admission.report.end();
+    exitOnGate(admission);
     probe.onSettle = () => admission.child.emit("exit", null, "SIGKILL");
 
     const managed = await import("../src/managed-shell.js");
@@ -409,9 +369,9 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
     // removed. Releasing without settling is how a half-admitted leaf leaks.
     // Nothing here has exited or closed its streams, so the refusal path is the
     // only thing that can settle the boundary.
-    const admission = scriptAdmissionChild(({ report }) => {
-      report.end();
-    });
+    const admission = scriptStartupChild();
+    admission.report.end();
+    exitOnGate(admission);
 
     const managed = await import("../src/managed-shell.js");
     await expect(
@@ -421,20 +381,24 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
     expect(order).toEqual(["settle", "release"]);
     expect(probe.settled).toEqual([FAKE_LEAF]);
     expect(probe.released).toEqual([FAKE_LEAF]);
-    // The half-admitted child is terminated rather than left behind.
-    expect(admission.kills).not.toHaveLength(0);
+    // Spec #168 / ticket #182: a refused startup REVOKES its control channel
+    // rather than signalling a PID whose identity it never confirmed — and a
+    // pre-`exec` prologue exits when that channel closes.
+    expect(admission.gateClosed).toBe(true);
+    expect(admission.kills).toEqual([]);
   });
 
   it("never signals a PID that was already reaped when the admission is refused", { timeout: 60_000 }, async () => {
     const probe = newProbe();
     mockContainment(probe);
-    // The prologue finished without ever reporting — the case where the child
-    // is ALREADY gone by the time the refusal is decided. Signalling it here
-    // would address whatever inherited that PID, which is the one thing the
-    // admission barrier must never do.
-    const admission = scriptAdmissionChild(({ child, report }) => {
-      child.emit("exit", 0, null);
-      report.end();
+    // The prologue finished without ever reporting — the case where the child is
+    // ALREADY gone by the time the refusal is decided, so its PID may already be
+    // a number some unrelated process owns.
+    const admission = scriptStartupChild({
+      onSpawn: () => {
+        admission.child.emit("exit", 0, null);
+        admission.report.end();
+      },
     });
 
     const managed = await import("../src/managed-shell.js");
@@ -443,9 +407,11 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
       managed.runManagedShellCommand({ cwd: tmpdir(), command: "printf never-confirmed" }),
     ).rejects.toMatchObject({
       code: "PROCESS_CONTAINMENT_REFUSED",
-      details: { reason: "ADMISSION_UNCONFIRMED", confirmed: false },
+      details: { reason: "STARTUP_IDENTITY_UNCONFIRMED", confirmed: false },
     });
     expect(Date.now() - startedAt).toBeLessThan(ADMISSION_BOUND_MS);
+    // Spec #168 / ticket #182: the contained startup path signals no PID at all,
+    // reaped or not — the gate is revoked and the boundary settled instead.
     expect(admission.kills).toEqual([]);
     // The refusal still settles the boundary it provisioned.
     expect(probe.settled).toEqual([FAKE_LEAF]);
@@ -455,9 +421,9 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
   it("keeps the refusal as the reported outcome when the refusal's own cleanup confirms the boundary", { timeout: 60_000 }, async () => {
     const probe = newProbe();
     mockContainment(probe);
-    scriptAdmissionChild(({ report }) => {
-      report.end();
-    });
+    const admission = scriptStartupChild();
+    admission.report.end();
+    exitOnGate(admission);
 
     const managed = await import("../src/managed-shell.js");
     await expect(
@@ -480,9 +446,9 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
     const probe = newProbe();
     probe.settleFails = true;
     mockContainment(probe);
-    scriptAdmissionChild(({ report }) => {
-      report.end();
-    });
+    const admission = scriptStartupChild();
+    admission.report.end();
+    exitOnGate(admission);
 
     const managed = await import("../src/managed-shell.js");
     let error: unknown = null;
@@ -500,7 +466,7 @@ describe("an admission refusal settles the boundary it provisioned (Spec #168 / 
     // The refusal is preserved as bounded context, not as the outcome.
     expect(details.containmentRefusal).toMatchObject({
       code: "PROCESS_CONTAINMENT_REFUSED",
-      reason: "ADMISSION_UNCONFIRMED",
+      reason: "STARTUP_IDENTITY_UNCONFIRMED",
     });
     // And the surviving-process evidence the cleanup error itself carries is
     // untouched by the refusal being present.

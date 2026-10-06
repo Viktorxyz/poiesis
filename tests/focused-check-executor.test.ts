@@ -42,6 +42,8 @@ import {
   type TestRepository,
 } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+import { ADMISSION_ARGV0 } from "../src/containment.js";
+import { FAKE_PID } from "./startup-harness.js";
 
 const CALM: ResourcePressureSample = {
   loadAverage1m: 0.1,
@@ -947,8 +949,10 @@ describe("an actionable containment refusal survives the focused surface (Spec #
             releaseContainment: () => undefined,
           };
         });
-        // A prologue that never reports and never exits: the exact shape of a
-        // child Poiesis cannot place inside the boundary it provisioned.
+        // A prologue that never reports: the exact shape of a child Poiesis
+        // cannot place inside the boundary it provisioned. It exits when the gate
+        // closes, which is what a real pre-`exec` prologue does — so the refusal
+        // is the reported outcome rather than an unresolved cleanup.
         vi.doMock("node:child_process", async () => {
           const actual = await vi.importActual<typeof import("node:child_process")>("node:child_process");
           return {
@@ -956,21 +960,23 @@ describe("an actionable containment refusal survives the focused surface (Spec #
             spawn: ((command: string, ...rest: unknown[]) => {
               const argv = (rest[0] as string[]) ?? [];
               spawns.push([command, ...argv].join(" "));
-              if (command !== "/bin/sh" || !argv.includes("poiesis-admission")) {
+              if (command !== "/bin/sh" || !argv.includes(ADMISSION_ARGV0)) {
                 return Reflect.apply(actual.spawn, undefined, [command, ...rest]) as never;
               }
               const fake = new EventEmitter() as ChildProcess;
               const report = new PassThrough();
+              const gate = new PassThrough();
               Object.assign(fake, {
-                pid: undefined,
-                stdin: null,
+                pid: FAKE_PID,
+                stdin: gate,
                 stdout: null,
                 stderr: null,
-                stdio: [null, null, null, report],
+                stdio: [gate, null, null, report],
                 kill: () => true,
                 unref: () => fake,
               });
               setTimeout(() => report.end(), 20);
+              gate.on("close", () => setImmediate(() => fake.emit("exit", 75, null)));
               return fake;
             }) as typeof actual.spawn,
           };
@@ -983,7 +989,7 @@ describe("an actionable containment refusal survives the focused surface (Spec #
       code: "PROCESS_CONTAINMENT_REFUSED",
       details: {
         containment: "cgroup-v2",
-        reason: "ADMISSION_UNCONFIRMED",
+        reason: "STARTUP_IDENTITY_UNCONFIRMED",
         detail: expect.stringContaining("without reporting"),
         check: {
           scope: "focused",
@@ -995,7 +1001,7 @@ describe("an actionable containment refusal survives the focused surface (Spec #
     // Exactly one managed spawn: the Poiesis-owned prologue. The caller's
     // command was never `exec`'d, because nothing may run before admission is
     // confirmed.
-    expect(observed.spawns.filter((argv) => argv.includes("poiesis-admission"))).toHaveLength(1);
+    expect(observed.spawns.filter((argv) => argv.includes(ADMISSION_ARGV0))).toHaveLength(1);
     const details = (observed.error as { details: Record<string, unknown> }).details;
     expect(details.migration).toBeUndefined();
     expect(details.remediation).toBeUndefined();

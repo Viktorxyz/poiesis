@@ -44,6 +44,8 @@ import { init } from "../src/maintenance.js";
 import { VERIFICATION_RECEIPT_DIRECTORY } from "../src/verification-receipt.js";
 import * as processModule from "../src/process.js";
 import { createTestRepository, describeManagedExecution, testConfig, type TestRepository } from "./helpers.js";
+import { formatStartupReport } from "../src/containment.js";
+import { FAKE_PID, scriptedIdentity } from "./startup-harness.js";
 
 const PLAN_COMMAND = "sleep 30";
 
@@ -119,7 +121,7 @@ async function dispatchQuietly(
 }
 
 /**
- * Script ONLY the admission prologue's managed child.
+ * Script ONLY the startup prologue's managed child.
  *
  * Everything else — every `git` call Verify makes around the plan — runs for
  * real, so the run reaches the managed command with a genuine provisioned
@@ -145,25 +147,37 @@ function interruptDuringAdmission(): void {
         }
         const fake = new EventEmitter() as ChildProcess;
         const report = new PassThrough();
+        const gate = new PassThrough();
         Object.assign(fake, {
-          pid: undefined,
-          stdin: null,
+          pid: FAKE_PID,
+          stdin: gate,
           stdout: null,
           stderr: null,
-          stdio: [null, null, null, report],
+          stdio: [gate, null, null, report],
           kill: () => true,
           unref: () => fake,
         });
         setImmediate(() => {
-          // Ctrl-C while the run is being admitted.
+          // Ctrl-C while the run is still being started.
           process.emit("SIGINT");
-          // The prologue then confirms and the admitted command succeeds.
-          report.write("a");
-          setTimeout(() => {
-            report.end();
-            fake.emit("exit", 0, null);
-          }, 50);
+          // The prologue then reports, admits, and the admitted command succeeds
+          // — which is what makes the loss material.
+          report.write(`${formatStartupReport("identity", scriptedIdentity())}\n`);
+          gate.on("data", (chunk: Buffer) => {
+            const line = chunk.toString("utf8");
+            if (line.startsWith("A ")) {
+              report.write(`${formatStartupReport("admitted", scriptedIdentity())}\n`);
+              return;
+            }
+            if (line.startsWith("E ")) {
+              setTimeout(() => {
+                report.end();
+                fake.emit("exit", 0, null);
+              }, 50);
+            }
+          });
         });
+        gate.on("close", () => setImmediate(() => fake.emit("exit", 75, null)));
         return fake;
       }) as typeof actual.spawn,
     };

@@ -191,7 +191,7 @@ in a kernel boundary before any of their text runs:
 | --- | --- |
 | Processor (POSIX) | `/bin/sh` with `["-c", <the exact command>]` |
 | Processor (Windows) | a validated absolute `ComSpec` naming `cmd.exe`, with `["/d", "/s", "/c", <the exact command>]` |
-| Admission barrier (Linux) | a Poiesis-owned prologue that moves ITSELF into the provisioned cgroup v2 leaf and confirms its membership before it `exec`s the processor |
+| Startup protocol (Linux) | a Poiesis-owned prologue that reports its kernel identity, waits, admits ITSELF into the provisioned cgroup v2 leaf, confirms that membership against the same identity, waits again, and only then runs the caller's argv |
 | Containment (Linux) | that delegated cgroup v2 leaf, provisioned BEFORE the spawn, settled with `cgroup.kill` and confirmed by `cgroup.events` |
 | Containment (Windows) | requires a no-breakaway Job Object from a native launcher, which this runtime does not ship |
 | Containment (macOS / other POSIX) | no portable primitive exists |
@@ -199,19 +199,42 @@ in a kernel boundary before any of their text runs:
 What Poiesis **does** claim:
 
 - the leaf exists before the process is created;
-- the managed child is a Poiesis-owned prologue, not the command. It admits and
-  confirms *itself* out of band (the leaf travels in the environment, never in
-  the argv) and only then `exec`s the already-resolved processor with the
-  already-resolved argv — so **no caller command text can execute before
-  admission is confirmed**, and that ordering is enforced by the prologue's own
-  control flow rather than by a parent-side write racing the child's `execve`;
-- the caller command is passed through verbatim: byte-identical as the final
-  argv element, never interpolated into the prologue;
-- the parent refuses the run if the confirmation never arrives — there is no
-  "it probably made it" branch, for a live child or a finished one;
+- the managed child is a Poiesis-owned prologue, not the command, and it is spawned
+  with **no caller text in its argv at all**. The startup is two phases:
+  1. the prologue reports its own kernel PID, process-group id, and
+     process-start identity and waits; Poiesis checks that report against the PID
+     `spawn` returned *and* against a fresh kernel read of that PID, establishes a
+     live validated lease, and only then sends the admission token;
+  2. the prologue admits *itself* into the leaf, confirms that membership is bound
+     to the SAME identity it reported, reports that, and waits for a **distinct**
+     execution token. Poiesis binds that report to the identity it leased, and only
+     then releases the caller's argv and arms stdin, the command timeout, and
+     cancellation;
+- so **no caller command text can execute before the admission is confirmed**, and
+  the ordering is structural rather than a race: the text does not exist in the
+  child's argv until the parent has the authority to release it;
+- the boundary path and both gate tokens travel out of band in the environment,
+  never in the argv, and are scrubbed before the processor is `exec`'d;
+- the caller's command is passed through verbatim: byte-identical as the released
+  argv, never interpolated into the prologue;
+- the parent refuses the run if either report is missing, malformed, or disagrees
+  with the kernel — there is no "it probably made it" branch, for a live child or a
+  finished one;
 - every process the command creates after admission inherits the leaf, because
   cgroup membership survives `fork`, `setsid(2)`, and reparenting;
 - settlement fails closed unless the kernel itself reports the leaf empty.
+
+Cleanup follows the phase the startup actually reached, because each phase earns a
+different authority. Before a lease exists nothing may be signalled: Poiesis
+REVOKES its own control channel — which is what a pre-`exec` prologue exits on —
+settles the leaf, and requires the child's own linked exit; without that proof it
+reports `PROCESS_CLEANUP_UNRESOLVED` with `details.reason:
+STARTUP_EXIT_UNCONFIRMED`. After a lease exists but before the admission is
+confirmed, the group and the leaf are settled independently, because an empty leaf
+cannot prove anything about a leader that never entered it. After a confirmed
+admission the cgroup is the authority and no group-local settlement runs at all.
+`src/process-tree.ts` remains the only place that signals a POSIX process group, and
+the contained startup path sends no raw PID signal of its own.
 
 What Poiesis **does not** claim: that it detects an escape. It never polls for
 one, never matches on a process name, port, user, or age, and never scans the

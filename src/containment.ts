@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PoiesisError } from "./errors.js";
@@ -32,18 +34,27 @@ import { PoiesisError } from "./errors.js";
  *
  *   - the leaf is provisioned BEFORE the process is created, so a run that
  *     cannot be contained never starts;
- *   - the child is spawned into a Poiesis-owned ADMISSION PROLOGUE, not into the
- *     command processor. The prologue runs Poiesis's own shell text, moves ITSELF
- *     into the leaf, confirms its own kernel membership by reading
- *     `cgroup.procs` back, reports that confirmation to the parent, and only
- *     then `exec`s the already-resolved processor with the already-resolved
- *     argv;
- *   - therefore NO caller command text can execute before admission is
- *     confirmed. The prologue is the only thing that runs before it, it is
- *     Poiesis-owned, and it contains no caller data;
- *   - the parent refuses the run unless that confirmation arrives. There is no
- *     path on which an unconfirmed child is reported contained, whether it is
- *     still live or already finished;
+ *   - the child is spawned into a Poiesis-owned STARTUP PROLOGUE, not into the
+ *     command processor, and it is spawned with NO caller text in its argv at
+ *     all. The prologue is Poiesis's own shell text and nothing else;
+ *   - startup is TWO PHASE, and each phase earns its authority before it is
+ *     used (ticket #182):
+ *       1. the prologue reports its own kernel PID, process-group id, and
+ *          process-start identity and WAITS. The parent checks that report
+ *          against `child.pid` AND against a fresh kernel read, establishes a
+ *          live validated lease, and only then sends the admission token;
+ *       2. the prologue admits ITSELF into the leaf, confirms that membership is
+ *          bound to the SAME identity it reported, reports that, and waits for a
+ *          DISTINCT execution token. The parent checks the admitted report
+ *          against the identity it leased, then releases the caller's argv;
+ *   - so no caller command text exists in the child's argv before admission,
+ *     nothing runs before it is released, and stdin, the command timeout, and
+ *     cancellation arm only after authority exists;
+ *   - the parent refuses the run unless both reports arrive and both bind. There
+ *     is no path on which an unconfirmed child is reported contained, whether it
+ *     is still live or already finished;
+ *   - the boundary path, both tokens, and Poiesis's own variables are scrubbed
+ *     before `exec`, so the caller's process inherits none of them;
  *   - every process the command creates after admission inherits the leaf;
  *   - settlement is `cgroup.kill` confirmed by the kernel's own
  *     `cgroup.events populated=0`, so a surviving member fails closed.
@@ -54,40 +65,101 @@ import { PoiesisError } from "./errors.js";
  */
 
 /**
- * The admission barrier: a Poiesis-owned shell prologue that admits ITSELF and
- * then becomes the command.
+ * The two-phase startup protocol: a Poiesis-owned shell prologue that reports
+ * itself, waits for authority, admits itself, waits again, and only then runs
+ * the caller's exact argv.
  *
- * Deterministic by construction: the prologue is the child's whole world until
- * admission is confirmed, so the ordering "admission confirmed, then any caller
- * text runs" is enforced by the prologue's own control flow rather than by a
- * parent-side `write(2)` racing the child's `execve`. The caller's command text
- * is never interpolated into this script — the processor and its argv arrive as
- * positional parameters and are handed to `exec` verbatim, so the final argv
- * element is byte-identical to what the caller passed.
+ * Deterministic by construction. Every byte the caller's text would occupy is
+ * held by the parent until the parent has a live validated lease AND a
+ * confirmed admission, so "no caller text before admission" is not a race
+ * between a parent-side write and a child-side `execve` — the text does not
+ * exist yet. The prologue is the only thing running in that window, it is
+ * Poiesis-owned, and it contains no caller data at all.
  *
- * The leaf arrives out of band, in the environment, so it cannot appear in the
- * command's own argv.
+ * Channel direction matters here, and it is a kernel fact rather than a
+ * convention: for `stdio` entries above fd 0 Node gives the PARENT the reading
+ * end of the pipe, so a parent→child channel can only be the child's stdin. The
+ * prologue therefore reads Poiesis's gate from fd 0, and it reads exactly the
+ * frames it is entitled to, leaving anything the caller piped in unread for the
+ * command it `exec`s.
+ *
+ * Frames, in order, all newline-terminated: the admission token, then the
+ * distinct execution token, then the argv count, then one frame per argv
+ * element. Every element is octal-escaped by the parent, so a frame can contain
+ * no literal newline and the shell's line reader is exact. It is decoded with
+ * `printf %b`, which POSIX makes a `sh` regular built-in, so the last element
+ * the command sees is byte-identical to what the caller passed.
+ *
+ * The leaf and both tokens arrive out of band, in the environment, so they can
+ * never appear in the caller's own argv — and are unset before `exec`.
  */
 export const ADMISSION_PROLOGUE = [
-  'leaf=$POIESIS_ADMISSION_LEAF',
+  // Pathname expansion is disabled for this script only: the frames below are
+  // split into positional parameters, and a glob in a /proc field must never be
+  // expanded into filenames.
+  "set -f",
+  // 1. Report THIS process's kernel identity, then wait for authority. Nothing
+  //    the caller said is in this process yet, not even in its argv.
+  "stat_line=",
+  'IFS= read -r stat_line < "/proc/$$/stat" || exit 72',
+  'rest=${stat_line##*") "}',
+  "set -- $rest",
+  "state=$1",
+  "pgid=$3",
+  "start=${20}",
+  "case $state in Z|X|x) exit 73 ;; esac",
+  "printf 'I %s %s %s\\n' \"$$\" \"$pgid\" \"$start\" >&3 || exit 74",
+  // 2. The parent validated that report and leased this identity. Its answer is
+  //    a token only it knows; anything else — including a closed gate — exits.
+  "IFS= read -r gate || exit 75",
+  '[ "$gate" = "A $POIESIS_ADMISSION_TOKEN" ] || exit 76',
+  // 3. Admit ITSELF into the provisioned leaf, exactly as the boundary requires.
+  "leaf=$POIESIS_ADMISSION_LEAF",
   '[ -n "$leaf" ] || exit 71',
-  'printf %s\\\\n "$$" > "$leaf/cgroup.procs" || exit 70',
-  'member=0',
-  'while IFS= read -r line; do',
-  '  if [ "$line" = "$$" ]; then member=1; break; fi',
+  "printf '%s\\n' \"$$\" > \"$leaf/cgroup.procs\" || exit 70",
+  "member=0",
+  "while IFS= read -r listed; do",
+  '  if [ "$listed" = "$$" ]; then member=1; break; fi',
   'done < "$leaf/cgroup.procs"',
   '[ "$member" = 1 ] || exit 71',
-  // Report the confirmed admission, then close the report channel so the command
-  // never inherits it. A refusal above exits instead, and the parent sees the
-  // channel close with no report.
-  'printf a >&3 || exit 71',
-  // The leaf has already been read into `$leaf`, so the Poiesis-owned variable is
-  // no longer needed. Scrubbing it here means the caller's command never inherits
-  // Poiesis's internal boundary path. It is deliberately NOT fatal: `unset` on an
-  // already-unset variable always succeeds, so the only way this can fail is a
-  // processor that refuses to drop a variable — which must not turn a confirmed
-  // admission into a refusal.
-  'unset POIESIS_ADMISSION_LEAF || :',
+  // 4. The membership must be bound to the SAME identity that was reported and
+  //    leased. A report is a claim about a process; these two fields are what
+  //    make it a claim about THIS process.
+  "admitted=",
+  'IFS= read -r admitted < "/proc/$$/stat" || exit 77',
+  'rest=${admitted##*") "}',
+  "set -- $rest",
+  '[ "$3" = "$pgid" ] || exit 78',
+  '[ "${20}" = "$start" ] || exit 79',
+  "printf 'A %s %s %s\\n' \"$$\" \"$pgid\" \"$start\" >&3 || exit 80",
+  // 5. A DISTINCT execution token. The admission token cannot double as it, so
+  //    a replay of the first phase cannot release the caller's text.
+  "IFS= read -r gate || exit 81",
+  '[ "$gate" = "E $POIESIS_EXECUTION_TOKEN" ] || exit 82',
+  // 6. The caller's exact argv, one octal-escaped frame per element. The count
+  //    is read first so the loop consumes exactly the frames the parent sent and
+  //    never a byte of the caller's own stdin.
+  "IFS= read -r count || exit 83",
+  'case $count in ""|*[!0-9]*) exit 84 ;; esac',
+  // Bounded before any arithmetic: the count can only be a number the parent's
+  // own argv could produce, and a value this shell cannot hold is refused rather
+  // than evaluated into a diagnostic on the caller's stderr.
+  "[ ${#count} -le 4 ] || exit 84",
+  "[ $count -ge 1 ] && [ $count -le 4096 ] || exit 84",
+  "set --",
+  "n=0",
+  'while [ "$n" -lt "$count" ]; do',
+  "  IFS= read -r encoded || exit 85",
+  "  argument=\"$(printf '%b' \"$encoded\"; printf X)\"",
+  "  argument=${argument%X}",
+  '  set -- "$@" "$argument"',
+  "  n=$((n + 1))",
+  "done",
+  // 7. Nothing Poiesis-owned reaches the caller's process: the boundary path and
+  //    both tokens are dropped, and the report channel is closed so no
+  //    descendant inherits it. `unset` on a missing name always succeeds, so
+  //    this can never turn a released run into a refusal.
+  "unset POIESIS_ADMISSION_LEAF POIESIS_ADMISSION_TOKEN POIESIS_EXECUTION_TOKEN || :",
   'exec "$@" 3>&-',
   "",
 ].join("\n");
@@ -95,14 +167,141 @@ export const ADMISSION_PROLOGUE = [
 /** The environment variable that carries the provisioned leaf out of band. */
 export const ADMISSION_LEAF_ENV = "POIESIS_ADMISSION_LEAF";
 
-/** The single byte the prologue writes once the kernel confirms its membership. */
-export const ADMISSION_CONFIRMATION = "a";
+/**
+ * Spec #168 / ticket #182 — the environment variable that carries the admission
+ * token out of band. The parent is the only holder of its value, so the token is
+ * proof that the parent itself decided the child may admit itself.
+ */
+export const ADMISSION_TOKEN_ENV = "POIESIS_ADMISSION_TOKEN";
 
-/** `$0` for the admission prologue; it keeps the caller's argv positions intact. */
+/**
+ * Spec #168 / ticket #182 — the DISTINCT execution token. It is not the
+ * admission token, and it is not derived from anything the child has already
+ * seen, so replaying the first phase cannot release the caller's argv.
+ */
+export const EXECUTION_TOKEN_ENV = "POIESIS_EXECUTION_TOKEN";
+
+/** Every Poiesis-owned variable the prologue must not leave behind. */
+export const STARTUP_ENVIRONMENT_KEYS = [
+  ADMISSION_LEAF_ENV,
+  ADMISSION_TOKEN_ENV,
+  EXECUTION_TOKEN_ENV,
+] as const;
+
+/** The first frame the prologue writes: its kernel identity, before any authority. */
+export const STARTUP_IDENTITY_REPORT = "I";
+
+/** The frame that confirms its admission, bound to the identity it reported. */
+export const ADMISSION_CONFIRMATION = "A";
+
+/** `$0` for the startup prologue. It is Poiesis-owned and carries no caller text. */
 export const ADMISSION_ARGV0 = "poiesis-admission";
 
-/** Bounded window the parent waits for the admission confirmation. */
+/** Bounded window the parent waits for each startup report. */
 export const ADMISSION_CONFIRM_MS = 5_000;
+
+/**
+ * Spec #168 / ticket #182 — one startup identity, as the kernel reports it.
+ *
+ * These three fields are the whole of what identifies a process for this
+ * protocol: a PID names a slot that any later process may be handed, a
+ * process-group id IS the PID of the process that created it, and only the
+ * process-start identity distinguishes the process at that PID from its
+ * predecessor. A report that carries all three is a claim; the parent's fresh
+ * read is what makes it a fact.
+ */
+export interface StartupIdentity {
+  readonly pid: number;
+  readonly processGroupId: number;
+  readonly startIdentity: string;
+}
+
+/** Which startup frame a report is, and therefore which phase it can answer. */
+export type StartupReportKind = "identity" | "admitted";
+
+export interface StartupReport {
+  readonly kind: StartupReportKind;
+  readonly identity: StartupIdentity;
+}
+
+/**
+ * Render a startup report. The parent and the prologue must agree on this to the
+ * byte, and the prologue builds the same three fields out of `/proc/$$/stat`, so
+ * this is the single definition of the wire format.
+ */
+export function formatStartupReport(kind: StartupReportKind, identity: StartupIdentity): string {
+  const marker = kind === "identity" ? STARTUP_IDENTITY_REPORT : ADMISSION_CONFIRMATION;
+  return `${marker} ${identity.pid} ${identity.processGroupId} ${identity.startIdentity}`;
+}
+
+/**
+ * Parse one startup report, or `null` when it is not one.
+ *
+ * Strict on purpose. The parser is the boundary between a Poiesis-owned shell
+ * and a parent that is about to act on what it says, so a line with a missing
+ * field, a non-numeric PID, a nonsense group id, or an unbounded identity token
+ * is not "mostly a report" — it is not a report, and anything else would be
+ * parsing around a child that is not speaking the protocol.
+ */
+export function parseStartupReport(line: string): StartupReport | null {
+  const match = /^([IA]) ([0-9]{1,10}) ([0-9]{1,10}) ([0-9]{1,64})$/.exec(line.trim());
+  if (match === null) return null;
+  const marker = match[1];
+  const pidToken = match[2];
+  const groupToken = match[3];
+  const startIdentity = match[4];
+  if (marker === undefined || pidToken === undefined || groupToken === undefined || startIdentity === undefined) {
+    return null;
+  }
+  const pid = Number(pidToken);
+  const processGroupId = Number(groupToken);
+  if (!Number.isSafeInteger(pid) || pid <= 1) return null;
+  if (!Number.isSafeInteger(processGroupId) || processGroupId <= 1) return null;
+  return {
+    kind: marker === STARTUP_IDENTITY_REPORT ? "identity" : "admitted",
+    identity: { pid, processGroupId, startIdentity },
+  };
+}
+
+/**
+ * Spec #168 / ticket #182 — mint the two gate tokens for one run.
+ *
+ * They are independent random values and are never equal: "the second phase uses
+ * a different token" has to be a property of what is minted, not a claim about
+ * how likely a collision is.
+ */
+export function mintStartupTokens(): { admissionToken: string; executionToken: string } {
+  const admissionToken = randomBytes(24).toString("hex");
+  let executionToken = randomBytes(24).toString("hex");
+  while (executionToken === admissionToken) {
+    executionToken = randomBytes(24).toString("hex");
+  }
+  return { admissionToken, executionToken };
+}
+
+/**
+ * Spec #168 / ticket #182 — encode the caller's argv for the release channel.
+ *
+ * Each element becomes one newline-free octal-escaped frame, preceded by the
+ * element count, so the shell's line reader reproduces the argv exactly and the
+ * prologue can consume precisely the frames the parent sent. `printf %b` is a
+ * POSIX `sh` regular built-in, so the decoder exists wherever the processor
+ * does. A byte an `execve` argument could never carry (NUL) cannot be expressed
+ * in an argument either, so it is encoded like any other byte rather than
+ * special-cased.
+ */
+export function encodeReleasePayload(argv: readonly string[]): string {
+  const frames = argv.map(encodeReleaseFrame);
+  return `${frames.length}\n${frames.join("\n")}\n`;
+}
+
+function encodeReleaseFrame(value: string): string {
+  let frame = "";
+  for (const byte of Buffer.from(value, "utf8")) {
+    frame += `\\0${byte.toString(8).padStart(3, "0")}`;
+  }
+  return frame;
+}
 
 /**
  * Spec #168 / ticket #176 — bounded window the parent drains the report channel
@@ -118,11 +317,6 @@ export const ADMISSION_CONFIRM_MS = 5_000;
  * still refused, one bound later.
  */
 export const ADMISSION_DRAIN_MS = 250;
-
-/** True when a chunk read from the report channel carries the confirmation. */
-export function isAdmissionConfirmation(chunk: string): boolean {
-  return chunk.includes(ADMISSION_CONFIRMATION);
-}
 
 /** The three containment models Poiesis can name. */
 export type ContainmentModel = "process-group" | "cgroup-v2" | "job-object";
@@ -468,6 +662,74 @@ export function provisionContainment(input: {
 }
 
 /**
+ * Spec #168 / ticket #182 — the parent's side of the FIRST phase: the startup
+ * identity report. It has exactly one outcome — refusal.
+ *
+ * Nothing may be leased, admitted, released, or signalled until this returns.
+ * That is the whole point of splitting the barrier in two: a report is a child's
+ * claim about itself, and a claim is only worth acting on when it agrees with
+ * the two things the parent can check independently — the PID `spawn` returned,
+ * and a fresh kernel read of that PID's process-group id and process-start
+ * identity. A report that names another PID, an earlier process at that PID, a
+ * group the kernel does not agree with, or a process that is already gone is not
+ * a report this run may act on.
+ *
+ * @throws `PROCESS_CONTAINMENT_REFUSED` — always, unless the identity is proven.
+ */
+export function requireValidatedStartupIdentity(
+  lease: ManagedContainmentLease,
+  input: {
+    pid: number;
+    /** The parsed report, or `null` when none was received. */
+    reported: StartupIdentity | null;
+    /** The parent's own kernel read of `pid`, or `null` when unreadable. */
+    fresh: StartupIdentity | null;
+    /** What the gate itself observed, when it observed nothing usable. */
+    detail: string;
+  },
+): void {
+  const problems: string[] = [];
+  if (input.reported === null) {
+    problems.push(input.detail);
+  } else {
+    if (input.reported.pid !== input.pid) {
+      problems.push(`the report named PID ${input.reported.pid}, not the spawned child ${input.pid}`);
+    }
+    if (input.fresh === null) {
+      problems.push(`the kernel identity at PID ${input.pid} could not be read`);
+    } else {
+      if (input.reported.processGroupId !== input.fresh.processGroupId) {
+        problems.push(
+          `the report named process group ${input.reported.processGroupId}, not the group ${input.fresh.processGroupId} the kernel reports for PID ${input.pid}`,
+        );
+      }
+      if (input.reported.startIdentity !== input.fresh.startIdentity) {
+        problems.push(
+          `the report named start identity ${input.reported.startIdentity}, not the identity ${input.fresh.startIdentity} the kernel reports for PID ${input.pid}`,
+        );
+      }
+    }
+  }
+  if (problems.length === 0) return;
+  throw new PoiesisError(
+    "PROCESS_CONTAINMENT_REFUSED",
+    `Managed command ${input.pid} reported no startup identity Poiesis could confirm against the kernel: ${problems.join("; ")}`,
+    {
+      containment: lease.model,
+      leaf: lease.leaf,
+      pid: input.pid,
+      reason: "STARTUP_IDENTITY_UNCONFIRMED",
+      detail: problems.join("; "),
+      // The two sides of the comparison, so an operator can see which one
+      // disagreed without re-running anything.
+      reported: input.reported,
+      fresh: input.fresh,
+      confirmed: false,
+    },
+  );
+}
+
+/**
  * The parent's side of admission. It has exactly one outcome — refusal.
  *
  * The prologue admits and confirms itself; the parent decides. If the
@@ -478,21 +740,54 @@ export function provisionContainment(input: {
  * unless the prologue said otherwise, because "finished" is exactly the case
  * where nothing can be re-checked afterwards.
  *
+ * Spec #168 / ticket #182: a confirmation is also only about a process when it
+ * is bound to the identity this run leased. An admitted report naming a
+ * different identity is a claim by something else, so it is refused here rather
+ * than accepted as "something in the leaf confirmed a membership".
+ *
  * @throws `PROCESS_CONTAINMENT_REFUSED` — always, unless admission confirmed.
  */
 export function requireConfirmedAdmission(
   lease: ManagedContainmentLease,
-  input: { confirmed: boolean; pid: number; detail: string },
+  input: {
+    confirmed: boolean;
+    pid: number;
+    detail: string;
+    /** The admitted report's identity, when one arrived. */
+    identity?: StartupIdentity | null;
+    /** The identity this run leased in the first phase. */
+    expected?: StartupIdentity | null;
+  },
 ): void {
-  if (input.confirmed) return;
+  const problems: string[] = [];
+  if (!input.confirmed) problems.push(input.detail);
+  const reported = input.identity ?? null;
+  const expected = input.expected ?? null;
+  if (reported !== null && expected !== null) {
+    if (
+      reported.pid !== expected.pid ||
+      reported.processGroupId !== expected.processGroupId ||
+      reported.startIdentity !== expected.startIdentity
+    ) {
+      problems.push(
+        `the admission was confirmed for PID ${reported.pid} in group ${reported.processGroupId} with start identity ${reported.startIdentity}, not the leased identity of PID ${expected.pid} in group ${expected.processGroupId} with start identity ${expected.startIdentity}`,
+      );
+    }
+  } else if (reported === null && expected !== null) {
+    problems.push("the admitted report carried no identity to bind the confirmation to");
+  }
+  if (problems.length === 0) return;
   throw new PoiesisError(
     "PROCESS_CONTAINMENT_REFUSED",
-    `Managed command ${input.pid} never reported a confirmed admission to the managed containment ${lease.leaf ?? "<none>"}: ${input.detail}`,
+    `Managed command ${input.pid} was never admitted under an identity Poiesis confirmed: ${problems.join("; ")}`,
     {
       containment: lease.model,
+      leaf: lease.leaf,
       pid: input.pid,
       reason: "ADMISSION_UNCONFIRMED",
-      detail: input.detail,
+      detail: problems.join("; "),
+      admittedIdentity: reported,
+      leasedIdentity: expected,
       confirmed: false,
     },
   );

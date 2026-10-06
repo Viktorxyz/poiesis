@@ -35,10 +35,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ChildProcess } from "node:child_process";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { resolveContainmentCapability, type ContainmentCapability } from "../src/containment.js";
+import { ADMISSION_ARGV0, resolveContainmentCapability, type ContainmentCapability } from "../src/containment.js";
 import { runManagedShellCommand } from "../src/managed-shell.js";
 import { run } from "../src/process.js";
 import { describeManagedExecution } from "./helpers.js";
+import { FAKE_PID } from "./startup-harness.js";
 
 const fixtures: string[] = [];
 const tracked = new Map<number, string | null>();
@@ -238,15 +239,16 @@ describeManagedExecution("strong containment for arbitrary managed shell command
   },
 );
 
-describeManagedExecution("command text reaches the processor verbatim, through the admission barrier",
+describeManagedExecution("command text reaches the processor verbatim, through the two-phase startup protocol",
   () => {
     /**
-     * A real contained run, observed at the spawn boundary. The caller's
-     * command must appear exactly once, byte-identical, as the final argv
-     * element of the processor invocation the barrier hands to `exec` — and must
-     * never appear inside the Poiesis-owned prologue.
+     * A real contained run, observed at the spawn boundary. The caller's command
+     * must not appear in the Poiesis-owned prologue at all — not as script text,
+     * not as an argument — because it is released only after the admission is
+     * confirmed, and the exact argv it is released into is proven by the run
+     * itself in `tests/process-startup-protocol.test.ts`.
      */
-    it("keeps the caller command out of the prologue and byte-identical in the exec'd argv", { timeout: 60_000 }, async () => {
+    it("keeps the caller command out of the prologue argv entirely", { timeout: 60_000 }, async () => {
       const spawns: { command: string; args: string[]; env: NodeJS.ProcessEnv | undefined }[] = [];
       vi.resetModules();
       vi.doMock("node:child_process", async () => {
@@ -271,21 +273,28 @@ describeManagedExecution("command text reaches the processor verbatim, through t
 
       expect(spawns).toHaveLength(1);
       const [spawned] = spawns;
-      // The child is the Poiesis-owned barrier, never the command itself.
+      // The child is the Poiesis-owned startup prologue, never the command itself.
       expect(spawned!.command).toBe("/bin/sh");
       expect(spawned!.args[0]).toBe("-c");
-      const [prologue, argv0, processor, ...rest] = spawned!.args.slice(1);
-      expect(argv0).toBe("poiesis-admission");
+      const [prologue, argv0] = spawned!.args.slice(1);
+      expect(argv0).toBe(ADMISSION_ARGV0);
       expect(prologue).not.toContain(marker);
       expect(prologue).not.toContain("byte identical");
-      // The leaf travels out of band: its VALUE is in the environment and
-      // nowhere in the argv, so it can never reach the command as an argument.
+      // Nothing of the caller's follows it: the argv is Poiesis-owned end to end.
+      expect(spawned!.args.slice(3)).toEqual([]);
+      // The leaf and BOTH tokens travel out of band, so no boundary value can
+      // reach the command as an argument: the leaf's VALUE is in the environment
+      // and nowhere in the argv.
       const leaf = spawned!.env?.POIESIS_ADMISSION_LEAF ?? "";
+      const admissionToken = spawned!.env?.POIESIS_ADMISSION_TOKEN ?? "";
+      const executionToken = spawned!.env?.POIESIS_EXECUTION_TOKEN ?? "";
       expect(leaf.length).toBeGreaterThan(0);
+      expect(admissionToken.length).toBeGreaterThan(0);
+      expect(executionToken.length).toBeGreaterThan(0);
+      expect(executionToken).not.toBe(admissionToken);
       expect(spawned!.args.join("|")).not.toContain(leaf);
-      // The processor and its argv are handed to `exec` untouched.
-      expect(processor).toBe("/bin/sh");
-      expect(rest).toEqual(["-c", marker]);
+      expect(spawned!.args.join("|")).not.toContain(admissionToken);
+      expect(spawned!.args.join("|")).not.toContain(executionToken);
     });
   },
 );
@@ -324,14 +333,15 @@ function scriptContainmentBoundary(): void {
   });
 }
 
-describe("unconfirmed admission is refused, never silently accepted", () => {
+describe("an unconfirmed startup is refused, never silently accepted", () => {
   /**
-   * Drive the public managed-command seam with a child that never reports an
-   * admission — which is what a prologue that could not write, or could not
-   * confirm, looks like from the parent. Both a live child and a child that has
-   * already finished must be refused; "it probably made it" is not an outcome.
+   * Drive the public managed-command seam with a child that never reports a
+   * startup identity — which is what a prologue that could not read `/proc`, or
+   * could not write, looks like from the parent. Both a live child and a child
+   * that has already finished must be refused; "it probably made it" is not an
+   * outcome.
    */
-  async function runWithUnreportingAdmission(
+  async function runWithUnreportingStartup(
     mode: "live" | "finished",
   ): Promise<{ error: unknown; spawnCalls: number }> {
     const spawnCalls = { count: 0 };
@@ -343,18 +353,19 @@ describe("unconfirmed admission is refused, never silently accepted", () => {
         ...actual,
         spawn: ((command: string, ...rest: unknown[]) => {
           const argv = (rest[0] as string[]) ?? [];
-          if (command !== "/bin/sh" || !argv.includes("poiesis-admission")) {
+          if (command !== "/bin/sh" || !argv.includes(ADMISSION_ARGV0)) {
             return Reflect.apply(actual.spawn, undefined, [command, ...rest]) as ChildProcess;
           }
           spawnCalls.count += 1;
           const fake = new EventEmitter() as ChildProcess;
           const report = new PassThrough();
+          const gate = new PassThrough();
           Object.assign(fake, {
-            pid: 424242,
-            stdin: null,
+            pid: FAKE_PID,
+            stdin: gate,
             stdout: null,
             stderr: null,
-            stdio: [null, null, null, report],
+            stdio: [gate, null, null, report],
             kill: () => true,
             unref: () => undefined,
           });
@@ -366,8 +377,9 @@ describe("unconfirmed admission is refused, never silently accepted", () => {
               fake.emit("exit", 0, null);
               return;
             }
-            // Still live, still silent.
-            setTimeout(() => report.end(), 60_000).unref?.();
+            // Still live, still silent — and, like a real prologue waiting on a
+            // channel Poiesis never answered, it exits when that channel closes.
+            gate.on("close", () => setImmediate(() => fake.emit("exit", 75, null)));
           });
           return fake;
         }) as typeof actual.spawn,
@@ -383,21 +395,21 @@ describe("unconfirmed admission is refused, never silently accepted", () => {
     return { error, spawnCalls: spawnCalls.count };
   }
 
-  it("refuses a live child that never reports an admission", { timeout: 60_000 }, async () => {
-    const observed = await runWithUnreportingAdmission("live");
+  it("refuses a live child that never reports a startup identity", { timeout: 60_000 }, async () => {
+    const observed = await runWithUnreportingStartup("live");
     expect(observed.spawnCalls).toBe(1);
     expect(observed.error).toMatchObject({
       code: "PROCESS_CONTAINMENT_REFUSED",
       exitCode: 1,
-      details: { reason: "ADMISSION_UNCONFIRMED", confirmed: false },
+      details: { reason: "STARTUP_IDENTITY_UNCONFIRMED", confirmed: false },
     });
   });
 
-  it("refuses a child that finished without ever reporting an admission", { timeout: 60_000 }, async () => {
-    const observed = await runWithUnreportingAdmission("finished");
+  it("refuses a child that finished without ever reporting", { timeout: 60_000 }, async () => {
+    const observed = await runWithUnreportingStartup("finished");
     expect(observed.error).toMatchObject({
       code: "PROCESS_CONTAINMENT_REFUSED",
-      details: { reason: "ADMISSION_UNCONFIRMED", confirmed: false },
+      details: { reason: "STARTUP_IDENTITY_UNCONFIRMED", confirmed: false },
     });
     expect((observed.error as { details: { detail: string } }).details.detail).toContain(
       "finished without reporting",
