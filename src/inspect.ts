@@ -6,6 +6,7 @@ import { loadManifest } from "./manifest.js";
 import { PoiesisError } from "./errors.js";
 import { resolveGitRoot } from "./paths.js";
 import { resolveConfigForRoot } from "./maintenance.js";
+import { TEAM_PROFILE_CONFIG_PATH, TEAM_PROFILE_DIRECTORY, TEAM_PROFILE_SKILLS_LOCK_PATH } from "./team-profile.js";
 
 export interface ProjectInspection {
   git: InspectResult;
@@ -24,6 +25,12 @@ export interface ProjectInspection {
      * pre-Spec #190 installations, which never made the choice.
      */
     mode?: "private" | "team";
+    /**
+     * Spec #190 / ticket #192: the shareable Team/shared profile paths that
+     * exist in this clone. Absent for a private installation, which shares
+     * nothing but its `.gitignore` policy.
+     */
+    sharedProfile?: string[];
   };
 }
 
@@ -84,6 +91,14 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
           Object.entries(scriptsValue).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
         )
       : {};
+  const sharedProfile =
+    manifest?.mode === "team"
+      ? [
+          TEAM_PROFILE_DIRECTORY,
+          ...((await exists(join(git.root, TEAM_PROFILE_CONFIG_PATH))) ? [TEAM_PROFILE_CONFIG_PATH] : []),
+          ...((await exists(join(git.root, TEAM_PROFILE_SKILLS_LOCK_PATH))) ? [TEAM_PROFILE_SKILLS_LOCK_PATH] : []),
+        ]
+      : undefined;
   return {
     git,
     packageManager: await detectPackageManager(git.root),
@@ -99,6 +114,7 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
             adapter: manifest.adapter.harness,
             configuredModels: config.models,
             ...(manifest.mode === undefined ? {} : { mode: manifest.mode }),
+            ...(sharedProfile === undefined ? {} : { sharedProfile }),
           },
   };
 }

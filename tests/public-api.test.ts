@@ -182,7 +182,25 @@ const forbiddenFunctions = [
   "renderManagedIgnoreBlock",
   "planManagedIgnoreBlock",
   "planManagedIgnoreBlockRemoval",
-  "privateIgnoreBlockLines",
+  "managedIgnoreBlockLines",
+  // Spec #190 / ticket #192: the Team/shared declarative profile stays
+  // CLI- and runtime-internal for the same reason. Promoting it would freeze
+  // the profile LAYOUT, the portability rules, and the skills-lock schema
+  // into a public API before the remaining sharing tickets settle them.
+  "TEAM_PROFILE_DIRECTORY",
+  "TEAM_PROFILE_CONFIG_PATH",
+  "TEAM_PROFILE_SKILLS_LOCK_PATH",
+  "TEAM_PROFILE_OVERRIDES_DIRECTORY",
+  "classifyTeamArtifact",
+  "teamProfileConfig",
+  "assertTeamProfilePortable",
+  "assertTeamProfileAdoptable",
+  "renderTeamSkillsLock",
+  "parseTeamSkillsLock",
+  "driftedLockedSkills",
+  "readTeamOverrides",
+  "readTeamProfileConfig",
+  "teamProfileFileHash",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache

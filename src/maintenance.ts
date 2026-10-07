@@ -67,15 +67,31 @@ import {
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
 import {
   GITIGNORE_RELATIVE_PATH,
+  INSTALLABLE_MODES,
   isInstallMode,
-  parseInstallMode,
   isInstallableMode,
+  parseInstallMode,
   parseManagedIgnoreBlocks,
   planManagedIgnoreBlock,
   planManagedIgnoreBlockRemoval,
-  privateIgnoreBlockLines,
+  managedIgnoreBlockLines,
   type InstallMode,
 } from "./install-mode.js";
+import {
+  TEAM_PROFILE_CONFIG_PATH,
+  TEAM_PROFILE_DIRECTORY,
+  TEAM_PROFILE_SKILLS_LOCK_PATH,
+  assertTeamProfileAdoptable,
+  assertTeamProfilePortable,
+  driftedLockedSkills,
+  parseTeamSkillsLock,
+  readTeamOverrides,
+  readTeamProfileConfig,
+  renderTeamSkillsLock,
+  teamProfileFileHash,
+  teamProfileConfig,
+  type TeamOverride,
+} from "./team-profile.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
@@ -416,6 +432,7 @@ export async function autoResolveConfigDefaults(
       }
     }
   }
+
   if (trackerProject.trim().length === 0) {
     throw new PoiesisError(
       "INVALID_TRACKER_CONFIG",
@@ -544,7 +561,17 @@ export function parseTrackerFromUrl(url: string): { provider: "github" | "gitlab
   return null;
 }
 
-async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile[]> {
+/**
+ * Spec #190 / ticket #192 — the generated mirrors this installation writes.
+ *
+ * `overrides` are the project's own instruction / role content from the
+ * shared profile. They REPLACE the package projection for the agent they
+ * name, so the manifest hash, `doctor`, and `uninstall` all keep describing
+ * the bytes that are actually on disk. The override file itself stays
+ * Author-owned and outside every manifest record.
+ */
+async function materializeFiles(config: PoiesisConfig, overrides: readonly TeamOverride[] = []): Promise<MaterializedFile[]> {
+  const overridden = new Map(overrides.map((override) => [override.destination, override.content]));
   const templates = await Promise.all(
     templateMappings.map(async (mapping) => ({
       path: mapping.destination,
@@ -552,7 +579,7 @@ async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile
       // Package-supplied canon is `package`; the OpenCode agent files are
       // generated projections of that same canon.
       provenance: mapping.kind === "canonical" ? ("package" as const) : ("projection" as const),
-      content: await readTemplate(mapping.source),
+      content: overridden.get(mapping.destination) ?? (await readTemplate(mapping.source)),
     })),
   );
   return [
@@ -861,7 +888,7 @@ async function rollbackInitOwnershipReceipt(
 }
 
 /**
- * Spec #190 / ticket #191 — the private classification, resolved at the
+ * Spec #190 / ticket #191 — the ignore classification, resolved at the
  * exact moment the block is written.
  *
  * Everything here is read from what THIS installation actually did, not
@@ -869,15 +896,22 @@ async function rollbackInitOwnershipReceipt(
  * created it, the delivery scripts only when Poiesis generated them, and
  * the skills only the ones Poiesis installed. A preexisting user file is
  * therefore never claimed by the policy Poiesis is about to publish.
+ *
+ * Ticket #192 adds no rule. Team mode shares the profile by NOT naming it;
+ * everything Poiesis installs stays untracked either way, which is what
+ * keeps the sharing decision from ever widening the ignore policy over user
+ * content.
  */
-function privateIgnoreLines(args: {
+function managedIgnoreLines(args: {
   root: string;
+  mode: InstallMode;
   openCodeConfigPath: string;
   openCodeConfigPresent: boolean;
   writtenDeliveryScripts: readonly string[];
   skills: readonly ManagedSkill[];
 }): string[] {
-  return privateIgnoreBlockLines({
+  return managedIgnoreBlockLines({
+    mode: args.mode,
     generatedAgentPaths: POIESIS_GENERATED_AGENT_PATHS,
     createdOpenCodeConfigPath: args.openCodeConfigPresent
       ? undefined
@@ -962,15 +996,14 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   // names both choices rather than silently installing one of them.
   const installMode = parseInstallMode(resolvedConfig.mode, "explicit init config");
   if (!isInstallableMode(installMode)) {
-    // Ticket #192 owns team/shared: the declarative shareable profile,
-    // its hydration, and its narrower ignore classification. Until that
-    // exists, `team` is an accepted value that refuses to install rather
-    // than a mode that quietly installs private semantics under a shared
-    // label.
+    // Fail closed rather than install an unknown sharing policy. Unreachable
+    // while `parseInstallMode` and `INSTALLABLE_MODES` agree, and kept so the
+    // two lists can never drift into a mode that installs under a label
+    // nothing implements.
     throw new PoiesisError(
       "INSTALL_MODE_UNSUPPORTED",
-      `Poiesis \`${installMode}\` installation is not available yet; only \`private\` installs today`,
-      { mode: installMode, supported: ["private"] },
+      `Poiesis \`${installMode}\` installation is not available; choose private or team`,
+      { mode: installMode, supported: [...INSTALLABLE_MODES] },
     );
   }
   await assertInitDestinationsAbsent(
@@ -1028,7 +1061,57 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
 
   const resolved = await autoResolveConfigDefaults(resolvedRoot, resolvedConfig);
   const resolvedConfigWithDefaults = resolved.config;
-  const files = await materializeFiles(resolvedConfigWithDefaults);
+  // Spec #190 / ticket #192 — Team/shared. The shareable profile is read
+  // BEFORE anything is materialized because it supplies the project's own
+  // instruction / role overrides, and because a value that cannot be
+  // committed must be refused while the repository is still untouched.
+  //
+  // Both reads are pure reads. A private installation never looks at the
+  // profile directory at all, so its behaviour is unchanged.
+  const teamProfile = installMode === "team" ? teamProfileConfig(resolvedConfigWithDefaults) : undefined;
+  const teamOverrides = teamProfile === undefined
+    ? []
+    : await readTeamOverrides(resolvedRoot, POIESIS_GENERATED_AGENT_PATHS);
+  // Spec #190 / ticket #192 (review B1) — BOTH shared files are USER
+  // SOURCE, and neither is subject to a byte-level adoption precondition.
+  //
+  // The projected values are policy Poiesis regenerates deterministically
+  // from its own inputs, so "the committed file disagrees with what I
+  // resolved" is a real contradiction and is refused. What differs is HOW
+  // that disagreement is decided:
+  //
+  //   - `config.jsonc` is hand-editable JSONC. A comment, reordered keys,
+  //     or different indentation is a LEGAL difference that
+  //     `assertTeamProfileAdoptable` already resolves correctly, on parsed
+  //     semantics. Byte-comparing it against `serializeConfig(...)` instead
+  //     refused every hand-formatted profile — it made the semantic check
+  //     unreachable and turned a non-issue into a hydration blocker.
+  //   - `skills.lock.json` records the revision and integrity the TEAM
+  //     agreed on, which legitimately differs from what this machine's
+  //     package resolves to (a newer package, a locally edited skill).
+  //     Byte-comparing it against `managedSkills` made legitimate drift
+  //     block hydration outright, which inverted the design: `doctor`'s
+  //     `team-profile` check exists precisely to WARN about that drift, so
+  //     the precondition made the warning unreachable.
+  //
+  // What is observed here, for BOTH files, is only the on-disk digest. The
+  // write step compares against that entry observation, so it can tell
+  // "adopted, untouched" from "adopted and concurrently replaced" — and
+  // nothing ever compares committed bytes to a reserialization.
+  const adoptedProfileHash = teamProfile === undefined
+    ? undefined
+    : await teamProfileFileHash(resolvedRoot, TEAM_PROFILE_CONFIG_PATH);
+  const adoptedSkillsLockHash = teamProfile === undefined
+    ? undefined
+    : await teamProfileFileHash(resolvedRoot, TEAM_PROFILE_SKILLS_LOCK_PATH);
+  if (teamProfile !== undefined) {
+    assertTeamProfilePortable(teamProfile, "shared Poiesis profile");
+    const adoptedProfile = await readTeamProfileConfig(resolvedRoot);
+    if (adoptedProfile !== null) {
+      assertTeamProfileAdoptable({ existing: adoptedProfile, wanted: teamProfile, source: TEAM_PROFILE_CONFIG_PATH });
+    }
+  }
+  const files = await materializeFiles(resolvedConfigWithDefaults, teamOverrides);
 
   await verifyGitRepository(resolvedRoot, resolvedConfigWithDefaults);
   await verifyOpenCodeEnvironment(resolvedConfigWithDefaults);
@@ -1077,6 +1160,12 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   // receipts survive byte-for-byte; only this invocation's authored
   // bytes are unlinked on failure.
   let authoredReceiptBytes: string | undefined;
+  // Spec #190 / ticket #192 — shared profile files THIS invocation created,
+  // with their exact installed digest. Rollback removes only those, and only
+  // while the on-disk bytes are still what this run wrote: an adopted profile
+  // is Author-owned shared content and must survive a failed hydration
+  // byte-for-byte.
+  const writtenTeamProfileFiles: Array<{ path: string; hash: string }> = [];
 
   try {
     await assertInitDestinationsAbsent(resolvedRoot, files);
@@ -1195,6 +1284,65 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       generatedScripts.push({ path: rel, hash: hashContent(scriptContent) });
     }
 
+    // Spec #190 / ticket #192 — Team/shared hydration. The profile is
+    // written here, AFTER the skills it locks, and only where it is absent:
+    // a clone already carrying the team's profile adopts it, so committed
+    // project intelligence is never overwritten by a teammate's machine.
+    if (teamProfile !== undefined) {
+      const configPath = TEAM_PROFILE_CONFIG_PATH;
+      const configAbsolute = join(resolvedRoot, configPath);
+      await assertSafeParents(resolvedRoot, configAbsolute);
+      if (await pathEntryExists(configAbsolute)) {
+        // Review B2b: adopted. The SEMANTIC equality was already proved
+        // before the transaction opened; `config.jsonc` is hand-editable
+        // JSONC, so a comment, reordered keys, or different formatting is a
+        // legal difference and must not read as a conflict. Re-reading here
+        // is compared against the digest observed at transaction entry, so
+        // what it detects is exactly the one thing that matters: the file
+        // was replaced underneath this run (or appeared after being absent
+        // at entry, in which case it is unverified content and refused).
+        if ((await hashFile(configAbsolute)) !== adoptedProfileHash) {
+          throw new PoiesisError("TEAM_PROFILE_CONFLICT", `The shared Poiesis profile changed during initialization`, {
+            path: configPath,
+          });
+        }
+      } else {
+        const content = serializeConfig(teamProfile);
+        await mkdir(dirname(configAbsolute), { recursive: true });
+        await atomicCreate(configAbsolute, content);
+        writtenTeamProfileFiles.push({ path: configPath, hash: hashContent(content) });
+      }
+
+      // Review B1: the lock is AUTHOR-CREATED SOURCE. A committed lock is
+      // adopted unconditionally — never compared against this machine's
+      // `managedSkills`, never rewritten. Revision and integrity drift is
+      // legitimate team state and is reported by `doctor`'s `team-profile`
+      // check as a warning, which is the only place a verdict on it belongs.
+      //
+      // The concurrency guard is a digest comparison against the bytes
+      // observed BEFORE this transaction opened, so it detects a teammate or
+      // a background process replacing the file mid-run without ever treating
+      // "differs from what I would have written" as a conflict.
+      const lockPath = TEAM_PROFILE_SKILLS_LOCK_PATH;
+      const lockAbsolute = join(resolvedRoot, lockPath);
+      await assertSafeParents(resolvedRoot, lockAbsolute);
+      const lockContent = renderTeamSkillsLock(managedSkills);
+      if (adoptedSkillsLockHash !== undefined) {
+        const currentHash = (await pathEntryExists(lockAbsolute)) ? await hashFile(lockAbsolute) : undefined;
+        if (currentHash !== adoptedSkillsLockHash) {
+          throw new PoiesisError(
+            "TEAM_PROFILE_CONFLICT",
+            `The shared Poiesis skill lock changed during initialization`,
+            { path: lockPath },
+          );
+        }
+      } else if (!(await pathEntryExists(lockAbsolute))) {
+        await mkdir(dirname(lockAbsolute), { recursive: true });
+        await atomicCreate(lockAbsolute, lockContent);
+        writtenTeamProfileFiles.push({ path: lockPath, hash: hashContent(lockContent) });
+      }
+    }
+
     // Spec #190 / ticket #191 — the ONE visible policy. Written from the
     // mode the Author chose and from what this installation actually
     // created, inside a uniquely delimited, mode-labelled block.
@@ -1205,20 +1353,27 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     // same block is a genuine no-op rather than a rewrite.
     await assertGitignoreAvailable(resolvedRoot);
     const currentGitignoreContent = (await exists(gitignorePath)) ? await readUtf8(gitignorePath) : null;
+    // The FULL classified body — comments included — is what the block must
+    // state. Passing only the effective patterns would silently drop the
+    // per-section explanation that turns this file from a list of paths into
+    // the reviewable sharing policy Spec #190 promises an Author, and would
+    // drop the team profile's stated omission along with it.
+    const ignoreBlockLines = managedIgnoreLines({
+      root: resolvedRoot,
+      mode: installMode,
+      openCodeConfigPath,
+      openCodeConfigPresent,
+      writtenDeliveryScripts,
+      skills: managedSkills,
+    });
     const ignoreBlockPlan = planManagedIgnoreBlock({
       existing: currentGitignoreContent,
       mode: installMode,
-      lines: privateIgnoreLines({
-        root: resolvedRoot,
-        openCodeConfigPath,
-        openCodeConfigPresent,
-        writtenDeliveryScripts,
-        skills: managedSkills,
-      }),
+      lines: ignoreBlockLines,
     });
     const writtenGitignore = await ensureGitignore(
       resolvedRoot,
-      [...(ignoreBlockPlan.block?.patterns ?? [])],
+      [...ignoreBlockLines],
       initialGitignoreSnapshot ?? null,
       { mode: installMode },
     );
@@ -1244,18 +1399,19 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       const destination = join(resolvedRoot, file.path);
       await assertSafeParents(resolvedRoot, destination);
       await atomicCreate(destination, file.content);
-      const template = templateMappings.find((mapping) => mapping.destination === file.path);
       managedFiles.push({
         path: file.path,
         kind: file.kind,
         hash: hashContent(file.content),
         owned: true,
-        // Spec #190 / ticket #191: `durable` means "this project tracks the
-        // artifact on purpose", which is a TEAM-mode property. A private
-        // installation tracks nothing, so recording `durable` here would make
-        // uninstall treat its own canon as released content and leave it
-        // behind forever.
-        ...(template?.trackInProject === true && installMode === "team" ? { durable: true } : {}),
+        // Spec #190 / ticket #192: `durable` means "the project tracks this
+        // artifact on purpose", and under BOTH installable modes nothing
+        // Poiesis installs is tracked. Package canon, generated projections,
+        // and the local resolved config are all mirrors regenerated from the
+        // package plus the shared profile; recording them as durable would make
+        // uninstall treat its own mirrors as released content and leave them
+        // behind forever. The shareable profile is deliberately not recorded
+        // here at all — it is Author content, not Poiesis ownership.
         provenance: file.provenance,
       });
     }
@@ -1385,6 +1541,18 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     });
     await rollbackStep(rollbackFailures, ".gitignore", async () => {
       await rollbackInitGitignore(gitignorePath, initialGitignoreSnapshot, writtenGitignoreHash);
+    });
+    // Spec #190 / ticket #192 — remove only the shared profile files THIS
+    // run created, and only while they still hold the bytes it wrote. An
+    // ADOPTED profile is the team's committed project intelligence: it is not
+    // in this list, so a failed hydration leaves it byte-for-byte intact.
+    await rollbackStep(rollbackFailures, "shared profile", async () => {
+      for (const file of writtenTeamProfileFiles) {
+        const absolute = join(resolvedRoot, file.path);
+        if (!(await pathEntryExists(absolute)) || !(await isRegularFile(absolute))) continue;
+        if ((await hashFile(absolute)) !== file.hash) continue;
+        await unlink(absolute);
+      }
     });
     await rollbackStep(rollbackFailures, "created directories", async () => {
       await removeCreatedInitDirectories(resolvedRoot, createdInitDirectories);
@@ -1678,6 +1846,71 @@ export async function doctor(root: string): Promise<DoctorReport> {
           details: errorDetails(error),
         });
       }
+    }
+  }
+
+  // Spec #190 / ticket #192 — report the Team/shared profile: which
+  // project-relative files are shareable source and whether the committed
+  // skill selection still matches what this machine installed.
+  //
+  // Reported, never repaired. A drifted lock is a legitimate outcome of a
+  // teammate running a newer package, and rewriting committed project
+  // intelligence on their behalf is exactly what Spec #190 forbids.
+  if (manifest !== undefined && manifest.mode === "team") {
+    try {
+      const details: Record<string, unknown> = {
+        directory: TEAM_PROFILE_DIRECTORY,
+        config: (await exists(join(resolvedRoot, TEAM_PROFILE_CONFIG_PATH))) ? TEAM_PROFILE_CONFIG_PATH : null,
+        skillsLock: (await exists(join(resolvedRoot, TEAM_PROFILE_SKILLS_LOCK_PATH)))
+          ? TEAM_PROFILE_SKILLS_LOCK_PATH
+          : null,
+        overrides: (await readTeamOverrides(resolvedRoot, POIESIS_GENERATED_AGENT_PATHS)).map(
+          (override) => override.source,
+        ),
+        // The mirrors this machine regenerated from package plus profile.
+        // Recorded so the sharing report is auditable in both directions:
+        // what a team commits and what stays local.
+        installedMirrors: manifest.files.map((file) => file.path),
+      };
+      if (details.skillsLock === null) {
+        checks.push({
+          id: "team-profile",
+          status: "warn",
+          message: "Poiesis is installed in team mode but the shared profile carries no skill lock",
+          details,
+        });
+      } else {
+        const drift = driftedLockedSkills(
+          parseTeamSkillsLock(
+            await readUtf8(join(resolvedRoot, TEAM_PROFILE_SKILLS_LOCK_PATH)),
+            TEAM_PROFILE_SKILLS_LOCK_PATH,
+          ),
+          manifest.skills,
+        );
+        details.skillLockDrift = drift;
+        checks.push(
+          drift.length === 0
+            ? {
+                id: "team-profile",
+                status: "pass",
+                message: "Poiesis team profile is present and its locked skills match this installation",
+                details,
+              }
+            : {
+                id: "team-profile",
+                status: "warn",
+                message: `Poiesis team profile locks ${drift.length} skill(s) that differ from this installation`,
+                details,
+              },
+        );
+      }
+    } catch (error) {
+      checks.push({
+        id: "team-profile",
+        status: "warn",
+        message: "Poiesis team profile could not be verified",
+        details: errorDetails(error),
+      });
     }
   }
 

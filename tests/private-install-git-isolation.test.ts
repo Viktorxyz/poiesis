@@ -743,34 +743,21 @@ describe("Spec #190 / ticket #191 - the guide never infers a mode for a template
     expect(template).toContain('"mode"');
   });
 
-  it("team is an accepted value that refuses to install rather than installing private semantics", async () => {
+  it("private installs share nothing at all: no profile, and one visible file", async () => {
+    // Ticket #192 added Team/shared as an installable mode. This is the
+    // other half of that decision, and it is the property this suite owns:
+    // choosing private must never quietly publish project intelligence, and
+    // the shareable profile must be a team-mode artifact rather than a
+    // side effect of installation.
     const repo = await createTestRepository();
     try {
-      const configPath = join(repo.parent, "team-install.jsonc");
-      await writeFile(
-        configPath,
-        `${JSON.stringify(
-          {
-            schema: 1,
-            mode: "team",
-            models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
-            repository: { remote: "origin", integrationBranch: "main" },
-            tracker: { provider: "fixture", project: join(repo.fixtures, "tracker") },
-            delivery: {
-              preview: { adapter: "fixture", path: join(repo.fixtures, "delivery") },
-              staging: { adapter: "fixture", path: join(repo.fixtures, "delivery") },
-              production: { adapter: "fixture", path: join(repo.fixtures, "delivery") },
-            },
-            verification: { commands: ["test -f README.md"] },
-          },
-          null,
-          2,
-        )}\n`,
-      );
+      const configPath = await writeInstallConfig(repo);
       const result = await poiesis(repo.root, "init", "--config", configPath, "--allow-fixtures");
-      expect(result.exitCode).not.toBe(0);
-      expect(errorCode(result)).toBe("INSTALL_MODE_UNSUPPORTED");
-      expect(await exists(join(repo.root, ".poiesis"))).toBe(false);
+      expect(result.exitCode, result.stderr).toBe(0);
+      // Exactly one file Git can see, and no shareable profile anywhere.
+      expect(await gitStatus(repo.root)).toEqual(VISIBLE_AFTER_PRIVATE_INIT);
+      expect(await exists(join(repo.root, ".opencode", "poiesis"))).toBe(false);
+      expect(await readFile(join(repo.root, ".gitignore"), "utf8")).not.toContain("mode=team");
     } finally {
       await rm(repo.parent, { recursive: true, force: true });
     }

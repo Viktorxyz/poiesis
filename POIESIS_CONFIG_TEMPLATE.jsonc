@@ -6,8 +6,10 @@
   // Spec #190: the installation mode is REQUIRED and is never inferred.
   // `private` keeps every Poiesis-owned artifact untracked in this clone,
   // behind the one marked `.gitignore` block that is the only Poiesis
-  // surface Git sees. `team` shares a declarative project profile; it is
-  // not installable yet.
+  // surface Git sees. `team` additionally writes a shareable project
+  // profile to `.opencode/poiesis/` — the declarative copy of this
+  // configuration, the locked skill selection, and project-created
+  // instruction overrides — while every generated mirror stays ignored.
   "mode": "private",
 
   "models": {

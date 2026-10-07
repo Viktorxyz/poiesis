@@ -220,7 +220,7 @@ export async function runInteractiveInit(args: InteractiveInitOptions): Promise<
 }
 
 /**
- * Spec #190 / ticket #191 — the required first question.
+ * Spec #190 — the required first question.
  *
  * The Author is asked in product language ("Private/local" vs
  * "Team/shared") and the answer is parsed strictly: no default, no
@@ -228,17 +228,18 @@ export async function runInteractiveInit(args: InteractiveInitOptions): Promise<
  * defaulting to private. Choosing a sharing policy on the Author's behalf
  * is precisely what this decision exists to prevent.
  *
- * Team/shared is accepted here as a declared future mode (ticket #192).
- * `init()` refuses to install it until that ticket lands, so the flow
- * reports the mode honestly instead of installing private semantics
- * under a shared label.
+ * Team/shared (ticket #192) writes the shareable project profile
+ * (`.opencode/poiesis/`) and the same local-only ignore policy; private
+ * shares nothing but that policy.
  */
 async function resolveInstallMode(io: InteractiveInitIO): Promise<InstallMode> {
   io.writeStderr("Poiesis init: installation mode");
   io.writeStderr("");
   io.writeStderr("private/local  everything Poiesis owns stays untracked in this clone;");
   io.writeStderr("                only the marked .gitignore policy is visible to Git.");
-  io.writeStderr("team/shared     a shareable project profile; not available yet.");
+  io.writeStderr("team/shared     commit the .opencode/poiesis project profile; every other");
+  io.writeStderr("                Poiesis artifact still stays untracked, and a fresh clone");
+  io.writeStderr("                hydrates its local projections from that profile.");
   io.writeStderr("");
   const answer = await io.promptLine("Installation mode (private|team)");
   const mode = parseInstallModeAnswer(answer, "interactive init mode prompt");

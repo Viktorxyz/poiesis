@@ -1,11 +1,11 @@
 /**
- * Spec #190 / ticket #191 — the installation mode and the ONE managed
+ * Spec #190 — the installation mode and the ONE managed
  * `.gitignore` block that expresses it.
  *
  * Two facts live here and nowhere else:
  *
- *  1. **The mode.** `private` (this clone only) or `team` (a shareable
- *     project profile, delivered by ticket #192). The mode is never
+ *  1. **The mode.** `private` (this clone only) or `team` (this clone plus
+ *     a shareable project profile, ticket #192). The mode is never
  *     inferred: `init` requires an explicit answer, interactively or in
  *     `--config`, because choosing a sharing policy on the Author's
  *     behalf is exactly the thing this Spec exists to prevent.
@@ -14,6 +14,11 @@
  *     mode-labelled `.gitignore` block. It is visible, reviewable, and it
  *     is the only Poiesis surface Git is ever meant to see. Everything
  *     else Poiesis owns is hidden behind it.
+ *
+ * Sharing works by what the block does NOT hide, never by widening it: the
+ * team profile sits outside every path this block names, so the same
+ * closed classification serves both modes and the policy can never grow
+ * over user content because a mode changed.
  *
  * The block is deliberately NOT a loose append of whatever rules each
  * caller happens to want. A loose append cannot answer "did I insert
@@ -32,6 +37,7 @@ import { PoiesisError } from "./errors.js";
 import { exists, readUtf8 } from "./fs.js";
 import { hashContent } from "./hash.js";
 import type { IgnoreBlockRecord } from "./manifest.js";
+import { TEAM_PROFILE_DIRECTORY } from "./team-profile.js";
 
 /** Spec #190 — the installation modes Poiesis can express. */
 export const INSTALL_MODES = ["private", "team"] as const;
@@ -45,17 +51,15 @@ export function isInstallMode(value: unknown): value is InstallMode {
 /**
  * The modes `init` can actually install today.
  *
- * `team` is an accepted VALUE — the schema, the guided prompt, and the
- * block label all speak it — but ticket #192 owns the shareable profile
- * and its narrower classification. Until that lands, installing `team`
- * would mean installing private semantics under a shared label, so it is
- * refused rather than faked.
+ * Both are installable. `team` additionally writes the shareable project
+ * profile (ticket #192) and therefore validates its portability before any
+ * byte is written; it never widens the ignore policy over user content.
  *
  * Deliberately NOT a type predicate: narrowing `InstallMode` here would
  * make every downstream `mode === "team"` branch unreachable to the
  * compiler, which is exactly the mistake this list exists to prevent.
  */
-export const INSTALLABLE_MODES: readonly InstallMode[] = ["private"];
+export const INSTALLABLE_MODES: readonly InstallMode[] = ["private", "team"];
 
 export function isInstallableMode(mode: InstallMode): boolean {
   return INSTALLABLE_MODES.includes(mode);
@@ -391,8 +395,10 @@ export async function refreshIgnoreBlockRecord(
   return { ...current, patterns: [...block.patterns], hash: block.hash };
 }
 
-/** Project-relative facts the private classification needs. */
-export interface PrivateIgnoreContext {
+/** Project-relative facts the managed ignore classification needs. */
+export interface ManagedIgnoreContext {
+  /** The sharing mode this block states. */
+  mode: InstallMode;
   /** Generated OpenCode agent projections this installation owns. */
   generatedAgentPaths: readonly string[];
   /**
@@ -408,8 +414,10 @@ export interface PrivateIgnoreContext {
 }
 
 /**
- * Spec #190: private/local ignores every Poiesis-owned artifact except
- * the visible block itself.
+ * Spec #190: the ONE managed block. Every Poiesis-owned artifact stays
+ * ignored in BOTH modes, so the classification below is mode-independent by
+ * construction — sharing policy changes what Poiesis WRITES outside the
+ * ignore list, never what it hides inside it.
  *
  * The classification is explicit and closed. Nothing here is a wildcard
  * over user content:
@@ -424,7 +432,7 @@ export interface PrivateIgnoreContext {
  *     installation generated / installed them. A preexisting skill
  *     directory is never broadly ignored, because the Author owns it.
  */
-export function privateIgnoreBlockLines(context: PrivateIgnoreContext): string[] {
+export function managedIgnoreBlockLines(context: ManagedIgnoreContext): string[] {
   return [
     "# Poiesis canon, config, manifest, receipts, runtime state, caches, workspaces, locks, and logs.",
     ".poiesis/",
@@ -440,8 +448,9 @@ export function privateIgnoreBlockLines(context: PrivateIgnoreContext): string[]
     // uninstall that reads the policy must be able to see which Poiesis-owned
     // local-state roots exist without re-deriving them from the block body.
     ".poiesis/cache/",
+    ...teamProfilePolicyLines(context.mode),
     "# Generated OpenCode agent projections. Ordinary `opencode` discovers them on disk,",
-    "# which is exactly why a private installation keeps them untracked.",
+    "# which is exactly why a Poiesis installation keeps them untracked.",
     ...context.generatedAgentPaths,
     ...(context.createdOpenCodeConfigPath === undefined ? [] : [context.createdOpenCodeConfigPath]),
     "# Delivery scripts this installation generated.",
@@ -449,5 +458,28 @@ export function privateIgnoreBlockLines(context: PrivateIgnoreContext): string[]
     ...(context.installedSkillPaths.length === 0
       ? []
       : ["# Skills this installation installed. Preexisting skills stay the Author's own.", ...context.installedSkillPaths]),
+  ];
+}
+
+/**
+ * Spec #190 / ticket #192 — the one difference the sharing MODE makes inside
+ * the block, and it is a statement rather than a rule.
+ *
+ * In `team` mode the profile is committed on purpose, so the block says so.
+ * That is not decoration: a reviewer reading `.gitignore` has to be able to
+ * tell "Poiesis ignores everything of mine" from "Poiesis ignores everything
+ * of mine except this directory, on purpose". A rule cannot express the
+ * exception because Git needs none — the profile simply is never named — so
+ * the block states the omission instead of manufacturing a negation that
+ * would silently start depending on Git's parent-directory semantics.
+ */
+function teamProfilePolicyLines(mode: InstallMode): string[] {
+  if (mode !== "team") return [];
+  return [
+    `# Shareable project profile: this block deliberately does NOT ignore ${TEAM_PROFILE_DIRECTORY}/.`,
+    "# That directory holds the project's declarative Poiesis intelligence (models,",
+    "# repository/tracker/delivery/verification policy, locked skill selection, and",
+    "# project-created instruction overrides) so a team commits it and a fresh clone",
+    "# hydrates its ignored local projections from it.",
   ];
 }

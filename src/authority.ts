@@ -31,18 +31,23 @@ function patchKey(file: string, path: readonly string[]): string {
 }
 
 /**
- * Spec #190 / ticket #191 — `durable` is a property of the installation's
+ * Spec #190 / ticket #192 — `durable` is a property of the installation's
  * SHARING MODE, not of the template table.
  *
- * `durable` means "the project tracks this artifact on purpose". That is
- * a team-mode property: a private installation tracks nothing Poiesis
- * owns, so recording `durable` there would make uninstall treat its own
- * canon as released content and leave it behind forever. A pre-Spec #190
- * manifest records no mode and keeps the classification it was written
- * with, which is what `manifest.mode === undefined` means here.
+ * `durable` means "the project tracks this artifact on purpose". Neither
+ * installable mode tracks anything Poiesis installs: `private` shares
+ * nothing, and `team` shares its declarative profile — which lives outside
+ * the managed paths entirely and is deliberately not a manifest record, so
+ * `uninstall` never treats Author content as disposable output. Package
+ * canon, generated projections, and the local resolved config are mirrors
+ * regenerated from the package plus the profile in every mode, so a `durable`
+ * claim on one would make uninstall release content it owns.
+ *
+ * A pre-Spec #190 manifest records no mode and keeps the classification it
+ * was written with, which is what `manifest.mode === undefined` means here.
  */
 function expectedManagedFiles(manifest: Manifest): Array<{ path: string; kind: ManagedFile["kind"]; durable: boolean }> {
-  const tracksProjectContent = manifest.mode !== "private";
+  const tracksProjectContent = manifest.mode === undefined;
   return [
     ...templateMappings.map((mapping) => ({
       path: mapping.destination,
