@@ -500,9 +500,22 @@ describe("a generated delivery target refuses a broken contract with nothing on 
 // =========================================================================
 
 describe("the delivery adapter accepts the generated receipt and still refuses a broken one", () => {
+  /**
+   * Ticket #188: `createCommandDeliveryAdapter` is a package-public factory, so
+   * the adapter it returns carries the delivery authority guard. Both tests
+   * below therefore install Poiesis first, and the receipt contract they assert
+   * is the one an installed project actually experiences. The refusal half of
+   * that contract — a deferred install refused through this same factory before
+   * any subprocess, artifact, or evidence — is pinned in
+   * `tests/deferred-delivery-lifecycle.test.ts`.
+   */
   it("promotes a generated preview to a new Staging identity and then to a preserved Production identity", async () => {
     const repository = await newRepository();
     await installGhStub();
+    await init(repository.root, testConfig(repository, { withDelivery: false }), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
     const tree = await resolveTree(repository.root, repository.baseSha);
     const scripts = {
       preview: await renderTarget(repository, "preview"),
@@ -555,6 +568,10 @@ describe("the delivery adapter accepts the generated receipt and still refuses a
     // Break: the schema becomes advisory, and any project file can claim a
     // delivery nobody verified.
     const repository = await newRepository();
+    await init(repository.root, testConfig(repository, { withDelivery: false }), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
     const tree = await resolveTree(repository.root, repository.baseSha);
     const script = join(repository.parent, "unverified-preview.mjs");
     await writeFile(script, UNVERIFIED_TARGET, "utf8");

@@ -42,6 +42,16 @@
  *     (`settleOnceLinePrompt` + `SettleOnceLinePromptArgs`) — it is
  *     a private CLI seam; production callers reach it through the
  *     factories above, never through the package root.
+ *   - the ticket #188 UNCHECKED delivery-construction seam
+ *     (`constructDeliveryAdapter`, `constructCommandDeliveryAdapter`,
+ *     `constructFixtureDeliveryAdapter`). The three exported delivery
+ *     factories return a policy-aware adapter, so the deferred
+ *     lifecycle cannot be bypassed through the package root; the
+ *     construction they delegate to has no policy check at all and
+ *     therefore stays module-internal — asserted against
+ *     `src/adapters.js`, which `src/index.ts` re-exports wholesale.
+ *     The refusal behavior itself is pinned in
+ *     `tests/deferred-delivery-lifecycle.test.ts`.
  *
  * The test uses TypeScript's type system:
  *   - Direct `import` statements from `../src/index.js` fail to compile
@@ -93,6 +103,27 @@ type PublicApiValues = typeof import("../src/index.js");
 type AssertNotExported<K extends string> = K extends keyof PublicApiValues
   ? ["forbidden key present", K]
   : true;
+
+// -- Spec #139 / ticket #188: the UNCHECKED delivery-construction seam. The
+//    three exported factories (`createDeliveryAdapter`,
+//    `createCommandDeliveryAdapter`, `createFixtureDeliveryAdapter`) return a
+//    policy-aware adapter, so the deferred lifecycle cannot be bypassed
+//    through the package public API. The construction they delegate to is
+//    module-internal: it runs the delivery subprocess, writes the delivery
+//    artifact, and mints delivery evidence with no policy check at all, so it
+//    must not exist as an export of the source module either. This is asserted
+//    against the SOURCE module, which `src/index.ts` re-exports wholesale, so
+//    `AssertNotExported` above could not see it.
+type AdapterModuleValues = typeof import("../src/adapters.js");
+type AssertNotModuleExported<K extends string> = K extends keyof AdapterModuleValues
+  ? ["module-internal seam exported", K]
+  : true;
+
+const uncheckedDeliveryConstructionSeams = [
+  "constructDeliveryAdapter",
+  "constructCommandDeliveryAdapter",
+  "constructFixtureDeliveryAdapter",
+] as const;
 
 // -- Forbidden: must NOT be re-exported by the package root.
 const forbiddenFunctions = [
@@ -552,6 +583,12 @@ describe("public API declarations (type-level)", () => {
   for (const name of forbiddenTypes) {
     it(`PublicApi does not re-export type \`${name}\``, () => {
       const assertion: AssertNotExported<typeof name> = true;
+      void assertion;
+    });
+  }
+  for (const name of uncheckedDeliveryConstructionSeams) {
+    it(`the unchecked delivery seam \`${name}\` stays module-internal`, () => {
+      const assertion: AssertNotModuleExported<typeof name> = true;
       void assertion;
     });
   }

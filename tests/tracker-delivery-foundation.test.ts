@@ -26,6 +26,7 @@ import {
   DEFERRED_DELIVERY_MODE,
   TRACKER_PROVIDERS,
   isDeferredDelivery,
+  loadConfig,
   requireConfiguredDelivery,
   serializeConfig,
   trackerProjectOf,
@@ -876,4 +877,182 @@ describe("delivery extension keys survive a managed init and update --config rew
     const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
     expect(JSON.parse(written).delivery).toEqual(delivery);
   }, 90_000);
+});
+
+/**
+ * Spec #139 / ticket #188 — the `linear` branch stays `.loose()`, and that is
+ * what let a credential ride into the managed config.
+ *
+ * The `linear` tracker block accepts unknown keys on purpose, so an existing
+ * installation's keys keep parsing and a compatible extension survives a
+ * managed rewrite. But `.loose()` also accepted `apiKey` / `oauthToken` /
+ * `authorization` / `secret` / `password`, and `serializeConfig` then PRESERVED
+ * them into `.poiesis/config.jsonc` — so the environment-only boundary was
+ * decided by how the field happened to be spelled. Poiesis reads a Linear
+ * credential only from the environment, so a credential in the config is a
+ * credential in a file that init, update, and every later rewrite carry.
+ *
+ * What is pinned here:
+ *
+ *   1. every credential-bearing FORM is refused BEFORE the schema result is
+ *      reported, so the value is never validated into a config that would be
+ *      persisted, with the offending field paths named;
+ *   2. `serializeConfig` refuses too, because a value can reach it from an
+ *      in-memory resolution or a caller's own object without passing through
+ *      `validateConfig` — and it refuses rather than silently dropping the
+ *      key, which would report a healthy installation whose credential is
+ *      nowhere;
+ *   3. the boundary is NOT strictness: `team`, `project`, and every compatible
+ *      unknown non-secret extension key still validate and still survive
+ *      serialization, nested and array-valued extensions included;
+ *   4. no OTHER provider is narrowed — a `github` / `gitlab` / `local` /
+ *     `fixture` block is untouched, and a non-Linear config may still carry a
+ *     key that would be credential-bearing under `linear`.
+ */
+describe("a linear tracker config carries coordinates only, never a credential", () => {
+  /**
+   * The spellings a credential arrives under. Poiesis compares the NORMALIZED
+   * key, so all four API-key spellings are the same form; the values are the
+   * distinct things the refusal must never echo.
+   */
+  const CREDENTIAL_FIELDS: readonly (readonly [string, unknown])[] = [
+    ["apiKey", "lin_key"],
+    ["api_key", "lin_key"],
+    ["API-KEY", "lin_key"],
+    ["LINEAR_API_KEY", "lin_key"],
+    ["oauthToken", "lin_key"],
+    ["access_token", "lin_key"],
+    ["refreshToken", "lin_key"],
+    ["Authorization", "Bearer lin_key"],
+    ["authorizationHeader", "Bearer lin_key"],
+    ["webhookSecret", "lin_key"],
+    ["clientSecret", "lin_key"],
+    ["password", "lin_key"],
+    ["passwd", "lin_key"],
+    ["credentials", { token: "lin_key" }],
+    ["extension", { nested: { apiKey: "lin_key" } }],
+    ["extension", [{ bearer: "lin_key" }]],
+  ];
+
+  it("refuses every credential-bearing key form before validation, naming the field", () => {
+    for (const [field, value] of CREDENTIAL_FIELDS) {
+      let thrown: unknown;
+      try {
+        validateConfig({ ...baseConfig(), tracker: { provider: "linear", team: "ENG", [field]: value } }, "test");
+      } catch (error) {
+        thrown = error;
+      }
+      expect(thrown, `expected validateConfig to refuse tracker.${field}`).toBeInstanceOf(PoiesisError);
+      expect(thrown).toMatchObject({
+        code: "INVALID_TRACKER_CONFIG",
+        details: { provider: "linear", environmentOnly: true },
+      });
+      const details = (thrown as PoiesisError).details;
+      expect(JSON.stringify(details)).toContain("tracker.");
+      // The named paths are the offending ones, and neither the details nor the
+      // message ever echo the credential: a refusal that repeated it would leak
+      // the secret into a log or a CI transcript.
+      expect(JSON.stringify(details)).not.toContain("lin_key");
+      expect(String((thrown as PoiesisError).message)).not.toContain("lin_key");
+      expect(String((thrown as PoiesisError).message)).toContain("environment");
+    }
+  });
+
+  it("names the exact offending paths, including nested and array-valued extensions", () => {
+    let thrown: unknown;
+    try {
+      validateConfig(
+        {
+          ...baseConfig(),
+          tracker: {
+            provider: "linear",
+            team: "ENG",
+            credentials: { token: "lin_nested" },
+            extension: { nested: { apiKey: "lin_deep" } },
+            keep: "annotation",
+          },
+        },
+        "test",
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+      details: {
+        provider: "linear",
+        // The shallowest offending key is the actionable one (`tracker.credentials`),
+        // and a key that is only credential-bearing further down is still named.
+        credentialFields: ["tracker.credentials", "tracker.extension.nested.apiKey"],
+      },
+    });
+  });
+
+  it("refuses to serialize a credential-bearing linear config rather than writing it", () => {
+    const config = {
+      ...baseConfig(),
+      tracker: { provider: "linear", team: "ENG", apiKey: "lin_key" },
+    } as unknown as PoiesisConfig;
+    let thrown: unknown;
+    try {
+      serializeConfig(config);
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toBeInstanceOf(PoiesisError);
+    expect(thrown).toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+      details: { provider: "linear", credentialFields: ["tracker.apiKey"], environmentOnly: true },
+    });
+  });
+
+  it("keeps team, project, and every compatible unknown non-secret extension key", () => {
+    const tracker = {
+      provider: "linear",
+      team: "ENG",
+      project: "Roadmap",
+      note: "author annotation",
+      experimental: { workflowStates: ["triage", "doing"], retries: 2 },
+      listOfExtensions: [{ label: "kept" }],
+    };
+    const validated = validateConfig({ ...baseConfig(), tracker }, "test");
+    expect(validated.tracker).toMatchObject({ provider: "linear", team: "ENG", project: "Roadmap" });
+    // The extension survives the managed rewrite, nested values included: the
+    // boundary refuses a credential, it does not drop fields.
+    expect(JSON.parse(serializeConfig(validated)).tracker).toEqual(tracker);
+  });
+
+  it("narrows only the linear branch", () => {
+    // A field that would be credential-bearing under `linear` is none of this
+    // provider's business: no other branch is tightened, and no supported field
+    // disappears anywhere.
+    for (const tracker of [
+      { provider: "github", project: "owner/repo", token: "forge-coordinates" },
+      { provider: "gitlab", project: "group/project", password: "host-account" },
+      { provider: "local" },
+      { provider: "fixture", project: "/tmp/poiesis-fixture", apiKey: "test-only" },
+    ] satisfies PoiesisConfig["tracker"][]) {
+      const validated = validateConfig({ ...baseConfig(), tracker }, "test");
+      expect(JSON.parse(serializeConfig(validated)).tracker).toEqual(tracker);
+    }
+  });
+
+  it("refuses to load an installed config that carries a linear credential", async () => {
+    const repository = await createTestRepository();
+    try {
+      // A hand-written config file: the shape an Author, a template, or a
+      // copy-paste from a Linear dashboard actually produces.
+      await mkdir(join(repository.root, ".poiesis"), { recursive: true });
+      await writeFile(
+        join(repository.root, ".poiesis", "config.jsonc"),
+        JSON.stringify({ ...baseConfig(), tracker: { provider: "linear", team: "ENG", apiKey: "lin_key" } }),
+      );
+      await expect(loadConfig(repository.root)).rejects.toMatchObject({
+        code: "INVALID_TRACKER_CONFIG",
+        details: { provider: "linear", credentialFields: ["tracker.apiKey"] },
+      });
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
 });

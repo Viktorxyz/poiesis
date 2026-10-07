@@ -1166,9 +1166,17 @@ function isAlreadyExists(error: unknown): boolean {
   return isRecord(error) && error.code === "EEXIST";
 }
 
-export function createDeliveryAdapter(
+/**
+ * Spec #139 / ticket #188 — the UNCHECKED construction seam. Module-internal on
+ * purpose: a `DeliveryAdapter` built here runs the delivery subprocess, writes
+ * the delivery artifact, and produces delivery evidence with no policy check at
+ * all, so it must never be reachable from the package public surface. Only the
+ * guarded factories below and the already-guarded `previewDelivery` /
+ * `promoteDelivery` wrappers construct through it.
+ */
+function constructDeliveryAdapter(
   config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
-  root = process.cwd(),
+  root: string,
 ): DeliveryAdapter {
   switch (config.adapter) {
     case "command":
@@ -1182,12 +1190,90 @@ export function createDeliveryAdapter(
   }
 }
 
-export function createCommandDeliveryAdapter(config: CommandDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+function constructCommandDeliveryAdapter(config: CommandDeliveryConfig, root: string): DeliveryAdapter {
   return new CommandDeliveryAdapter(config, root);
 }
 
-export function createFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+function constructFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root: string): DeliveryAdapter {
   return new FixtureDeliveryAdapter(config, root);
+}
+
+/**
+ * Spec #139 / ticket #188 — every PUBLIC construction path is policy-aware.
+ *
+ * The factories below are re-exported by `src/index.ts`, so before this ticket
+ * a library consumer could call one and then drive `preview` / `promote`
+ * directly: the deferred lifecycle was bypassable through the public API,
+ * because only the `previewDelivery` / `promoteDelivery` wrappers consulted
+ * `assertDeliveryAuthority`. A deferred installation therefore could still run
+ * a delivery subprocess, revalidate a remote, write a fixture delivery
+ * artifact, and mint a delivery identity through a returned adapter object.
+ *
+ * The guard now belongs to the adapter the public factory hands back, so the
+ * deferred lifecycle cannot be bypassed by construction at all. It runs BEFORE
+ * the delegated call, in the established order — runtime identity first, then
+ * the single central lifecycle-policy guard — and therefore before remote
+ * revalidation, before any delivery subprocess, before any filesystem artifact,
+ * and before any evidence. Construction itself stays side-effect-free and
+ * unguarded: `verifyDeliveryConfiguration` classifies a configured target by
+ * `kind` from an installation that may itself be deferred or not yet installed,
+ * so the policy is judged by the mutation, which is where the work happens.
+ *
+ * `previewDelivery` / `promoteDelivery` keep their own explicit guard and then
+ * construct through the unchecked seam, so a guarded wrapper still guards
+ * exactly once.
+ */
+class PolicyEnforcingDeliveryAdapter implements DeliveryAdapter {
+  readonly kind: "command" | "fixture";
+
+  constructor(
+    private readonly adapter: DeliveryAdapter,
+    private readonly root: string,
+  ) {
+    this.kind = adapter.kind;
+  }
+
+  async preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult> {
+    await assertDeliveryAuthority(this.root, "poiesis preview");
+    return this.adapter.preview(input);
+  }
+
+  promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
+  promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
+  async promote(input: PromoteDeliveryInput): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
+    await assertDeliveryAuthority(this.root, `poiesis promote --target ${input.target}`);
+    return input.target === "staging" ? this.adapter.promote(input) : this.adapter.promote(input);
+  }
+}
+
+/**
+ * Ticket #188 — the package-public factory. It returns a POLICY-AWARE adapter:
+ * the guard runs before the delegated `preview` / `promote`, so the deferred
+ * lifecycle cannot be bypassed through the public delivery-adapter API.
+ */
+export function createDeliveryAdapter(
+  config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
+  root = process.cwd(),
+): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructDeliveryAdapter(config, root), root);
+}
+
+/**
+ * Ticket #188 — the package-public command factory. It is guarded exactly as
+ * `createDeliveryAdapter` is; only the unchecked construction it delegates to
+ * is module-internal.
+ */
+export function createCommandDeliveryAdapter(config: CommandDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructCommandDeliveryAdapter(config, root), root);
+}
+
+/**
+ * Ticket #188 — the package-public fixture factory, guarded exactly as
+ * `createDeliveryAdapter` is. A deferred installation refuses before the
+ * fixture writes any delivery record.
+ */
+export function createFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructFixtureDeliveryAdapter(config, root), root);
 }
 
 /**
@@ -1244,8 +1330,11 @@ export async function previewDelivery(
   // Spec #139 / ticket #157: all three read the PRIMARY installation, while
   // the adapter below still resolves the candidate and runs the delivery
   // command in the linked worktree the caller named.
+  // Ticket #188: the guard above is the ONLY one on this path, so the wrapper
+  // constructs through the module-internal unchecked seam; the public factories
+  // are the ones that must carry the guard themselves.
   await assertDeliveryAuthority(root, "poiesis preview");
-  return createDeliveryAdapter(config, root).preview(input);
+  return constructDeliveryAdapter(config, root).preview(input);
 }
 
 export function promoteDelivery(
@@ -1274,6 +1363,6 @@ export async function promoteDelivery(
   // clone, so a configured linked worktree promotes against the install that
   // governs it, and the adapter below still promotes in that worktree.
   await assertDeliveryAuthority(root, `poiesis promote --target ${input.target}`);
-  const adapter = createDeliveryAdapter(config, root);
+  const adapter = constructDeliveryAdapter(config, root);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

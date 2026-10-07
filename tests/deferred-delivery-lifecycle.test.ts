@@ -33,11 +33,18 @@ import {
   type ResolvedPoiesisConfig,
 } from "../src/config.js";
 import {
+  createCommandDeliveryAdapter,
+  createDeliveryAdapter,
+  createFixtureDeliveryAdapter,
   createTrackerAdapter,
   previewDelivery,
   promoteDelivery,
+  type DeliveryAdapter,
   type DeliveryIdentity,
+  type PreviewDeliveryInput,
   type PreviewDeliveryResult,
+  type ProductionPromotionInput,
+  type StagingPromotionInput,
 } from "../src/adapters.js";
 import {
   checkpoint,
@@ -722,6 +729,226 @@ describe("explicit deferred delivery hard-blocks every delivery-integrated opera
       verify({ cwd: fixture.workspace.path, candidateSha: fixture.candidateSha, commands: ["test -f feature.txt"] }),
     ).resolves.toMatchObject({ candidateSha: fixture.candidateSha });
   }, 30_000);
+});
+
+/**
+ * Spec #139 / ticket #188 — the deferred lifecycle is not bypassable through
+ * the PUBLIC delivery-adapter API.
+ *
+ * `src/index.ts` re-exports `createDeliveryAdapter`,
+ * `createCommandDeliveryAdapter`, and `createFixtureDeliveryAdapter`, and each
+ * one returns an adapter object. Before this ticket only the
+ * `previewDelivery` / `promoteDelivery` wrappers consulted
+ * `assertDeliveryAuthority`, so a library consumer could construct through any
+ * exported factory and drive `preview` / `promote` directly: a deferred
+ * installation still ran a delivery subprocess, still revalidated a remote,
+ * still wrote a fixture delivery record, and still minted a delivery identity.
+ *
+ * What is pinned here:
+ *
+ *   1. EVERY exported factory refuses a deferred install, by the canonical
+ *      operation name, with the guard running BEFORE remote revalidation,
+ *      BEFORE any delivery subprocess, BEFORE any filesystem artifact, and
+ *      BEFORE any evidence.
+ *   2. The guard ORDER is unchanged on those paths: runtime identity first,
+ *      then the single central lifecycle-policy guard, so an absent manifest
+ *      still reports `RUNTIME_VERSION_MISMATCH` and a manifest-present project
+ *      with no installed config still reports `CONFIG_NOT_INSTALLED`.
+ *   3. The refusal is POLICY, not a blanket denial: the same exported
+ *      factories still drive a real Preview and Staging in a CONFIGURED
+ *      installation, writing the artifacts they are supposed to write.
+ */
+describe("every exported delivery factory is policy-aware", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+  let probeCommand: { adapter: "command"; command: string[] };
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+    probeCommand = await deliveryProbeCommand(fixture);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  function fixtureDeliveryPath(): string {
+    return join(fixture.repository.fixtures, "delivery");
+  }
+
+  function previewAttempt(): Promise<unknown> {
+    return createDeliveryAdapter(probeCommand, fixture.repository.root).preview({
+      sha: fixture.candidateSha,
+      candidateTree: fixture.candidateTree,
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+      remote: "origin",
+    });
+  }
+
+  function stagingAttempt(adapter: DeliveryAdapter): Promise<unknown> {
+    return adapter.promote({
+      sha: fixture.candidateSha,
+      target: "staging",
+      candidateTree: fixture.candidateTree,
+      identity: previewIdentity(fixture),
+    });
+  }
+
+  function productionAttempt(adapter: DeliveryAdapter): Promise<unknown> {
+    return adapter.promote({
+      sha: fixture.candidateSha,
+      target: "production",
+      candidateTree: fixture.candidateTree,
+      identity: {
+        ...previewIdentity(fixture),
+        target: "staging",
+        artifactIdentity: "artifact-staging",
+        artifact: "artifact-staging",
+      },
+      productionAuthorization: {
+        candidateSha: fixture.candidateSha,
+        candidateTree: fixture.candidateTree,
+        stagingArtifactIdentity: "artifact-staging",
+        integrationSha: fixture.candidateSha,
+        authorIdentity: "author",
+        approved: true,
+      },
+      integrationRemote: "origin",
+      integrationBranch: "main",
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      integration: {
+        candidateSha: fixture.candidateSha,
+        candidateTree: fixture.candidateTree,
+        integrationSha: fixture.candidateSha,
+        integrationTree: fixture.candidateTree,
+        contentMatchesCandidate: true,
+      },
+    });
+  }
+
+  it("refuses createDeliveryAdapter before remote revalidation, any subprocess, and any evidence", async () => {
+    const adapter = createDeliveryAdapter(probeCommand, fixture.repository.root);
+    const mark = markSubprocesses();
+    await expect(previewAttempt()).rejects.toMatchObject(expectedDeferredFailure("poiesis preview"));
+    await expect(stagingAttempt(adapter)).rejects.toMatchObject(expectedDeferredFailure("poiesis promote --target staging"));
+    await expect(productionAttempt(adapter)).rejects.toMatchObject(
+      expectedDeferredFailure("poiesis promote --target production"),
+    );
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 30_000);
+
+  it("refuses createCommandDeliveryAdapter the same way", async () => {
+    const adapter = createCommandDeliveryAdapter(probeCommand, fixture.repository.root);
+    const mark = markSubprocesses();
+    await expect(adapter.preview({
+      sha: fixture.candidateSha,
+      candidateTree: fixture.candidateTree,
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+      remote: "origin",
+    })).rejects.toMatchObject(expectedDeferredFailure("poiesis preview"));
+    await expect(stagingAttempt(adapter)).rejects.toMatchObject(expectedDeferredFailure("poiesis promote --target staging"));
+    await expect(productionAttempt(adapter)).rejects.toMatchObject(
+      expectedDeferredFailure("poiesis promote --target production"),
+    );
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 30_000);
+
+  it("refuses createFixtureDeliveryAdapter before it writes any delivery record", async () => {
+    const adapter = createFixtureDeliveryAdapter(
+      { adapter: "fixture", path: fixtureDeliveryPath() },
+      fixture.repository.root,
+    );
+    const mark = markSubprocesses();
+    await expect(adapter.preview({
+      sha: fixture.candidateSha,
+      candidateTree: fixture.candidateTree,
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+      remote: "origin",
+    })).rejects.toMatchObject(expectedDeferredFailure("poiesis preview"));
+    await expect(stagingAttempt(adapter)).rejects.toMatchObject(expectedDeferredFailure("poiesis promote --target staging"));
+    await expect(productionAttempt(adapter)).rejects.toMatchObject(
+      expectedDeferredFailure("poiesis promote --target production"),
+    );
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    for (const directory of ["candidates", "staging", "production"]) {
+      expect(existsSync(join(fixtureDeliveryPath(), directory)), `${directory} must not be written`).toBe(false);
+    }
+  }, 30_000);
+
+  it("keeps runtime identity ahead of the deferred refusal through an exported factory", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "manifest.json"));
+    const adapter = createDeliveryAdapter(probeCommand, fixture.repository.root);
+    const mark = markSubprocesses();
+    await expect(previewAttempt()).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
+    await expect(stagingAttempt(adapter)).rejects.toMatchObject({ code: "RUNTIME_VERSION_MISMATCH" });
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+  }, 30_000);
+
+  it("fails closed at the installed state through an exported factory", async () => {
+    await rm(join(fixture.repository.root, ".poiesis", "config.jsonc"));
+    const adapter = createFixtureDeliveryAdapter(
+      { adapter: "fixture", path: fixtureDeliveryPath() },
+      fixture.repository.root,
+    );
+    const mark = markSubprocesses();
+    await expect(adapter.preview({
+      sha: fixture.candidateSha,
+      candidateTree: fixture.candidateTree,
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+      remote: "origin",
+    })).rejects.toMatchObject(expectedMissingConfigFailure("poiesis preview"));
+    await expect(stagingAttempt(adapter)).rejects.toMatchObject(expectedMissingConfigFailure("poiesis promote --target staging"));
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(join(fixtureDeliveryPath(), "candidates"))).toBe(false);
+    expect(existsSync(join(fixtureDeliveryPath(), "staging"))).toBe(false);
+  }, 30_000);
+
+  it("still delivers through the same exported factories in a CONFIGURED installation", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const script = join(repository.parent, PROBE);
+    const commandArtifact = join(repository.parent, "configured-artifacts", "ran.json");
+    await writeFile(script, probeScript(commandArtifact));
+    const delivery = { adapter: "command" as const, command: ["node", script, "{sha}", "{target}"] };
+    const changeBranch = "poiesis/configured";
+    await run("git", ["push", "--quiet", "origin", `${repository.baseSha}:refs/heads/${changeBranch}`], {
+      cwd: repository.root,
+    });
+    await init(
+      repository.root,
+      { ...testConfig(repository), delivery: { preview: delivery, staging: delivery, production: delivery } },
+      { skipSkills: true, allowFixtureAdapters: true },
+    );
+    const sha = repository.baseSha;
+    const tree = await resolveTree(repository.root, sha);
+    const proof = proofShell(sha, tree);
+    const publish = publishEvidence(sha, tree, changeBranch);
+
+    // The command factory: a real delivery subprocess runs and reports.
+    const command = createCommandDeliveryAdapter(delivery, repository.root);
+    const preview = await command.preview({ sha, candidateTree: tree, proof, publish, remote: "origin" });
+    expect(preview).toMatchObject({ target: "preview", verified: true, artifactIdentity: "artifact-preview" });
+    const staging = await command.promote({ sha, target: "staging", candidateTree: tree, identity: preview });
+    expect(staging).toMatchObject({ target: "staging", verified: true, artifactIdentity: "artifact-staging" });
+    expect(existsSync(commandArtifact)).toBe(true);
+
+    // The fixture factory: the delivery record it is supposed to write is written.
+    const fixturePath = join(repository.fixtures, "delivery");
+    const fixtureAdapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: fixturePath }, repository.root);
+    const fixturePreview = await fixtureAdapter.preview({ sha, candidateTree: tree, proof, publish, remote: "origin" });
+    expect(fixturePreview).toMatchObject({ target: "preview", verified: true, id: `fixture:${sha}` });
+    expect(existsSync(join(fixturePath, "candidates"))).toBe(true);
+  }, 90_000);
 });
 
 describe("the lifecycle-policy guard reads the installed config without auto-resolution or network", () => {
