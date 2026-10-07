@@ -1222,27 +1222,44 @@ function constructFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root: st
  * `previewDelivery` / `promoteDelivery` keep their own explicit guard and then
  * construct through the unchecked seam, so a guarded wrapper still guards
  * exactly once.
+ *
+ * Ticket #189 — the delegate and the authority root are ECMAScript
+ * runtime-PRIVATE (`#adapter`, `#root`), NOT TypeScript `private`. A
+ * TypeScript `private` is erased at emit and leaves an ordinary own
+ * enumerable property behind, so the object every public factory hands back
+ * exposed its unchecked delegate: `wrapper.adapter.preview(...)` revalidated
+ * the remote, ran the delivery subprocess, wrote the artifact, and minted the
+ * delivery identity with no runtime identity check and no deferred policy
+ * whatsoever. A `#private` is a real language-level slot with no property key,
+ * no descriptor, and no symbol, so the delegate is unreachable from JavaScript
+ * by any means short of the wrapper's own guarded methods.
+ *
+ * `kind` stays a plain public readonly field: it is part of the published
+ * `DeliveryAdapter` interface (and is what `verifyDeliveryConfiguration`
+ * classifies on), it is a discriminant string, and it yields neither the
+ * delegate nor any way around the guard.
  */
 class PolicyEnforcingDeliveryAdapter implements DeliveryAdapter {
   readonly kind: "command" | "fixture";
+  readonly #adapter: DeliveryAdapter;
+  readonly #root: string;
 
-  constructor(
-    private readonly adapter: DeliveryAdapter,
-    private readonly root: string,
-  ) {
+  constructor(adapter: DeliveryAdapter, root: string) {
+    this.#adapter = adapter;
+    this.#root = root;
     this.kind = adapter.kind;
   }
 
   async preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult> {
-    await assertDeliveryAuthority(this.root, "poiesis preview");
-    return this.adapter.preview(input);
+    await assertDeliveryAuthority(this.#root, "poiesis preview");
+    return this.#adapter.preview(input);
   }
 
   promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
   promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
   async promote(input: PromoteDeliveryInput): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
-    await assertDeliveryAuthority(this.root, `poiesis promote --target ${input.target}`);
-    return input.target === "staging" ? this.adapter.promote(input) : this.adapter.promote(input);
+    await assertDeliveryAuthority(this.#root, `poiesis promote --target ${input.target}`);
+    return input.target === "staging" ? this.#adapter.promote(input) : this.#adapter.promote(input);
   }
 }
 

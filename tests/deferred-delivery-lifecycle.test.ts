@@ -398,6 +398,76 @@ function blockedAttempts(
 }
 
 /**
+ * Spec #139 / ticket #189 — the shape through which an UNCHECKED delivery
+ * delegate could be reached, however it was named and whatever it hid
+ * behind: an object whose `preview` and `promote` are both callable. The
+ * `DeliveryAdapter` interface is the whole surface, so nothing else needs to
+ * be special-cased — a reachable delegate is detectable by shape alone.
+ */
+function isDeliveryAdapterLike(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  const candidate = value as { preview?: unknown; promote?: unknown };
+  return typeof candidate.preview === "function" && typeof candidate.promote === "function";
+}
+
+function prototypeChainOf(value: object): object[] {
+  const chain: object[] = [];
+  let current: object | null = Object.getPrototypeOf(value);
+  while (current !== null) {
+    chain.push(current);
+    current = Object.getPrototypeOf(current);
+  }
+  return chain;
+}
+
+/**
+ * Everything reflection can hand a JavaScript consumer from `subject`: its
+ * own string and symbol keys, every prototype up the chain, every data
+ * descriptor value, and every accessor result. This deliberately does NOT
+ * look for a particular field name — a TS `private readonly` field emits an
+ * ordinary own property, and a later regression could rename it, nest it, or
+ * hide it behind a symbol. The invariant is behavioural: no object reachable
+ * from the wrapper is a delivery adapter other than the wrapper itself.
+ *
+ * The subject's own prototype chain is the wrapper's CLASS SHAPE and is not a
+ * leak: it holds no state, and calling its `preview` / `promote` on the wrapper
+ * still runs the guard. A delegate is a separate object, and that is what this
+ * reports.
+ */
+function reachableUncheckedDelegates(subject: DeliveryAdapter): string[] {
+  const leaked: string[] = [];
+  const seen = new Set<unknown>();
+  const shape = new Set<unknown>([subject, ...prototypeChainOf(subject)]);
+
+  const visit = (value: unknown, path: string, depth: number): void => {
+    if (depth > 5 || value === null || (typeof value !== "object" && typeof value !== "function")) return;
+    if (seen.has(value)) return;
+    seen.add(value);
+    if (!shape.has(value) && isDeliveryAdapterLike(value)) leaked.push(path);
+    for (const holder of [value as object, ...prototypeChainOf(value as object)]) {
+      for (const key of Reflect.ownKeys(holder)) {
+        const descriptor = Object.getOwnPropertyDescriptor(holder, key);
+        if (descriptor === undefined) continue;
+        const name = String(key);
+        if ("value" in descriptor) {
+          visit(descriptor.value, `${path}.${name}`, depth + 1);
+          continue;
+        }
+        if (descriptor.get === undefined) continue;
+        try {
+          visit(descriptor.get.call(value), `${path}.${name}()`, depth + 1);
+        } catch {
+          // A getter that refuses this receiver exposes nothing to reach.
+        }
+      }
+    }
+  };
+
+  visit(subject, "adapter", 0);
+  return leaked;
+}
+
+/**
  * The same six operations as the operator invokes them, through the CLI
  * command seams, with complete and otherwise-valid arguments. The CLI
  * wrappers each run the shared preflight (runtime identity, then the central
@@ -948,7 +1018,136 @@ describe("every exported delivery factory is policy-aware", () => {
     const fixturePreview = await fixtureAdapter.preview({ sha, candidateTree: tree, proof, publish, remote: "origin" });
     expect(fixturePreview).toMatchObject({ target: "preview", verified: true, id: `fixture:${sha}` });
     expect(existsSync(join(fixturePath, "candidates"))).toBe(true);
+
+    // Ticket #189: the factories deliver exactly as before, and the adapters
+    // that did the delivering still expose no unchecked delegate.
+    expect(reachableUncheckedDelegates(command)).toEqual([]);
+    expect(reachableUncheckedDelegates(fixtureAdapter)).toEqual([]);
   }, 90_000);
+});
+
+/**
+ * Spec #139 / ticket #189 — TypeScript `private` is erased at emit, so the
+ * policy-aware wrapper handed back by a public delivery factory was not
+ * actually sealed: `private readonly adapter` compiles to an ordinary own
+ * enumerable property, and a JavaScript consumer could call
+ * `adapter.adapter.preview(...)` on the UNCHECKED `CommandDeliveryAdapter` /
+ * `FixtureDeliveryAdapter` — skipping runtime identity and the central
+ * deferred guard entirely. In a deferred installation that is the whole
+ * lifecycle block: the delegate would revalidate the remote, run the delivery
+ * subprocess, write the artifact, and mint the Preview identity.
+ *
+ * What is pinned here:
+ *
+ *   1. Every public factory hands back an object from which NO property,
+ *      symbol, enumerable value, or descriptor yields the delegate or the
+ *      authority root — checked generically by reachability, not by name.
+ *   2. A bypass attempt is a hard refusal that produces no remote
+ *      revalidation, no subprocess, no filesystem write, no artifact, and no
+ *      delivery evidence, in the installation where a reachable delegate
+ *      would have produced all five.
+ */
+describe("no public delivery factory exposes the unchecked delegate at runtime", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let fixture: DeferredLocalProgress;
+  let probeCommand: { adapter: "command"; command: string[] };
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    fixture = await deferredLocalProgress(repositories);
+    probeCommand = await deliveryProbeCommand(fixture);
+  }, 60_000);
+
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repository) => rm(repository.parent, { recursive: true, force: true })));
+  });
+
+  function fixtureDeliveryPath(): string {
+    return join(fixture.repository.fixtures, "delivery");
+  }
+
+  /** What a library consumer actually receives from each public factory. */
+  function publicAdapters(): Array<{ label: string; adapter: DeliveryAdapter }> {
+    return [
+      { label: "createDeliveryAdapter", adapter: createDeliveryAdapter(probeCommand, fixture.repository.root) },
+      { label: "createCommandDeliveryAdapter", adapter: createCommandDeliveryAdapter(probeCommand, fixture.repository.root) },
+      {
+        label: "createFixtureDeliveryAdapter",
+        adapter: createFixtureDeliveryAdapter({ adapter: "fixture", path: fixtureDeliveryPath() }, fixture.repository.root),
+      },
+    ];
+  }
+
+  function previewInput(): PreviewDeliveryInput {
+    return {
+      sha: fixture.candidateSha,
+      candidateTree: fixture.candidateTree,
+      proof: proofShell(fixture.candidateSha, fixture.candidateTree),
+      publish: publishEvidence(fixture.candidateSha, fixture.candidateTree, BRANCH),
+      remote: "origin",
+    };
+  }
+
+  async function outcome(attempt: () => unknown): Promise<unknown> {
+    try {
+      await attempt();
+      return null;
+    } catch (error) {
+      return error;
+    }
+  }
+
+  it("exposes no property, symbol, enumerable value, or descriptor that yields the unchecked delegate", () => {
+    for (const { label, adapter } of publicAdapters()) {
+      const ownKeys = Reflect.ownKeys(adapter).map(String);
+      expect(ownKeys, `${label} own keys`).not.toContain("adapter");
+      expect(ownKeys, `${label} own keys`).not.toContain("root");
+
+      const enumerated = [...Object.keys(adapter)];
+      for (const inherited in adapter) enumerated.push(inherited);
+      expect(enumerated, `${label} enumeration`).not.toContain("adapter");
+      expect(enumerated, `${label} enumeration`).not.toContain("root");
+
+      // The invariant behind the two names above: nothing reachable by
+      // reflection is a delivery adapter other than the guarded wrapper.
+      expect(reachableUncheckedDelegates(adapter), `${label} reflection`).toEqual([]);
+    }
+  });
+
+  it("refuses a bypass attempt with no remote, process, filesystem, artifact, or evidence effect", async () => {
+    const mark = markSubprocesses();
+    for (const { label, adapter } of publicAdapters()) {
+      const reachable = adapter as unknown as Record<string, unknown>;
+      expect(reachable.adapter, `${label} .adapter`).toBeUndefined();
+      expect(reachable.root, `${label} .root`).toBeUndefined();
+
+      // The delegate itself would have succeeded here: the candidate is
+      // published, proven, and the deferred block is the ONLY thing that
+      // stops it. Reading through the wrapper must fail as a missing
+      // property, not as a typed Poiesis policy refusal.
+      const delegate = reachable.adapter as DeliveryAdapter;
+      const preview = await outcome(() => delegate.preview(previewInput()));
+      expect(preview, `${label} .adapter.preview`).toBeInstanceOf(TypeError);
+      const staging = await outcome(() => delegate.promote({
+        sha: fixture.candidateSha,
+        target: "staging",
+        candidateTree: fixture.candidateTree,
+        identity: previewIdentity(fixture),
+      }));
+      expect(staging, `${label} .adapter.promote`).toBeInstanceOf(TypeError);
+    }
+
+    // Zero remote revalidation, zero delivery subprocess, zero artifact.
+    expect(reachedSideEffects(subprocessCallsSince(mark))).toEqual([]);
+    expect(existsSync(fixture.artifactPath)).toBe(false);
+    // Zero delivery evidence of any kind, for both the command and the
+    // fixture delegate.
+    for (const directory of ["candidates", "staging", "production"]) {
+      expect(existsSync(join(fixtureDeliveryPath(), directory)), `${directory} must not be written`).toBe(false);
+    }
+  }, 60_000);
 });
 
 describe("the lifecycle-policy guard reads the installed config without auto-resolution or network", () => {
