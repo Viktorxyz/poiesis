@@ -54,6 +54,7 @@ import {
   type RecommendedModelIds,
 } from "./model-selector.js";
 import { settleOnceLinePrompt } from "./prompt-line.js";
+import { parseInstallModeAnswer, type InstallMode } from "./install-mode.js";
 import { init, parseOpenCodeModelInventory } from "./maintenance.js";
 import { loadManifest, type Manifest } from "./manifest.js";
 import { run as runChildProcess } from "./process.js";
@@ -172,32 +173,39 @@ export async function runInteractiveInit(args: InteractiveInitOptions): Promise<
     // has Poiesis installed.
     await refuseIfAlreadyInstalled(args.root);
 
-    // Step 2: compose discovery. The composer is read-only — it inspects
+    // Step 2 (Spec #190 / ticket #191): the sharing decision comes
+    // FIRST, before any other configuration question. It changes what
+    // every later answer means — what stays untracked, what may be
+    // shared — so answering it after the models and delivery questions
+    // would ask the Author to re-read everything they just entered.
+    const mode = await resolveInstallMode(args.io);
+
+    // Step 3: compose discovery. The composer is read-only — it inspects
     // the repo and the user's draft, then reports either a fully resolved
     // config or a list of unresolved paths.
     const discovery = await composeInitDiscovery(args.root, args.draft);
 
-    // Step 3: print the detected facts to stderr so the Author can see
+    // Step 4: print the detected facts to stderr so the Author can see
     // what was inferred before any prompt is issued.
-    printDetections(args.io, discovery);
+    printDetections(args.io, discovery, mode);
 
-    // Step 4: resolve every Author-owned field. Order matters — model
+    // Step 5: resolve every Author-owned field. Order matters — model
     // selection runs before tracker auth so the Author sees the same
     // config that the auth probe will read.
-    const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft);
+    const resolvedDraft = await resolveAuthorChoices(args.io, discovery, args.draft, mode);
 
-    // Step 5: probe tracker auth BEFORE `init()` writes any byte. Auth
+    // Step 6: probe tracker auth BEFORE `init()` writes any byte. Auth
     // failures mention `gh auth login` / `glab auth login` and never
     // wait-for-enter.
     await probeTrackerAuthBeforeInstall(args.io, resolvedDraft);
 
-    // Step 6: the existing init() function owns every transactional
+    // Step 7: the existing init() function owns every transactional
     // invariant. This module never duplicates that surface.
     const manifest = await init(args.root, resolvedDraft);
 
-    // Step 7: success. Print a restart notice on stderr; Poiesis does not
+    // Step 8: success. Print a restart notice on stderr; Poiesis does not
     // restart OpenCode on the Author's behalf.
-    args.io.writeStderr(formatRestartNotice());
+    args.io.writeStderr(formatRestartNotice(mode));
     return manifest;
   } finally {
     // Ticket #75: flow-scoped resource release. The interactive flow
@@ -209,6 +217,34 @@ export async function runInteractiveInit(args: InteractiveInitOptions): Promise<
     // undefined.
     args.io.releaseStdin?.();
   }
+}
+
+/**
+ * Spec #190 / ticket #191 — the required first question.
+ *
+ * The Author is asked in product language ("Private/local" vs
+ * "Team/shared") and the answer is parsed strictly: no default, no
+ * best-guess, and an unrecognised answer fails closed rather than
+ * defaulting to private. Choosing a sharing policy on the Author's behalf
+ * is precisely what this decision exists to prevent.
+ *
+ * Team/shared is accepted here as a declared future mode (ticket #192).
+ * `init()` refuses to install it until that ticket lands, so the flow
+ * reports the mode honestly instead of installing private semantics
+ * under a shared label.
+ */
+async function resolveInstallMode(io: InteractiveInitIO): Promise<InstallMode> {
+  io.writeStderr("Poiesis init: installation mode");
+  io.writeStderr("");
+  io.writeStderr("private/local  everything Poiesis owns stays untracked in this clone;");
+  io.writeStderr("                only the marked .gitignore policy is visible to Git.");
+  io.writeStderr("team/shared     a shareable project profile; not available yet.");
+  io.writeStderr("");
+  const answer = await io.promptLine("Installation mode (private|team)");
+  const mode = parseInstallModeAnswer(answer, "interactive init mode prompt");
+  io.writeStderr(`  installation mode: ${mode}`);
+  io.writeStderr("");
+  return mode;
 }
 
 async function refuseIfAlreadyInstalled(root: string): Promise<void> {
@@ -230,10 +266,12 @@ async function refuseIfAlreadyInstalled(root: string): Promise<void> {
   );
 }
 
-function printDetections(io: InteractiveInitIO, discovery: InitDiscoveryResult): void {
+function printDetections(io: InteractiveInitIO, discovery: InitDiscoveryResult, mode: InstallMode): void {
   const lines: string[] = [];
   lines.push("Poiesis init: detected repository facts");
   lines.push("");
+  lines.push(`  installation mode: ${mode}`);
+  lines.push(`  git ignore policy: one marked .gitignore block (mode: ${mode})`);
 
   const remote = discovery.detections.remote;
   lines.push(formatRemoteDetection(remote));
@@ -320,10 +358,13 @@ async function resolveAuthorChoices(
   io: InteractiveInitIO,
   discovery: InitDiscoveryResult,
   draft: PoiesisConfig | undefined,
+  mode: InstallMode,
 ): Promise<PoiesisConfig> {
   // If the composer returned a fully resolved config, skip every prompt.
+  // The mode still rides through: it was answered, not discovered, and the
+  // resolved config is what init writes to disk.
   if (discovery.config !== undefined) {
-    return discovery.config;
+    return { ...discovery.config, mode };
   }
 
   // The composer has the detection objects even when it could not
@@ -361,6 +402,9 @@ async function resolveAuthorChoices(
   }) as PoiesisConfig;
 
   const next: PoiesisConfig = JSON.parse(JSON.stringify(base)) as PoiesisConfig;
+  // The mode is an explicit answer, carried on every resolution path so
+  // `init()` never has to infer it.
+  next.mode = mode;
 
   // Models: select reasoning first, then execution. Both go through the
   // shared model selector; the IO is responsible for failure-closed
@@ -594,20 +638,20 @@ async function probeTrackerAuthBeforeInstall(io: InteractiveInitIO, config: Poie
   );
 }
 
-function formatRestartNotice(): string {
+function formatRestartNotice(mode: InstallMode): string {
   return [
     "",
-    "Poiesis init succeeded.",
+    `Poiesis init succeeded (${mode} mode).`,
     "",
     "Next:",
     "  1. Restart OpenCode. The agent projections, permissions, and skills only",
     "     take effect on a fresh start. Poiesis does not restart it for you.",
-    "  2. Confirm it is healthy:   pnpm poiesis doctor",
+    "  2. Confirm it is healthy:   poiesis doctor",
     "  3. Ask the repository a question:",
-    "       pnpm poiesis repository query --question \"...\"",
+    "       poiesis repository query --question \"...\"",
     "",
-    "Every Poiesis command from here is just `pnpm poiesis <command>`.",
-    "You never need to name a version, and you never need a cache flag.",
+    "Every Poiesis command from here is just `poiesis <command>`.",
+    "Your package.json is untouched; nothing was added to it.",
     "",
   ].join("\n");
 }
@@ -615,7 +659,7 @@ function formatRestartNotice(): string {
 // Export the helpers so tests can drive individual steps without spinning
 // up the full init() transaction. Kept module-internal so they do not
 // leak through `src/index.ts`; tests import from the source module.
-export const __test = { resolveAuthorChoices, refuseIfAlreadyInstalled };
+export const __test = { resolveAuthorChoices, refuseIfAlreadyInstalled, resolveInstallMode };
 
 /**
  * Production IO factory. Wires the interactive init IO to

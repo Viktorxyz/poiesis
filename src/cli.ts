@@ -43,8 +43,8 @@ const HELP = `Poiesis deterministic runtime
 
 Usage:
   poiesis bootstrap --print                            # print the one paste-able prompt that installs Poiesis into a project
-  poiesis init                                          # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
-  poiesis init --config <file> [--allow-fixtures]
+  poiesis init                                          # default: interactive TTY discovery; asks Private/local vs Team/shared first, then the rest of the guided configuration
+  poiesis init --config <file> [--allow-fixtures]       # non-interactive: the config MUST state "mode": "private" | "team"
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
@@ -219,6 +219,16 @@ export async function commandInit(args: string[]): Promise<void> {
   if (typeof configArg === "string" && configArg.trim().length > 0) {
     const configPath = resolve(cwd, configArg);
     const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
+    // Spec #190 / ticket #191 — non-interactive init requires an explicit
+    // mode. Reported here, at the flag surface, so an operator sees which
+    // file is missing the decision before any repository state is touched.
+    if (config.mode === undefined) {
+      throw new PoiesisError(
+        "INVALID_INSTALL_MODE",
+        "Non-interactive `poiesis init` requires an explicit installation mode in the config; add `\"mode\": \"private\"` (or \"team\")",
+        { path: configPath, supported: ["private", "team"] },
+      );
+    }
     writeSuccess(
       "init",
       await init(root, config, {

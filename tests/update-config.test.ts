@@ -2079,6 +2079,8 @@ exit 0
   async function installProduction(repository: TestRepository): Promise<Manifest> {
     const productionConfig: PoiesisConfig = {
       schema: 1,
+      // Spec #190 / ticket #191: `init` requires an explicit mode.
+      mode: "private",
       models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
       tracker: { provider: "github", project: "poiesis-test/qualification" },
       delivery: {

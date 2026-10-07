@@ -3,6 +3,13 @@
   // The installer resolves real values during `poiesis init`.
   "schema": 1,
 
+  // Spec #190: the installation mode is REQUIRED and is never inferred.
+  // `private` keeps every Poiesis-owned artifact untracked in this clone,
+  // behind the one marked `.gitignore` block that is the only Poiesis
+  // surface Git sees. `team` shares a declarative project profile; it is
+  // not installable yet.
+  "mode": "private",
+
   "models": {
     "reasoning": "<provider/model>",
     "execution": "<provider/model>"

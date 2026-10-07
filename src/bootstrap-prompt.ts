@@ -55,17 +55,22 @@ the strongest available model for reasoning and a fast one for execution.
 
 ## 4. Install
 
-Write a config file with ONLY the models - do not hand-write delivery
+Ask the human ONE question first: private/local or team/shared. Then write a
+config file with ONLY that mode and the models - do not hand-write delivery
 commands, tracker, repository, or verification blocks. Poiesis infers all of
 them:
 
     {
       "schema": 1,
+      "mode": "private",
       "models": {
         "reasoning": "<their reasoning model>",
         "execution": "<their execution model>"
       }
     }
+
+The mode is never inferred. If the human does not answer, stop and ask again
+rather than choosing for them.
 
 Then run:
 
@@ -78,14 +83,16 @@ from step 1, not a bug. Fix the prerequisite and re-run the same command.
 
 Run:
 
-    pnpm poiesis doctor
+    poiesis doctor
 
 Then tell the human, in plain language:
 
-  - That Poiesis is installed, and that the project now has a \`pnpm poiesis\`
-    command they can use for everything.
+  - That Poiesis is installed in the mode the human chose, and that every
+    command runs as \`poiesis <command>\` with no package.json script added.
   - The one thing they must do themselves: restart OpenCode.
-  - That they can verify with \`pnpm poiesis doctor\`.
+  - That they can verify with \`poiesis doctor\`.
+  - That one marked block in \`.gitignore\` is the only Poiesis surface Git
+    sees, and that \`package.json\` was not modified.
   - What was inferred for them (tracker, integration branch, verification
     commands) and that generated delivery scripts live in \`scripts/\` and are
     theirs to edit.

@@ -30,12 +30,24 @@ function patchKey(file: string, path: readonly string[]): string {
   return `${file}\0${path.join("\0")}`;
 }
 
-function expectedManagedFiles(): Array<{ path: string; kind: ManagedFile["kind"]; durable: boolean }> {
+/**
+ * Spec #190 / ticket #191 — `durable` is a property of the installation's
+ * SHARING MODE, not of the template table.
+ *
+ * `durable` means "the project tracks this artifact on purpose". That is
+ * a team-mode property: a private installation tracks nothing Poiesis
+ * owns, so recording `durable` there would make uninstall treat its own
+ * canon as released content and leave it behind forever. A pre-Spec #190
+ * manifest records no mode and keeps the classification it was written
+ * with, which is what `manifest.mode === undefined` means here.
+ */
+function expectedManagedFiles(manifest: Manifest): Array<{ path: string; kind: ManagedFile["kind"]; durable: boolean }> {
+  const tracksProjectContent = manifest.mode !== "private";
   return [
     ...templateMappings.map((mapping) => ({
       path: mapping.destination,
       kind: mapping.kind,
-      durable: mapping.trackInProject === true,
+      durable: tracksProjectContent && mapping.trackInProject === true,
     })),
     { path: ".poiesis/config.jsonc", kind: "generated", durable: false },
   ];
@@ -49,11 +61,41 @@ function fail(code: string, message: string, details: Record<string, unknown> = 
   throw new PoiesisError(code, message, details);
 }
 
+/**
+ * Spec #190 / ticket #191 — a manifest a previous PARTIAL uninstall already
+ * consumed is not a complete installation, and must not be judged by the
+ * install-completeness loops in `assertManifestAuthorityImpl`.
+ *
+ * With this set, exactly three completeness requirements are lifted:
+ *
+ *   - every adapter-managed file the adapter would install must be claimed;
+ *   - the manifest must identify a patched OpenCode config file at all;
+ *   - every desired OpenCode patch must be claimed.
+ *
+ * Every PER-CLAIM rule is unchanged and still fails closed: duplicates,
+ * unknown/unsafe paths, wrong `kind`/`durable`, and — for any patch the
+ * manifest does still claim — equality with the adapter's projection. The
+ * relaxation is only about what an already-consumed manifest is still
+ * REQUIRED to carry, never about whether what it carries is genuine.
+ *
+ * It exists because `uninstall` is the only actor that prunes those records,
+ * so their absence from a receipt-authenticated manifest proves that this
+ * very runtime already removed them. Demanding them back would make the
+ * LAST uninstall of a partially removed installation impossible — the
+ * installation could never be fully removed no matter what the Author did,
+ * which is the exact failure this relaxation removes.
+ */
+export interface ManifestAuthorityOptions {
+  allowPartialConsumption?: boolean;
+}
+
 async function assertManifestAuthorityImpl(
   root: string,
   manifest: Manifest,
   desired: ReadonlyArray<{ path: readonly string[]; value: unknown }>,
+  options: ManifestAuthorityOptions = {},
 ): Promise<void> {
+  const allowPartialConsumption = options.allowPartialConsumption === true;
   if (manifest.schema !== 1) {
     fail("MANIFEST_MIGRATION_REQUIRED", "Manifest schema is not supported by this adapter", {
       schema: manifest.schema,
@@ -76,7 +118,7 @@ async function assertManifestAuthorityImpl(
     });
   }
 
-  const expectedFiles = expectedManagedFiles();
+  const expectedFiles = expectedManagedFiles(manifest);
   const expectedByPath = new Map(expectedFiles.map((file) => [file.path, file]));
   const seenFiles = new Set<string>();
   let generatedConfigPath: string | undefined;
@@ -107,9 +149,11 @@ async function assertManifestAuthorityImpl(
     generatedConfigPath = file.path;
   }
 
-  for (const expected of expectedFiles) {
-    if (!seenFiles.has(expected.path)) {
-      fail("MANIFEST_AUTHORITY_INVALID", "Manifest is missing a required adapter-managed file", { path: expected.path });
+  if (!allowPartialConsumption) {
+    for (const expected of expectedFiles) {
+      if (!seenFiles.has(expected.path)) {
+        fail("MANIFEST_AUTHORITY_INVALID", "Manifest is missing a required adapter-managed file", { path: expected.path });
+      }
     }
   }
 
@@ -150,7 +194,7 @@ async function assertManifestAuthorityImpl(
     }
   }
 
-  if (patchFile === undefined) {
+  if (patchFile === undefined && !allowPartialConsumption) {
     fail("MANIFEST_AUTHORITY_INVALID", "Manifest does not identify the OpenCode config file");
   }
   if (generatedConfigPath !== undefined && generatedConfigPath !== patchFile) {
@@ -159,12 +203,14 @@ async function assertManifestAuthorityImpl(
       patches: patchFile,
     });
   }
-  for (const desiredPatch of desired) {
-    if (!seenPatches.has(patchKey(patchFile, desiredPatch.path))) {
-      fail("MANIFEST_AUTHORITY_INVALID", "Manifest is missing a required adapter config patch", {
-        file: patchFile,
-        path: desiredPatch.path,
-      });
+  if (patchFile !== undefined) {
+    for (const desiredPatch of desired) {
+      if (!seenPatches.has(patchKey(patchFile, desiredPatch.path))) {
+        fail("MANIFEST_AUTHORITY_INVALID", "Manifest is missing a required adapter config patch", {
+          file: patchFile,
+          path: desiredPatch.path,
+        });
+      }
     }
   }
 
@@ -700,11 +746,39 @@ export async function assertManifestAuthorityToleratingPredecessor(
  * `pnpm dlx poiesis-cli@<X>` that THIS manifest records, independent of
  * the runtime image.
  */
-export async function assertManifestAuthority(root: string, manifest: Manifest, config: PoiesisConfig): Promise<void> {
-  await assertManifestAuthorityImpl(root, manifest, desiredOpenCodePatches(config, manifest.poiesisVersion));
+/**
+ * Spec #190 / ticket #191 — authority over a manifest a PARTIAL uninstall
+ * has already consumed.
+ *
+ * There is no `.poiesis/config.jsonc` left to recompute the OpenCode
+ * projection from, so `desired` is empty and every patch-completeness
+ * requirement is vacuous by construction. What remains is the FULL per-claim
+ * validation over the records the manifest still carries: duplicate and
+ * unknown-path rejection, `kind` / `durable` correctness, skill destination
+ * correctness, and — for any claimed patch — nothing, because there is no
+ * projection to compare it to. The receipt is what authenticates WHICH
+ * manifest this is; this function is what proves its remaining claims are
+ * inside the adapter's vocabulary.
+ */
+export async function assertConsumedManifestAuthority(root: string, manifest: Manifest): Promise<void> {
+  await assertManifestAuthorityImpl(root, manifest, [], { allowPartialConsumption: true });
 }
 
-export function nextAdapterFiles(manifest: Manifest, materialized: Array<{ path: string; kind: ManagedFile["kind"]; hash: string; durable?: boolean }>): ManagedFile[] {
+export async function assertManifestAuthority(
+  root: string,
+  manifest: Manifest,
+  config: PoiesisConfig,
+  options: ManifestAuthorityOptions = {},
+): Promise<void> {
+  await assertManifestAuthorityImpl(
+    root,
+    manifest,
+    desiredOpenCodePatches(config, manifest.poiesisVersion),
+    options,
+  );
+}
+
+export function nextAdapterFiles(manifest: Manifest, materialized: Array<{ path: string; kind: ManagedFile["kind"]; hash: string; durable?: boolean; provenance?: ManagedFile["provenance"] }>): ManagedFile[] {
   const generatedConfig = manifest.files.find(
     (file) => isRecognizedOpenCodeConfig(file.path) && !materialized.some((candidate) => candidate.path === file.path),
   );
@@ -715,6 +789,10 @@ export function nextAdapterFiles(manifest: Manifest, materialized: Array<{ path:
       hash: file.hash,
       owned: true as const,
       ...(file.durable === true ? { durable: true } : {}),
+      // Spec #190 / ticket #191: an update carries the artifact's
+      // provenance forward instead of dropping the classification, so the
+      // sharing matrix stays readable on an updated installation.
+      ...(file.provenance === undefined ? {} : { provenance: file.provenance }),
     })),
     ...(generatedConfig === undefined ? [] : [generatedConfig]),
   ];

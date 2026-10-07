@@ -155,13 +155,14 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
-  // Spec #133 / tickets #134-#137: the `pnpm poiesis` package-script
-  // module (`src/package-script.ts`) stays internal. These are the
-  // init/update transaction seams and the single source of truth for the
-  // script value; promoting them would freeze the Author-owned
-  // `package.json` edit contract (including the refusing/repairing
-  // entry-point split that forces each caller to choose deliberately)
-  // into the packed public surface.
+  // Spec #190 / ticket #191: the `pnpm poiesis` package-script module is
+  // GONE — invoking Poiesis no longer mutates `package.json` — and the
+  // installation-mode / managed-ignore-block capability stays CLI- and
+  // runtime-internal for the same reason. These names must never reach the
+  // package root: promoting them would freeze the Author-owned
+  // `package.json` contract that Spec #190 removed, or the block
+  // delimiter/parse surface, into a public API before later tickets
+  // (#192) settle them.
   "POIESIS_SCRIPT_NAME",
   "POIESIS_SCRIPT_COMMAND",
   "PACKAGE_JSON_RELATIVE",
@@ -170,6 +171,18 @@ const forbiddenFunctions = [
   "repairPoiesisScript",
   "rollbackPackageJson",
   "EnsurePoiesisScriptOptions",
+  "INSTALL_MODES",
+  "parseInstallMode",
+  "parseInstallModeAnswer",
+  "GITIGNORE_RELATIVE_PATH",
+  "IGNORE_BLOCK_TOKEN",
+  "ignoreBlockStartLabel",
+  "ignoreBlockEndLabel",
+  "parseManagedIgnoreBlocks",
+  "renderManagedIgnoreBlock",
+  "planManagedIgnoreBlock",
+  "planManagedIgnoreBlockRemoval",
+  "privateIgnoreBlockLines",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache

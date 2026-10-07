@@ -18,6 +18,12 @@ export interface ProjectInspection {
     version?: string;
     adapter?: string;
     configuredModels?: { reasoning: string; execution: string };
+    /**
+     * Spec #190: the selected installation mode, so `inspect` reports
+     * which sharing policy the install actually chose. Absent for
+     * pre-Spec #190 installations, which never made the choice.
+     */
+    mode?: "private" | "team";
   };
 }
 
@@ -92,6 +98,7 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
             version: manifest.poiesisVersion,
             adapter: manifest.adapter.harness,
             configuredModels: config.models,
+            ...(manifest.mode === undefined ? {} : { mode: manifest.mode }),
           },
   };
 }

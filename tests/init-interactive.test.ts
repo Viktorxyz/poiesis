@@ -117,7 +117,14 @@ function scriptedInitIO(options: {
   const prompts: { prompt: string; answer: string }[] = [];
   const modelSelections: ModelSelection[] = [];
   const authProbes: { provider: "github" | "gitlab"; command: string }[] = [];
-  const promptAnswers = options.promptAnswers ?? {};
+  // Spec #190 / ticket #191: the installation mode is the FIRST required
+  // question, so every scripted flow answers it. A test that cares about
+  // the answer passes its own; the rest take private, which is the mode the
+  // suite installs.
+  const promptAnswers: Record<string, string> = {
+    "installation mode (private|team)": "private",
+    ...(options.promptAnswers ?? {}),
+  };
   const modelAnswers = options.modelAnswers ?? {};
   const inventory = options.inventory ?? [];
   const auth = options.auth ?? {};
@@ -318,8 +325,12 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(stderr).toContain("main");
     expect(stderr).toContain("poiesis-preview");
 
-    // No Author prompt was needed because everything was discoverable.
-    expect(io.prompts).toEqual([]);
+    // The ONLY Author prompt is the installation mode, which is a decision
+    // and never a discovery (Spec #190 / ticket #191). Everything else was
+    // discoverable.
+    expect(io.prompts.map((entry) => entry.prompt)).toEqual([
+      "Installation mode (private|team)",
+    ]);
     expect(io.modelSelections).toEqual([]);
 
     // Restart notice is written to stderr; Poiesis does not restart OpenCode.
@@ -480,7 +491,10 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(stderr).toContain("scripts/poiesis-preview");
     expect(stderr).toContain("scripts/poiesis-staging");
     expect(stderr).toContain("scripts/poiesis-production");
-  }, 30_000);
+    // Spec #174: this flow runs a real install (git, the skills
+    // transaction, the OpenCode projection), so it needs the file's
+    // general loaded-host bound rather than the tighter one.
+  }, 60_000);
 
   it("still stores argv containing {sha} when the Author supplies a custom command (fail-closed validation, ticket #64)", async () => {
     const repo = await createTestRepository();

@@ -27,6 +27,7 @@ import {
   renderDefaultDeliveryScript,
 } from "./delivery-defaults.js";
 import {
+  assertConsumedManifestAuthority,
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
   nextAdapterFiles,
@@ -45,6 +46,8 @@ import {
   loadManifest,
   serializeManifest,
   type ConfigPatch,
+  type GeneratedScriptRecord,
+  type IgnoreBlockRecord,
   type ManagedFile,
   type ManagedSkill,
   type Manifest,
@@ -63,10 +66,16 @@ import {
 } from "./opencode.js";
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
 import {
-  assertPoiesisScriptAvailable,
-  ensurePoiesisScriptRefusing,
-  rollbackPackageJson,
-} from "./package-script.js";
+  GITIGNORE_RELATIVE_PATH,
+  isInstallMode,
+  parseInstallMode,
+  isInstallableMode,
+  parseManagedIgnoreBlocks,
+  planManagedIgnoreBlock,
+  planManagedIgnoreBlockRemoval,
+  privateIgnoreBlockLines,
+  type InstallMode,
+} from "./install-mode.js";
 import { run } from "./process.js";
 import {
   hashOwnedSkillDirectory,
@@ -79,8 +88,7 @@ import {
   type CapabilityInstallInput,
 } from "./skills.js";
 import {
-  POIESIS_DURABLE_PATHS,
-  POIESIS_LOCAL_STATE_PATHS,
+  POIESIS_GENERATED_AGENT_PATHS,
   ensureGitignore,
   readTemplate,
   templateMappings,
@@ -125,6 +133,12 @@ interface MaterializedFile {
   path: string;
   kind: ManagedFile["kind"];
   content: string;
+  /**
+   * Spec #190 / ticket #191 — where the artifact came from, recorded in
+   * the manifest so the sharing classification is readable without
+   * re-deriving the template table.
+   */
+  provenance: ManagedFile["provenance"];
 }
 
 type JsonObject = Record<string, unknown>;
@@ -421,6 +435,11 @@ export async function autoResolveConfigDefaults(
 
   const resolved: ResolvedPoiesisConfig = {
     schema: 1,
+    // Spec #190 / ticket #191: the chosen mode is a resolved fact, not a
+    // discovery. It rides through resolution so the installed
+    // `.poiesis/config.jsonc` records the decision the Author actually
+    // made instead of dropping it on the way to disk.
+    ...(config.mode === undefined ? {} : { mode: config.mode }),
     models: { reasoning: config.models.reasoning, execution: config.models.execution, ...(config.models.roles === undefined ? {} : { roles: config.models.roles }) },
     repository: { remote: remote!, integrationBranch: integrationBranch! },
     tracker: { provider: resolvedTrackerProvider, project: trackerProject },
@@ -530,12 +549,15 @@ async function materializeFiles(config: PoiesisConfig): Promise<MaterializedFile
     templateMappings.map(async (mapping) => ({
       path: mapping.destination,
       kind: mapping.kind,
+      // Package-supplied canon is `package`; the OpenCode agent files are
+      // generated projections of that same canon.
+      provenance: mapping.kind === "canonical" ? ("package" as const) : ("projection" as const),
       content: await readTemplate(mapping.source),
     })),
   );
   return [
     ...templates,
-    { path: ".poiesis/config.jsonc", kind: "generated", content: serializeConfig(config) },
+    { path: ".poiesis/config.jsonc", kind: "generated", provenance: "config" as const, content: serializeConfig(config) },
   ];
 }
 
@@ -839,57 +861,64 @@ async function rollbackInitOwnershipReceipt(
 }
 
 /**
- * Transactional default-path `.gitignore` seam.
+ * Spec #190 / ticket #191 — the private classification, resolved at the
+ * exact moment the block is written.
  *
- * Receipt-bearing normal `update` and explicit 1.0.0 `bootstrap` MUST
- * install the `.poiesis/workspaces/` ignore rule before any default-path
- * workspace can leak into the primary checkout as foreign work. `init`
- * installs the rule via the broader init gitignore call. `updateFromConfig`
- * is the strict transactional path and intentionally does NOT mutate
- * `.gitignore` to keep the receipt-authenticated transaction contract
- * identical across the strict set of inputs.
- *
- * `ensureDefaultPathGitignore` only invokes `ensureGitignore` with the
- * transactional rule. The caller is responsible for snapshotting the
- * exact preimage (including absence) BEFORE the try block so any later
- * failure can restore it byte-for-byte via `rollbackDefaultPathGitignore`.
- * `ensureGitignore` returns its post-write content so the caller can
- * capture the commit hash gate and detect concurrent user edits between
- * the write and the rollback. Splitting snapshot + ensure keeps the
- * gitignore mutation inside the transaction; the helper encapsulates
- * only the "what rule to add" logic.
+ * Everything here is read from what THIS installation actually did, not
+ * from a static list: the OpenCode config is only listed when Poiesis
+ * created it, the delivery scripts only when Poiesis generated them, and
+ * the skills only the ones Poiesis installed. A preexisting user file is
+ * therefore never claimed by the policy Poiesis is about to publish.
  */
-const DEFAULT_PATH_GITIGNORE_HEADER =
-  "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
-const DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
-const DEFAULT_PATH_GITIGNORE_RULES: readonly string[] = [
-  DEFAULT_PATH_GITIGNORE_HEADER,
-  DEFAULT_PATH_GITIGNORE_PATTERN,
-];
-
-async function ensureDefaultPathGitignore(
-  root: string,
-  expected: Buffer | null,
-): Promise<{ writtenHash: string | undefined }> {
-  const written = await ensureGitignore(root, [...DEFAULT_PATH_GITIGNORE_RULES], expected);
-  return { writtenHash: written === undefined ? undefined : hashContent(written) };
+function privateIgnoreLines(args: {
+  root: string;
+  openCodeConfigPath: string;
+  openCodeConfigPresent: boolean;
+  writtenDeliveryScripts: readonly string[];
+  skills: readonly ManagedSkill[];
+}): string[] {
+  return privateIgnoreBlockLines({
+    generatedAgentPaths: POIESIS_GENERATED_AGENT_PATHS,
+    createdOpenCodeConfigPath: args.openCodeConfigPresent
+      ? undefined
+      : relative(args.root, args.openCodeConfigPath),
+    generatedDeliveryScripts: [...args.writtenDeliveryScripts],
+    installedSkillPaths: args.skills
+      .filter((skill) => !skill.preexisting)
+      .map((skill) => relative(args.root, skillPath(args.root, skill.name))),
+  });
 }
 
-async function rollbackDefaultPathGitignore(
-  path: string,
-  snapshot: Buffer | null,
-  writtenHash: string | undefined,
-): Promise<void> {
-  if (writtenHash === undefined) return;
-  if (!(await pathEntryExists(path))) return;
-  if (!(await isRegularFile(path)) || (await hashFile(path)) !== writtenHash) return;
-  if (snapshot === null) {
-    await unlink(path);
-    return;
-  }
-  // Byte-exact restoration: preserve the exact bytes that were snapshotted,
-  // including the precise trailing newline state (or absence thereof).
-  await atomicWrite(path, snapshot.toString("utf8"));
+/**
+ * Spec #190 / ticket #191 — fail closed when the sharing decision cannot
+ * be honoured because the OpenCode config is a TRACKED, user-owned file.
+ *
+ * A private installation exists so that ordinary `opencode` still
+ * discovers Poiesis while nothing Poiesis owns is ever pushed. That is
+ * only coherent when the config Poiesis would patch is not something the
+ * project already publishes: patching a tracked file would put a
+ * generated edit into the Author's shared history and quietly widen a
+ * private installation into a shared one. An untracked config is fine —
+ * it is local, and Poiesis's ownership of it stays reversible.
+ */
+async function assertOpenCodeConfigNotTracked(root: string, configPath: string, mode: InstallMode): Promise<void> {
+  if (!isInstallMode(mode) || mode !== "private") return;
+  const relativePath = relative(root, configPath);
+  if (!(await exists(configPath))) return;
+  const tracked = await run("git", ["ls-files", "--error-unmatch", "--", relativePath], {
+    cwd: root,
+    allowFailure: true,
+  });
+  if (tracked.exitCode !== 0) return;
+  throw new PoiesisError(
+    "OPENCODE_CONFIG_TRACKED_REFUSED",
+    `A private Poiesis installation will not patch the tracked OpenCode configuration ${relativePath}; the generated projections stay invisible to ordinary OpenCode otherwise. Untrack it, or install Poiesis where the config is local, and re-run \`poiesis init\`.`,
+    {
+      path: relativePath,
+      mode,
+      hint: "a tracked OpenCode config is user-owned shared project content; a private install must not mutate it",
+    },
+  );
 }
 
 /**
@@ -926,6 +955,24 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   const resolvedRoot = resolve(root);
   const resolvedConfig = validateConfig(config, "explicit init config");
   assertResolvedConfig(resolvedConfig);
+  // Spec #190 / ticket #191 — the sharing decision is REQUIRED and is
+  // never inferred. Interactive init asks for it before anything else;
+  // non-interactive init states it in `--config`. A config that omits it
+  // fails here, before a single byte is written, with a typed error that
+  // names both choices rather than silently installing one of them.
+  const installMode = parseInstallMode(resolvedConfig.mode, "explicit init config");
+  if (!isInstallableMode(installMode)) {
+    // Ticket #192 owns team/shared: the declarative shareable profile,
+    // its hydration, and its narrower ignore classification. Until that
+    // exists, `team` is an accepted value that refuses to install rather
+    // than a mode that quietly installs private semantics under a shared
+    // label.
+    throw new PoiesisError(
+      "INSTALL_MODE_UNSUPPORTED",
+      `Poiesis \`${installMode}\` installation is not available yet; only \`private\` installs today`,
+      { mode: installMode, supported: ["private"] },
+    );
+  }
   await assertInitDestinationsAbsent(
     resolvedRoot,
     templateMappings.map((mapping) => ({ path: mapping.destination })),
@@ -972,14 +1019,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const rel = deliveryScriptPath(target);
     initialDeliverySnapshots.set(rel, await snapshotFile(join(resolvedRoot, rel)));
   }
-  // Spec #133 / ticket #134: `package.json` is an Author-owned file, so
-  // the package-script conflict check is a READ-ONLY pre-flight placed
-  // with the other `assert*Available` guards, before any write. A
-  // conflicting `scripts.poiesis` therefore fails closed without leaving
-  // any other file mutated. A project with no `package.json` is not an
-  // error; it simply gets no script.
-  await assertPoiesisScriptAvailable(resolvedRoot);
-  const initialPackageJsonSnapshot = await snapshotFile(join(resolvedRoot, "package.json"));
+  // Spec #190 / ticket #191: `package.json` is no longer read or written
+  // by init at all. Invoking Poiesis must not require a project manifest
+  // mutation, so the Author's own scripts are exactly as they were.
   const initialSkills = options.skipSkills
     ? undefined
     : await assertDefaultSkillDestinationsAvailable(resolvedRoot);
@@ -1002,16 +1044,21 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   let managedSkills: Manifest["skills"] = [];
   let configPatches: ConfigPatch[] = [];
   let writtenManifestHash: string | undefined;
-  const gitignorePath = join(resolvedRoot, ".gitignore");
+  const gitignorePath = join(resolvedRoot, GITIGNORE_RELATIVE_PATH);
   let writtenGitignoreHash: string | undefined;
-  // Spec #133 / ticket #134: the package script is a bounded, reversible
-  // edit to an Author-owned file, not a manifest record and not a
-  // mutation-journal entry. It is gated by the same snapshot +
-  // written-hash rollback the `.gitignore` transaction already uses.
-  let writtenPackageJsonHash: string | undefined;
+  // Spec #190 / ticket #191 — exact ownership of the ONE managed block
+  // this install inserts, recorded in the manifest so `uninstall` can
+  // reverse exactly those bytes and report anything else.
+  let ignoreBlockRecord: IgnoreBlockRecord | undefined;
   // Spec #138: delivery scripts this init created, so a failed transaction removes
   // exactly those and leaves an Author-authored script untouched.
   const writtenDeliveryScripts: string[] = [];
+  // Spec #190 / ticket #191: the same scripts with their installed digests,
+  // so a private uninstall can recognise an UNCHANGED generated script and
+  // remove it while preserving and reporting one the Author edited. They stay
+  // out of `files` on purpose: Spec #138 lets the Author edit them freely, and
+  // a `files` record would turn an edit into a doctor failure.
+  const generatedScripts: GeneratedScriptRecord[] = [];
   const createdInitDirectories = new Set<string>();
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
@@ -1034,6 +1081,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   try {
     await assertInitDestinationsAbsent(resolvedRoot, files);
     await assertGitignoreAvailable(resolvedRoot);
+    await assertOpenCodeConfigNotTracked(resolvedRoot, openCodeConfigPath, installMode);
     const currentGitignoreSnapshot = await snapshotFile(gitignorePath);
     const gitignoreUnchanged = initialGitignoreSnapshot === null
       ? currentGitignoreSnapshot === null
@@ -1129,24 +1177,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         path: relative(resolvedRoot, currentOpenCodeConfig),
       });
     }
-    await assertGitignoreAvailable(resolvedRoot);
-    const writtenGitignore = await ensureGitignore(resolvedRoot, [
-      `# Allow durable Poiesis project files to be tracked`,
-      ...POIESIS_DURABLE_PATHS.map((path) => `!${path}`),
-      `!${".poiesis"}/`,
-      `# Hide local Poiesis state (added by \`poiesis init\` so the default-path workspace area and ownership snapshot never appear as foreign work)`,
-      ...POIESIS_LOCAL_STATE_PATHS,
-    ], initialGitignoreSnapshot ?? null);
-    if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
-    // Spec #133 / ticket #134: the `pnpm poiesis` package script. The
-    // `expected` snapshot is the drift guard taken before any write; the
-    // helper returns `undefined` for an already-correct value so a
-    // correct script is never rewritten. The REFUSING entry point is
-    // what keeps acceptance #4 at the write site too, so the guarantee
-    // does not depend on the pre-flight above having run.
     // Spec #138: write a working delivery script for every target the project
     // does not already have. Never overwrites - an existing script belongs to
-    // the Author, which is what makes "edit it freely" a real promise.
+    // the Author, which is what makes "edit it freely" a real promise. The
+    // private ignore classification below reads `writtenDeliveryScripts`, so
+    // this runs first.
     for (const target of DELIVERY_TARGETS) {
       const rel = deliveryScriptPath(target);
       if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
@@ -1154,12 +1189,55 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       }
       const abs = join(resolvedRoot, rel);
       await mkdir(dirname(abs), { recursive: true });
-      await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
+      const scriptContent = renderDefaultDeliveryScript(target, new Date().toISOString());
+      await writeFile(abs, scriptContent, { flag: "wx" });
       writtenDeliveryScripts.push(rel);
+      generatedScripts.push({ path: rel, hash: hashContent(scriptContent) });
     }
 
-    const writtenPackageJson = await ensurePoiesisScriptRefusing(resolvedRoot, initialPackageJsonSnapshot);
-    if (writtenPackageJson !== undefined) writtenPackageJsonHash = hashContent(writtenPackageJson);
+    // Spec #190 / ticket #191 — the ONE visible policy. Written from the
+    // mode the Author chose and from what this installation actually
+    // created, inside a uniquely delimited, mode-labelled block.
+    //
+    // `ensureGitignore` refuses malformed / duplicate / conflicting
+    // blocks BEFORE writing, and returns `undefined` when the file
+    // already states everything requested, so a repeat install over the
+    // same block is a genuine no-op rather than a rewrite.
+    await assertGitignoreAvailable(resolvedRoot);
+    const currentGitignoreContent = (await exists(gitignorePath)) ? await readUtf8(gitignorePath) : null;
+    const ignoreBlockPlan = planManagedIgnoreBlock({
+      existing: currentGitignoreContent,
+      mode: installMode,
+      lines: privateIgnoreLines({
+        root: resolvedRoot,
+        openCodeConfigPath,
+        openCodeConfigPresent,
+        writtenDeliveryScripts,
+        skills: managedSkills,
+      }),
+    });
+    const writtenGitignore = await ensureGitignore(
+      resolvedRoot,
+      [...(ignoreBlockPlan.block?.patterns ?? [])],
+      initialGitignoreSnapshot ?? null,
+      { mode: installMode },
+    );
+    if (writtenGitignore !== undefined) writtenGitignoreHash = hashContent(writtenGitignore);
+    const [recordedBlock] = parseManagedIgnoreBlocks(writtenGitignore ?? currentGitignoreContent ?? "");
+    if (recordedBlock === undefined) {
+      throw new PoiesisError("GITIGNORE_BLOCK_MISSING", "Poiesis could not state its ignore policy", {
+        path: GITIGNORE_RELATIVE_PATH,
+      });
+    }
+    ignoreBlockRecord = {
+      path: GITIGNORE_RELATIVE_PATH,
+      mode: installMode,
+      patterns: [...recordedBlock.patterns],
+      hash: recordedBlock.hash,
+      fileCreated: !ignoreBlockPlan.fileExisted,
+      owned: true,
+    };
+
     await assertInitDestinationsAbsent(resolvedRoot, files);
     await createInitFileParents(resolvedRoot, files, createdInitDirectories);
     for (const file of files) {
@@ -1172,7 +1250,13 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         kind: file.kind,
         hash: hashContent(file.content),
         owned: true,
-        ...(template?.trackInProject === true ? { durable: true } : {}),
+        // Spec #190 / ticket #191: `durable` means "this project tracks the
+        // artifact on purpose", which is a TEAM-mode property. A private
+        // installation tracks nothing, so recording `durable` here would make
+        // uninstall treat its own canon as released content and leave it
+        // behind forever.
+        ...(template?.trackInProject === true && installMode === "team" ? { durable: true } : {}),
+        provenance: file.provenance,
       });
     }
 
@@ -1182,6 +1266,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         kind: "generated",
         hash: writtenOpenCodeConfigHash,
         owned: true,
+        provenance: "config",
       });
     }
 
@@ -1197,6 +1282,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       files: managedFiles,
       skills: managedSkills,
       configPatches,
+      mode: installMode,
+      ...(ignoreBlockRecord === undefined ? {} : { ignoreBlock: ignoreBlockRecord }),
+      ...(generatedScripts.length === 0 ? {} : { generatedScripts }),
     };
     const manifestContent = serializeManifest(manifest);
     await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
@@ -1294,13 +1382,6 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       for (const rel of writtenDeliveryScripts) {
         await rm(join(resolvedRoot, rel), { force: true });
       }
-    });
-    await rollbackStep(rollbackFailures, "package.json", async () => {
-      await rollbackPackageJson(
-        join(resolvedRoot, "package.json"),
-        initialPackageJsonSnapshot,
-        writtenPackageJsonHash,
-      );
     });
     await rollbackStep(rollbackFailures, ".gitignore", async () => {
       await rollbackInitGitignore(gitignorePath, initialGitignoreSnapshot, writtenGitignoreHash);
@@ -1543,6 +1624,61 @@ export async function doctor(root: string): Promise<DoctorReport> {
   } else {
     checks.push({ id: "hashes", status: "fail", message: "Managed hashes cannot be checked without a manifest" });
     checks.push({ id: "skills", status: "fail", message: "Skills cannot be checked without a manifest" });
+  }
+
+  // Spec #190 / ticket #191 — report the sharing decision and the state of
+  // the one visible ignore policy it produced.
+  //
+  // Only installations that actually chose a mode emit this check: a
+  // pre-Spec #190 manifest records no mode and no block, and reporting a
+  // mode for it would be exactly the silent inference this Spec forbids.
+  if (manifest !== undefined && manifest.mode !== undefined) {
+    const record = manifest.ignoreBlock;
+    if (record === undefined) {
+      checks.push({
+        id: "install-mode",
+        status: "warn",
+        message: `Poiesis is installed in ${manifest.mode} mode but records no managed ignore block`,
+        details: { mode: manifest.mode },
+      });
+    } else {
+      try {
+        const path = ownedPath(resolvedRoot, record.path);
+        if (!(await exists(path)) || !(await isRegularManagedFile(resolvedRoot, path))) {
+          throw new PoiesisError("GITIGNORE_BLOCK_MISSING", "Poiesis ignore policy is missing", {
+            path: record.path,
+          });
+        }
+        const [block] = parseManagedIgnoreBlocks(await readUtf8(path));
+        if (block === undefined) {
+          throw new PoiesisError("GITIGNORE_BLOCK_MISSING", "Poiesis ignore policy no longer carries the managed block", {
+            path: record.path,
+          });
+        }
+        if (block.hash !== record.hash) {
+          checks.push({
+            id: "install-mode",
+            status: "warn",
+            message: `Poiesis is installed in ${manifest.mode} mode but the ignore block changed; uninstall will preserve it`,
+            details: { mode: manifest.mode, expected: record.hash, actual: block.hash },
+          });
+        } else {
+          checks.push({
+            id: "install-mode",
+            status: "pass",
+            message: `Poiesis is installed in ${manifest.mode} mode and owns its ignore block`,
+            details: { mode: manifest.mode, ignored: record.patterns, path: record.path },
+          });
+        }
+      } catch (error) {
+        checks.push({
+          id: "install-mode",
+          status: "warn",
+          message: `Poiesis is installed in ${manifest.mode} mode but its ignore policy could not be verified`,
+          details: errorDetails(error),
+        });
+      }
+    }
   }
 
   try {
@@ -2256,8 +2392,28 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   // authority / receipt / config / marker check runs.
   await assertRuntimeVersionMatchesProject(resolvedRoot);
   const manifest = await loadManifest(resolvedRoot);
-  const config = await resolveConfigForRoot(resolvedRoot);
-  await assertManifestAuthority(resolvedRoot, manifest, config);
+  // Read only when it exists: a consumed remainder has none, and reading it
+  // unconditionally is what made the LAST uninstall impossible.
+  const config = (await exists(poiesisPath(resolvedRoot, "config.jsonc")))
+    ? await resolveConfigForRoot(resolvedRoot)
+    : undefined;
+  // Spec #190 / ticket #191 — a PARTIAL uninstall may already have removed
+  // `.poiesis/config.jsonc`, because it is an owned generated file. Its absence
+  // is the deterministic signal that this installation is a consumed
+  // remainder: `uninstall` is the only actor that ever removes it, and the
+  // receipt below still authenticates the (already-pruned) manifest.
+  //
+  // With the config gone there is nothing left to recompute the OpenCode
+  // projection from, and the manifest legitimately no longer claims the
+  // adapter's whole file/patch set. Authority is therefore asserted over WHAT
+  // the manifest still claims — every per-claim rule unchanged — instead of
+  // demanding completeness it cannot have. Every FIRST uninstall, on a
+  // complete installation, keeps the strict check exactly as before.
+  if (config === undefined) {
+    await assertConsumedManifestAuthority(resolvedRoot, manifest);
+  } else {
+    await assertManifestAuthority(resolvedRoot, manifest, config);
+  }
   const receipt = await assertOwnershipReceipt(resolvedRoot, manifest);
   const result: UninstallResult = {
     complete: false,
@@ -2266,6 +2422,17 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     revertedConfigPatches: 0,
     preserved: [],
   };
+  // Spec #190 / ticket #191 — ownership this run actually RESOLVED, so a
+  // partial uninstall does not keep claiming it. See the retained-manifest
+  // construction at the end of this function: an ownership record survives a
+  // partial run only while something it names is still unresolved.
+  //
+  // "Resolved" deliberately includes PROVABLE ABSENCE (review B1b). When the
+  // ignore policy is gone, Poiesis has nothing left to reverse, and retaining
+  // a record naming a block that provably cannot be found would make the
+  // installation permanently uninstallable.
+  let ignoreBlockResolved = false;
+  const resolvedGeneratedScripts = new Set<string>();
 
   const known = knownPoiesisPaths(manifest);
   for (const path of await listTree(resolvedRoot, poiesisPath(resolvedRoot))) {
@@ -2336,6 +2503,121 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   result.removed.push(...skillResult.removed);
   result.preserved.push(...skillResult.preserved);
 
+  // Spec #190 / ticket #191 — remove the delivery scripts this installation
+  // generated, but only while they are byte-for-byte what it wrote. An edited
+  // script is the Author's and is preserved and reported. The `scripts/`
+  // directory itself goes only when removing the last script leaves it empty,
+  // so a directory the Author made is never removed on their behalf.
+  for (const script of manifest.generatedScripts ?? []) {
+    try {
+      const path = ownedPath(resolvedRoot, script.path);
+      if (!(await exists(path))) {
+        result.removed.push(script.path);
+        resolvedGeneratedScripts.add(script.path);
+        continue;
+      }
+      if (!(await isRegularManagedFile(resolvedRoot, path))) {
+        result.preserved.push({ path: script.path, reason: "generated delivery script is not a regular file" });
+        continue;
+      }
+      if ((await hashFile(path)) !== script.hash) {
+        result.preserved.push({ path: script.path, reason: "generated delivery script changed after installation" });
+        continue;
+      }
+      await unlink(path);
+      result.removed.push(script.path);
+      resolvedGeneratedScripts.add(script.path);
+      try {
+        await rmdir(dirname(path));
+      } catch {
+        // Only an empty directory is removable; a directory the Author owns
+        // survives.
+      }
+    } catch (error) {
+      result.preserved.push({ path: script.path, reason: `generated delivery script was preserved: ${errorDetails(error).message}` });
+    }
+  }
+
+  // Spec #190 / ticket #191 — reverse exactly the `.gitignore` block this
+  // installation inserted.
+  //
+  // "Exactly" is enforced by the manifest's recorded block hash: an
+  // unchanged block is cut out byte-for-byte (and the file goes away too
+  // when Poiesis created it and nothing else was in it); a block the Author
+  // edited or relabelled is PRESERVED and reported, so uninstall never
+  // deletes an edit on the strength of a hash it can no longer recognise. A
+  // pre-Spec #190 manifest records no block and this step is a no-op.
+  //
+  // The ownership lifecycle closes on PROVABLE ABSENCE as well as on removal
+  // by this run (review B1b). An absent `.gitignore`, or a regular readable
+  // one that carries no Poiesis managed block, PROVES the policy is gone —
+  // there is nothing left to reverse and nothing to preserve. Reporting
+  // those as preserved content kept the record alive forever, so the block
+  // was reported "missing" on every later run and the installation could
+  // never be fully removed.
+  //
+  // Authority is deliberately KEPT for every state where absence cannot be
+  // proven, or where content is present that Poiesis still owns:
+  //   - a NON-REGULAR path (a symlink, say): absence is unprovable, and
+  //     writing through or deleting it is what the safety guard prevents.
+  //     The probe below is therefore the `lstat`-based `pathEntryExists`,
+  //     NOT `exists`: `exists` follows symlinks, so a DANGLING `.gitignore`
+  //     symlink would read as absent and silently drop Poiesis's authority
+  //     over a directory entry that is still right there. Every entry —
+  //     including a dangling link — must fall through to the non-regular
+  //     refusal below and keep its ownership record;
+  //   - an UNREADABLE file: no parse, no proof;
+  //   - a MALFORMED or RELABELLED block: content IS present, and is either
+  //     the Author's edit or a block Poiesis can no longer identify.
+  // Each still lands in `result.preserved` below, which keeps the manifest,
+  // the receipt, and Poiesis's authority over it intact.
+  if (manifest.ignoreBlock !== undefined) {
+    const record = manifest.ignoreBlock;
+    const path = join(resolvedRoot, record.path);
+    if (!(await pathEntryExists(path))) {
+      ignoreBlockResolved = true;
+    } else {
+      try {
+        if (!(await isRegularManagedFile(resolvedRoot, path))) {
+          throw new PoiesisError("UNSAFE_MANAGED_PATH", "Poiesis ignore policy is not a regular file", {
+            path: record.path,
+          });
+        }
+        const removal = planManagedIgnoreBlockRemoval({
+          existing: await readUtf8(path),
+          mode: record.mode,
+          hash: record.hash,
+          fileCreated: record.fileCreated,
+        });
+        if (removal.removed) {
+          if (removal.content === null) {
+            await unlink(path);
+            result.removed.push(record.path);
+          } else {
+            await atomicWrite(path, removal.content);
+            result.removed.push(`${record.path} (Poiesis-managed ignore block)`);
+          }
+          ignoreBlockResolved = true;
+        } else if (removal.block === null) {
+          // A regular, readable policy file carrying no Poiesis block: the
+          // block is provably absent, so the ownership it carried is resolved.
+          ignoreBlockResolved = true;
+        } else {
+          result.preserved.push({
+            path: record.path,
+            reason: "Poiesis-managed ignore block changed after installation",
+          });
+        }
+      } catch (error) {
+        const message = error instanceof PoiesisError ? error.message : String(error);
+        result.preserved.push({
+          path: record.path,
+          reason: `Poiesis-managed ignore block was preserved: ${message}`,
+        });
+      }
+    }
+  }
+
   // Spec #120 / ticket #121: Repository Intelligence cache cleanup.
   // The cache is Poiesis-owned local state and is removed here so a
   // full uninstall leaves no stale derived artifacts behind. The
@@ -2393,13 +2675,32 @@ export async function uninstall(root: string): Promise<UninstallResult> {
   } else {
     const removed = new Set(result.removed);
     const changedConfigFiles = new Set(configResult.reverted.map((patch) => patch.file));
+    // Spec #190 / ticket #191 — the retained manifest keeps authority over
+    // UNRESOLVED artifacts only.
+    //
+    // The two Spec #190 records are pruned when THIS run resolved them, for
+    // exactly the same reason `files`/`skills`/`configPatches` already are: an
+    // ownership record that names something already reversed is a record the
+    // next uninstall would act on and fail to find. Spreading the old
+    // `ignoreBlock` forward made a partial uninstall that HAD cut the block
+    // out unreachable — the next run would report "ignore block is missing"
+    // as preserved content and could never complete, so the installation could
+    // never be fully removed no matter what the Author did. An UNRESOLVED
+    // block (edited, relabelled, or unreadable) is retained, so Poiesis still
+    // knows it owns that policy and keeps reporting it.
+    const { ignoreBlock: priorIgnoreBlock, generatedScripts: priorGeneratedScripts, ...carried } = manifest;
+    const unresolvedGeneratedScripts = (priorGeneratedScripts ?? []).filter(
+      (script) => !resolvedGeneratedScripts.has(script.path),
+    );
     const retained: Manifest = {
-      ...manifest,
+      ...carried,
       files: manifest.files.filter(
         (file) => !removed.has(file.path) && !changedConfigFiles.has(file.path) && !releasedDurable.has(file.path),
       ),
       skills: manifest.skills.filter((skill) => !removed.has(skill.path)),
       configPatches: configResult.preserved,
+      ...(priorIgnoreBlock === undefined || ignoreBlockResolved ? {} : { ignoreBlock: priorIgnoreBlock }),
+      ...(unresolvedGeneratedScripts.length === 0 ? {} : { generatedScripts: unresolvedGeneratedScripts }),
     };
     await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), serializeManifest(retained));
     await replaceOwnershipReceipt(resolvedRoot, retained, receipt);

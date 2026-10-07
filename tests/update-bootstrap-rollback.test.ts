@@ -310,6 +310,17 @@ async function asLegacy1000Projection(
   await removeOwnershipReceipt(repository.root);
 }
 
+/**
+ * Remove the transactional `.poiesis/workspaces/` rule so the transaction
+ * under test MUST install it.
+ *
+ * Spec #190 / ticket #191: this used to rejoin with a LITERAL `\n` two
+ * -character sequence, which collapsed the whole file onto one line. That
+ * was harmless while Poiesis appended loose rules it never parsed; now that
+ * `.gitignore` carries one delimited, mode-labelled block, a collapsed file
+ * is a genuinely malformed policy and `update` correctly refuses it. Joining
+ * with a real newline restores the intent of the helper.
+ */
 async function stripNewGitignoreRule(repository: TestRepository): Promise<Buffer> {
   const gitignorePath = join(repository.root, ".gitignore");
   const before = await readFile(gitignorePath, "utf8");
@@ -317,7 +328,7 @@ async function stripNewGitignoreRule(repository: TestRepository): Promise<Buffer
     .split(/\r?\n/)
     .filter((line) => line.trim() !== ".poiesis/workspaces/")
     .filter((line) => !line.includes("default-path workspace area"))
-    .join("\\n");
+    .join("\n");
   await writeFile(gitignorePath, stripped);
   return readFile(gitignorePath);
 }

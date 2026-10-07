@@ -18,22 +18,13 @@
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
  *
- * Spec #133 / ticket #137 — the Author-owned `pnpm poiesis` package
- * script IS reconciled here, which deliberately differs from the
- * `.gitignore` carve-out documented in `src/maintenance.ts`. That
- * carve-out exists because the default-path ignore rule is a safety
- * invariant of the default workspace layout, which this config-only
- * transaction never creates. The package script is different: it is a
- * declared feature of an installed project, and `setModel` — reachable
- * from the `pnpm poiesis model set ...` command the README advertises —
- * runs this transaction. If this path skipped the script, the Author's
- * most-used command would be the one command able to leave the everyday
- * command surface broken, in direct violation of acceptance #7.
- *
- * The script keeps the `src/update-internal.ts` contract exactly: no
- * manifest record, no journal entry, snapshot before the write, and a
- * written-hash-gated `rollbackPackageJson` in the catch in reverse write
- * order.
+ * Spec #190 / ticket #191 — this transaction no longer touches
+ * `package.json` at all. Invoking Poiesis must not require a project
+ * manifest mutation, so the `scripts.poiesis` reconcile this file used to
+ * perform (and its whole snapshot + written-hash rollback apparatus) is
+ * gone. That makes a config no-op a genuine whole-project no-op again:
+ * `setModel` reaching an already-current value now returns without any
+ * second surface to reconcile, and the journal drives the only writes.
  */
 import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -56,11 +47,6 @@ import {
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
-import {
-  PACKAGE_JSON_RELATIVE,
-  repairPoiesisScript,
-  rollbackPackageJson,
-} from "./package-script.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { ResolvedPoiesisConfig } from "./config.js";
@@ -100,18 +86,6 @@ export interface UpdateTransactionHooks {
   prePoiesisConfigWrite?: () => void | Promise<void>;
   /** Called immediately after writing the new Poiesis config. */
   postPoiesisConfigWrite?: () => void | Promise<void>;
-  /**
-   * Called immediately BEFORE the `pnpm poiesis` package script is
-   * reconciled on the Author's `package.json`. Ticket #137.
-   */
-  prePoiesisScriptEnsure?: () => void | Promise<void>;
-  /**
-   * Called immediately AFTER the package script is reconciled. Fires
-   * even when the value was already correct and no write happened. Tests
-   * use this to land a concurrent foreign write to `package.json` and
-   * prove the transaction fails closed without clobbering it.
-   */
-  postPoiesisScriptEnsure?: () => void | Promise<void>;
   /** Called immediately before applying the OpenCode projection to the managed config. */
   preOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately after writing the new OpenCode config. */
@@ -200,20 +174,6 @@ async function isRegularFileNoFollow(path: string): Promise<boolean> {
     return details.isFile() && !details.isSymbolicLink();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-}
-
-/**
- * Exact preimage bytes of the Author's `package.json`, or `null` when it
- * does not exist. Absence is meaningful here: it is what lets
- * `rollbackPackageJson` unlink a file the transaction created.
- */
-async function snapshotPackageJson(path: string): Promise<Buffer | null> {
-  try {
-    return await readFile(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
 }
@@ -559,17 +519,6 @@ async function runLockedUpdateConfigTransaction(
   //    that patch-only ownership intact while recognizing that the projection
   //    would write exactly the bytes already on disk. Do NOT advance generation;
   //    return the existing manifest unchanged.
-  // Spec #133 / ticket #138: the Author-owned `package.json` state, declared
-  // before the no-op branch so BOTH branches can bind the post-write identity.
-  // `package.json` is neither a manifest record nor a journal artifact; it is
-  // reversed by its own written-hash-gated helper, exactly as the ordinary
-  // update path does.
-  const packageJson: { snapshot: Buffer | null; writtenHash: string | undefined } = {
-    snapshot: null,
-    writtenHash: undefined,
-  };
-  const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
-
   const poiesisConfigBytesMatch = currentConfigBytes.equals(Buffer.from(newConfigContent, "utf8"));
   const openCodeBytesMatch = openCodeConfigCurrentBytes.equals(Buffer.from(preflightSerialized, "utf8"));
   // Adapter-fixture invariant. Must run AFTER the bytes are computed
@@ -598,31 +547,12 @@ async function runLockedUpdateConfigTransaction(
     // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
     // on schema rejection.
     await hooks?.preNoopDoctor?.();
-
-    // Spec #133 / ticket #138: a config no-op is NOT a whole-project no-op.
-    // The `pnpm poiesis` package script is an artifact independent of the
-    // config bytes, so it must still be reconciled here. Without this,
-    // `poiesis model set reasoning <already-current-model>` silently left a
-    // missing or drifted script unrepaired, because that path lands in this
-    // branch and returned before the write site below.
-    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
-    await hooks?.prePoiesisScriptEnsure?.();
-    try {
-      await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
-        onWritten: (content) => {
-          packageJson.writtenHash = hashContent(content);
-        },
-      });
-      await hooks?.postPoiesisScriptEnsure?.();
-      const report = await doctor(resolvedRoot);
-      assertUpdateConfigDoctorGate(report, manifest);
-      return { manifest, doctor: report };
-    } catch (error) {
-      // Reversal is hash-gated, so a foreign replacement of `package.json`
-      // during this window is preserved rather than clobbered.
-      await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
-      throw error;
-    }
+    // Spec #190 / ticket #191: this is now a genuine whole-project no-op.
+    // `package.json` is no longer an artifact Poiesis mutates at all, so a
+    // config no-op has nothing left to reconcile.
+    const report = await doctor(resolvedRoot);
+    assertUpdateConfigDoctorGate(report, manifest);
+    return { manifest, doctor: report };
   }
 
   // 8. Validate the projected (post-write) OpenCode config payload against the
@@ -682,27 +612,6 @@ async function runLockedUpdateConfigTransaction(
     await journal.replace(poiesisConfigArtifact, newConfigContent);
     await hooks.postPoiesisConfigWrite?.();
 
-    // 10b. Reconcile the `pnpm poiesis` package script (acceptance #7).
-    //      Written after the config and before the OpenCode projection, so
-    //      the catch block reverses it in exact reverse write order.
-    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
-    await hooks?.prePoiesisScriptEnsure?.();
-    await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
-      onWritten: (content) => {
-        packageJson.writtenHash = hashContent(content);
-      },
-    });
-    await hooks?.postPoiesisScriptEnsure?.();
-    if (packageJson.writtenHash !== undefined && (await exists(packageJsonPath))) {
-      if (hashContent(await readFile(packageJsonPath)) !== packageJson.writtenHash) {
-        throw new PoiesisError(
-          "PACKAGE_JSON_CHANGED",
-          "package.json changed between transaction write and manifest materialization",
-          { file: PACKAGE_JSON_RELATIVE },
-        );
-      }
-    }
-
     // 11. Write the already validated, deterministic OpenCode projection
     //     through the same journal guard used for every other artifact.
     await hooks?.preOpenCodeApply?.();
@@ -728,6 +637,10 @@ async function runLockedUpdateConfigTransaction(
     //     same `nextPoiesisVersion` captured at step 6 so the manifest's recorded version exactly
     //     matches the version baked into the OpenCode config bash projection.
     const nextManifest: Manifest = {
+      // Spec #190 / ticket #191: an update reconciles the installation; it
+      // never re-decides its sharing mode. `mode` and the exact
+      // `.gitignore` block ownership ride through unchanged.
+      ...manifest,
       schema: 1,
       poiesisVersion: nextPoiesisVersion,
       adapter: {
@@ -738,7 +651,17 @@ async function runLockedUpdateConfigTransaction(
       },
       files: manifest.files.map((file) => {
         if (file.path === POIESIS_CONFIG_RELATIVE_PATH) {
-          return { path: POIESIS_CONFIG_RELATIVE_PATH, kind: "generated", hash: newConfigHash, owned: true };
+          // Key order matches `managedFileSchema` exactly. `manifestSchema`
+          // is a strict object, so a round-trip through `loadManifest`
+          // normalises key order; a literal built in a different order would
+          // serialize to different bytes and break the receipt digest.
+          return {
+            path: POIESIS_CONFIG_RELATIVE_PATH,
+            kind: "generated",
+            hash: newConfigHash,
+            owned: true,
+            provenance: "config",
+          };
         }
         if (file.path === openCodeRelativePath) {
           return { ...file, hash: openCodeWrittenHash! };
@@ -779,10 +702,6 @@ async function runLockedUpdateConfigTransaction(
     // 16. Exact rollback is journal-driven and always runs in reverse write
     //     order. Foreign replacements are preserved and reported explicitly.
     const diagnostics = await journal.rollback();
-    // Ticket #137: the Author-owned `package.json` is reversed AFTER the
-    // journal (it was written after the journal's first artifact) and
-    // its helper no-ops on any foreign replacement.
-    await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
     if (diagnostics.length > 0) {
       if (error instanceof PoiesisError) {
         error.details.incompleteRollback = diagnostics;

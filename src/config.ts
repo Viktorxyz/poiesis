@@ -12,6 +12,16 @@ const adapterTargetSchema = z
 
 export const configSchema = z.strictObject({
   schema: z.literal(1),
+  /**
+   * Spec #190 / ticket #191 — the installation mode.
+   *
+   * Optional in the SCHEMA so every pre-Spec #190 config still parses
+   * (legacy installs must stay operable), and REQUIRED by `init`, which
+   * is where a sharing policy is actually chosen. A non-interactive
+   * `poiesis init --config` therefore cannot install without stating it
+   * explicitly, which is the whole point of the decision.
+   */
+  mode: z.enum(["private", "team"]).optional(),
   models: z
     .strictObject({
       reasoning: z.string().regex(/^[^/]+\/.+$/, "must use provider/model format"),
@@ -56,6 +66,7 @@ export const configSchema = z.strictObject({
 export type PoiesisConfig = z.infer<typeof configSchema>;
 export type ResolvedPoiesisConfig = {
   schema: 1;
+  mode?: "private" | "team";
   models: { reasoning: string; execution: string; roles?: Record<string, string> };
   repository: { remote: string; integrationBranch: string };
   tracker: { provider: "github" | "gitlab" | "fixture"; project: string };

@@ -62,7 +62,12 @@ describe("legacy 1.0.0 ownership bootstrap", () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const configPath = join(repository.parent, "legacy-config.jsonc");
-    await writeFile(configPath, `${JSON.stringify(testConfig(repository), null, 2)}\n`);
+    // Spec #190 / ticket #191: a genuinely legacy config states NO
+    // installation mode — the published 1.0.0 CLI's strict schema rejects
+    // an unknown `mode` key, which is exactly the legacy shape this test
+    // needs. Migration to the current adapter is what adds the mode.
+    const { mode: _legacyMode, ...legacyConfig } = testConfig(repository);
+    await writeFile(configPath, `${JSON.stringify(legacyConfig, null, 2)}\n`);
     // The legacy poiesis-cli@1.0.0 init bundles CERTIFIED_OPENCODE_VERSION = "1.18.29"
     // and fails closed against any other version. To exercise the real
     // published legacy package on a host whose OpenCode is a later
