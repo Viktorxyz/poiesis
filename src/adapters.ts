@@ -19,6 +19,17 @@ import {
   type PublishEvidence,
   type StagingEvidence,
 } from "./evidence.js";
+// Type-only: the receipt module is reached through a deferred import at
+// runtime, so the top-level module graph stays acyclic.
+import type { VerificationReceiptAuthority } from "./verification-receipt.js";
+
+/**
+ * Spec #168 / ticket #186 — what Preview authenticates a receipt against: the
+ * shared lifecycle authority plus the primary installation whose live plan the
+ * receipt must have been produced under. Structurally satisfied by
+ * `LifecycleAuthority`.
+ */
+type PreviewVerificationAuthority = VerificationReceiptAuthority & { primaryRoot: string };
 
 export type TrackerProvider = "github" | "gitlab" | "fixture";
 export type TrackerItemKind = "spec" | "ticket";
@@ -1236,14 +1247,77 @@ export async function previewDelivery(
   input: PreviewDeliveryInput,
   root = process.cwd(),
 ): Promise<PreviewDeliveryResult> {
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Preview is not an upgrade channel; the running package must equal
-  // the durable `manifest.poiesisVersion` before the adapter creates
-  // a Preview identity. Dynamic import keeps the top-level module
-  // graph acyclic (adapters.ts and maintenance.ts must not import each
-  // other at module-load time).
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
-  return createDeliveryAdapter(config, root).preview(input);
+  // Spec #168 / ticket #169: resolve the shared lifecycle authority.
+  // Preview is not an upgrade channel, and the authoritative manifest /
+  // receipt / runtime identity come from the PRIMARY receipt-authenticated
+  // installation — never from a prepared candidate workspace's own
+  // generated config. Delivery therefore runs against
+  // `authority.primaryRoot`. Dynamic imports keep the top-level module
+  // graph acyclic (`adapters.ts` and `git.ts` reference each other only
+  // through type positions and deferred imports).
+  const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
+  // Spec #168 / ticket #186: the forwarded documents are fully validated and
+  // AUTHENTICATED here, before the adapter is even constructed, so no
+  // delivery side effect — a remote call, a published artifact, a written
+  // fixture record — can happen on evidence that names no real proof.
+  //
+  // The structural pass runs FIRST on purpose: both documents are pure,
+  // caller-facing contracts, and forwarding the adapter's own validators keeps
+  // every existing refusal naming the exact field it violated. The adapters
+  // repeat the identical checks as their own delivery contract, which is what
+  // keeps them independently testable.
+  validateProofEvidence(input.proof, input.sha, input.candidateTree);
+  validatePreviewPublishEvidence(input.publish, input.sha, input.candidateTree);
+  await authenticateForwardedVerification(authority, input);
+  return createDeliveryAdapter(config, authority.primaryRoot).preview(input);
+}
+
+/**
+ * Spec #168 / ticket #186 — resolve and authenticate the verification receipt
+ * the forwarded proof and Publish evidence name.
+ *
+ * Preview used to believe any well-formed reference: it never read the stored
+ * receipt, so a reference to a receipt that was never written, a digest that
+ * does not match the stored document, a receipt minted by another installation
+ * or another verification plan, or a Publish that rested on a DIFFERENT receipt
+ * than the proof all moved a delivery forward.
+ *
+ * Both references are resolved through the SAME receipt resolver Publish uses,
+ * against the same lifecycle authority and the same live plan of the PRIMARY
+ * installation, so there is exactly one receipt-validation implementation and
+ * one set of typed refusals across the lifecycle. They must additionally
+ * identify the SAME receipt: proof and Publish are two halves of one claim
+ * about one candidate, so a Publish that resolved something other than the
+ * receipt its proof names is refused.
+ */
+async function authenticateForwardedVerification(
+  authority: PreviewVerificationAuthority,
+  input: PreviewDeliveryInput,
+): Promise<void> {
+  const { resolveLiveVerificationPlan, resolveVerificationReceipt } = await import("./verification-receipt.js");
+  const migration = `Run \`poiesis verify --sha ${input.sha}\` for this exact candidate, then Publish and Preview again.`;
+  const plan = await resolveLiveVerificationPlan(authority.primaryRoot);
+  const shared = { authority, candidateSha: input.sha, candidateTree: input.candidateTree, plan };
+  const proofReceipt = await resolveVerificationReceipt({ ...shared, reference: forwardedVerification(input.proof) });
+  const publishReceipt = await resolveVerificationReceipt({ ...shared, reference: forwardedVerification(input.publish) });
+  invariant(
+    proofReceipt.id === publishReceipt.id && proofReceipt.digest === publishReceipt.digest,
+    "PUBLISH_VERIFICATION_IDENTITY_MISMATCH",
+    "Publish evidence resolved a different verification receipt than the proof it delivers",
+    {
+      expected: proofReceipt.id,
+      actual: publishReceipt.id,
+      expectedDigest: proofReceipt.digest,
+      actualDigest: publishReceipt.digest,
+      candidateSha: input.sha,
+      migration,
+    },
+  );
+}
+
+/** The caller-carried receipt reference of one forwarded evidence document. */
+function forwardedVerification(document: unknown): unknown {
+  return isRecord(document) ? document.verification : undefined;
 }
 
 export function promoteDelivery(
@@ -1261,11 +1335,10 @@ export async function promoteDelivery(
   input: PromoteDeliveryInput,
   root = process.cwd(),
 ): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Promote is the extension of preview into staging / production; the
-  // guard mirrors `previewDelivery` so the surfaced error code is
-  // uniform across delivery mutations.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(root);
-  const adapter = createDeliveryAdapter(config, root);
+  // Spec #168 / ticket #169: the guard mirrors `previewDelivery` so the
+  // surfaced error code is uniform across delivery mutations, and the
+  // authority is the same PRIMARY receipt-authenticated installation.
+  const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
+  const adapter = createDeliveryAdapter(config, authority.primaryRoot);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

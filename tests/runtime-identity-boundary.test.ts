@@ -60,7 +60,7 @@ import {
 } from "../src/git.js";
 import { previewDelivery, promoteDelivery } from "../src/adapters.js";
 import { predecessorProjectionV111 } from "../src/authority.js";
-import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, testConfig, verificationReference, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 interface OwnedByteSnapshot {
@@ -264,6 +264,7 @@ describe("runtime identity boundary (ticket #106)", () => {
             provider: "fixture",
             action: "pushed",
             changeRequest: { id: null, url: null },
+            verification: verificationReference(repository.baseSha, repository.baseSha),
           },
           remote: "origin",
         },

@@ -51,6 +51,29 @@ Action keys are the singular OpenCode `1.18.29` / `1.18.30` / `1.18.31` keys: `r
 
 The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not copied into projects. Its plural `agents`/`permissions` and `shell`/`subagent` action names are not accepted by any certified tag. Poiesis generates the current native shape and validates it with `opencode debug config`.
 
+### Same-release projection migration (pre-focused-check)
+
+A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.4.2 is the current release and the migration boundary for that install.
+
+A project installed by the earlier `1.4.0` image therefore records `poiesisVersion = "1.4.0"` with a `configPatches` set that no longer equals the `1.4.0` focused-check projection. The compatible migration is:
+
+- **Admitted:** the exact **pre-focused-check** projection for `poiesisVersion = "1.4.0"` — that published predecessor version and no other — and only through the receipt-gated `poiesis update`. For the version it is keyed on, the predecessor differs from that version's own projection in exactly one field: `agent.poiesis-worker.permission.bash` omits the single focused-check allow key, derived through the same builder the current projection uses.
+- **Not admitted:** any other version, and any drift from that exact set. A `1.4.0` manifest that does not match is rethrown by the strict check and never falls through to the older 1.0.x projection.
+- **Not admitted elsewhere:** `doctor`, `uninstall`, `capability install`, and `poiesis update --config` remain current-projection-only, so a mismatched install is always visible as a `doctor` failure instead of being silently tolerated.
+- **No launcher widening:** the projection the migration installs is the current one. It grants the exact-version canonical route `pnpm dlx poiesis-cli@<version> …` only — never a broad `pnpm dlx poiesis-cli@<version> *`, `@latest`, or unversioned route. An off-version runtime (`RUNTIME_VERSION_MISMATCH`) still fails closed before any mutation.
+
+### Release-to-release crossing
+
+An ordinary release bump needs no exceptional migration entry. `assertManifestAuthority` builds the strict projection from the MANIFEST's own `poiesisVersion`, so a project installed by the previously published `1.4.1` image carries the authentic `1.4.1` projection and satisfies the ordinary strict manifest-version check before any predecessor tolerance is consulted. v1.4.2 is the current release.
+
+- **Admitted:** the exact authentic `1.4.1` projection, on the ordinary strict path — the same path a 1.2.1 install takes. Every operation accepts it, including the receipt-gated `poiesis update`.
+- **Not admitted:** `"1.4.1"` is deliberately NOT added to the accepted predecessor set. The strict path already admits that exact projection, so a predecessor entry would grant an exceptional migration route to a surface that needs no exception and would widen what projection drift can reach.
+- **Drift still fails closed:** a `1.4.1` manifest that does not match its own exact `1.4.1` projection is drift, and fails closed with `MANIFEST_AUTHORITY_INVALID` on every path — strict, predecessor-tolerant, and the receipt-gated `update`.
+- **The receipt-gated `update` crosses the release:** it advances `manifest.poiesisVersion` to `1.4.2`, re-keys the exact-version launcher onto `pnpm dlx poiesis-cli@1.4.2 …`, and advances the ownership receipt by exactly one generation.
+- **No launcher widening:** the crossed projection grants the exact-version canonical route only — never a broad `pnpm dlx poiesis-cli@<version> *`, `@latest`, or unversioned route.
+- **Published artifact parity:** the packed artifact for this release is `poiesis-cli-1.4.2.tgz` and its version agrees with `package.json`, so the exact-version launcher and the published tarball always name the same release.
+- **Historical predecessors are unchanged:** the `1.4.0` pre-focused-check migration above, the v1.1.3 / v1.1.4 projection, and the v1.0.0/1.0.1/1.0.2 legacy projection all behave exactly as they did under 1.4.1.
+
 ### Subagent visibility
 
 Five internal specialists are projected with `mode: "subagent"` and `hidden: true`:
@@ -75,7 +98,7 @@ Session cleanup targets the supported HTTP endpoints at the OpenCode server (`ht
 - `GET /session/<id>/children` — child enumeration
 - `DELETE /session/<id>` — deletion
 
-Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness. Session-server integration is exercised via black-box acceptance, not by unit tests in this bundle.
+Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctness. It is required at a deterministic handoff or termination whenever the child session identity is known, and still never gates the lifecycle. Session-server integration is exercised via black-box acceptance, not by unit tests in this bundle.
 
 ## Skills
 
@@ -188,4 +211,57 @@ All external command execution is bounded:
 - structured `COMMAND_TIMEOUT` error with diagnostic detail on timeout;
 - `COMMAND_FAILED` on ordinary non-zero exit;
 - `stdoutTruncated`/`stderrTruncated` flags recorded when bound is hit;
-- safe SIGTERM then SIGKILL termination on timeout.
+- bounded SIGTERM then SIGKILL termination of the managed process group, on the platforms where the group can still be attributed to the lease (see below).
+
+### Group-local cleanup: what a platform must be able to prove
+
+A managed process group is addressed as a group or not at all. Poiesis never enumerates it: there is no process-table walk, no member snapshot, no per-PID signal, and therefore no survivor list to report. The group may be signalled only while the leased leader that gave the group its id can still be re-confirmed by exact **process-start identity** and exact process-group id — the Linux model, read from the kernel's per-PID process table. Group liveness proves absence, never ownership: once the leader is gone, the group id is a PID that any later process may be handed.
+
+| Host | Live managed group at timeout, cancellation, or a lingering leak |
+| --- | --- |
+| Linux | settled: group `SIGTERM`, bounded wait, leader re-confirmed, group `SIGKILL`, bounded wait, success confirmed only when the group no longer exists |
+| macOS and the other non-Linux POSIX platforms | no signal is sent at all; the run rejects `PROCESS_CLEANUP_REFUSED` with `details.reason: UNSUPPORTED_IDENTITY` and the actionable `details.pid` / `details.processGroupId`, because nothing about the group can be attributed without a readable process-start identity. A command that exits on its own still settles normally |
+| Windows | no POSIX groups exist; the tree is reached with `taskkill /PID <pid> /T`, then `/F`, then `child.kill`, each phase bounded by the child's own `exit` event, and each PID-directed step suppressed once the child has exited |
+| Linux with a delegated cgroup v2 leaf | unchanged and authoritative: `cgroup.kill` empties the leaf and `cgroup.events` confirms `populated 0`; once that confirmation lands, no group-local settlement runs at all |
+
+Two failure envelopes describe a managed process group on any platform, and both outrank success, failure, timeout, and cancellation because they mean a process Poiesis spawned may still be running:
+
+- `PROCESS_CLEANUP_REFUSED` — nothing was signalled and nothing can be. Carries `details.reason` (`MALFORMED_LEASE`, `UNSAFE_TARGET`, `UNSUPPORTED_IDENTITY`, `IDENTITY_AMBIGUOUS`, `PID_REUSE`, `FOREIGN_PROCESS`), `details.detail`, `details.operationId`, `details.workspaceId`, `details.pid`, `details.processGroupId`.
+- `PROCESS_CLEANUP_UNRESOLVED` — a signal was sent but the group is still there, or Poiesis declined to send the next one. Carries `details.reason` (`GROUP_AUTHORITY_LOST` when the leader stopped being provable while the group remained — nothing further is signalled, and a leader that merely finished first waits a bounded natural-settlement window for the group to empty itself; `GROUP_STILL_PRESENT` when a provable leader still did not empty it), `details.phase` (`before-sigterm`, `before-sigkill`, `confirm`), `details.leaderState` (`live`, `gone`, `terminal`, `unreadable`, `reused`, `foreign`, `unconfirmed`), `details.pid`, `details.processGroupId`, `details.membersEnumerated: false`, `details.confirmed: false`. On Windows the same code carries `details.platform` and `details.phases` instead, because that path is `taskkill`-based.
+
+A zombie is terminal: it can never be a signal target, and it is never reported as a surviving process.
+
+### Strong containment for arbitrary command text
+
+Two execution contracts exist and are not interchangeable.
+
+**Fixed-argv commands** — `git`, `gh`, `uv`, `opencode`, delivery executables, and any direct library caller of `run()` with a vector Poiesis chose — run under a managed process GROUP. That is isolation, not containment: `setsid(2)` creates a new session and process group, and a descendant is reparented when its parent exits, so neither is visible to a group-directed signal afterwards.
+
+**Arbitrary command TEXT** cannot rely on that. Three surfaces execute it, and all three require the same kernel-enforced boundary:
+
+| Surface | Commands it runs |
+| --- | --- |
+| `poiesis verify` | the installation's verification plan, in the exact candidate workspace |
+| `poiesis check` | the explicit `--command` values, in an owned (possibly dirty) candidate workspace |
+| `poiesis integrate` | the configured `postIntegrationCommands`, in a throwaway worktree over the integrated revision |
+
+Each reaches the command processor through the same seam (`/bin/sh -c` on POSIX; a validated absolute `ComSpec` naming `cmd.exe` with `/d /s /c` on Windows), passes the command through byte-identical as the final argv element, and runs inside a boundary provisioned BEFORE the spawn.
+
+| Host | Required capability | Status |
+| --- | --- | --- |
+| Linux, delegated cgroup v2 subtree | a Poiesis-owned leaf exposing `cgroup.kill`, `cgroup.procs`, `cgroup.events` | supported; the leaf is provisioned before the spawn and entered through a Poiesis-owned two-phase startup — the child reports its kernel identity, is admitted and confirms that membership against the same identity, and only then runs the caller's argv — settled with `cgroup.kill` confirmed by `cgroup.events` |
+| Linux, no delegated subtree | — | refused before spawning |
+| Windows | a no-breakaway Job Object created by a native launcher before the child is created | refused before spawning; this runtime ships no such launcher |
+| macOS and the other non-Linux POSIX platforms | — | refused before spawning; no portable strong primitive exists |
+
+On a refused host the three surfaces above fail with `PROCESS_CONTAINMENT_UNAVAILABLE`, carrying `details.reason` (`NO_CGROUP_V2`, `NO_DELEGATION`, `NO_CGROUP_KILL`, `PROVISION_FAILED`, `UNSUPPORTED_PLATFORM`), `details.platform`, the missing capability in `details.detail`, and a `details.remediation` naming a Linux host with a delegated cgroup v2 subtree. Nothing is spawned and nothing is reported as verified, so "the plan passed" can never be a statement about a run that never happened.
+
+Post-integration commands are gated by the same rule as the verification plan. A host that cannot contain the candidate's plan cannot contain the integrated revision either; `postIntegrationCommands` is not a weaker surface and does not fall back to `verification.commands`.
+
+When the host does provide the capability but the startup cannot be confirmed, the run is refused with `PROCESS_CONTAINMENT_REFUSED`, carrying `details.reason` — `STARTUP_IDENTITY_UNCONFIRMED` when the child's reported kernel identity is missing, malformed, or disagrees with a fresh kernel read of that PID, and `ADMISSION_UNCONFIRMED` when the admission itself is missing or is not bound to the identity Poiesis leased. When the boundary cannot be confirmed settled, it fails with `PROCESS_CLEANUP_UNRESOLVED`; a startup refused before a lease existed additionally requires the child's own linked exit and reports `details.reason: STARTUP_EXIT_UNCONFIRMED` when that proof never arrives. Both outrank success, failure, timeout, and cancellation, because they mean a process Poiesis spawned may still be running.
+
+### Command-processor availability
+
+The processor is resolved and validated BEFORE any process exists, so a host with no usable one refuses rather than failing as an opaque spawn error. `COMMAND_PROCESSOR_UNAVAILABLE` carries `details.reason` (`PROCESSOR_NOT_EXECUTABLE` on POSIX; `COMSPEC_MISSING`, `COMSPEC_NOT_ABSOLUTE`, `COMSPEC_NOT_COMMAND_PROCESSOR`, `COMSPEC_UNAVAILABLE` on Windows), `details.platform`, `details.processor` (the path that was rejected), `details.detail`, and a `details.remediation` for the host.
+
+`poiesis check` passes that refusal through with its own code and those fields intact, and with the bounded `details.check` evidence attached — it is a host limitation, not a failing command. It deliberately attaches none of the `details.migration` advice that a genuine `FOCUSED_CHECK_FAILED` carries, because `poiesis verify` resolves command text through the same processor and would refuse identically. `verify` keeps its own fail-closed propagation of the same error. Nothing is spawned either way.

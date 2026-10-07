@@ -8,7 +8,14 @@ import {
   validatePublishEvidence,
   type PublishEvidence,
 } from "../src/evidence.js";
-import { createTestRepository, proofShell, testConfig, type TestRepository } from "./helpers.js";
+import {
+  createTestRepository,
+  describeManagedExecution,
+  testConfig,
+  verifiedProof,
+  verificationReference,
+  type TestRepository,
+} from "./helpers.js";
 import { init } from "../src/maintenance.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
@@ -132,11 +139,20 @@ function assertCommonEvidenceContract(
       id: result.requestId,
       url: result.requestUrl,
     },
+    // Spec #168 / ticket #171: Publish evidence carries the identity of the
+    // verification receipt it resolved out of runtime storage.
+    verification: result.evidence.verification,
   });
+  expect(result.evidence.verification).toMatchObject({
+    candidateSha: expectedSha,
+    candidateTree: expectedTree,
+  });
+  expect(result.evidence.verification.receiptId.length).toBeGreaterThan(0);
+  expect(result.evidence.verification.receiptDigest).toMatch(/^[0-9a-f]{64}$/);
   validatePublishEvidence(result.evidence, expectedSha, expectedTree, expectedBranch, `refs/heads/${expectedBranch}`);
 }
 
-describe("ticket #48 — fixture publish emits candidate-bound evidence", () => {
+describeManagedExecution("ticket #48 — fixture publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence with verified:true for the first publish", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
@@ -154,7 +170,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
       project: repository.fixtures,
       title: "fixture first",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(result.provider).toBe("fixture");
     expect(result.action).toBe("pushed");
@@ -177,7 +193,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
       project: repository.fixtures,
       title: "fixture ff",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
     });
     expect(first.action).toBe("pushed");
 
@@ -199,7 +215,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
       project: repository.fixtures,
       title: "fixture ff v2",
       body: "body",
-      proof: proofShell(second.sha, tree2),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: second.sha, candidateTree: tree2 }),
     });
     expect(republished.action).toBe("updated");
     expect(republished.publishedHeadSha).toBe(second.sha);
@@ -207,7 +223,7 @@ describe("ticket #48 — fixture publish emits candidate-bound evidence", () => 
   });
 });
 
-describe("ticket #48 — command publish emits candidate-bound evidence", () => {
+describeManagedExecution("ticket #48 — command publish emits candidate-bound evidence", () => {
   it("emits identity-bound evidence when the command provider reports verified:true", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
@@ -241,7 +257,7 @@ printf '{"id":"42","url":"https://example.test/pr/42","verified":true,"action":"
       project: repository.fixtures,
       title: "command ok",
       body: "body",
-      proof: proofShell(sha, tree),
+      proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       command: [script],
     });
     expect(result.provider).toBe("command");
@@ -282,7 +298,7 @@ printf '{"id":"x","url":"https://example.test/pr/x"}\n'
         project: repository.fixtures,
         title: "command unverified",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
         command: [script],
       }),
     ).rejects.toMatchObject({ code: "PUBLISH_PROVIDER_INCOMPLETE" });
@@ -318,7 +334,7 @@ printf '{"id":"x","url":"https://example.test/pr/x","verified":true,"candidateSh
         project: repository.fixtures,
         title: "command wrong sha",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
         command: [script],
       }),
     ).rejects.toMatchObject({ code: "PUBLISH_COMMAND_CANDIDATE_MISMATCH" });
@@ -343,13 +359,13 @@ printf '{"id":"x","url":"https://example.test/pr/x","verified":true,"candidateSh
         project: repository.fixtures,
         title: "command missing",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "INVALID_PUBLISH_COMMAND" });
   });
 });
 
-describe("ticket #48 — publish evidence fails closed", () => {
+describeManagedExecution("ticket #48 — publish evidence fails closed", () => {
   it("rejects Publish with no success evidence when the candidate tree does not match", async () => {
     const repository = await installedTestRepository();
     const { workspacePath, sha, tree } = await freshWorkspace(
@@ -369,7 +385,7 @@ describe("ticket #48 — publish evidence fails closed", () => {
         project: repository.fixtures,
         title: "wrong tree",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "CANDIDATE_TREE_MISMATCH" });
   });
@@ -382,6 +398,10 @@ describe("ticket #48 — publish evidence fails closed", () => {
       "poiesis/proof-mismatch",
     );
     const wrongSha = "a".repeat(40);
+    // The proof is a real, receipt-backed proof of the REAL candidate whose
+    // candidateSha was then rewritten: the receipt is sound, the proof is not,
+    // and Publish must refuse on the proof's own identity.
+    const proof = await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree });
     await expect(
       publish({
         cwd: workspacePath,
@@ -393,7 +413,7 @@ describe("ticket #48 — publish evidence fails closed", () => {
         project: repository.fixtures,
         title: "wrong proof",
         body: "body",
-        proof: proofShell(wrongSha, tree),
+        proof: { ...proof, candidateSha: wrongSha },
       }),
     ).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
   });
@@ -434,7 +454,7 @@ describe("ticket #48 — publish evidence fails closed", () => {
         project: repository.fixtures,
         title: "diverged",
         body: "body",
-        proof: proofShell(sha, tree),
+        proof: await verifiedProof({ cwd: workspacePath, candidateSha: sha, candidateTree: tree }),
       }),
     ).rejects.toMatchObject({ code: "PUBLISHED_BRANCH_DIVERGED" });
   });
@@ -452,6 +472,7 @@ describe("ticket #48 — PublishEvidence validator", () => {
       provider: "fixture",
       action: "pushed",
       changeRequest: { id: null, url: null },
+      verification: verificationReference("1".repeat(40), "2".repeat(40)),
       ...overrides,
     };
   }

@@ -1,8 +1,71 @@
 import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { describe, it } from "vitest";
+import { resolveContainmentCapability } from "../src/containment.js";
 import { run } from "../src/process.js";
+import { resolveLifecycleAuthority, verify } from "../src/git.js";
+import { resolveLiveVerificationPlan, type VerificationEvidence } from "../src/verification-receipt.js";
+import type { ProofPayload } from "../src/adapters.js";
 import type { PoiesisConfig } from "../src/config.js";
+
+/**
+ * Spec #168 / ticket #176 — whether THIS host can strongly contain a managed
+ * shell command.
+ *
+ * `verify`, `check`, and post-integration commands execute caller-supplied
+ * command TEXT, so they refuse with `PROCESS_CONTAINMENT_UNAVAILABLE` before
+ * spawning anything on a host with no delegated cgroup v2 subtree — Windows,
+ * macOS, and non-delegated Linux. A test that drives one of those paths is
+ * therefore testing the HOST's capability, not the code, and must skip rather
+ * than fail there.
+ *
+ * The corollary is as important: pure resolver, refusal, evidence, and
+ * control-flow assertions must NOT gate on it. Those prove the fail-closed
+ * contract and have to run on every host, including the ones that cannot contain
+ * anything — that is precisely where they carry their weight.
+ */
+export function strongContainmentAvailable(): boolean {
+  return resolveContainmentCapability().available;
+}
+
+/** The per-test options these suites actually pass alongside a gated case. */
+export interface ManagedExecutionOptions {
+  timeout?: number;
+  retry?: number;
+}
+
+/**
+ * The ONE shared capability gate, in its two forms.
+ *
+ * Both read the same predicate, so every skip carries the same reason and no
+ * suite can quietly introduce a second, looser gate. Use `describeManagedExecution`
+ * when every case in a suite needs a real managed command, and
+ * `itManagedExecution` for the individual cases inside a suite whose other cases
+ * are pure.
+ */
+export function describeManagedExecution(name: string, fn: () => void): void {
+  describe.skipIf(!strongContainmentAvailable())(name, fn);
+}
+
+export function itManagedExecution(
+  name: string,
+  fn: () => void | Promise<void>,
+  options?: ManagedExecutionOptions,
+): void;
+export function itManagedExecution(
+  name: string,
+  options: ManagedExecutionOptions,
+  fn: () => void | Promise<void>,
+): void;
+export function itManagedExecution(
+  name: string,
+  fn: () => void | Promise<void>,
+  timeout: number,
+): void;
+export function itManagedExecution(name: string, ...rest: unknown[]): void {
+  (it.skipIf(!strongContainmentAvailable()) as (...args: unknown[]) => void)(name, ...rest);
+}
 
 export interface TestRepository {
   parent: string;
@@ -98,7 +161,64 @@ export const publishEvidence = (sha: string, tree: string, branch: string) => ({
   provider: "fixture" as const,
   action: "pushed" as const,
   changeRequest: { id: null, url: null },
+  // Spec #168 / ticket #171: Publish evidence carries the identity of the
+  // verification receipt Publish resolved. Preview validates this reference
+  // structurally; the receipt itself was already resolved against live
+  // authority by Publish.
+  verification: verificationReference(sha, tree),
 });
+
+/** A structurally valid receipt reference for evidence fixtures. */
+export const verificationReference = (sha: string, tree: string): VerificationEvidence => ({
+  receiptId: `receipt-${sha.slice(0, 12)}`,
+  receiptDigest: "a".repeat(64),
+  runtime: "poiesis-test-runtime",
+  candidateSha: sha,
+  candidateTree: tree,
+  verificationPlanDigest: "b".repeat(64),
+});
+
+/**
+ * Spec #168 / ticket #171: the PRIMARY installation's live verification plan,
+ * resolved exactly the way Publish resolves it.
+ */
+export async function liveVerificationPlan(cwd: string, ownershipId?: string): Promise<string[]> {
+  const authority = await resolveLifecycleAuthority(cwd, ownershipId);
+  return resolveLiveVerificationPlan(authority.primaryRoot);
+}
+
+export interface VerifiedProofInput {
+  cwd: string;
+  ownershipId?: string;
+  candidateSha: string;
+  candidateTree: string;
+  /**
+   * Verify commands. Defaults to the installation's live plan, which is what
+   * Publish validates the receipt against; pass an explicit list only when the
+   * test deliberately verifies off-plan.
+   */
+  verificationCommands?: readonly string[];
+}
+
+/**
+ * Spec #168 / ticket #171: run the candidate's verification and return the
+ * proof a caller must forward, carrying the runtime-owned receipt reference
+ * Publish resolves. Replaces the old `proofShell(...)` shape for every
+ * operation that consumes a proof after Verify.
+ */
+export async function verifiedProof(input: VerifiedProofInput): Promise<ProofPayload> {
+  const commands = input.verificationCommands ?? (await liveVerificationPlan(input.cwd, input.ownershipId));
+  const result = await verify({
+    cwd: input.cwd,
+    candidateSha: input.candidateSha,
+    commands: [...commands],
+    ...(input.ownershipId === undefined ? {} : { ownershipId: input.ownershipId }),
+  });
+  if (result.verification === null) {
+    throw new Error("Verify issued no verification receipt; publish cannot be proven");
+  }
+  return { ...proofShell(input.candidateSha, input.candidateTree), verification: result.verification };
+}
 
 export const integration = (candidateTree: string, integrationSha: string, integrationTree: string) => ({
   candidateTree,

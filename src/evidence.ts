@@ -1,4 +1,7 @@
 import { invariant } from "./errors.js";
+import { isVerificationEvidenceShape, type VerificationEvidence } from "./verification-receipt.js";
+
+export type { VerificationEvidence };
 
 const SHA_PATTERN = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/;
 
@@ -15,6 +18,17 @@ export interface ProofEvidence {
   verified: true;
   specReview: ReviewVerdictEvidence;
   standardsReview: ReviewVerdictEvidence;
+  /**
+   * Spec #168 / ticket #171 — the runtime-owned whole-change Verify receipt
+   * this proof claims to rest on.
+   *
+   * Deliberately optional on the TYPE and mandatory at the Publish boundary:
+   * a legacy or fabricated proof must still be constructible so it can be
+   * refused with a typed, actionable `VERIFICATION_RECEIPT_REQUIRED` instead
+   * of a compile error in the caller. `publish` resolves the reference against
+   * live authority and refuses anything it cannot resolve.
+   */
+  verification?: VerificationEvidence;
 }
 
 export interface StagingEvidence {
@@ -55,6 +69,13 @@ export interface PublishEvidence {
     id: string | null;
     url: string | null;
   };
+  /**
+   * Spec #168 / ticket #171 — the verification receipt this Publish RESOLVED
+   * out of runtime storage, not a value the caller supplied. Preview requires
+   * it: forwarded Publish evidence that cannot name the receipt that proved
+   * the candidate is legacy evidence and is refused before delivery runs.
+   */
+  verification: VerificationEvidence;
 }
 
 export function validateProofEvidence(proof: ProofEvidence, candidateSha: string, candidateTree: string): void {
@@ -193,6 +214,7 @@ export function validatePublishEvidence(
     "Publish evidence belongs to a different candidate tree",
     { expected: expectedTree, actual: evidence.candidateTree },
   );
+  validateVerificationEvidenceReference(evidence.verification, expectedSha, expectedTree);
   invariant(
     evidence.verified === true,
     "PUBLISH_NOT_VERIFIED",
@@ -306,6 +328,42 @@ export function validatePreviewPublishEvidence(
 }
 
 const PUBLISH_PROVIDERS: readonly PublishProvider[] = ["github", "gitlab", "fixture", "command"];
+
+/**
+ * Spec #168 / ticket #171 — the forwarded-evidence half of the receipt
+ * contract.
+ *
+ * Publish evidence is a document a caller can carry from one process to the
+ * next, so Preview cannot resolve storage. What it CAN do is refuse evidence
+ * that does not name a well-formed receipt reference bound to the same exact
+ * candidate: the identity of runtime-owned verification evidence must travel
+ * with the Publish that resolved it, or the evidence is legacy and the
+ * delivery must not run.
+ */
+function validateVerificationEvidenceReference(
+  verification: unknown,
+  candidateSha: string,
+  candidateTree: string,
+): void {
+  invariant(
+    isRecord(verification),
+    "PUBLISH_VERIFICATION_EVIDENCE_MISSING",
+    "Publish evidence does not reference the verification receipt it resolved; run Verify and Publish again for this exact candidate",
+    { candidateSha, migration: `Run \`poiesis verify --sha ${candidateSha}\` for this exact candidate, then Publish again.` },
+  );
+  invariant(
+    isVerificationEvidenceShape(verification),
+    "PUBLISH_VERIFICATION_EVIDENCE_INVALID",
+    "Publish evidence verification receipt reference is malformed",
+    { candidateSha, verification },
+  );
+  invariant(
+    verification.candidateSha === candidateSha && verification.candidateTree === candidateTree,
+    "PUBLISH_VERIFICATION_IDENTITY_MISMATCH",
+    "Publish evidence verification receipt belongs to a different candidate",
+    { expected: candidateSha, actual: verification.candidateSha, expectedTree: candidateTree, actualTree: verification.candidateTree },
+  );
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

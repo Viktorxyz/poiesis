@@ -101,6 +101,11 @@ describe("OpenCode adapter", () => {
     // AFTER the `pnpm dlx poiesis-cli@*` deny so OpenCode's
     // last-match-wins resolver grants only the documented operations
     // and leaves every other Poiesis lifecycle invocation denied.
+    //
+    // Spec #168 / ticket #173 ADDS exactly one more exact-version allow
+    // after the same deny: the non-authoritative `check` subcommand. It
+    // is the only Poiesis route the Worker owns, and it grants no
+    // lifecycle authority.
     expect(workerBash).toEqual({
       "*": "allow",
       "git *": "deny",
@@ -113,20 +118,27 @@ describe("OpenCode adapter", () => {
       "pnpm dlx poiesis-cli@1.1.2 repository query *": "allow",
       "pnpm dlx poiesis-cli@1.1.2 repository path *": "allow",
       "pnpm dlx poiesis-cli@1.1.2 repository explain *": "allow",
+      "pnpm dlx poiesis-cli@1.1.2 check *": "allow",
     });
     expect(workerBash["pnpm dlx poiesis-cli *"]).toBe("deny");
     expect(workerBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     // Worker must NOT retain a primary-style arbitrary-lifecycle
     // exact-version allow (e.g. `pnpm dlx poiesis-cli@1.1.2 *`).
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 *");
-    // Worker MUST NOT gain lifecycle subcommand allows.
+    // Worker MUST NOT gain lifecycle subcommand allows. `check` is the sole
+    // permitted exact-version subcommand because it is the non-authoritative
+    // focused-check surface.
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 verify *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 workspace *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 checkpoint *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 publish *");
-    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 integrate *");
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 preview *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 promote *");
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 integrate *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 tracker *");
     expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 capability *");
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 session *");
+    expect(workerBash).not.toHaveProperty("pnpm dlx poiesis-cli@1.1.2 update");
     // Primary alone retains the lifecycle exact-version canonical route.
     const primaryBash = (patches["agent.poiesis"] as { permission: { bash: Record<string, string> } }).permission.bash;
     expect(primaryBash["pnpm dlx poiesis-cli@1.1.2 *"]).toBe("allow");
