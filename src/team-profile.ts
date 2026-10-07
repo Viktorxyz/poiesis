@@ -50,7 +50,7 @@ import { z } from "zod";
 import { parseJsonc, validateConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { readUtf8 } from "./fs.js";
-import { hashFile } from "./hash.js";
+import { hashContent, hashFile } from "./hash.js";
 import type { ManagedSkill } from "./manifest.js";
 
 /** Project-relative root of the shareable profile. */
@@ -369,6 +369,56 @@ export async function readTeamOverrides(
     });
   }
   return overrides;
+}
+
+/**
+ * Ticket #197 — the identity of the shared override SET, not of one file.
+ *
+ * A set digest rather than per-file digests because the interesting race is
+ * not only "this file was edited" but also "an override was added or removed
+ * between the read and the write": the second case has no file to hash, and a
+ * per-file guard would miss it. Entries are sorted so directory enumeration
+ * order cannot make the identity flap.
+ */
+export function teamOverrideSetDigest(overrides: readonly TeamOverride[]): string {
+  const entries = overrides
+    .map((override) => `${override.source} ${hashContent(override.content)}`)
+    .sort();
+  return hashContent(entries.join("\n"));
+}
+
+/**
+ * Ticket #197 — refuse to project a shared override set this transaction did
+ * not read.
+ *
+ * The analogue of init's `adoptedProfileHash` guard, and the same question it
+ * asks: not "does the file still equal what I would have written" but "is the
+ * source still the source I planned from". A teammate pulling a new override,
+ * or a background process replacing one, between the read and the first
+ * projection write must fail closed rather than project stale bytes and
+ * re-baseline manifest ownership onto them.
+ *
+ * Re-reads through `readTeamOverrides`, so the re-validation applies exactly
+ * the same unsafe-source refusal the initial read did — one seam, one verdict.
+ */
+export async function assertTeamOverridesUnchanged(args: {
+  root: string;
+  projectionDestinations: readonly string[];
+  observed: readonly TeamOverride[];
+}): Promise<void> {
+  const current = await readTeamOverrides(args.root, args.projectionDestinations);
+  const before = teamOverrideSetDigest(args.observed);
+  const after = teamOverrideSetDigest(current);
+  if (before === after) return;
+  throw new PoiesisError(
+    "TEAM_OVERRIDE_CONFLICT",
+    `The shared Poiesis overrides changed during the update; refusing to project stale project content`,
+    {
+      overrides: current.map((override) => override.source),
+      observedDigest: before,
+      currentDigest: after,
+    },
+  );
 }
 
 /**

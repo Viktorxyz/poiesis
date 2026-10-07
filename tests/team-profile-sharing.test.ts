@@ -31,6 +31,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { run } from "../src/process.js";
 import { parseJsonc } from "../src/config.js";
+import { hashContent } from "../src/hash.js";
 import {
   TEAM_PROFILE_CONFIG_PATH,
   TEAM_PROFILE_DIRECTORY,
@@ -600,6 +601,60 @@ describe("Spec #190 / ticket #192 - a fresh clone hydrates from the shared profi
     expect(await ignored(clone.root, ".opencode/agents/poiesis-worker.md")).toBe(true);
     expect(await ignored(clone.root, TEAM_PROFILE_OVERRIDES_DIRECTORY + "/poiesis-worker.md")).toBe(false);
   }, 180_000);
+
+  it("keeps a shared override effective across repeated ordinary updates", async () => {
+    // Ticket #197. Hydration is only the first half of the promise: the
+    // teammate who later runs `poiesis update` must not lose the team's
+    // committed instructions. The shipped binary used to materialize every
+    // managed file from package canon alone, so the ownership precondition
+    // still passed (the mirror matched the hash `init` had recorded FROM the
+    // override) and one update overwrote the override with canon while
+    // re-baselining the manifest record onto those bytes — reported as a clean
+    // `doctor`. Asserted through the packaged CLI, and REPEATED, because the
+    // first update is where a defect can hide behind the second.
+    const { author } = await publishedTeam();
+    const clone = await freshClone(author);
+    expect(
+      (
+        await poiesis(
+          clone.root,
+          "init",
+          "--config",
+          join(clone.root, TEAM_PROFILE_CONFIG_PATH),
+          "--allow-fixtures",
+        )
+      ).exitCode,
+    ).toBe(0);
+
+    const agent = join(clone.root, ".opencode", "agents", "poiesis-worker.md");
+    const overridePath = join(clone.root, TEAM_PROFILE_OVERRIDES_DIRECTORY, "poiesis-worker.md");
+    const override = await readFile(overridePath, "utf8");
+    // The premise: this projection is override-derived, not package canon.
+    expect(await readFile(agent, "utf8")).toBe(override);
+
+    for (const round of [1, 2]) {
+      const updated = await poiesis(clone.root, "update");
+      expect(updated.exitCode, `${round}: ${updated.stderr}`).toBe(0);
+
+      // The committed instruction survived, and ownership still describes it.
+      expect(await readFile(agent, "utf8")).toBe(override);
+      const manifest = json(await readFile(join(clone.root, ".poiesis", "manifest.json"), "utf8")) as {
+        files: Array<{ path: string; hash: string }>;
+      };
+      expect(manifest.files.find((file) => file.path === ".opencode/agents/poiesis-worker.md")?.hash).toBe(
+        hashContent(override),
+      );
+      // Convergence: nothing drifted into a doctor failure.
+      const doctor = await poiesis(clone.root, "doctor");
+      expect(doctor.exitCode, `${round}: ${doctor.stderr}`).toBe(0);
+    }
+
+    // The shared source is Author content throughout: never rewritten, never
+    // claimed as a Poiesis-owned mirror, still untracked-but-shareable.
+    expect(await readFile(overridePath, "utf8")).toBe(override);
+    expect(await ignored(clone.root, ".opencode/agents/poiesis-worker.md")).toBe(true);
+    expect(await ignored(clone.root, TEAM_PROFILE_OVERRIDES_DIRECTORY + "/poiesis-worker.md")).toBe(false);
+  }, 300_000);
 
   it("refuses to hydrate from a configuration the committed profile contradicts", async () => {
     const { author } = await publishedTeam();

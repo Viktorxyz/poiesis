@@ -74,7 +74,8 @@ import {
 } from "./receipt.js";
 import { installDefaultSkills } from "./skills.js";
 import { refreshIgnoreBlockRecord } from "./install-mode.js";
-import { templateMappings } from "./templates.js";
+import { POIESIS_GENERATED_AGENT_PATHS, templateMappings } from "./templates.js";
+import { assertTeamOverridesUnchanged, readTeamOverrides, type TeamOverride } from "./team-profile.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
@@ -416,6 +417,26 @@ async function runLockedUpdateTransaction(
   // `hashContent(file.content)` and is captured BEFORE `atomicWrite`
   // runs so the rollback comparison is a function of what we wrote,
   // not what the kernel happened to leave on disk afterwards.
+  //
+  // Spec #190 / ticket #197 — Team/shared. An update reconciles the
+  // installation it finds, so it has to read the SAME shared source `init`
+  // hydrated from: package canon plus the project's own instruction / role
+  // overrides. Reading canon alone passed the ownership precondition anyway
+  // (the mirror on disk matched the hash `init` recorded FROM the override),
+  // so the transaction silently overwrote a project-created projection with
+  // package canon and re-baselined the manifest record onto those bytes —
+  // destroying committed team intelligence with a clean doctor verdict.
+  //
+  // The read happens BEFORE any content is computed, so every hash this
+  // transaction derives — the write identity, the journal entry, and the next
+  // manifest's record — describes the override-derived bytes that are actually
+  // on disk afterwards. It is the SAME seam `init` and `doctor` use, so the
+  // unsafe-source refusal cannot drift between hydration and reconcile, and a
+  // private installation (or a team installation with no overrides) reaches
+  // none of this: `readTeamOverrides` is never called for it.
+  const teamOverrides: readonly TeamOverride[] =
+    manifest.mode === "team" ? await readTeamOverrides(resolvedRoot, POIESIS_GENERATED_AGENT_PATHS) : [];
+  const overridden = new Map(teamOverrides.map((override) => [override.destination, override.content]));
   const { readTemplate } = await import("./templates.js");
   const { serializeConfig } = await import("./config.js");
   const materialized: Array<{ path: string; kind: "canonical" | "generated"; provenance: "package" | "projection" | "config"; content: string }> = [];
@@ -424,7 +445,7 @@ async function runLockedUpdateTransaction(
       path: mapping.destination,
       kind: mapping.kind,
       provenance: mapping.kind === "canonical" ? "package" : "projection",
-      content: await readTemplate(mapping.source),
+      content: overridden.get(mapping.destination) ?? (await readTemplate(mapping.source)),
     });
   }
   materialized.push({ path: ".poiesis/config.jsonc", kind: "generated", provenance: "config", content: serializeConfig(config) });
@@ -510,6 +531,27 @@ async function runLockedUpdateTransaction(
     //    hash-gated rollback apply uniformly. The preimage captured by
     //    `journal.capture` is the EXACT preimage bytes; the rollback
     //    restores them byte-for-byte.
+    //
+    //    Spec #190 / ticket #197 — the shared override source is re-validated
+    //    HERE, immediately before the first projection write and before any
+    //    write at all. That placement is what makes the refusal free of a
+    //    partial rewrite: there is nothing yet for the journal to restore, so
+    //    "stale project content was never projected" is mechanical rather than
+    //    a rollback that had to be trusted.
+    //
+    //    Gated on the MODE, not on the set being non-empty. An EMPTY set is
+    //    exactly the state where an override ADDED mid-run would otherwise be
+    //    invisible — there is no earlier file whose digest moved — so gating on
+    //    it would leave the most damaging race unguarded. A private
+    //    installation still never reaches the read, so its behaviour is
+    //    unchanged.
+    if (manifest.mode === "team") {
+      await assertTeamOverridesUnchanged({
+        root: resolvedRoot,
+        projectionDestinations: POIESIS_GENERATED_AGENT_PATHS,
+        observed: teamOverrides,
+      });
+    }
     for (const file of materialized) {
       const destination = join(resolvedRoot, file.path);
       const entry = journal.entries.find((candidate) => candidate.path === destination);
