@@ -201,6 +201,27 @@ const forbiddenFunctions = [
   "readTeamOverrides",
   "readTeamProfileConfig",
   "teamProfileFileHash",
+  // Spec #190 / ticket #193: the Private <-> Team TRANSITION surface stays
+  // CLI- and runtime-internal for the same reason. Promoting it would freeze
+  // the transition PLAN shape, the manifest-derived ignore classification, and
+  // the shared-profile directory bookkeeping into a public API — and a public
+  // "change my sharing mode" helper would let a library caller reach the
+  // `.gitignore` rewrite without the receipt authentication, doctor gate, and
+  // rollback that `poiesis update --config` provides. The transition is reached
+  // by stating a different `mode` in a config handed to `update --config`, and
+  // by nothing else. `assertOpenCodeConfigNotTracked` is exported from
+  // `maintenance.ts` for that transaction's reuse of the init-side private-
+  // mode guard and must not reach the package root either.
+  // `managedIgnoreContextFromManifest` is deliberately NOT exported at all:
+  // the manifest-derived ignore classification is only ever consumed as part of
+  // a plan, and a separately callable classifier would let a caller build an
+  // ignore policy without the block, block-identity, and portability checks.
+  "planInstallModeTransition",
+  "managedIgnoreContextFromManifest",
+  "assertTransitionCaptureIdentity",
+  "ensureTransitionProfileParents",
+  "removeEmptyTransitionDirectories",
+  "assertOpenCodeConfigNotTracked",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache
@@ -416,6 +437,12 @@ const forbiddenTypes = [
   "RefreshLockContent",
   "RefreshGuardContent",
   "REFRESH_LOCK_CONTENT_VERSION",
+  // Spec #190 / ticket #193: the transition PLAN shape and the shared-profile
+  // file bookkeeping type stay internal with the read-only planner that owns
+  // them, so the plan a caller receives can never be constructed outside the
+  // transaction that wrote it.
+  "InstallModeTransitionPlan",
+  "TransitionProfileFile",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

@@ -25,6 +25,24 @@
  * gone. That makes a config no-op a genuine whole-project no-op again:
  * `setModel` reaching an already-current value now returns without any
  * second surface to reconcile, and the journal drives the only writes.
+ *
+ * Spec #190 / ticket #193 — this transaction is ALSO the explicit
+ * `Private <-> Team` transition surface. `mode` is part of the config an
+ * operator hands to `poiesis update --config`, so stating a different one
+ * IS the explicit request, and there is no second command to learn and no
+ * hidden activation to discover. Two rules make that coherent:
+ *
+ *   - a config that OMITS `mode` never drops the installed one. An install
+ *     that chose a sharing policy keeps it through an unrelated config
+ *     update, so `.poiesis/config.jsonc` can never silently disagree with
+ *     the manifest and the block it was written with;
+ *   - a config that STATES a different `mode` transitions the whole sharing
+ *     surface — the one managed `.gitignore` block and, going to `team`, the
+ *     shareable project profile — inside THIS transaction, so it is receipt
+ *     authenticated, journal-captured, doctor-gated, and rolled back by the
+ *     same machinery as every other owned byte. Planning lives in
+ *     `src/install-mode-transition.ts` and is read-only; this file owns the
+ *     writes.
  */
 import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
@@ -34,11 +52,20 @@ import { exists, readUtf8 } from "./fs.js";
 import { hashContent } from "./hash.js";
 import { assertManifestAuthority, nextAdapterPatches } from "./authority.js";
 import {
+  assertTransitionCaptureIdentity,
+  ensureTransitionProfileParents,
+  planInstallModeTransition,
+  removeEmptyTransitionDirectories,
+  type InstallModeTransitionPlan,
+} from "./install-mode-transition.js";
+import { GITIGNORE_RELATIVE_PATH } from "./install-mode.js";
+import {
   assertOwnershipReceipt,
   ownershipReceiptLocation,
   type OwnershipReceipt,
 } from "./receipt.js";
 import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
+import { POIESIS_GENERATED_AGENT_PATHS } from "./templates.js";
 import {
   desiredOpenCodePatches,
   OPENCODE_ADAPTER_VERSION,
@@ -137,6 +164,29 @@ export interface UpdateTransactionHooks {
    * `dist/index.d.ts`.
    */
   injectDriftedOnWrittenContent?: (defaultContent: string) => string;
+  /**
+   * Spec #190 / ticket #193 — fires immediately BEFORE the transition
+   * writes its first byte (the relabelled `.gitignore` block). Tests that
+   * need a concurrent writer to land inside the transaction's window use
+   * this to prove the bounded journal detects the replacement and preserves
+   * the foreign bytes. Production callers leave it unset.
+   */
+  preModeTransitionApply?: () => void | Promise<void>;
+  /**
+   * Spec #190 / ticket #193 — fires immediately AFTER the `.gitignore` block
+   * is written and BEFORE the shared profile files are created. A test that
+   * makes the profile appear here exercises "this file was replaced while
+   * the transaction ran" against a file the journal captured as ABSENT.
+   */
+  postModeTransitionGitignore?: () => void | Promise<void>;
+  /**
+   * Spec #190 / ticket #193 — fires immediately AFTER every transition
+   * write completes and BEFORE the manifest is advanced. Throwing here is
+   * the deterministic way to prove the rollback restores the relabelled
+   * `.gitignore` byte-for-byte and removes the profile files this run
+   * created, while the manifest and receipt never advance.
+   */
+  postModeTransitionApply?: () => void | Promise<void>;
 }
 
 /**
@@ -361,6 +411,7 @@ async function runLockedUpdateConfigTransaction(
   // into `maintenance.ts`. Types only (`UpdateResult`) are imported
   // statically and erased at compile time.
   const {
+    assertOpenCodeConfigNotTracked,
     assertResolvedConfig,
     autoResolveConfigDefaults,
     doctor,
@@ -420,7 +471,19 @@ async function runLockedUpdateConfigTransaction(
   //    content). Discovered defaults are persisted because this is the value
   //    that is written to `.poiesis/config.jsonc`, projected onto the OpenCode
   //    config, and baked into the new manifest entry.
-  const { config: resolvedConfigWithDefaults } = await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+  const { config: autoResolvedConfig } = await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+  // Spec #190 / ticket #193 — the installed mode is CARRIED FORWARD when the
+  // proposed config omits it. `mode` is optional in the schema so every
+  // pre-Spec #190 config still parses, which means an unrelated config update
+  // could otherwise write a config that no longer states the sharing mode its
+  // manifest and its `.gitignore` block were written with. The Author picks a
+  // mode once, explicitly; they do not re-pick it every time they change a
+  // model id. Only an EXPLICIT different mode transitions the installation.
+  const effectiveMode = autoResolvedConfig.mode ?? manifest.mode;
+  const resolvedConfigWithDefaults: ResolvedPoiesisConfig = {
+    ...autoResolvedConfig,
+    ...(effectiveMode === undefined ? {} : { mode: effectiveMode }),
+  };
 
   // 4. Complete environment validation BEFORE the first write. The narrowest
   //    internal helpers from `init` are reused so a missing model, an
@@ -512,6 +575,54 @@ async function runLockedUpdateConfigTransaction(
     patches: desiredOpenCodeProjectionPatches,
   });
 
+  // 6a. Spec #190 / ticket #193 — decide whether an EXPLICIT sharing mode was
+  // requested, and refuse the request this transaction cannot honour.
+  //
+  // Read the candidate's OWN mode rather than the carry-forwarded one. The
+  // candidate is what the Author said; `effectiveMode` is what this run will
+  // write, and conflating the two is what previously let a config land that
+  // the manifest and the `.gitignore` block never agreed with.
+  //
+  // An EXPLICIT mode against an installation that records none is refused, not
+  // absorbed. A pre-Spec #190 manifest states no mode, owns no block, and has
+  // no shared profile, so writing `mode` into `.poiesis/config.jsonc` here
+  // would leave the installation stating three different things: a mode in the
+  // config, no mode in the manifest, and a block that names no sharing policy
+  // at all. The next reader would have to guess which one was meant, and
+  // `uninstall` would have a config mode with nothing to reverse. Giving that
+  // installation a mode is a migration decision with its own authority
+  // questions, so this refuses and names what is missing instead — the same
+  // `INSTALL_MODE_TRANSITION_UNSUPPORTED` the planner raises for an
+  // unblockable installation, because it is the same condition seen from the
+  // cheaper side.
+  //
+  // The omission case is untouched: a candidate that says nothing about
+  // sharing is an ordinary config update, and `effectiveMode` stays undefined
+  // so a legacy installation keeps behaving exactly as it did.
+  const requestedMode = autoResolvedConfig.mode;
+  const installedMode = manifest.mode;
+  const transitionRequested = requestedMode !== undefined && requestedMode !== installedMode;
+  if (transitionRequested && installedMode === undefined) {
+    throw new PoiesisError(
+      "INSTALL_MODE_TRANSITION_UNSUPPORTED",
+      `This Poiesis installation records no sharing mode, so \`${requestedMode}\` cannot be applied to it. Re-install with \`poiesis init\` and choose private or team, or omit \`mode\` from this config to update the installation without changing how it shares`,
+      { path: ".poiesis/manifest.json", requested: requestedMode, recorded: null },
+    );
+  }
+  //
+  // Going to `private` re-runs the tracked-OpenCode-config guard `init`
+  // applies, and it runs HERE rather than with the rest of the plan because it
+  // is the cheapest possible statement of the rule and the one that decides
+  // whether this transition is coherent at all: a private installation must
+  // not leave the generated projections invisible to ordinary OpenCode, and
+  // patching a tracked config would put that generated edit into shared
+  // project history. A team installation that has since committed its config
+  // therefore cannot quietly become private. The check belongs to the TARGET
+  // mode, not to the act of installation, which is why it is reused here.
+  if (transitionRequested && requestedMode === "private") {
+    await assertOpenCodeConfigNotTracked(resolvedRoot, openCodeConfigPath, "private");
+  }
+
   // 7. No-op detection compares both captured serialized files directly with
   //    the complete intended payloads. A pre-existing OpenCode config is owned
   //    only through manifest config patches, so it deliberately has no
@@ -535,7 +646,12 @@ async function runLockedUpdateConfigTransaction(
     poiesisConfigBytesMatch,
     openCodeBytesMatch,
   );
-  if (poiesisConfigBytesMatch && openCodeBytesMatch) {
+  // Spec #190 / ticket #193 — a pending mode transition is never a no-op, even
+  // if the config and OpenCode projection happen to serialize identically. The
+  // `.gitignore` block and the manifest still have to advance, so returning the
+  // existing manifest here would leave the installation stating two different
+  // sharing modes at once.
+  if (poiesisConfigBytesMatch && openCodeBytesMatch && !transitionRequested) {
     // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
     // so tests can deterministically fail the gate (e.g. by toggling a
     // doctor-failure environment variable) and prove the extracted
@@ -571,6 +687,23 @@ async function runLockedUpdateConfigTransaction(
   //    `validateOpenCodeConfigPayload`'s preexisting error code on rejection.
   await validateOpenCodeConfigPayload(preflightSerialized);
 
+  // 8a. Spec #190 / ticket #193 — plan the explicit Private <-> Team
+  // transition. Deliberately the LAST read-only step before the journal opens:
+  // planning and capturing are separate observations, and the narrower the gap
+  // between them, the less state the plan can be stale about. Everything the
+  // transition refuses — an edited / missing / mislabelled / duplicated /
+  // malformed block, a non-portable profile, a contradicting committed profile
+  // — surfaces from this read-only step with the offending path in its details.
+  const transition: InstallModeTransitionPlan | undefined = transitionRequested
+    ? await planInstallModeTransition({
+        root: resolvedRoot,
+        manifest,
+        to: requestedMode!,
+        resolvedConfig: resolvedConfigWithDefaults,
+        generatedAgentPaths: POIESIS_GENERATED_AGENT_PATHS,
+      })
+    : undefined;
+
   // 9. Snapshot the manifest preimage for fail-closed rollback. Reading the
   //    manifest is the last read-only step; everything from step 10 onward
   //    mutates owned bytes. The snapshot read happens AFTER the schema
@@ -580,14 +713,46 @@ async function runLockedUpdateConfigTransaction(
   const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-  const journal = new ArtifactJournal(4);
+  // Spec #190 / ticket #193 — the limit covers the transition surface too:
+  // poiesis config, OpenCode config, `.gitignore`, up to two shared profile
+  // files, the manifest, and the receipt. Captured in EXACT write order, so
+  // the journal's reverse-order rollback is reverse write order and the
+  // shared profile files a failed transition created are removed rather than
+  // left behind next to a manifest that never advanced.
+  const journal = new ArtifactJournal(8);
   const poiesisConfigArtifact = await journal.capture(poiesisConfigPath, "whole-file");
   const openCodeArtifact = await journal.capture(
     openCodeConfigPath,
     manifest.files.some((file) => file.path === openCodeRelativePath) ? "whole-file" : "patch",
   );
+  const gitignoreArtifact = transition === undefined
+    ? undefined
+    : await journal.capture(join(resolvedRoot, GITIGNORE_RELATIVE_PATH), "whole-file");
+  const profileArtifacts: Array<{ path: string; entry: ArtifactJournalEntry }> = [];
+  for (const file of transition?.createProfileFiles ?? []) {
+    profileArtifacts.push({ path: file.path, entry: await journal.capture(join(resolvedRoot, file.path), "whole-file") });
+  }
   const manifestArtifact = await journal.capture(manifestPath, "whole-file");
   const receiptArtifact = await journal.capture(receiptPath, "whole-file");
+  if (transition !== undefined && gitignoreArtifact !== undefined) {
+    // Bind the plan to what the journal actually captured: the `.gitignore`
+    // must still be the content the splice was rendered from, and a shared
+    // profile the plan decided to create must still be absent. Without this,
+    // a writer that lands in the window between planning and capturing would
+    // be silently overwritten by a decision made about different bytes.
+    assertTransitionCaptureIdentity(transition, {
+      gitignorePreimage: gitignoreArtifact.preimage,
+      profileCaptures: profileArtifacts.map((artifact) => ({
+        path: artifact.path,
+        physicalExists: artifact.entry.physicalExists,
+      })),
+    });
+  }
+  // The profile's parent directory is not a journal entry (the journal owns
+  // file preimages), so the transition records which directories it created
+  // and the catch block removes the ones still empty. Deliberated LAST, between
+  // the drift check and the `try`, so the catch block is guaranteed to be
+  // reachable for anything that can leave one behind.
   const expectedSnapshots: Array<[ArtifactJournalEntry, Buffer]> = [
     [poiesisConfigArtifact, currentConfigBytes],
     [openCodeArtifact, openCodeConfigCurrentBytes],
@@ -600,6 +765,10 @@ async function runLockedUpdateConfigTransaction(
     }
   }
   await hooks.onJournalReady?.(journal.entries);
+  const createdProfileDirectories =
+    transition === undefined || transition.createProfileFiles.length === 0
+      ? []
+      : await ensureTransitionProfileParents(resolvedRoot);
 
   // Spec #133 / ticket #137: the Author-owned `package.json` state.
   // Declared here (before the try) so the catch block can close over the
@@ -627,6 +796,32 @@ async function runLockedUpdateConfigTransaction(
     }
     const appliedPatches = projectedOpenCodePatches;
     const openCodeWrittenHash = hashContent(preflightSerialized);
+
+    // 11b. Spec #190 / ticket #193 — apply the planned transition through the
+    //      same bounded journal every other owned byte uses. `.gitignore` is
+    //      spliced, not rewritten: the plan already proved the recorded block
+    //      is unchanged and produced content that preserves every byte outside
+    //      it, and the journal's pre-write identity guard closes the window
+    //      between that proof and this write against a concurrent writer.
+    if (transition !== undefined) {
+      await hooks?.preModeTransitionApply?.();
+      if (gitignoreArtifact !== undefined) {
+        await journal.replace(gitignoreArtifact, transition.gitignoreContent);
+      }
+      await hooks?.postModeTransitionGitignore?.();
+      // Shared profile files are created only where they are absent, so a
+      // transition never overwrites Author-committed project intelligence.
+      for (const profile of transition.createProfileFiles) {
+        const artifact = profileArtifacts.find((candidate) => candidate.path === profile.path);
+        if (artifact === undefined) {
+          throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the shared profile entry", {
+            path: profile.path,
+          });
+        }
+        await journal.replace(artifact.entry, profile.content);
+      }
+      await hooks?.postModeTransitionApply?.();
+    }
 
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
@@ -670,6 +865,14 @@ async function runLockedUpdateConfigTransaction(
       }),
       skills: manifest.skills,
       configPatches: mergedPatches,
+      // Spec #190 / ticket #193 — an EXPLICIT mode change is the one thing an
+      // `update --config` may decide about sharing. Both keys already exist on
+      // the manifest the spread above carried (the planner refuses without
+      // them), so overriding them in place adds no new key and therefore
+      // cannot shift the canonical serialization key order the receipt digest
+      // is computed over. `ignoreBlock.hash` is the hash of the block this run
+      // actually wrote, so `uninstall` reverses exactly these bytes.
+      ...(transition === undefined ? {} : { mode: transition.to, ignoreBlock: transition.record }),
     };
     await hooks?.preManifestWrite?.();
     // Serialize nextManifest exactly once; derive the post-write identity
@@ -702,6 +905,13 @@ async function runLockedUpdateConfigTransaction(
     // 16. Exact rollback is journal-driven and always runs in reverse write
     //     order. Foreign replacements are preserved and reported explicitly.
     const diagnostics = await journal.rollback();
+    // Spec #190 / ticket #193 — the journal restored (or removed) every FILE
+    //     the transition touched, `.gitignore` included. A parent directory it
+    //     created for the shared profile is not a journal entry, so it is
+    //     removed here — deepest first, and only while still empty, which is
+    //     why a rollback can never delete project structure on the strength of
+    //     a bookkeeping list. Never able to fail the transaction it is undoing.
+    await removeEmptyTransitionDirectories(resolvedRoot, createdProfileDirectories);
     if (diagnostics.length > 0) {
       if (error instanceof PoiesisError) {
         error.details.incompleteRollback = diagnostics;

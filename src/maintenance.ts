@@ -934,8 +934,14 @@ function managedIgnoreLines(args: {
  * generated edit into the Author's shared history and quietly widen a
  * private installation into a shared one. An untracked config is fine —
  * it is local, and Poiesis's ownership of it stays reversible.
+ *
+ * Exported (but NOT re-exported from `src/index.ts`) because Spec #190 /
+ * ticket #193 reuses it as the guard on a `Team -> Private` TRANSITION,
+ * where the same reasoning applies to a config a team has since committed.
+ * The check belongs to the TARGET mode, not to the act of installation, so
+ * it must not be reachable only from `init`.
  */
-async function assertOpenCodeConfigNotTracked(root: string, configPath: string, mode: InstallMode): Promise<void> {
+export async function assertOpenCodeConfigNotTracked(root: string, configPath: string, mode: InstallMode): Promise<void> {
   if (!isInstallMode(mode) || mode !== "private") return;
   const relativePath = relative(root, configPath);
   if (!(await exists(configPath))) return;
