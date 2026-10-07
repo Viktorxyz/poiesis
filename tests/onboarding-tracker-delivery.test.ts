@@ -31,6 +31,7 @@
  *      tracker or delivery block keeps its legacy inference/generated-script
  *      behavior, and an ordinary update changes no recorded choice.
  */
+import { Buffer } from "node:buffer";
 import { chmod, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -202,7 +203,11 @@ class LinearScript {
     const operation = /^(?:query|mutation)\s+(\w+)/.exec(JSON.parse(request.body).query as string)?.[1] ?? "";
     const data = this.replies[operation];
     if (data === undefined) throw new Error(`unscripted Linear operation: ${operation}`);
-    return { status: 200, headers: {}, body: JSON.stringify({ data }) } satisfies LinearHttpResponse;
+    return {
+      status: 200,
+      headers: {},
+      body: { text: JSON.stringify({ data }), capturedBytes: Buffer.byteLength(JSON.stringify({ data }), "utf8"), truncated: false },
+    } satisfies LinearHttpResponse;
   };
 
   operations(): string[] {

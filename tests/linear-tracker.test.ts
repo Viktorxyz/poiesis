@@ -24,6 +24,7 @@
  *   5. SUPERSEDE — uses the existing metadata + comment + close
  *      semantics and never fabricates a native Linear relation.
  */
+import { Buffer } from "node:buffer";
 import { rm } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createTrackerAdapter } from "../src/adapters.js";
@@ -35,6 +36,7 @@ import {
   createLinearTrackerAdapter,
   verifyLinearTrackerAuthorized,
   verifyLinearTrackerConfigured,
+  type LinearBodyCapture,
   type LinearHttpRequest,
   type LinearHttpResponse,
   type LinearTimer,
@@ -242,13 +244,15 @@ class LinearScript {
       return {
         status: reply.status,
         headers: { ...reply.headers },
-        body: reply.body,
+        body: completeCapture(reply.body),
       } satisfies LinearHttpResponse;
     }
     return {
       status: 200,
       headers: {},
-      body: JSON.stringify({ data: reply.data ?? null, ...(reply.errors === undefined ? {} : { errors: reply.errors }) }),
+      body: completeCapture(
+        JSON.stringify({ data: reply.data ?? null, ...(reply.errors === undefined ? {} : { errors: reply.errors }) }),
+      ),
     } satisfies LinearHttpResponse;
   };
 
@@ -267,6 +271,18 @@ class LinearScript {
 function operationNameOf(request: LinearHttpRequest): string {
   const match = /^(?:query|mutation)\s+(\w+)/.exec(JSON.parse(request.body).query as string);
   return match?.[1] ?? "";
+}
+
+/**
+ * Ticket #167 — a scripted answer is a COMPLETE capture.
+ *
+ * A response body is no longer a bare string, because a string cannot say
+ * whether Poiesis holds all of it. A scripted reply is by construction a whole
+ * answer, so it says so — and a test that needs a cut one reaches for the
+ * seam in `tests/linear-response-bounds.test.ts` instead.
+ */
+function completeCapture(text: string): LinearBodyCapture {
+  return { text, capturedBytes: Buffer.byteLength(text, "utf8"), truncated: false };
 }
 
 /**
@@ -1900,7 +1916,11 @@ describe("the Linear adapter is reachable from the shipped surfaces", () => {
           operation === "PoiesisViewer"
             ? { viewer: { id: "user-1" } }
             : TEAM_PAGE([{ id: "team-eng", key: "ENG", name: "Engineering" }]);
-        return { status: 200, headers: {}, body: JSON.stringify({ data }) } satisfies LinearHttpResponse;
+        return {
+          status: 200,
+          headers: {},
+          body: completeCapture(JSON.stringify({ data })),
+        } satisfies LinearHttpResponse;
       },
     });
 

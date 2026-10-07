@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { PoiesisError, invariant } from "./errors.js";
 import {
   assertKind,
@@ -10,6 +11,8 @@ import {
   type TrackerItemKind,
   type TrackerMetadata,
 } from "./tracker-item.js";
+import { completeUtf8PrefixLength } from "./utf8-prefix.js";
+import { sanitizeSubprocessOutput } from "./url-userinfo.js";
 import type {
   CreateSpecInput,
   CreateTicketInput,
@@ -58,6 +61,38 @@ import type {
  * read is retried, an idempotent create re-probes the identity it already
  * used, and a non-idempotent mutation is reported as the ambiguity it is
  * rather than replayed.
+ *
+ * ---------------------------------------------------------------------------
+ * BOUNDED RESPONSE (ticket #167)
+ * ---------------------------------------------------------------------------
+ *
+ * The transport ended at `await response.text()`, so an answer of ANY size
+ * became a resident string before a single byte of it was judged: the only
+ * bound was on the diagnostic built afterwards, which arrives after the whole
+ * document has already been read, held, and handed to the redaction rule. The
+ * ceiling now lives where the bytes arrive. The body is read delivery by
+ * delivery, the first byte past the ceiling CANCELS the transfer, and the text
+ * kept is the longest valid UTF-8 PREFIX of what was received.
+ *
+ * `Content-Length` is deliberately never consulted. It is a claim by the very
+ * party being bounded, and a bound that trusts it is not a bound: a header
+ * that says 12 bytes must not make Poiesis read an unbounded body, and a
+ * chunked answer with no header at all must be bounded exactly the same way.
+ *
+ * A 2xx whose capture was cut is `LINEAR_RESPONSE_TOO_LARGE` and is never
+ * parsed and never retried — a cut body is not malformed JSON, it is Poiesis'
+ * own ceiling, and the same answer would be cut again. A MUTATION that reached
+ * Linear and whose answer was cut is `LINEAR_MUTATION_UNCERTAIN` with
+ * `reason: response-too-large`, because the work may or may not have landed
+ * and the answer that would have said so is the one Poiesis refused to read.
+ *
+ * Everything Poiesis echoes about a failure — a transport exception's
+ * message, an HTTP body, a GraphQL `message` / `code` — goes through ONE
+ * pipeline: the bounded capture, then the existing URL-userinfo rule told the
+ * TRUTH about whether the text was cut, then exact credential replacement,
+ * then a final 8 KiB bound. A SUCCESSFUL `data` payload is returned
+ * byte-for-byte: it is the Author's own content coming back, not an upstream
+ * diagnostic, and rewriting it would corrupt the item Poiesis just read.
  */
 
 /** The official Linear GraphQL endpoint. Never proxied, never overridden by config. */
@@ -85,7 +120,42 @@ export interface LinearHttpRequest {
 export interface LinearHttpResponse {
   readonly status: number;
   readonly headers: Readonly<Record<string, string>>;
-  readonly body: string;
+  /**
+   * Ticket #167 — the BOUNDED capture, never a bare string.
+   *
+   * A `string` cannot say whether it is the whole answer, so a transport
+   * that returned one made "Poiesis could not read this" indistinguishable
+   * from "there was nothing to refuse": the truncation would be invisible at
+   * the one place that has to act on it. The three fields are the whole
+   * contract — what was read, how much of it the text really carries, and
+   * whether anything was dropped.
+   */
+  readonly body: LinearBodyCapture;
+}
+
+/** What one response capture actually holds. */
+export interface LinearBodyCapture {
+  /** The longest valid UTF-8 PREFIX of the bytes received, and nothing else. */
+  readonly text: string;
+  /** The bytes `text` really carries — the ceiling, never a claimed length. */
+  readonly capturedBytes: number;
+  /** True when the ceiling or an undecodable byte dropped something. */
+  readonly truncated: boolean;
+}
+
+/**
+ * Ticket #167 — the ONE thing a capture needs from a response body.
+ *
+ * Deliberately structural rather than the platform's `Response["body"]`: the
+ * capture is a real read against a reader and a cancel, and a test can
+ * therefore hand it a reader whose deliveries, cut, and cancel behavior it
+ * owns. Nothing here is a production capability a caller can widen.
+ */
+export interface LinearResponseBodyStream {
+  getReader(): {
+    read(): Promise<{ readonly done: boolean; readonly value?: Uint8Array | undefined }>;
+    cancel(reason?: unknown): Promise<unknown>;
+  };
 }
 
 export type LinearTransport = (request: LinearHttpRequest) => Promise<LinearHttpResponse>;
@@ -238,8 +308,82 @@ const defaultTransport: LinearTransport = async (request) => {
   response.headers.forEach((value, key) => {
     headers[key.toLowerCase()] = value;
   });
-  return { status: response.status, headers, body: await response.text() };
+  return { status: response.status, headers, body: await captureLinearResponseBody(response.body) };
 };
+
+/**
+ * Ticket #167 — the ONE bounded body capture.
+ *
+ * `response.text()` reads until the peer stops sending, so the ceiling has to
+ * be enforced on the WIRE rather than on the finished string: a bound applied
+ * afterwards is applied to a document that is already fully resident, which is
+ * the memory cost the ceiling exists to refuse. So the body is read delivery
+ * by delivery, the first byte past the ceiling stops the read, and the reader
+ * is CANCELLED so the bytes Poiesis already refused are not queued behind a
+ * decision it has made. Cancelling is also what releases the socket, rather
+ * than abandoning a transfer that is still running.
+ *
+ * The text is the longest valid UTF-8 PREFIX of the bytes received (see
+ * `src/utf8-prefix.ts`). A ceiling can stop inside a code point and a peer can
+ * simply send a bad byte, and neither may become a U+FFFD inside a document
+ * Poiesis will quote back to an Author.
+ *
+ * A body that is absent (204, HEAD) is an empty COMPLETE capture: there is
+ * nothing to refuse and nothing to parse.
+ */
+export async function captureLinearResponseBody(
+  body: LinearResponseBodyStream | null,
+): Promise<LinearBodyCapture> {
+  if (body === null) return { text: "", capturedBytes: 0, truncated: false };
+  const reader = body.getReader();
+  const chunks: Buffer[] = [];
+  let captured = 0;
+  let truncated = false;
+  let drained = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) {
+        drained = true;
+        break;
+      }
+      if (value === undefined || value.byteLength === 0) continue;
+      // The ceiling is a fact about the bytes Poiesis ACCEPTED, so `remaining`
+      // is recomputed on every delivery and is the only thing that can end this
+      // loop: a capture that kept whole deliveries would grow without limit,
+      // would never reach `done`, and would read a peer that never stops
+      // forever — a bound that never fires is not a bound.
+      const remaining = LINEAR_MAX_RESPONSE_BYTES - captured;
+      if (value.byteLength > remaining) {
+        // A delivery that crosses the ceiling is cut AT it. Only the part under
+        // it is retained: the bytes past it are exactly what the ceiling
+        // refuses, and keeping them is the memory cost this ticket removed.
+        if (remaining > 0) {
+          chunks.push(Buffer.from(value.subarray(0, remaining)));
+          captured += remaining;
+        }
+        truncated = true;
+        break;
+      }
+      // `>` and not `>=`, and a body that is EXACTLY the ceiling is COMPLETE:
+      // nothing was refused, so calling it truncated would refuse to parse a
+      // legal answer and train an operator to ignore the refusal.
+      chunks.push(Buffer.from(value));
+      captured += value.byteLength;
+    }
+  } finally {
+    if (!drained) {
+      // The rest of the answer is exactly what the ceiling refuses. Leaving
+      // the reader open keeps a transfer running for bytes nobody will read,
+      // and a cancel that fails changes nothing about the capture above.
+      await reader.cancel().catch(() => undefined);
+    }
+  }
+  const received = Buffer.concat(chunks, captured);
+  const prefix = completeUtf8PrefixLength(received);
+  if (prefix < received.length) truncated = true;
+  return { text: received.subarray(0, prefix).toString("utf8"), capturedBytes: prefix, truncated };
+}
 
 /** The GraphQL operation name, used to label every typed failure. */
 function operationOf(document: string): string {
@@ -286,10 +430,18 @@ export interface LinearProbeBudget {
 type LinearAttempt =
   | { readonly kind: "data"; readonly data: Record<string, unknown> }
   | { readonly kind: "rate-limited"; readonly status: number; readonly retryAfterMs: number }
-  | { readonly kind: "server-error"; readonly status: number; readonly body: string }
+  | { readonly kind: "server-error"; readonly status: number; readonly body: string; readonly bodyTruncated: boolean }
   | { readonly kind: "transport"; readonly cause: string; readonly message: string }
   | { readonly kind: "timeout"; readonly timeoutMs: number }
   | { readonly kind: "probe-failed"; readonly cause: string }
+  /**
+   * Ticket #167 — a 2xx answer whose capture was cut by the ceiling.
+   *
+   * It is neither data nor a refusal: Linear answered, and Poiesis holds a
+   * prefix of the answer. Parsing that prefix would blame Linear's encoding
+   * for Poiesis' own ceiling, so the attempt is classified and never parsed.
+   */
+  | { readonly kind: "response-too-large"; readonly status: number; readonly capturedBytes: number }
   | { readonly kind: "rejected"; readonly error: PoiesisError };
 
 /**
@@ -335,7 +487,10 @@ async function attemptOnce(
     return {
       kind: "transport",
       cause: error instanceof Error ? error.name : "unknown",
-      message: redact(seams, error instanceof Error ? error.message : String(error)),
+      // A transport exception is the ONE diagnostic nobody chose to be safe:
+      // its text is built by the socket layer and routinely carries the URL
+      // that failed, and a proxy URL carries a credential in its userinfo.
+      message: diagnose(seams, error instanceof Error ? error.message : String(error), false).text,
     };
   } finally {
     // The deadline is taken back the moment the attempt is over, so a settled
@@ -369,21 +524,38 @@ async function attemptOnce(
     };
   }
   if (response.status >= 500) {
-    return { kind: "server-error", status: response.status, body: redact(seams, response.body) };
+    return serverError(seams, operation, response);
   }
   if (response.status < 200 || response.status >= 300) {
+    const body = diagnose(seams, response.body.text, response.body.truncated);
     return {
       kind: "rejected",
       error: new PoiesisError("LINEAR_HTTP_ERROR", `Linear request ${operation} failed with HTTP ${response.status}`, {
         operation,
         status: response.status,
-        body: redact(seams, response.body),
+        body: body.text,
+        // Only when it happened, and it means one thing: this is not the whole
+        // body. A flag that is always present is a flag an operator learns to
+        // skip, and a body that stopped mid-sentence is evidence about the
+        // answer, not about the refusal.
+        ...(response.body.truncated || body.truncated ? { bodyTruncated: true } : {}),
       }),
+    };
+  }
+  if (response.body.truncated) {
+    // Ticket #167. The status says Linear answered, and the capture says
+    // Poiesis does not hold the answer. Parsing the prefix would report a
+    // syntax error for a body that is not malformed but refused, and the
+    // reason has to name the ceiling rather than blame Linear's encoding.
+    return {
+      kind: "response-too-large",
+      status: response.status,
+      capturedBytes: response.body.capturedBytes,
     };
   }
   let payload: unknown;
   try {
-    payload = JSON.parse(response.body);
+    payload = JSON.parse(response.body.text);
   } catch (error) {
     return {
       kind: "rejected",
@@ -408,14 +580,7 @@ async function attemptOnce(
       kind: "rejected",
       error: new PoiesisError("LINEAR_GRAPHQL_ERROR", `Linear rejected the ${operation} operation`, {
         operation,
-        errors: payload.errors.map((entry) => ({
-          message: redact(seams, 
-            isRecord(entry) && typeof entry.message === "string" ? entry.message : String(entry),
-          ),
-          ...(isRecord(entry) && isRecord(entry.extensions) && typeof entry.extensions.code === "string"
-            ? { code: entry.extensions.code }
-            : {}),
-        })),
+        ...graphqlErrorDetails(seams, payload.errors, response.body.truncated),
       }),
     };
   }
@@ -493,6 +658,16 @@ async function executeWith(
     const outcome = await attemptOnce(seams, document, variables, budget);
     if (outcome.kind === "data") return outcome.data;
     if (outcome.kind === "rejected") throw outcome.error;
+    if (outcome.kind === "response-too-large") {
+      // Ticket #167 — the ceiling is not a transient condition, so no mode
+      // retries it: the same answer is the same size. What differs is what
+      // the refusal MEANS. A read changed nothing and is simply too large to
+      // read. A mutation REACHED Linear, and the one document that would have
+      // said whether the work landed is the document Poiesis refused to
+      // parse — so the outcome is the ambiguity it is, reported with the
+      // inspect-in-Linear instruction and never replayed.
+      throw mode === "read" ? responseTooLarge(operation, outcome) : uncertainMutation(operation, outcome);
+    }
     if (!retryable) throw uncertainMutation(operation, outcome);
     // A timed-out attempt is retried like any other transient failure, but not
     // once the operation itself is out of time: the deadline is the outer
@@ -528,6 +703,101 @@ function redact(seams: ResolvedSeams, value: string): string {
     readCredential(seams.env, LINEAR_API_KEY_VARIABLE) ??
     readCredential(seams.env, LINEAR_OAUTH_TOKEN_VARIABLE);
   return credential === null ? value : value.split(credential).join("[redacted]");
+}
+
+/** One diagnostic, and whether the final bound cut it. */
+interface LinearDiagnostic {
+  readonly text: string;
+  readonly truncated: boolean;
+}
+
+/**
+ * Ticket #167 — the ONE pipeline every echoed byte goes through.
+ *
+ * The order is the whole point and is not interchangeable:
+ *
+ *   1. the input is already a BOUNDED capture (the response ceiling, or an
+ *      exception message small enough that bounding it is a formality), so no
+ *      caller can hand this function an unbounded document;
+ *   2. the existing URL-userinfo rule runs FIRST, because it is the only
+ *      step that knows about structure, and a later cut through
+ *      `scheme://authority` would leave exactly the partial userinfo the rule
+ *      exists to withhold. It is told the TRUTH about the capture: a text the
+ *      ceiling cut ends inside a possible authority, and the rule already
+ *      fails closed on exactly that case. It is NOT told about the final
+ *      bound, because that cut is not something it can be honest about: the
+ *      sanitizer sees the whole text, where the authority may well be closed,
+ *      and a capture flag it cannot verify is a guess;
+ *   3. exact credential replacement runs on what survives the redaction —
+ *      a credential outside any URL is still a credential, and a redactor
+ *      that only understood URLs would miss every occurrence;
+ *   4. the final bound runs LAST, so nothing after it can lengthen a
+ *      diagnostic past the ceiling it exists to enforce. It is also safe
+ *      after the redaction rather than before it: a cut applied to text that
+ *      already carries no credential can only shorten it, so the only
+ *      credential that could survive a cut is one the cut REVEALED — and
+ *      revealing it is exactly what ordering the bound first would allow.
+ *
+ * A SUCCESSFUL `data` payload never comes here. It is the Author's own
+ * content coming back, not a diagnostic about a failure, and rewriting it
+ * would corrupt the item Poiesis just read.
+ */
+function diagnose(seams: ResolvedSeams, raw: string, captureTruncated: boolean): LinearDiagnostic {
+  return boundDiagnostic(redact(seams, sanitizeSubprocessOutput(raw, { truncated: captureTruncated })));
+}
+
+/**
+ * The final bound. The cut lands on a COMPLETE code point, so a diagnostic
+ * never ends in U+FFFD, and it appends no marker of its own: the marker would
+ * be the byte that pushes the text past the ceiling it exists to enforce, and
+ * the byte counts that make the cut visible already travel beside it as
+ * metadata.
+ */
+function boundDiagnostic(text: string): LinearDiagnostic {
+  const encoded = Buffer.from(text, "utf8");
+  if (encoded.length <= LINEAR_MAX_DIAGNOSTIC_BYTES) return { text, truncated: false };
+  const prefix = completeUtf8PrefixLength(encoded.subarray(0, LINEAR_MAX_DIAGNOSTIC_BYTES));
+  return { text: encoded.subarray(0, prefix).toString("utf8"), truncated: true };
+}
+
+/**
+ * Ticket #167 — a Linear `errors` array, bounded and self-reporting.
+ *
+ * The list is unbounded on the wire and a validation refusal can carry a
+ * megabyte in one entry, so three ceilings apply and each is REPORTED rather
+ * than performed silently: at most `LINEAR_MAX_GRAPHQL_ERRORS` entries, each
+ * `message` and `code` bounded, and `errorCount` / `errorsOmitted` saying how
+ * many Linear sent and how many Poiesis left out. An operator who sees five
+ * reported errors and a count of 300 knows the answer is incomplete, which is
+ * the difference between a diagnosis and a guess.
+ */
+function graphqlErrorDetails(
+  seams: ResolvedSeams,
+  errors: readonly unknown[],
+  captureTruncated: boolean,
+): Record<string, unknown> {
+  const reported = errors.slice(0, LINEAR_MAX_GRAPHQL_ERRORS);
+  const omitted = errors.length - reported.length;
+  return {
+    errors: reported.map((entry) => {
+      const rawMessage =
+        isRecord(entry) && typeof entry.message === "string" ? entry.message : String(entry);
+      const message = diagnose(seams, rawMessage, captureTruncated);
+      const rawCode =
+        isRecord(entry) && isRecord(entry.extensions) && typeof entry.extensions.code === "string"
+          ? entry.extensions.code
+          : null;
+      const code = rawCode === null ? null : diagnose(seams, rawCode, captureTruncated);
+      return {
+        message: message.text,
+        ...(code === null ? {} : { code: code.text }),
+        ...(message.truncated ? { messageTruncated: true } : {}),
+        ...(code?.truncated === true ? { codeTruncated: true } : {}),
+      };
+    }),
+    errorCount: errors.length,
+    ...(omitted > 0 ? { errorsOmitted: omitted } : {}),
+  };
 }
 
 function boundedDelay(
@@ -575,6 +845,55 @@ function uncertainMutation(operation: string, outcome: LinearAttempt): PoiesisEr
       reason: outcome.kind,
       ...(status === null ? {} : { status }),
       ...(outcome.kind === "probe-failed" ? { probeFailure: outcome.cause } : {}),
+      // Ticket #167: an operator staring at "response-too-large" needs the
+      // numbers to know whether the ceiling was far away or barely crossed.
+      ...(outcome.kind === "response-too-large"
+        ? { capturedBytes: outcome.capturedBytes, maxResponseBytes: LINEAR_MAX_RESPONSE_BYTES }
+        : {}),
+    },
+  );
+}
+
+/**
+ * Ticket #167 — the ONE diagnostic a 5xx contributes.
+ *
+ * A 5xx is the only status worth retrying, so its body is the one diagnostic
+ * a retry will carry up to `LINEAR_MAX_ATTEMPTS` times: it is bounded,
+ * sanitized, and credential-free here, once, instead of at each of the
+ * refusals it eventually produces. `bodyTruncated` means one thing — this is
+ * not the whole body — and is true whether the ceiling cut the capture or
+ * the final bound cut the diagnostic.
+ */
+function serverError(seams: ResolvedSeams, operation: string, response: LinearHttpResponse): LinearAttempt {
+  const body = diagnose(seams, response.body.text, response.body.truncated);
+  return {
+    kind: "server-error",
+    status: response.status,
+    body: body.text,
+    bodyTruncated: response.body.truncated || body.truncated,
+  };
+}
+
+/**
+ * Ticket #167 — a read whose answer Poiesis would not hold.
+ *
+ * The ceiling is a property of Poiesis, not of Linear, so the refusal names
+ * Poiesis: the answer arrived, the bytes are real, and reading it is the thing
+ * this ticket made impossible. The captured count and the ceiling travel with
+ * it so the gap between them is visible without re-running anything.
+ */
+function responseTooLarge(
+  operation: string,
+  outcome: { readonly status: number; readonly capturedBytes: number },
+): PoiesisError {
+  return new PoiesisError(
+    "LINEAR_RESPONSE_TOO_LARGE",
+    `Linear's answer to ${operation} was not fully captured: Poiesis holds ${outcome.capturedBytes} bytes of it and will not parse a partial body`,
+    {
+      operation,
+      status: outcome.status,
+      capturedBytes: outcome.capturedBytes,
+      maxResponseBytes: LINEAR_MAX_RESPONSE_BYTES,
     },
   );
 }
@@ -598,6 +917,7 @@ function exhausted(
       attempts,
       status: outcome.status,
       body: outcome.body,
+      ...(outcome.bodyTruncated ? { bodyTruncated: true } : {}),
     });
   }
   if (outcome.kind === "timeout") {
@@ -1200,6 +1520,28 @@ export const LINEAR_DEFAULT_RETRY_DELAY_MS = 500;
  */
 export const LINEAR_ATTEMPT_TIMEOUT_MS = 10_000;
 export const LINEAR_OPERATION_DEADLINE_MS = 45_000;
+
+/**
+ * Ticket #167 — the three response bounds.
+ *
+ * They are ceilings, and none of them is a setting: each exists because
+ * Poiesis reads, holds, and quotes bytes that some other party chose the
+ * length of, and a bound a caller can raise is not a bound.
+ *
+ *   - `LINEAR_MAX_RESPONSE_BYTES` bounds the CAPTURE, in bytes read off the
+ *     wire. It is the outer one: the two below both apply to text derived
+ *     from a capture this one already bounded, so nothing reaches them
+ *     without having passed it.
+ *   - `LINEAR_MAX_DIAGNOSTIC_BYTES` bounds ONE echoed diagnostic — a body, an
+ *     exception message, a GraphQL `message` or `code`. It is the number that
+ *     actually reaches a receipt, a CI annotation, or a pasted issue.
+ *   - `LINEAR_MAX_GRAPHQL_ERRORS` bounds the COUNT of entries, because a list
+ *     of short messages can be longer than a list of long ones and the bound
+ *     has to be on both axes.
+ */
+export const LINEAR_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
+export const LINEAR_MAX_DIAGNOSTIC_BYTES = 8 * 1024;
+export const LINEAR_MAX_GRAPHQL_ERRORS = 20;
 
 const ISSUE_FIELDS = "id identifier title description url state { type } team { id }";
 

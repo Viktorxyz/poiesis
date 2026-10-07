@@ -299,6 +299,18 @@ const forbiddenFunctions = [
   "LINEAR_MAX_RETRY_DELAY_MS",
   "LINEAR_MAX_RETRY_WAIT_MS",
   "LINEAR_DEFAULT_RETRY_DELAY_MS",
+  // Ticket #167: the three response bounds (the byte ceiling, the
+  // per-diagnostic bound, and the GraphQL error-count bound) and the bounded
+  // capture seam are one internal contract. Promoting them would freeze the
+  // ceilings into a public API AND, worse, hand a caller the capture type
+  // whose `truncated` flag the adapter's own refusals are derived from: a
+  // caller able to shape a response could declare an answer whole when it is
+  // not. The tests in `tests/linear-response-bounds.test.ts` reach them
+  // through the source module directly.
+  "LINEAR_MAX_RESPONSE_BYTES",
+  "LINEAR_MAX_DIAGNOSTIC_BYTES",
+  "LINEAR_MAX_GRAPHQL_ERRORS",
+  "captureLinearResponseBody",
   // Ticket #141: the Poiesis tracker metadata envelope and the tracker item
   // helpers were extracted from `src/adapters.ts` into `src/tracker-item.ts`
   // so every adapter — including Linear — shares ONE implementation of the
@@ -466,6 +478,17 @@ const forbiddenTypes = [
   "LocalTrackerLockContent",
   "LocalTrackerState",
   "LocalTrackerOperation",
+  // Ticket #167: the capture shape a Linear response carries and the
+  // structural body stream the capture reads are module-internal. The
+  // capture is what the adapter's `LINEAR_RESPONSE_TOO_LARGE` refusal is
+  // derived from, so its `truncated` flag must not be settable from outside
+  // the module; the body stream is a reader and a cancel, not a capability.
+  "LinearBodyCapture",
+  "LinearResponseBodyStream",
+  // Tickets #149 / #167: the complete-UTF-8-prefix rule is shared by the
+  // subprocess capture and the Linear capture and has one implementation in
+  // `src/utf8-prefix.ts`. It is a decoding rule, not a public helper.
+  "completeUtf8PrefixLength",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported

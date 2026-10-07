@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, readdirSync } from "node:fs";
 import { PoiesisError } from "./errors.js";
+import { completeUtf8PrefixLength } from "./utf8-prefix.js";
 import { sanitizeSubprocessOutput } from "./url-userinfo.js";
 
 const DEFAULT_MAX_BYTES = 256 * 1024;
@@ -342,40 +343,6 @@ function finalizeCapture(capture: Capture): void {
 function captureText(capture: Capture): string {
   finalizeCapture(capture);
   return Buffer.concat(capture.chunks, capture.bytes).toString("utf8");
-}
-
-function completeUtf8PrefixLength(buffer: Buffer): number {
-  let offset = 0;
-  while (offset < buffer.length) {
-    const lead = buffer[offset]!;
-    if (lead <= 0x7f) {
-      offset += 1;
-      continue;
-    }
-
-    let width: number;
-    if (lead >= 0xc2 && lead <= 0xdf) width = 2;
-    else if (lead >= 0xe0 && lead <= 0xef) width = 3;
-    else if (lead >= 0xf0 && lead <= 0xf4) width = 4;
-    else return offset;
-    if (offset + width > buffer.length) return offset;
-
-    const second = buffer[offset + 1]!;
-    if (!isUtf8Continuation(second)) return offset;
-    if (lead === 0xe0 && second < 0xa0) return offset;
-    if (lead === 0xed && second > 0x9f) return offset;
-    if (lead === 0xf0 && second < 0x90) return offset;
-    if (lead === 0xf4 && second > 0x8f) return offset;
-    for (let index = 2; index < width; index += 1) {
-      if (!isUtf8Continuation(buffer[offset + index]!)) return offset;
-    }
-    offset += width;
-  }
-  return offset;
-}
-
-function isUtf8Continuation(byte: number): boolean {
-  return byte >= 0x80 && byte <= 0xbf;
 }
 
 function isExpectedStdinClosure(error: Error): boolean {
