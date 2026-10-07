@@ -214,13 +214,22 @@ interface HttpResult {
 }
 
 /**
- * One bounded HTTP request.
+ * One bounded HTTP request: headers AND body, under ONE deadline.
  *
  * The budget is enforced twice on purpose: the `AbortSignal` lets the
  * transport cancel the in-flight request, and the explicit race means the
  * bound holds even for a transport that ignores signals (a stalled socket,
  * a fixture that never settles). Both settle branches handle their own
  * rejection so a late failure can never surface as an unhandled rejection.
+ *
+ * Ticket #186 — the race must cover the COMPLETE request. Headers can arrive
+ * long before the body does, and `response.text()` is itself an unbounded
+ * await: racing only the headers let a peer that answered and then stalled
+ * hold a managed operation open forever. Consuming the body inside the raced
+ * work makes the deadline the deadline for the whole exchange, even when the
+ * body ignores `abort()`. Both late settle paths stay handled: the raced work
+ * carries its own rejection handler, so a body that rejects after the deadline
+ * already resolved is absorbed instead of becoming an unhandled rejection.
  */
 async function request(
   fetcher: typeof globalThis.fetch,
@@ -238,7 +247,7 @@ async function request(
       }, timeoutMs);
     });
     const outcome = await Promise.race([
-      fetcher(url, { method, headers: { accept: "application/json" }, signal: controller.signal }).then(
+      boundedResponse(fetcher, url, method, controller.signal).then(
         (response) => ({ kind: "response" as const, response }),
         (error: unknown) => ({
           kind: "error" as const,
@@ -253,11 +262,7 @@ async function request(
     if (outcome.kind === "error") {
       return { ok: false, body: "", error: outcome.message };
     }
-    return {
-      ok: outcome.response.ok,
-      status: outcome.response.status,
-      body: await outcome.response.text(),
-    };
+    return outcome.response;
   } catch (error) {
     return {
       ok: false,
@@ -267,6 +272,17 @@ async function request(
   } finally {
     if (timer !== null) clearTimeout(timer);
   }
+}
+
+/** The whole exchange — transport plus body consumption — as one unit of work. */
+async function boundedResponse(
+  fetcher: typeof globalThis.fetch,
+  url: URL,
+  method: "GET" | "DELETE",
+  signal: AbortSignal,
+): Promise<HttpResult> {
+  const response = await fetcher(url, { method, headers: { accept: "application/json" }, signal });
+  return { ok: response.ok, status: response.status, body: await response.text() };
 }
 
 /**

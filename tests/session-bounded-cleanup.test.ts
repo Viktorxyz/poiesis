@@ -106,6 +106,63 @@ describe("bounded OpenCode session cleanup", () => {
     expect(result.deleted).toEqual([]);
   }, 15_000);
 
+  /**
+   * Ticket #186 — the bound covers the COMPLETE request, not just its headers.
+   *
+   * A peer that answers with response headers and then stalls forever on the
+   * body used to defeat the budget completely: the race resolved on the
+   * headers, and `response.text()` was awaited outside it, so one never-settling
+   * body held a managed Poiesis operation open with no bound at all. These
+   * tests drive the two late-body cases directly — a body that never settles,
+   * and a body that fails AFTER the deadline — because a transport injected by
+   * a test never honours the abort signal, which is exactly the shape the
+   * explicit bound exists for.
+   */
+  it("settles inside the bound when headers arrive but the body never settles", async () => {
+    const startedAt = Date.now();
+    const result = await cleanupOpenCodeSession("root", {
+      requestTimeoutMs: 150,
+      fetch: async () =>
+        ({
+          ok: true,
+          status: 200,
+          text: () => new Promise<string>(() => {}),
+        }) as unknown as Response,
+    });
+    const elapsed = Date.now() - startedAt;
+    expect(elapsed).toBeLessThan(5_000);
+    expect(result.warnings.length).toBeGreaterThan(0);
+    expect(result.warnings.some((warning) => warning.operation === "enumerate")).toBe(true);
+    expect(result.deleted).toEqual([]);
+  }, 15_000);
+
+  it("settles inside the bound and never leaks a late body failure when the body fails after the deadline", async () => {
+    const startedAt = Date.now();
+    const result = await cleanupOpenCodeSession("root", {
+      requestTimeoutMs: 150,
+      fetch: async () =>
+        ({
+          ok: true,
+          status: 200,
+          text: () =>
+            new Promise<string>((_resolve, reject) => {
+              setTimeout(() => reject(new Error("body transport failed late")), 600);
+            }),
+        }) as unknown as Response,
+    });
+    const elapsed = Date.now() - startedAt;
+    // The bound decided the outcome, so the late failure is not waited for and
+    // not reported as this request's error. Vitest fails the file if that late
+    // rejection escaped as an unhandled one.
+    expect(elapsed).toBeLessThan(500);
+    expect(result.warnings.length).toBeGreaterThan(0);
+    expect(result.deleted).toEqual([]);
+    // Give the late rejection time to land: an unhandled one is reported after
+    // the test body has already returned.
+    await new Promise((resolve) => setTimeout(resolve, 700));
+    expect(result.warnings.some((warning) => warning.message.includes("body transport failed late"))).toBe(false);
+  }, 15_000);
+
   it("bounds the traversal without deleting sessions it never enumerated", async () => {
     const fake = fakeOpenCode({
       root: ["c1"],

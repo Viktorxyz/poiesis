@@ -34,17 +34,16 @@ import {
   verify,
   workspacePrepare,
 } from "../src/git.js";
-import { previewDelivery, promoteDelivery } from "../src/adapters.js";
+import { previewDelivery, promoteDelivery, type ProofPayload } from "../src/adapters.js";
 import { init, packageVersion, setRuntimePackageVersionOverrideForTest } from "../src/maintenance.js";
 import { serializeConfig } from "../src/config.js";
 import { loadManifest } from "../src/manifest.js";
 import { manifestDigest, removeOwnershipReceipt } from "../src/receipt.js";
 import { run } from "../src/process.js";
+import type { PublishEvidence } from "../src/evidence.js";
 import {
   createTestRepository,
   itManagedExecution,
-  proofShell,
-  publishEvidence,
   testConfig,
   type TestRepository,
   verifiedProof,
@@ -133,9 +132,15 @@ async function ownedCandidateWithStaleGeneratedConfig(
 async function publishCandidate(
   repository: TestRepository,
   candidate: { path: string; ownershipId: string; branch: string; sha: string; tree: string },
-): Promise<void> {
+): Promise<{ proof: ProofPayload; evidence: PublishEvidence }> {
   const { publish } = await import("../src/git.js");
-  await publish({
+  const proof = await verifiedProof({
+    cwd: candidate.path,
+    ownershipId: candidate.ownershipId,
+    candidateSha: candidate.sha,
+    candidateTree: candidate.tree,
+  });
+  const published = await publish({
     cwd: candidate.path,
     ownershipId: candidate.ownershipId,
     remote: "origin",
@@ -146,8 +151,9 @@ async function publishCandidate(
     project: repository.fixtures,
     title: "Candidate",
     body: "body",
-    proof: await verifiedProof({ cwd: candidate.path, ownershipId: candidate.ownershipId, candidateSha: candidate.sha, candidateTree: candidate.tree }),
+    proof,
   });
+  return { proof, evidence: published.evidence };
 }
 
 describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
@@ -200,7 +206,11 @@ describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
   itManagedExecution("delivery operations from an owned candidate use the primary installation authority", async () => {
     const repository = await installedRepository();
     const candidate = await ownedCandidateWithStaleGeneratedConfig(repository, "spec-delivery");
-    await publishCandidate(repository, candidate);
+    // Spec #168 / ticket #186: delivery runs on the REAL proof and the REAL
+    // Publish evidence, so the authoritative `previewDelivery` boundary
+    // authenticates the receipt those two documents name against this owned
+    // candidate's lifecycle authority and the primary installation's live plan.
+    const { proof, evidence } = await publishCandidate(repository, candidate);
     const delivery = { adapter: "fixture" as const, path: join(repository.fixtures, "delivery") };
 
     // The candidate workspace carries NO `.poiesis/manifest.json` and no
@@ -210,8 +220,8 @@ describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
       {
         sha: candidate.sha,
         candidateTree: candidate.tree,
-        proof: proofShell(candidate.sha, candidate.tree),
-        publish: publishEvidence(candidate.sha, candidate.tree, candidate.branch),
+        proof,
+        publish: evidence,
         remote: "origin",
       },
       candidate.path,
@@ -282,6 +292,61 @@ describe("candidate lifecycle authority (Spec #168 / ticket #169)", () => {
     expect(authority.marker).toBeNull();
     expect(authority.markerPath).toBeNull();
     expect(authority.manifest.poiesisVersion).toBe(await packageVersion());
+  }, 60_000);
+});
+
+/**
+ * Spec #168 / ticket #186 — the CLI Preview dispatch keeps the same authority
+ * as the other lifecycle dispatches.
+ *
+ * `poiesis verify` runs in `authority.candidateRoot` and `poiesis publish`
+ * publishes from it, so the receipt a candidate earns is bound to the OWNED
+ * CANDIDATE workspace and its ownership identity. The Preview dispatch handed
+ * `previewDelivery` the PRIMARY root instead, which resolved an authority with
+ * no ownership marker at all: the receipt could never authenticate against that
+ * workspace, and every real candidate prepared through `workspacePrepare` was
+ * refused after ticket #186 made that binding load-bearing. The dispatch now
+ * forwards the candidate workspace, exactly like Verify and Publish.
+ */
+describe("CLI preview resolves the candidate workspace authority (Spec #168 / ticket #186)", () => {
+  function captureStdout(): { chunks: string[]; restore: () => void } {
+    const chunks: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      chunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    return { chunks, restore: () => { process.stdout.write = original; } };
+  }
+
+  itManagedExecution("previews a published candidate from its own owned workspace", async () => {
+    const repository = await installedRepository();
+    const candidate = await ownedCandidateWithStaleGeneratedConfig(repository, "spec-cli-preview");
+    const { proof, evidence } = await publishCandidate(repository, candidate);
+    const { dispatchCli } = await import("../src/cli.js");
+
+    const capture = captureStdout();
+    let payload: { ok: boolean; result: { candidateSha: string; target: string } };
+    try {
+      await dispatchCli([
+        "preview",
+        "--sha",
+        candidate.sha,
+        "--candidate-tree",
+        candidate.tree,
+        "--proof",
+        JSON.stringify(proof),
+        "--publish",
+        JSON.stringify(evidence),
+        "--cwd",
+        candidate.path,
+      ]);
+    } finally {
+      capture.restore();
+    }
+    payload = JSON.parse(capture.chunks.join("")) as typeof payload;
+    expect(payload.ok).toBe(true);
+    expect(payload.result).toMatchObject({ candidateSha: candidate.sha, target: "preview" });
   }, 60_000);
 });
 

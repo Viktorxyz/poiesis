@@ -3,8 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+  createCommandDeliveryAdapter,
   createFixtureDeliveryAdapter,
-  previewDelivery,
+  type PreviewDeliveryInput,
 } from "../src/adapters.js";
 import { validatePreviewPublishEvidence, type PublishEvidence } from "../src/evidence.js";
 import { init } from "../src/maintenance.js";
@@ -104,6 +105,27 @@ async function writeDeliveryScript(fixturesDir: string, body: string): Promise<s
   return scriptPath;
 }
 
+/**
+ * Spec #168 / ticket #186 — this suite owns the delivery ADAPTER's evidence
+ * contract, so it drives the adapter seam directly.
+ *
+ * `previewDelivery` is the authoritative lifecycle boundary and now
+ * authenticates the forwarded verification receipt against live authority and
+ * the live verification plan before it constructs an adapter; that half of the
+ * Preview contract is owned by `tests/verification-receipt-publish.test.ts`.
+ * What is asserted here is the structural evidence contract — canonical Proof
+ * plus matching successful Publish evidence, candidate/tree/branch/remote-head
+ * revalidation — which is a pure property of the forwarded documents and
+ * therefore stays provable with a synthetic receipt reference.
+ */
+function previewWithCommand(
+  repository: TestRepository,
+  command: readonly string[],
+  input: PreviewDeliveryInput,
+) {
+  return createCommandDeliveryAdapter({ adapter: "command", command: [...command] }, repository.root).preview(input);
+}
+
 describe("ticket #49 — Publish evidence is required before Preview", () => {
   it("happy path: returns a concrete Preview identity when Proof and matching Publish evidence are both valid", async () => {
     const repository = await installedTestRepository();
@@ -118,10 +140,10 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
       fixtures,
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nconst id = `https://preview.example/${sha}`;\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: true, url: id, artifactIdentity: id }) + \"\\n\");",
     );
-    const preview = await previewDelivery(
-      { adapter: "command", command: ["node", script, "{sha}", "{target}"] },
+    const preview = await previewWithCommand(
+      repository,
+      ["node", script, "{sha}", "{target}"],
       { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-      repository.root,
     );
     expect(preview.sha).toBe(sha);
     expect(preview.candidateTree).toBe(tree);
@@ -446,10 +468,10 @@ describe("ticket #49 — Publish evidence is required before Preview", () => {
       fixtures,
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: true, url: `https://preview/${sha}`, artifactIdentity: `https://preview/${sha}` }) + \"\\n\");",
     );
-    const preview = await previewDelivery(
-      { adapter: "command", command: ["node", script, "{sha}", "{target}"] },
+    const preview = await previewWithCommand(
+      repository,
+      ["node", script, "{sha}", "{target}"],
       { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-      repository.root,
     );
     expect(preview.sha).toBe(sha);
     expect(preview.candidateSha).toBe(sha);

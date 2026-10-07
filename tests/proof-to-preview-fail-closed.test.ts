@@ -2,7 +2,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { previewDelivery } from "../src/adapters.js";
+import { createCommandDeliveryAdapter, type PreviewDeliveryInput } from "../src/adapters.js";
 import { init } from "../src/maintenance.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
@@ -25,6 +25,28 @@ async function installedTestRepository(): Promise<TestRepository> {
     allowFixtureAdapters: true,
   });
   return repository;
+}
+
+/**
+ * Spec #168 / ticket #186 — these invariants are the ADAPTER's delivery
+ * contract, so they are driven at the adapter seam.
+ *
+ * `previewDelivery` is the authoritative lifecycle boundary and now
+ * authenticates the forwarded verification receipt against live authority and
+ * the live plan before it will construct an adapter at all; that half of the
+ * contract is owned by `tests/verification-receipt-publish.test.ts`. What
+ * remains here is what a delivery refuses to ACCEPT as a result — a command
+ * reporting `verified: false`, a command reporting no artifact identity, a
+ * non-zero exit, a candidate that is not a commit — which is a property of the
+ * adapter and is exercised directly here so it stays provable without inventing
+ * a runtime-owned receipt for evidence that never had one.
+ */
+function previewWithCommand(
+  repository: TestRepository,
+  command: readonly string[],
+  input: PreviewDeliveryInput,
+) {
+  return createCommandDeliveryAdapter({ adapter: "command", command: [...command] }, repository.root).preview(input);
 }
 
 /**
@@ -85,13 +107,10 @@ describe("preview fail-closed invariants", () => {
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: false, artifactIdentity: \"should-be-rejected\", id: \"should-be-rejected\" }) + \"\\n\");",
     );
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", script, "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", script, "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_VERIFICATION_FAILED" });
   });
@@ -109,13 +128,10 @@ describe("preview fail-closed invariants", () => {
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: true, id: \"only-id\" }) + \"\\n\");",
     );
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", script, "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", script, "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_ARTIFACT_IDENTITY_MISSING" });
   });
@@ -133,13 +149,10 @@ describe("preview fail-closed invariants", () => {
       "#!/usr/bin/env node\nprocess.stderr.write(\"preview infrastructure unavailable\\n\");\nprocess.exit(2);",
     );
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", script, "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", script, "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toThrow();
   });
@@ -149,13 +162,10 @@ describe("preview fail-closed invariants", () => {
     const tree = await resolveTree(repository.root, repository.baseSha);
     const fakeSha = "f".repeat(40);
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", "/nonexistent", "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", "/nonexistent", "{sha}", "{target}"],
         { sha: fakeSha, candidateTree: tree, proof: proofShell(fakeSha, tree), publish: publishEvidence(fakeSha, tree, "poiesis/failclosed-missing"), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "DELIVERY_CANDIDATE_NOT_FOUND" });
   });
@@ -174,13 +184,10 @@ describe("preview fail-closed invariants", () => {
       standardsReview: { verdict: "PASS" as const, reviewerIdentity: "standards" },
     };
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", "/nonexistent", "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", "/nonexistent", "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_REVIEW_IDENTITY_MISSING" });
   });
@@ -199,13 +206,10 @@ describe("preview fail-closed invariants", () => {
       standardsReview: { verdict: "FAIL" as unknown as "PASS", reviewerIdentity: "standards" },
     };
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", "/nonexistent", "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", "/nonexistent", "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_REVIEW_FAILED" });
   });
@@ -224,13 +228,10 @@ describe("preview fail-closed invariants", () => {
       standardsReview: { verdict: "PASS" as const, reviewerIdentity: "standards" },
     };
     await expect(
-      previewDelivery(
-        {
-          adapter: "command",
-          command: ["node", "/nonexistent", "{sha}", "{target}"],
-        },
+      previewWithCommand(
+        repository,
+        ["node", "/nonexistent", "{sha}", "{target}"],
         { sha, candidateTree: tree, proof: brokenProof, publish: publishEvidence(sha, tree, branch), remote: "origin" },
-        repository.root,
       ),
     ).rejects.toMatchObject({ code: "PROOF_IDENTITY_MISMATCH" });
   });
@@ -248,13 +249,10 @@ describe("preview fail-closed invariants", () => {
       fixtures,
       "#!/usr/bin/env node\nconst [sha, target] = process.argv.slice(2);\nconst id = \"https://preview.example/\" + sha;\nprocess.stdout.write(JSON.stringify({ sha, candidateTree: process.env.POIESIS_CANDIDATE_TREE, target, verified: true, url: id, artifactIdentity: id }) + \"\\n\");",
     );
-    const preview = await previewDelivery(
-      {
-        adapter: "command",
-        command: ["node", script, "{sha}", "{target}"],
-      },
+    const preview = await previewWithCommand(
+      repository,
+      ["node", script, "{sha}", "{target}"],
       { sha, candidateTree: tree, proof: proofShell(sha, tree), publish: publishEvidence(sha, tree, branch), remote: "origin" },
-      repository.root,
     );
     expect(preview.sha).toBe(sha);
     expect(preview.candidateTree).toBe(tree);

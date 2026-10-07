@@ -61,7 +61,7 @@ Usage:
   poiesis check --command <command>... [--timeout <ms>] [--output-limit <bytes>] [--ownership-id <id>] [--progress] [--retry-reason <token>]
                                              # Spec #168 / ticket #172 — NON-AUTHORITATIVE focused checks for ticket work. Runs EXPLICIT commands in a Poiesis-owned (possibly dirty) candidate workspace and returns bounded per-command evidence (command, workspace state fingerprint, exit/signal, duration, timeout state, bounded output, truncation), a deterministic action fingerprint, and a deterministic failure classification (command-failed | timeout | timeout-unknown | likely-load-induced-timeout | infrastructure | dirty-candidate). It never creates a verification receipt or any other proof and never retries; whole-change authority stays with \`poiesis verify\`. A failed check exits non-zero with the full result under \`details.check\`.
   poiesis publish --sha <sha> --candidate-tree <tree> --proof <json> --title <text> --body <text>   # Publish only after Verify, Spec Review, and Standards Review pass; \`--proof\` is the canonical identity-bound proof (candidateSha, candidateTree, verified: true, specReview { verdict: PASS, reviewerIdentity }, standardsReview { verdict: PASS, reviewerIdentity }, verification { ...Verify's receipt reference }) for the same clean candidate. Publish resolves that receipt from runtime storage and revalidates it against the live installation, live plan, and live candidate before pushing anything.
-  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest, verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }) that drove the successful Publish; Preview validates the forwarded receipt reference and the remote change-branch head. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
+  poiesis preview --sha <sha> --candidate-tree <tree> --proof <json> --publish <json>   # Preview only after Publish succeeds. \`--publish\` is the same canonical candidate-bound Publish evidence (candidateSha, candidateTree, verified: true, branch, remoteRef, publishedHeadSha, provider, action, changeRequest, verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }) that drove the successful Publish; Preview resolves the receipt the proof and that evidence name out of runtime storage, revalidates it against the live installation, live plan, and live candidate, requires both to identify the SAME receipt, and revalidates the remote change-branch head. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic \`poiesis preview\` operation succeeds and returns a concrete Preview identity (\`id\`, \`url\`, and/or \`artifact\`).
   poiesis integrate --sha <sha> --base <sha> --candidate-tree <tree> --proof <json> --staging <json> --acceptance <text> --message <text>
   poiesis promote --sha <sha> --candidate-tree <tree> --target staging --identity <preview-json>
   poiesis promote --sha <sha> --candidate-tree <tree> --target production --identity <staging-json> --authorization <json> --proof <json> --integration <json>
@@ -957,7 +957,15 @@ async function commandPreview(args: string[]): Promise<void> {
         publish: json<PublishEvidence>(required(values, "publish"), "publish"),
         remote: config.repository.remote,
       },
-      authority.primaryRoot,
+      // Spec #168 / ticket #186: the CANDIDATE workspace, exactly like the
+      // Verify and Publish dispatches above. `previewDelivery` resolves its own
+      // authority from this root and still runs delivery against
+      // `authority.primaryRoot`, so nothing about the delivery adapter changes;
+      // what this preserves is the ownership identity the forwarded verification
+      // receipt is bound to. Handing over the primary root instead resolved an
+      // authority with no ownership marker, which refused every receipt Verify
+      // had legitimately minted for an owned candidate.
+      authority.candidateRoot,
     ),
   );
 }

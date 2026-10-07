@@ -390,6 +390,29 @@ export async function resolveVerificationReceipt(
     "Verification receipt reference does not match the stored receipt digest",
     { expected: reference.receiptDigest, actual: receipt.digest },
   );
+  // Spec #168 / ticket #186 — the caller's copy must AGREE with the document it
+  // names. Every other reference field was compared to live authority or to the
+  // live plan; `runtime` and `verificationPlanDigest` were only ever checked on
+  // the STORED receipt, so a reference could describe a different runtime or a
+  // different plan than the evidence actually proven while all checks passed.
+  // Both are now fail-closed equalities against the authenticated document, and
+  // both name the same migration every other receipt refusal names.
+  invariant(
+    reference.runtime === receipt.runtime,
+    "VERIFICATION_RECEIPT_RUNTIME_MISMATCH",
+    "Verification receipt reference names a different runtime identity than the stored receipt",
+    { expected: receipt.runtime, actual: reference.runtime, migration: freshVerify },
+  );
+  invariant(
+    reference.verificationPlanDigest === receipt.verificationPlanDigest,
+    "VERIFICATION_PLAN_MISMATCH",
+    "Verification receipt reference names a different verification plan than the stored receipt",
+    {
+      expected: receipt.verificationPlanDigest,
+      actual: reference.verificationPlanDigest,
+      migration: freshVerify,
+    },
+  );
   invariant(
     receipt.commonDir === authority.commonDir && receipt.workspace === authority.candidateRoot,
     "VERIFICATION_RECEIPT_WORKSPACE_MISMATCH",

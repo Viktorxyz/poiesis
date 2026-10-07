@@ -14,7 +14,7 @@
  * with its own typed code and a fresh-Verify migration, never with a push.
  */
 import { randomUUID } from "node:crypto";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, rm, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { checkpoint, publish, resolveTree, verify, workspacePrepare } from "../src/git.js";
@@ -227,6 +227,47 @@ describeManagedExecution("Publish resolves the verification receipt (Spec #168 /
     ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_INVALID" });
   }, 60_000);
 
+  /**
+   * Ticket #186 — the caller's copy of a receipt must AGREE with the document
+   * it names.
+   *
+   * `runtime` and `verificationPlanDigest` were revalidated on the STORED
+   * receipt against live authority and the live plan, but never against the
+   * reference the caller forwarded. That left a reference free to describe a
+   * different runtime or a different plan than the receipt it points at: the
+   * evidence a caller carries could disagree with the evidence that is actually
+   * proven, while every existing check still passed.
+   */
+  itManagedExecution("rejects a reference that names a different runtime than the stored receipt", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-ref-runtime");
+    const verification = await verifyCandidate(candidate);
+
+    await expect(
+      publish(
+        publishOptions(repository, candidate, proofFor(candidate, { ...verification, runtime: "9.9.9-other-runtime" })),
+      ),
+    ).rejects.toMatchObject({
+      code: "VERIFICATION_RECEIPT_RUNTIME_MISMATCH",
+      details: { migration: expect.stringContaining("poiesis verify") },
+    });
+  }, 60_000);
+
+  itManagedExecution("rejects a reference that names a different verification plan than the stored receipt", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-ref-plan");
+    const verification = await verifyCandidate(candidate);
+
+    await expect(
+      publish(
+        publishOptions(repository, candidate, proofFor(candidate, { ...verification, verificationPlanDigest: "c".repeat(64) })),
+      ),
+    ).rejects.toMatchObject({
+      code: "VERIFICATION_PLAN_MISMATCH",
+      details: { migration: expect.stringContaining("poiesis verify") },
+    });
+  }, 60_000);
+
   itManagedExecution("rejects a reference bound to a different candidate", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-wrong-ref-candidate");
@@ -393,13 +434,14 @@ describeManagedExecution("Publish resolves the verification receipt (Spec #168 /
   }, 60_000);
 });
 
-describeManagedExecution("Preview validates forwarded Publish evidence (Spec #168 / ticket #171)", () => {
-  async function publishCandidate(repository: TestRepository, candidate: Candidate) {
-    const verification = await verifyCandidate(candidate);
-    const published = await publish(publishOptions(repository, candidate, proofFor(candidate, verification)));
-    return published.evidence;
-  }
+/** Verify then Publish the candidate, returning the canonical evidence. */
+async function publishCandidate(repository: TestRepository, candidate: Candidate): Promise<PublishEvidence> {
+  const verification = await verifyCandidate(candidate);
+  const published = await publish(publishOptions(repository, candidate, proofFor(candidate, verification)));
+  return published.evidence;
+}
 
+describeManagedExecution("Preview validates forwarded Publish evidence (Spec #168 / ticket #171)", () => {
   it("accepts forwarded evidence that carries the resolved receipt and revalidates the remote head", async () => {
     const repository = await installedRepository();
     const candidate = await acceptedCandidate(repository, "spec-171-preview");
@@ -486,6 +528,148 @@ describeManagedExecution("Preview validates forwarded Publish evidence (Spec #16
         candidate.path,
       ),
     ).rejects.toMatchObject({ code: "PUBLISH_VERIFICATION_IDENTITY_MISMATCH" });
+  }, 60_000);
+});
+
+/**
+ * Spec #168 / ticket #186 — Preview resolves the FORWARDED receipt.
+ *
+ * Preview used to perform structural proof/Publish validation and remote-head
+ * revalidation and then run the adapter. It never resolved the receipt those
+ * documents name, so any well-formed reference moved a delivery forward: a
+ * receipt that was never written, a digest that does not match the stored
+ * document, a receipt minted by another installation or another plan, and a
+ * Publish whose evidence rested on a DIFFERENT receipt than the proof did were
+ * all indistinguishable from a real one at the delivery boundary.
+ *
+ * The authoritative boundary — `previewDelivery`, the same lifecycle seam the
+ * CLI dispatches through — now authenticates BOTH references against primary
+ * lifecycle authority and the live verification plan, requires them to identify
+ * the same resolved receipt, and refuses before any adapter side effect. The
+ * candidate/tree/remote-head contract the adapters enforce is unchanged.
+ */
+describeManagedExecution("Preview authenticates the forwarded verification receipt (Spec #168 / ticket #186)", () => {
+  function fixtureDelivery(repository: TestRepository) {
+    return { adapter: "fixture" as const, path: join(repository.fixtures, "delivery") };
+  }
+
+  /** The immutable artifact record the fixture adapter would have written. */
+  async function fixtureRecords(repository: TestRepository): Promise<string[]> {
+    try {
+      return (await readdir(join(repository.fixtures, "delivery", "candidates"))).sort();
+    } catch {
+      return [];
+    }
+  }
+
+  function preview(
+    repository: TestRepository,
+    candidate: Candidate,
+    proof: ProofPayload,
+    publishEvidenceDocument: PublishEvidence,
+  ) {
+    return previewDelivery(
+      fixtureDelivery(repository),
+      { sha: candidate.sha, candidateTree: candidate.tree, proof, publish: publishEvidenceDocument, remote: "origin" },
+      candidate.path,
+    );
+  }
+
+  it("rejects a forwarded receipt that was never written, before any adapter side effect", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-absent");
+    const evidence = await publishCandidate(repository, candidate);
+
+    await expect(
+      preview(repository, candidate, proofFor(candidate, { ...evidence.verification, receiptId: randomUUID() }), evidence),
+    ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_MISSING" });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a forwarded receipt whose digest does not match the stored document", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-digest");
+    const evidence = await publishCandidate(repository, candidate);
+
+    await expect(
+      preview(
+        repository,
+        candidate,
+        proofFor(candidate, { ...evidence.verification, receiptDigest: "0".repeat(64) }),
+        evidence,
+      ),
+    ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_INVALID" });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a forwarded receipt minted by a different installation identity", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-stale");
+    const evidence = await publishCandidate(repository, candidate);
+    const stored = await readVerificationReceipt(candidate.commonDir, evidence.verification.receiptId);
+    const forged = await forgeReceipt(candidate.commonDir, stored, { installationId: randomUUID() });
+
+    await expect(preview(repository, candidate, proofFor(candidate, forged), evidence)).rejects.toMatchObject({
+      code: "VERIFICATION_RECEIPT_STALE",
+      details: { migration: expect.stringContaining("poiesis verify") },
+    });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a forwarded receipt produced by a different verification plan than the live plan", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-plan");
+    const evidence = await publishCandidate(repository, candidate);
+    // A real second Verify of the same candidate against a weaker plan: a real
+    // receipt, real commands, and an identity that resolves out of storage.
+    const weaker = await verifyCandidate(candidate, ["printf weaker-plan"]);
+
+    await expect(preview(repository, candidate, proofFor(candidate, weaker), evidence)).rejects.toMatchObject({
+      code: "VERIFICATION_PLAN_MISMATCH",
+    });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a forwarded receipt that identifies a different candidate", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-candidate");
+    const evidence = await publishCandidate(repository, candidate);
+
+    await expect(
+      preview(
+        repository,
+        candidate,
+        proofFor(candidate, { ...evidence.verification, candidateSha: "5".repeat(40) }),
+        evidence,
+      ),
+    ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_CANDIDATE_MISMATCH" });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a proof whose receipt is the one Publish did not resolve", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-disagreement");
+    const evidence = await publishCandidate(repository, candidate);
+    // Two real receipts for the SAME candidate and plan. Both authenticate;
+    // they are simply not the same proof.
+    const other = await verifyCandidate(candidate);
+
+    await expect(preview(repository, candidate, proofFor(candidate, other), evidence)).rejects.toMatchObject({
+      code: "PUBLISH_VERIFICATION_IDENTITY_MISMATCH",
+      details: { migration: expect.stringContaining("poiesis verify") },
+    });
+    expect(await fixtureRecords(repository)).toEqual([]);
+  }, 60_000);
+
+  it("rejects a legacy proof that asserts verified without naming a receipt", async () => {
+    const repository = await installedRepository();
+    const candidate = await acceptedCandidate(repository, "spec-186-preview-legacy-proof");
+    const evidence = await publishCandidate(repository, candidate);
+
+    await expect(preview(repository, candidate, proofFor(candidate), evidence)).rejects.toMatchObject({
+      code: "VERIFICATION_RECEIPT_REQUIRED",
+    });
+    expect(await fixtureRecords(repository)).toEqual([]);
   }, 60_000);
 });
 
