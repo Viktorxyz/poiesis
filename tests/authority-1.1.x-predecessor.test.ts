@@ -66,7 +66,7 @@
  * The fake-opencode binary is the certified `1.18.29` plus the
  * stable model list documented in `tests/fake-opencode.ts`. The
  * fake-uv binary mirrors the `installFakeUv` pattern from
- * `tests/release-contract-v1.4.2.test.ts`.
+ * `tests/release-contract-v1.5.0.test.ts`.
  */
 import { spawnSync } from "node:child_process";
 import { access, mkdir, readFile, rm } from "node:fs/promises";
