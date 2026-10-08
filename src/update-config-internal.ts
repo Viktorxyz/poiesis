@@ -18,36 +18,55 @@
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
  *
- * Spec #133 / ticket #137 — the Author-owned `pnpm poiesis` package
- * script IS reconciled here, which deliberately differs from the
- * `.gitignore` carve-out documented in `src/maintenance.ts`. That
- * carve-out exists because the default-path ignore rule is a safety
- * invariant of the default workspace layout, which this config-only
- * transaction never creates. The package script is different: it is a
- * declared feature of an installed project, and `setModel` — reachable
- * from the `pnpm poiesis model set ...` command the README advertises —
- * runs this transaction. If this path skipped the script, the Author's
- * most-used command would be the one command able to leave the everyday
- * command surface broken, in direct violation of acceptance #7.
+ * Spec #190 / ticket #191 — this transaction no longer touches
+ * `package.json` at all. Invoking Poiesis must not require a project
+ * manifest mutation, so the `scripts.poiesis` reconcile this file used to
+ * perform (and its whole snapshot + written-hash rollback apparatus) is
+ * gone. That makes a config no-op a genuine whole-project no-op again:
+ * `setModel` reaching an already-current value now returns without any
+ * second surface to reconcile, and the journal drives the only writes.
  *
- * The script keeps the `src/update-internal.ts` contract exactly: no
- * manifest record, no journal entry, snapshot before the write, and a
- * written-hash-gated `rollbackPackageJson` in the catch in reverse write
- * order.
+ * Spec #190 / ticket #193 — this transaction is ALSO the explicit
+ * `Private <-> Team` transition surface. `mode` is part of the config an
+ * operator hands to `poiesis update --config`, so stating a different one
+ * IS the explicit request, and there is no second command to learn and no
+ * hidden activation to discover. Two rules make that coherent:
+ *
+ *   - a config that OMITS `mode` never drops the installed one. An install
+ *     that chose a sharing policy keeps it through an unrelated config
+ *     update, so `.poiesis/config.jsonc` can never silently disagree with
+ *     the manifest and the block it was written with;
+ *   - a config that STATES a different `mode` transitions the whole sharing
+ *     surface — the one managed `.gitignore` block and, going to `team`, the
+ *     shareable project profile — inside THIS transaction, so it is receipt
+ *     authenticated, journal-captured, doctor-gated, and rolled back by the
+ *     same machinery as every other owned byte. Planning lives in
+ *     `src/install-mode-transition.ts` and is read-only; this file owns the
+ *     writes.
  */
 import { readFile, lstat } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { loadConfig, parseJsonc, serializeConfig, validateConfig, type PoiesisConfig } from "./config.js";
+import { loadConfig, parseJsonc, serializeConfig, trackerProjectOf, validateConfig, type PoiesisConfig } from "./config.js";
+import { DELIVERY_TARGETS } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import { exists, readUtf8 } from "./fs.js";
 import { hashContent } from "./hash.js";
 import { assertManifestAuthority, nextAdapterPatches } from "./authority.js";
+import {
+  assertTransitionCaptureIdentity,
+  ensureTransitionProfileParents,
+  planInstallModeTransition,
+  removeEmptyTransitionDirectories,
+  type InstallModeTransitionPlan,
+} from "./install-mode-transition.js";
+import { GITIGNORE_RELATIVE_PATH } from "./install-mode.js";
 import {
   assertOwnershipReceipt,
   ownershipReceiptLocation,
   type OwnershipReceipt,
 } from "./receipt.js";
 import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
+import { POIESIS_GENERATED_AGENT_PATHS } from "./templates.js";
 import {
   desiredOpenCodePatches,
   OPENCODE_ADAPTER_VERSION,
@@ -56,11 +75,6 @@ import {
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
-import {
-  PACKAGE_JSON_RELATIVE,
-  repairPoiesisScript,
-  rollbackPackageJson,
-} from "./package-script.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { ResolvedPoiesisConfig } from "./config.js";
@@ -82,6 +96,65 @@ type JsonObject = Record<string, unknown>;
 const POIESIS_CONFIG_RELATIVE_PATH = ".poiesis/config.jsonc";
 
 /**
+ * Spec #139 / ticket #166 — the operation name this module reports. The
+ * refusal below is CONTEXTUAL, so the Author has to be told which command
+ * applies the rule: `init --config` and `update --config` read the same
+ * schema and answer the same question differently.
+ */
+const UPDATE_CONFIG_OPERATION = "update --config";
+
+/**
+ * Ticket #166 — an omitted `delivery` block is a FRESH-INSTALL default, never
+ * an UPDATE default.
+ *
+ * `init --config` may complete a project that states no delivery at all: the
+ * block resolves to the three generated command targets and `init` writes the
+ * matching `scripts/poiesis-<target>.mjs`. That is the legacy behavior an
+ * existing noninteractive installation was created under, so it stays exactly
+ * as it is.
+ *
+ * `update --config` is handed a proposed document for an installation that
+ * ALREADY recorded a delivery decision, and delivery is the one default that
+ * must not be invented there. Resolving the omission to the generated targets
+ * would replace a recorded `deferred` state — or the Author's three real
+ * commands — with three script names this transaction never writes, and
+ * `update --config` writes only the four managed artifacts. The document
+ * therefore has to state the decision, and an omission is refused.
+ *
+ * Why the check is HERE, and not in the schema:
+ *
+ *   - It is contextual. `delivery` stays optional in `configSchema` so
+ *     `init --config` keeps its legacy default, so this module — never the
+ *     shared parser — is where the operation's own rule belongs.
+ *   - It runs at step 1, immediately after the document is parsed, and
+ *     therefore BEFORE `autoResolveConfigDefaults` (the resolution that would
+ *     otherwise invent the three generated targets), before the capability
+ *     probes (`verifyModels`, `verifyTracker`, `verifyDeliveryConfiguration`,
+ *     the OpenCode schema call), before the journal is captured, and before
+ *     any write. A document that does not answer the question must not reach
+ *     the code that would answer it for it.
+ *   - It is `INVALID_DELIVERY_CONFIG`, the code `assertDeliveryShape` already
+ *     reports for a partial block, an unknown `mode`, and a deferred block
+ *     that also carries a target, so one rule, one code, and one place to read
+ *     about delivery shapes. `details.field` and `details.operation` are what
+ *     distinguish the omitted block from the partial one: an omitted block is
+ *     not an incomplete answer, it is no answer.
+ *
+ * A stated `delivery: null` is NOT absent — it is a malformed value, and it
+ * keeps the schema's own `INVALID_CONFIG` verdict.
+ */
+function assertUpdateConfigStatesDeliveryDecision(config: PoiesisConfig): void {
+  if (config.delivery !== undefined) return;
+  throw new PoiesisError(
+    "INVALID_DELIVERY_CONFIG",
+    `${UPDATE_CONFIG_OPERATION} configures an existing installation, so it requires a delivery decision: ` +
+      `add either the three delivery targets or { "mode": "deferred" } to the proposed config. ` +
+      `An omitted delivery block is only defaulted by \`poiesis init --config\`, which is the one operation that completes a fresh project.`,
+    { field: "delivery", operation: UPDATE_CONFIG_OPERATION },
+  );
+}
+
+/**
  * Test-only deterministic fault-injection hooks used by `runUpdateConfigTransaction`.
  * Each callback fires immediately BEFORE the corresponding write step (or
  * immediately AFTER for `postManifestWrite` / `postReceiptReplace`). Throwing
@@ -100,18 +173,6 @@ export interface UpdateTransactionHooks {
   prePoiesisConfigWrite?: () => void | Promise<void>;
   /** Called immediately after writing the new Poiesis config. */
   postPoiesisConfigWrite?: () => void | Promise<void>;
-  /**
-   * Called immediately BEFORE the `pnpm poiesis` package script is
-   * reconciled on the Author's `package.json`. Ticket #137.
-   */
-  prePoiesisScriptEnsure?: () => void | Promise<void>;
-  /**
-   * Called immediately AFTER the package script is reconciled. Fires
-   * even when the value was already correct and no write happened. Tests
-   * use this to land a concurrent foreign write to `package.json` and
-   * prove the transaction fails closed without clobbering it.
-   */
-  postPoiesisScriptEnsure?: () => void | Promise<void>;
   /** Called immediately before applying the OpenCode projection to the managed config. */
   preOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately after writing the new OpenCode config. */
@@ -163,6 +224,29 @@ export interface UpdateTransactionHooks {
    * `dist/index.d.ts`.
    */
   injectDriftedOnWrittenContent?: (defaultContent: string) => string;
+  /**
+   * Spec #190 / ticket #193 — fires immediately BEFORE the transition
+   * writes its first byte (the relabelled `.gitignore` block). Tests that
+   * need a concurrent writer to land inside the transaction's window use
+   * this to prove the bounded journal detects the replacement and preserves
+   * the foreign bytes. Production callers leave it unset.
+   */
+  preModeTransitionApply?: () => void | Promise<void>;
+  /**
+   * Spec #190 / ticket #193 — fires immediately AFTER the `.gitignore` block
+   * is written and BEFORE the shared profile files are created. A test that
+   * makes the profile appear here exercises "this file was replaced while
+   * the transaction ran" against a file the journal captured as ABSENT.
+   */
+  postModeTransitionGitignore?: () => void | Promise<void>;
+  /**
+   * Spec #190 / ticket #193 — fires immediately AFTER every transition
+   * write completes and BEFORE the manifest is advanced. Throwing here is
+   * the deterministic way to prove the rollback restores the relabelled
+   * `.gitignore` byte-for-byte and removes the profile files this run
+   * created, while the manifest and receipt never advance.
+   */
+  postModeTransitionApply?: () => void | Promise<void>;
 }
 
 /**
@@ -200,20 +284,6 @@ async function isRegularFileNoFollow(path: string): Promise<boolean> {
     return details.isFile() && !details.isSymbolicLink();
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
-    throw error;
-  }
-}
-
-/**
- * Exact preimage bytes of the Author's `package.json`, or `null` when it
- * does not exist. Absence is meaningful here: it is what lets
- * `rollbackPackageJson` unlink a file the transaction created.
- */
-async function snapshotPackageJson(path: string): Promise<Buffer | null> {
-  try {
-    return await readFile(path);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;
   }
 }
@@ -293,27 +363,45 @@ function assertUpdateConfigDoctorGate(report: DoctorReport, manifest: Manifest):
  * `update --config` rejects the `allowFixtureAdapters` option up front,
  * so this invariant is the only line of defense against an introduced
  * or altered fixture configuration in this transaction.
+ *
+ * Ticket #140: both the tracker and the delivery block are discriminated
+ * unions now. A deferred delivery block has no adapter at all, so it is
+ * neither a fixture introduction nor an alteration — an install may
+ * legitimately transition between a complete delivery block and an
+ * explicit deferred state, and neither direction fabricates a fixture.
  */
-function detectFixtureAdapter(config: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined }): { fixture: boolean; targets: string[]; signature: string } {
+function detectFixtureAdapter(config: {
+  tracker?: { provider: string; project?: unknown } | undefined;
+  delivery?: { mode?: unknown; preview?: unknown; staging?: unknown; production?: unknown } | undefined;
+}): { fixture: boolean; targets: string[]; signature: string } {
   const targets: string[] = [];
   const parts: string[] = [];
   if (config.tracker?.provider === "fixture") {
     targets.push("tracker");
-    parts.push(`tracker=${config.tracker.provider}:${config.tracker.project ?? ""}`);
+    parts.push(`tracker=${config.tracker.provider}:${trackerProjectOf(config.tracker) ?? ""}`);
   }
-  for (const target of ["preview", "staging", "production"] as const) {
+  for (const target of DELIVERY_TARGETS) {
     const adapter = config.delivery?.[target];
-    if (adapter?.adapter === "fixture") {
+    if (
+      typeof adapter === "object" &&
+      adapter !== null &&
+      (adapter as { adapter?: unknown }).adapter === "fixture"
+    ) {
       targets.push(`delivery.${target}`);
-      parts.push(`delivery.${target}=${adapter.adapter}:${adapter.path ?? ""}`);
+      parts.push(`delivery.${target}=fixture:${fixturePath(adapter)}`);
     }
   }
   return { fixture: targets.length > 0, targets, signature: parts.join("|") };
 }
 
+function fixturePath(adapter: object): string {
+  const path = (adapter as { path?: unknown }).path;
+  return typeof path === "string" ? path : "";
+}
+
 function assertUpdateConfigNoFixtureIntroduceOrAlter(
   proposed: ResolvedPoiesisConfig,
-  current: { tracker?: { provider: string; project?: string | undefined } | undefined; delivery?: Record<string, { adapter: string; path?: string | undefined }> | undefined },
+  current: { tracker?: { provider: string; project?: unknown } | undefined; delivery?: { mode?: unknown; preview?: unknown; staging?: unknown; production?: unknown } | undefined },
   poiesisConfigBytesMatch: boolean,
   openCodeBytesMatch: boolean,
 ): void {
@@ -366,7 +454,11 @@ function assertUpdateConfigNoFixtureIntroduceOrAlter(
  * `replaceOwnershipReceipt` paths run).
  *
  * Step layout:
- *   1. parse + validate + assertResolvedConfig       (no I/O writes)
+ *   1. parse + validate + assertResolvedConfig + state the delivery decision
+ *      (no I/O writes; the contextual `INVALID_DELIVERY_CONFIG` refusal for an
+ *      omitted `delivery` block is ticket #166 and lands here, before step 3's
+ *      default resolution, before every probe, before the journal, and before
+ *      any write)
  *   2. ownership / auth / git / opencode-version      (no I/O writes)
  *   3. auto-discover defaults                         (no I/O writes)
  *   4. env validation: git / models / tracker / ...  (no I/O writes)
@@ -401,6 +493,7 @@ async function runLockedUpdateConfigTransaction(
   // into `maintenance.ts`. Types only (`UpdateResult`) are imported
   // statically and erased at compile time.
   const {
+    assertOpenCodeConfigNotTracked,
     assertResolvedConfig,
     autoResolveConfigDefaults,
     doctor,
@@ -421,6 +514,12 @@ async function runLockedUpdateConfigTransaction(
   const proposedConfigRaw = await readUtf8(resolvedConfigPath);
   const proposedConfig = validateConfig(parseJsonc<unknown>(proposedConfigRaw, resolvedConfigPath), resolvedConfigPath);
   assertResolvedConfig(proposedConfig);
+  // Spec #139 / ticket #166: the proposed document must STATE its delivery
+  // decision. This runs before `autoResolveConfigDefaults` below — the step
+  // that would otherwise resolve an omitted block to the three generated
+  // command targets — and therefore before every capability probe, before the
+  // journal is captured, and before the first write.
+  assertUpdateConfigStatesDeliveryDecision(proposedConfig);
 
   // 2. Authenticate the trusted receipt FIRST, before any other ownership check
   //    consumes manifest records. This locks in the receipt's claim about the
@@ -460,7 +559,19 @@ async function runLockedUpdateConfigTransaction(
   //    content). Discovered defaults are persisted because this is the value
   //    that is written to `.poiesis/config.jsonc`, projected onto the OpenCode
   //    config, and baked into the new manifest entry.
-  const { config: resolvedConfigWithDefaults } = await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+  const { config: autoResolvedConfig } = await autoResolveConfigDefaults(resolvedRoot, proposedConfig);
+  // Spec #190 / ticket #193 — the installed mode is CARRIED FORWARD when the
+  // proposed config omits it. `mode` is optional in the schema so every
+  // pre-Spec #190 config still parses, which means an unrelated config update
+  // could otherwise write a config that no longer states the sharing mode its
+  // manifest and its `.gitignore` block were written with. The Author picks a
+  // mode once, explicitly; they do not re-pick it every time they change a
+  // model id. Only an EXPLICIT different mode transitions the installation.
+  const effectiveMode = autoResolvedConfig.mode ?? manifest.mode;
+  const resolvedConfigWithDefaults: ResolvedPoiesisConfig = {
+    ...autoResolvedConfig,
+    ...(effectiveMode === undefined ? {} : { mode: effectiveMode }),
+  };
 
   // 4. Complete environment validation BEFORE the first write. The narrowest
   //    internal helpers from `init` are reused so a missing model, an
@@ -552,6 +663,54 @@ async function runLockedUpdateConfigTransaction(
     patches: desiredOpenCodeProjectionPatches,
   });
 
+  // 6a. Spec #190 / ticket #193 — decide whether an EXPLICIT sharing mode was
+  // requested, and refuse the request this transaction cannot honour.
+  //
+  // Read the candidate's OWN mode rather than the carry-forwarded one. The
+  // candidate is what the Author said; `effectiveMode` is what this run will
+  // write, and conflating the two is what previously let a config land that
+  // the manifest and the `.gitignore` block never agreed with.
+  //
+  // An EXPLICIT mode against an installation that records none is refused, not
+  // absorbed. A pre-Spec #190 manifest states no mode, owns no block, and has
+  // no shared profile, so writing `mode` into `.poiesis/config.jsonc` here
+  // would leave the installation stating three different things: a mode in the
+  // config, no mode in the manifest, and a block that names no sharing policy
+  // at all. The next reader would have to guess which one was meant, and
+  // `uninstall` would have a config mode with nothing to reverse. Giving that
+  // installation a mode is a migration decision with its own authority
+  // questions, so this refuses and names what is missing instead — the same
+  // `INSTALL_MODE_TRANSITION_UNSUPPORTED` the planner raises for an
+  // unblockable installation, because it is the same condition seen from the
+  // cheaper side.
+  //
+  // The omission case is untouched: a candidate that says nothing about
+  // sharing is an ordinary config update, and `effectiveMode` stays undefined
+  // so a legacy installation keeps behaving exactly as it did.
+  const requestedMode = autoResolvedConfig.mode;
+  const installedMode = manifest.mode;
+  const transitionRequested = requestedMode !== undefined && requestedMode !== installedMode;
+  if (transitionRequested && installedMode === undefined) {
+    throw new PoiesisError(
+      "INSTALL_MODE_TRANSITION_UNSUPPORTED",
+      `This Poiesis installation records no sharing mode, so \`${requestedMode}\` cannot be applied to it. Re-install with \`poiesis init\` and choose private or team, or omit \`mode\` from this config to update the installation without changing how it shares`,
+      { path: ".poiesis/manifest.json", requested: requestedMode, recorded: null },
+    );
+  }
+  //
+  // Going to `private` re-runs the tracked-OpenCode-config guard `init`
+  // applies, and it runs HERE rather than with the rest of the plan because it
+  // is the cheapest possible statement of the rule and the one that decides
+  // whether this transition is coherent at all: a private installation must
+  // not leave the generated projections invisible to ordinary OpenCode, and
+  // patching a tracked config would put that generated edit into shared
+  // project history. A team installation that has since committed its config
+  // therefore cannot quietly become private. The check belongs to the TARGET
+  // mode, not to the act of installation, which is why it is reused here.
+  if (transitionRequested && requestedMode === "private") {
+    await assertOpenCodeConfigNotTracked(resolvedRoot, openCodeConfigPath, "private");
+  }
+
   // 7. No-op detection compares both captured serialized files directly with
   //    the complete intended payloads. A pre-existing OpenCode config is owned
   //    only through manifest config patches, so it deliberately has no
@@ -559,17 +718,6 @@ async function runLockedUpdateConfigTransaction(
   //    that patch-only ownership intact while recognizing that the projection
   //    would write exactly the bytes already on disk. Do NOT advance generation;
   //    return the existing manifest unchanged.
-  // Spec #133 / ticket #138: the Author-owned `package.json` state, declared
-  // before the no-op branch so BOTH branches can bind the post-write identity.
-  // `package.json` is neither a manifest record nor a journal artifact; it is
-  // reversed by its own written-hash-gated helper, exactly as the ordinary
-  // update path does.
-  const packageJson: { snapshot: Buffer | null; writtenHash: string | undefined } = {
-    snapshot: null,
-    writtenHash: undefined,
-  };
-  const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
-
   const poiesisConfigBytesMatch = currentConfigBytes.equals(Buffer.from(newConfigContent, "utf8"));
   const openCodeBytesMatch = openCodeConfigCurrentBytes.equals(Buffer.from(preflightSerialized, "utf8"));
   // Adapter-fixture invariant. Must run AFTER the bytes are computed
@@ -586,7 +734,12 @@ async function runLockedUpdateConfigTransaction(
     poiesisConfigBytesMatch,
     openCodeBytesMatch,
   );
-  if (poiesisConfigBytesMatch && openCodeBytesMatch) {
+  // Spec #190 / ticket #193 — a pending mode transition is never a no-op, even
+  // if the config and OpenCode projection happen to serialize identically. The
+  // `.gitignore` block and the manifest still have to advance, so returning the
+  // existing manifest here would leave the installation stating two different
+  // sharing modes at once.
+  if (poiesisConfigBytesMatch && openCodeBytesMatch && !transitionRequested) {
     // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
     // so tests can deterministically fail the gate (e.g. by toggling a
     // doctor-failure environment variable) and prove the extracted
@@ -598,31 +751,12 @@ async function runLockedUpdateConfigTransaction(
     // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
     // on schema rejection.
     await hooks?.preNoopDoctor?.();
-
-    // Spec #133 / ticket #138: a config no-op is NOT a whole-project no-op.
-    // The `pnpm poiesis` package script is an artifact independent of the
-    // config bytes, so it must still be reconciled here. Without this,
-    // `poiesis model set reasoning <already-current-model>` silently left a
-    // missing or drifted script unrepaired, because that path lands in this
-    // branch and returned before the write site below.
-    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
-    await hooks?.prePoiesisScriptEnsure?.();
-    try {
-      await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
-        onWritten: (content) => {
-          packageJson.writtenHash = hashContent(content);
-        },
-      });
-      await hooks?.postPoiesisScriptEnsure?.();
-      const report = await doctor(resolvedRoot);
-      assertUpdateConfigDoctorGate(report, manifest);
-      return { manifest, doctor: report };
-    } catch (error) {
-      // Reversal is hash-gated, so a foreign replacement of `package.json`
-      // during this window is preserved rather than clobbered.
-      await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
-      throw error;
-    }
+    // Spec #190 / ticket #191: this is now a genuine whole-project no-op.
+    // `package.json` is no longer an artifact Poiesis mutates at all, so a
+    // config no-op has nothing left to reconcile.
+    const report = await doctor(resolvedRoot);
+    assertUpdateConfigDoctorGate(report, manifest);
+    return { manifest, doctor: report };
   }
 
   // 8. Validate the projected (post-write) OpenCode config payload against the
@@ -641,6 +775,23 @@ async function runLockedUpdateConfigTransaction(
   //    `validateOpenCodeConfigPayload`'s preexisting error code on rejection.
   await validateOpenCodeConfigPayload(preflightSerialized);
 
+  // 8a. Spec #190 / ticket #193 — plan the explicit Private <-> Team
+  // transition. Deliberately the LAST read-only step before the journal opens:
+  // planning and capturing are separate observations, and the narrower the gap
+  // between them, the less state the plan can be stale about. Everything the
+  // transition refuses — an edited / missing / mislabelled / duplicated /
+  // malformed block, a non-portable profile, a contradicting committed profile
+  // — surfaces from this read-only step with the offending path in its details.
+  const transition: InstallModeTransitionPlan | undefined = transitionRequested
+    ? await planInstallModeTransition({
+        root: resolvedRoot,
+        manifest,
+        to: requestedMode!,
+        resolvedConfig: resolvedConfigWithDefaults,
+        generatedAgentPaths: POIESIS_GENERATED_AGENT_PATHS,
+      })
+    : undefined;
+
   // 9. Snapshot the manifest preimage for fail-closed rollback. Reading the
   //    manifest is the last read-only step; everything from step 10 onward
   //    mutates owned bytes. The snapshot read happens AFTER the schema
@@ -650,14 +801,46 @@ async function runLockedUpdateConfigTransaction(
   const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-  const journal = new ArtifactJournal(4);
+  // Spec #190 / ticket #193 — the limit covers the transition surface too:
+  // poiesis config, OpenCode config, `.gitignore`, up to two shared profile
+  // files, the manifest, and the receipt. Captured in EXACT write order, so
+  // the journal's reverse-order rollback is reverse write order and the
+  // shared profile files a failed transition created are removed rather than
+  // left behind next to a manifest that never advanced.
+  const journal = new ArtifactJournal(8);
   const poiesisConfigArtifact = await journal.capture(poiesisConfigPath, "whole-file");
   const openCodeArtifact = await journal.capture(
     openCodeConfigPath,
     manifest.files.some((file) => file.path === openCodeRelativePath) ? "whole-file" : "patch",
   );
+  const gitignoreArtifact = transition === undefined
+    ? undefined
+    : await journal.capture(join(resolvedRoot, GITIGNORE_RELATIVE_PATH), "whole-file");
+  const profileArtifacts: Array<{ path: string; entry: ArtifactJournalEntry }> = [];
+  for (const file of transition?.createProfileFiles ?? []) {
+    profileArtifacts.push({ path: file.path, entry: await journal.capture(join(resolvedRoot, file.path), "whole-file") });
+  }
   const manifestArtifact = await journal.capture(manifestPath, "whole-file");
   const receiptArtifact = await journal.capture(receiptPath, "whole-file");
+  if (transition !== undefined && gitignoreArtifact !== undefined) {
+    // Bind the plan to what the journal actually captured: the `.gitignore`
+    // must still be the content the splice was rendered from, and a shared
+    // profile the plan decided to create must still be absent. Without this,
+    // a writer that lands in the window between planning and capturing would
+    // be silently overwritten by a decision made about different bytes.
+    assertTransitionCaptureIdentity(transition, {
+      gitignorePreimage: gitignoreArtifact.preimage,
+      profileCaptures: profileArtifacts.map((artifact) => ({
+        path: artifact.path,
+        physicalExists: artifact.entry.physicalExists,
+      })),
+    });
+  }
+  // The profile's parent directory is not a journal entry (the journal owns
+  // file preimages), so the transition records which directories it created
+  // and the catch block removes the ones still empty. Deliberated LAST, between
+  // the drift check and the `try`, so the catch block is guaranteed to be
+  // reachable for anything that can leave one behind.
   const expectedSnapshots: Array<[ArtifactJournalEntry, Buffer]> = [
     [poiesisConfigArtifact, currentConfigBytes],
     [openCodeArtifact, openCodeConfigCurrentBytes],
@@ -670,6 +853,10 @@ async function runLockedUpdateConfigTransaction(
     }
   }
   await hooks.onJournalReady?.(journal.entries);
+  const createdProfileDirectories =
+    transition === undefined || transition.createProfileFiles.length === 0
+      ? []
+      : await ensureTransitionProfileParents(resolvedRoot);
 
   // Spec #133 / ticket #137: the Author-owned `package.json` state.
   // Declared here (before the try) so the catch block can close over the
@@ -681,27 +868,6 @@ async function runLockedUpdateConfigTransaction(
     await hooks?.prePoiesisConfigWrite?.();
     await journal.replace(poiesisConfigArtifact, newConfigContent);
     await hooks.postPoiesisConfigWrite?.();
-
-    // 10b. Reconcile the `pnpm poiesis` package script (acceptance #7).
-    //      Written after the config and before the OpenCode projection, so
-    //      the catch block reverses it in exact reverse write order.
-    packageJson.snapshot = await snapshotPackageJson(packageJsonPath);
-    await hooks?.prePoiesisScriptEnsure?.();
-    await repairPoiesisScript(resolvedRoot, packageJson.snapshot, {
-      onWritten: (content) => {
-        packageJson.writtenHash = hashContent(content);
-      },
-    });
-    await hooks?.postPoiesisScriptEnsure?.();
-    if (packageJson.writtenHash !== undefined && (await exists(packageJsonPath))) {
-      if (hashContent(await readFile(packageJsonPath)) !== packageJson.writtenHash) {
-        throw new PoiesisError(
-          "PACKAGE_JSON_CHANGED",
-          "package.json changed between transaction write and manifest materialization",
-          { file: PACKAGE_JSON_RELATIVE },
-        );
-      }
-    }
 
     // 11. Write the already validated, deterministic OpenCode projection
     //     through the same journal guard used for every other artifact.
@@ -719,6 +885,32 @@ async function runLockedUpdateConfigTransaction(
     const appliedPatches = projectedOpenCodePatches;
     const openCodeWrittenHash = hashContent(preflightSerialized);
 
+    // 11b. Spec #190 / ticket #193 — apply the planned transition through the
+    //      same bounded journal every other owned byte uses. `.gitignore` is
+    //      spliced, not rewritten: the plan already proved the recorded block
+    //      is unchanged and produced content that preserves every byte outside
+    //      it, and the journal's pre-write identity guard closes the window
+    //      between that proof and this write against a concurrent writer.
+    if (transition !== undefined) {
+      await hooks?.preModeTransitionApply?.();
+      if (gitignoreArtifact !== undefined) {
+        await journal.replace(gitignoreArtifact, transition.gitignoreContent);
+      }
+      await hooks?.postModeTransitionGitignore?.();
+      // Shared profile files are created only where they are absent, so a
+      // transition never overwrites Author-committed project intelligence.
+      for (const profile of transition.createProfileFiles) {
+        const artifact = profileArtifacts.find((candidate) => candidate.path === profile.path);
+        if (artifact === undefined) {
+          throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the shared profile entry", {
+            path: profile.path,
+          });
+        }
+        await journal.replace(artifact.entry, profile.content);
+      }
+      await hooks?.postModeTransitionApply?.();
+    }
+
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -728,6 +920,10 @@ async function runLockedUpdateConfigTransaction(
     //     same `nextPoiesisVersion` captured at step 6 so the manifest's recorded version exactly
     //     matches the version baked into the OpenCode config bash projection.
     const nextManifest: Manifest = {
+      // Spec #190 / ticket #191: an update reconciles the installation; it
+      // never re-decides its sharing mode. `mode` and the exact
+      // `.gitignore` block ownership ride through unchanged.
+      ...manifest,
       schema: 1,
       poiesisVersion: nextPoiesisVersion,
       adapter: {
@@ -738,7 +934,17 @@ async function runLockedUpdateConfigTransaction(
       },
       files: manifest.files.map((file) => {
         if (file.path === POIESIS_CONFIG_RELATIVE_PATH) {
-          return { path: POIESIS_CONFIG_RELATIVE_PATH, kind: "generated", hash: newConfigHash, owned: true };
+          // Key order matches `managedFileSchema` exactly. `manifestSchema`
+          // is a strict object, so a round-trip through `loadManifest`
+          // normalises key order; a literal built in a different order would
+          // serialize to different bytes and break the receipt digest.
+          return {
+            path: POIESIS_CONFIG_RELATIVE_PATH,
+            kind: "generated",
+            hash: newConfigHash,
+            owned: true,
+            provenance: "config",
+          };
         }
         if (file.path === openCodeRelativePath) {
           return { ...file, hash: openCodeWrittenHash! };
@@ -747,6 +953,14 @@ async function runLockedUpdateConfigTransaction(
       }),
       skills: manifest.skills,
       configPatches: mergedPatches,
+      // Spec #190 / ticket #193 — an EXPLICIT mode change is the one thing an
+      // `update --config` may decide about sharing. Both keys already exist on
+      // the manifest the spread above carried (the planner refuses without
+      // them), so overriding them in place adds no new key and therefore
+      // cannot shift the canonical serialization key order the receipt digest
+      // is computed over. `ignoreBlock.hash` is the hash of the block this run
+      // actually wrote, so `uninstall` reverses exactly these bytes.
+      ...(transition === undefined ? {} : { mode: transition.to, ignoreBlock: transition.record }),
     };
     await hooks?.preManifestWrite?.();
     // Serialize nextManifest exactly once; derive the post-write identity
@@ -779,10 +993,13 @@ async function runLockedUpdateConfigTransaction(
     // 16. Exact rollback is journal-driven and always runs in reverse write
     //     order. Foreign replacements are preserved and reported explicitly.
     const diagnostics = await journal.rollback();
-    // Ticket #137: the Author-owned `package.json` is reversed AFTER the
-    // journal (it was written after the journal's first artifact) and
-    // its helper no-ops on any foreign replacement.
-    await rollbackPackageJson(packageJsonPath, packageJson.snapshot, packageJson.writtenHash);
+    // Spec #190 / ticket #193 — the journal restored (or removed) every FILE
+    //     the transition touched, `.gitignore` included. A parent directory it
+    //     created for the shared profile is not a journal entry, so it is
+    //     removed here — deepest first, and only while still empty, which is
+    //     why a rollback can never delete project structure on the strength of
+    //     a bookkeeping list. Never able to fail the transaction it is undoing.
+    await removeEmptyTransitionDirectories(resolvedRoot, createdProfileDirectories);
     if (diagnostics.length > 0) {
       if (error instanceof PoiesisError) {
         error.details.incompleteRollback = diagnostics;

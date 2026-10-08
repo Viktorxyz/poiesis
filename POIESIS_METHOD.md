@@ -58,11 +58,24 @@ Required infrastructure includes:
 - Git repository;
 - configured remote;
 - supported tracker;
-- configured Preview, Staging, and Production targets;
+- configured Preview, Staging, and Production targets, or an explicit `"delivery": { "mode": "deferred" }` state;
 - supported harness;
 - configured reasoning and execution models.
 
 Never consume foreign uncommitted work as the implementation base.
+
+### Tracker choice
+
+The tracker choice and the delivery choice are independent. A project decides where its canonical Spec and its tickets live separately from whether a candidate can be published, previewed, and released today. Choosing one never silently changes the other, and neither choice promises that a change request, a Preview, or a release will happen.
+
+The supported tracker adapters are:
+
+- `github` and `gitlab` — the Spec and tickets live in the forge repository, addressed by `tracker.project`, operated through the authenticated `gh` or `glab` CLI.
+- `linear` — the Spec and tickets live in a Linear team, addressed by a required `tracker.team` and an optional `tracker.project`. Poiesis reads the Linear credential from the environment only: set exactly one of `LINEAR_API_KEY` (sent as the raw credential) or `LINEAR_OAUTH_TOKEN` (sent as a `Bearer` token). Poiesis never reads, stores, writes, or logs a Linear credential in the config, a tracker item, an error, or a log line. Setting both variables fails closed with `LINEAR_AUTH_AMBIGUOUS` rather than picking one silently; setting neither fails closed with `LINEAR_AUTH_MISSING`.
+- `local` — `local` persists Spec and ticket state in the clone itself under `poiesis-tracker-v1` beneath the Git common directory, outside every working tree, and makes no network call. It needs no CLI and no credential, its items carry monotonic `LOCAL-<n>` identities, and it is a first-class product tracker, not a test fixture. A `local` install still resolves the integration branch and any publishing destination from the Git repository itself. Every read-modify-write runs under a token-checked `store.lock` whose mutation is serialized by a short-lived `store.lock.guard`, so a stale canonical lock is reclaimed inside the bounded wait and a live one is never stolen. Poiesis never reclaims a `store.lock.guard` left behind by a crash: the guard stays on disk, every later acquisition fails closed with `LOCAL_TRACKER_LOCK_TIMEOUT` naming both the canonical `store.lock` and the exact `store.lock.guard`, and clearing it is an operator decision. The recovery is always the same: first verify that no Poiesis process is accessing the clone, then remove only the exact `store.lock.guard` artifact and retry. The exact guard path travels as a field on that error, and the procedure is stated in prose that names the two artifacts rather than printing a command to run. A clone directory name Poiesis did not choose can never become an argument or a substitution in a command an operator copies out of an error message. The canonical `store.lock` is never removed by hand, because its holder PID and ownership token already reclaim a stale one within the bounded wait.
+- `fixture` — test-only, requires `--allow-fixtures` at `init`, and writes outside the repository root. It is never offered as an Author choice.
+
+A `github` or `gitlab` coordinate may be inferred from a recognized `github.com` or `gitlab.com` Git remote when the config does not state one. `linear` and `local` coordinates are never inferred from a remote: `linear` needs an Author-supplied team, and `local` needs no coordinate at all. Poiesis never invents a coordinate the Author did not state and the remote did not record.
 
 ### Capability Check
 
@@ -318,6 +331,44 @@ Canonical Publish evidence fields (runtime-required, equality invariants shown a
 
 A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
+### Publishing coordinates
+
+Publishing coordinates are a property of the configured Git remote, never of the tracker. A project that keeps its Spec and tickets in Linear or in the clone still publishes to the repository its Git remote points at. Poiesis resolves them in exactly one order:
+
+1. the configured remote, when it is a recognized `github.com` or `gitlab.com` host;
+2. otherwise, the configured `tracker.project`, and only when the tracker is the test-only `fixture`;
+3. otherwise nothing.
+
+A remote URL that carries userinfo (`https://user:token@github.com/owner/repo.git`) is still a recognized remote, and Poiesis keeps the credential out of every coordinate, report, error detail, log line, and evidence file it produces.
+
+`linear` and `local` can never supply publishing coordinates and can never appear as the `provider` of Publish evidence. When no coordinate resolves, Poiesis fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence.
+
+A fork is a different repository, not a shortcut to its upstream. A remote pointing at a fork is a recognized host, so Poiesis publishes to the fork that remote names and opens the change request against that fork's own configured integration branch. Nothing in a clone records the fork/upstream relationship, so Poiesis can never publish back to the upstream it was forked from and never pretends to: if the change request that comes back is owned by a repository other than the coordinates Poiesis resolved, Publish fails closed. A self-hosted host (`gitlab.example.com`) or a filesystem remote is not a recognized host at all, so it yields no coordinates of its own.
+
+### Deferred delivery
+
+An installed project may state `"delivery": { "mode": "deferred" }`. That is an explicit, honest state, not a defect: the work stays local. Everything up to and including whole-change Proof therefore continues normally — Prepare, Realize, Checkpoint, accepted Review, and Verify for the exact candidate — and `poiesis doctor` reports the deferred state as a nonblocking warning.
+
+Deferral stops the lifecycle before anything leaves the project. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with a typed `DELIVERY_DEFERRED` error that names the blocked operation and the remediation, before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, worktree removal, or delivery evidence.
+
+The refusal is a property of the installed state and the operation, not of the order the runtime happens to check things in. `publish`, `preview`, `promote`, and `integrate` decide it from the installed config before they read that config for anything else, and a project with no installed config stops there with `CONFIG_NOT_INSTALLED`; a project with no installed manifest stops even earlier, at the runtime identity boundary. Workspace ownership outranks the installed state for `poiesis workspace cleanup` alone, the one operation that has to know what it would delete. Workspace ownership comes first for cleanup: `poiesis workspace cleanup` proves it owns the workspace before it reads any installation, so a cleanup invoked outside a workspace Poiesis can prove it owns is refused with `WORKSPACE_OWNERSHIP_UNKNOWN` and never reaches the installed-state decision. `poiesis workspace cleanup` invoked outside a workspace Poiesis can prove it owns never reports a delivery code at all: on a fully installed deferred project it reports `WORKSPACE_OWNERSHIP_UNKNOWN` rather than `DELIVERY_DEFERRED`. A cleanup that cannot prove what it would delete has no standing to report on delivery, so the primary checkout and a worktree Poiesis never prepared all report that code, and a directory that is not inside a Git repository at all is refused even earlier, with `NOT_GIT_REPOSITORY`. `poiesis publish` and `poiesis integrate` reach workspace ownership only after the shared preflight has accepted the installed state, so their commands invoked from an unowned working directory report the installed-state code the preflight decided, never `WORKSPACE_OWNERSHIP_UNKNOWN`. Inside an owned workspace the precedence is unchanged and strictly ordered: `RUNTIME_VERSION_MISMATCH` when the installed version does not match, then `CONFIG_NOT_INSTALLED` naming the PRIMARY checkout's `.poiesis/config.jsonc` when that installed config is missing, then `DELIVERY_DEFERRED` when it states the deferred mode. Every one of those refusals is decided before the first lifecycle side effect: before any side-effecting subprocess, before any remote branch deletion, before any worktree removal, before any local ref deletion, and before any change to the immutable workspace ownership marker. The read-only `git rev-parse` calls that locate a root and read the ownership markers complete before the refusal is raised, and what is guaranteed is that nothing that mutates has run. On a CONFIGURED install, Publish may refuse with `PUBLISH_PROVIDER_UNRESOLVED` (see **Publishing coordinates** above) when the configured remote is not a recognized forge. Those are separate conditions with their own typed codes; the guarantee they share is the one that matters: no push, no fetch, no remote revalidation, no change request, and no delivery evidence.
+
+A deferred lifecycle pauses after exact-candidate Proof. Poiesis must not claim that Publish, Preview, Staging, Production, integration, Author validation, or completion happened, and must not ask the Author to validate a realization that was never delivered. Report the proven candidate and the blocked operations, and continue when the Author configures delivery.
+
+Deferral is a statement about delivery only; it never changes the tracker. Spec and ticket create, update, comment, close, and supersede keep working through the configured tracker, and a `local` tracker keeps persisting them in the clone. A deferred install also generates no delivery script, because there is no delivery command to run.
+
+Adopting a deferred install requires no change to any existing project workflow: nothing is pushed, no pull or merge request is opened, and nothing is deployed to any environment. A project that already ships through its own pipeline keeps shipping through that pipeline. Poiesis does not adopt, replace, reorder, or reconfigure an existing deployment workflow, and adopting Poiesis is not a deployment step.
+
+Configuring delivery later is the ordinary managed-configuration workflow, never a hand edit of `.poiesis/config.jsonc`: `poiesis update --config`. Supply the proposed complete config as the argument —
+
+    poiesis update --config ./poiesis-config.jsonc
+
+— replacing the `delivery` block with the complete Preview, Staging, and Production command targets and leaving the `tracker` block exactly as it is. The authenticated transaction writes the new config, the OpenCode projection, the manifest, and the ownership receipt atomically before `doctor` gates the result. Tracker and delivery stay independent through the change: a `local` tracker may keep its Spec and tickets in the clone while delivery becomes configured, and a deferred install on a forge tracker keeps its forge Spec and tickets.
+
+An omitted `delivery` block is a fresh-install default, never an update default: `poiesis init --config` resolves it to the three generated command targets, and `poiesis update --config` refuses it. `poiesis update --config` refuses a proposed config that omits `delivery` with `INVALID_DELIVERY_CONFIG` and details `{ field: "delivery", operation: "update --config" }`, before any default resolution, probe, journal, or write, so an installation's recorded delivery decision is never replaced by a default its Author did not choose. The distinction is contextual, never a schema change: `delivery` is optional in the config schema, so the legacy noninteractive install path that supplies no block at all keeps completing the project with generated targets and generated scripts, and a document that states its decision — the three targets, the deferred mode, or both with extension keys — is accepted by either command. `poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands.
+
+The rule composes with the rest of the transaction rather than bypassing it. A model change through `poiesis model set` proposes the installed config with one model field mutated, so the resolved `delivery` block it carries is an explicit one and the model change lands with delivery unchanged. A delivery transition — deferred to configured, or configured to deferred — is an ordinary proposed document, and it is still the receipt-authenticated transaction that writes the config, the OpenCode projection, the manifest, and the ownership receipt, still with no-op detection, still with fail-closed rollback, and still with `doctor` as the gate. Only the absence of the decision is refused, and it is refused before the first side effect, so a rejected document leaves the installation byte-for-byte as it was.
+
 ## 12. Preview
 
 Preview only after Publish succeeds. Pass, to `poiesis preview`:
@@ -451,6 +502,8 @@ Then:
 ## Operating rules
 
 - Keep Git, tracker, PR/MR, and delivery mechanics internal unless the Author asks for them.
+- The tracker choice and the delivery choice are independent; never let one imply the other, and never invent a tracker coordinate, a credential, or a publishing destination.
+- Report only what the deterministic operations actually produced; a paused, blocked, or unconfigured state is reported as itself, never as progress.
 - Use strong reasoning for consequential judgment and final semantic review.
 - Use execution-oriented models for exploration, implementation, routine review, debugging, and fact gathering.
 - Keep child returns bounded; do not forward transcripts, raw exploration, or large logs.
@@ -461,3 +514,4 @@ Then:
 - Do not repeat work without new evidence or a meaningful change in approach.
 - Prefer focused Repository Intelligence queries over broad mechanical rediscovery when the index can answer the question economically.
 - Repository Intelligence is a rebuildable, non-canonical local state, not durable project truth; an unavailable or stale cache falls back to ordinary source exploration without blocking the Method. The fallback is not a new lifecycle phase and does not create new durable state.
+- The generated delivery runtime is owned rebuildable, non-canonical local state at exactly `.poiesis/runtime/delivery/`; the container around it and every other sibling in it belong to the Author. Keep it ignored so a delivery run never shows up as project dirtiness, and remove only the owned subtree, never a link Poiesis has not validated.

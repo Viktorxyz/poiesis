@@ -42,6 +42,16 @@
  *     (`settleOnceLinePrompt` + `SettleOnceLinePromptArgs`) — it is
  *     a private CLI seam; production callers reach it through the
  *     factories above, never through the package root.
+ *   - the ticket #188 UNCHECKED delivery-construction seam
+ *     (`constructDeliveryAdapter`, `constructCommandDeliveryAdapter`,
+ *     `constructFixtureDeliveryAdapter`). The three exported delivery
+ *     factories return a policy-aware adapter, so the deferred
+ *     lifecycle cannot be bypassed through the package root; the
+ *     construction they delegate to has no policy check at all and
+ *     therefore stays module-internal — asserted against
+ *     `src/adapters.js`, which `src/index.ts` re-exports wholesale.
+ *     The refusal behavior itself is pinned in
+ *     `tests/deferred-delivery-lifecycle.test.ts`.
  *
  * The test uses TypeScript's type system:
  *   - Direct `import` statements from `../src/index.js` fail to compile
@@ -93,6 +103,27 @@ type PublicApiValues = typeof import("../src/index.js");
 type AssertNotExported<K extends string> = K extends keyof PublicApiValues
   ? ["forbidden key present", K]
   : true;
+
+// -- Spec #139 / ticket #188: the UNCHECKED delivery-construction seam. The
+//    three exported factories (`createDeliveryAdapter`,
+//    `createCommandDeliveryAdapter`, `createFixtureDeliveryAdapter`) return a
+//    policy-aware adapter, so the deferred lifecycle cannot be bypassed
+//    through the package public API. The construction they delegate to is
+//    module-internal: it runs the delivery subprocess, writes the delivery
+//    artifact, and mints delivery evidence with no policy check at all, so it
+//    must not exist as an export of the source module either. This is asserted
+//    against the SOURCE module, which `src/index.ts` re-exports wholesale, so
+//    `AssertNotExported` above could not see it.
+type AdapterModuleValues = typeof import("../src/adapters.js");
+type AssertNotModuleExported<K extends string> = K extends keyof AdapterModuleValues
+  ? ["module-internal seam exported", K]
+  : true;
+
+const uncheckedDeliveryConstructionSeams = [
+  "constructDeliveryAdapter",
+  "constructCommandDeliveryAdapter",
+  "constructFixtureDeliveryAdapter",
+] as const;
 
 // -- Forbidden: must NOT be re-exported by the package root.
 const forbiddenFunctions = [
@@ -155,13 +186,14 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
-  // Spec #133 / tickets #134-#137: the `pnpm poiesis` package-script
-  // module (`src/package-script.ts`) stays internal. These are the
-  // init/update transaction seams and the single source of truth for the
-  // script value; promoting them would freeze the Author-owned
-  // `package.json` edit contract (including the refusing/repairing
-  // entry-point split that forces each caller to choose deliberately)
-  // into the packed public surface.
+  // Spec #190 / ticket #191: the `pnpm poiesis` package-script module is
+  // GONE — invoking Poiesis no longer mutates `package.json` — and the
+  // installation-mode / managed-ignore-block capability stays CLI- and
+  // runtime-internal for the same reason. These names must never reach the
+  // package root: promoting them would freeze the Author-owned
+  // `package.json` contract that Spec #190 removed, or the block
+  // delimiter/parse surface, into a public API before later tickets
+  // (#192) settle them.
   "POIESIS_SCRIPT_NAME",
   "POIESIS_SCRIPT_COMMAND",
   "PACKAGE_JSON_RELATIVE",
@@ -170,6 +202,74 @@ const forbiddenFunctions = [
   "repairPoiesisScript",
   "rollbackPackageJson",
   "EnsurePoiesisScriptOptions",
+  "INSTALL_MODES",
+  "parseInstallMode",
+  "parseInstallModeAnswer",
+  "GITIGNORE_RELATIVE_PATH",
+  "IGNORE_BLOCK_TOKEN",
+  "ignoreBlockStartLabel",
+  "ignoreBlockEndLabel",
+  "parseManagedIgnoreBlocks",
+  "renderManagedIgnoreBlock",
+  "planManagedIgnoreBlock",
+  "planManagedIgnoreBlockRemoval",
+  "managedIgnoreBlockLines",
+  // Spec #190 / ticket #192: the Team/shared declarative profile stays
+  // CLI- and runtime-internal for the same reason. Promoting it would freeze
+  // the profile LAYOUT, the portability rules, and the skills-lock schema
+  // into a public API before the remaining sharing tickets settle them.
+  "TEAM_PROFILE_DIRECTORY",
+  "TEAM_PROFILE_CONFIG_PATH",
+  "TEAM_PROFILE_SKILLS_LOCK_PATH",
+  "TEAM_PROFILE_OVERRIDES_DIRECTORY",
+  "classifyTeamArtifact",
+  "teamProfileConfig",
+  "assertTeamProfilePortable",
+  "assertTeamProfileAdoptable",
+  "renderTeamSkillsLock",
+  "parseTeamSkillsLock",
+  "driftedLockedSkills",
+  "readTeamOverrides",
+  "readTeamProfileConfig",
+  "teamProfileFileHash",
+  // Spec #190 / ticket #193: the Private <-> Team TRANSITION surface stays
+  // CLI- and runtime-internal for the same reason. Promoting it would freeze
+  // the transition PLAN shape, the manifest-derived ignore classification, and
+  // the shared-profile directory bookkeeping into a public API — and a public
+  // "change my sharing mode" helper would let a library caller reach the
+  // `.gitignore` rewrite without the receipt authentication, doctor gate, and
+  // rollback that `poiesis update --config` provides. The transition is reached
+  // by stating a different `mode` in a config handed to `update --config`, and
+  // by nothing else. `assertOpenCodeConfigNotTracked` is exported from
+  // `maintenance.ts` for that transaction's reuse of the init-side private-
+  // mode guard and must not reach the package root either.
+  // `managedIgnoreContextFromManifest` is deliberately NOT exported at all:
+  // the manifest-derived ignore classification is only ever consumed as part of
+  // a plan, and a separately callable classifier would let a caller build an
+  // ignore policy without the block, block-identity, and portability checks.
+  "planInstallModeTransition",
+  "managedIgnoreContextFromManifest",
+  "assertTransitionCaptureIdentity",
+  "ensureTransitionProfileParents",
+  "removeEmptyTransitionDirectories",
+  "assertOpenCodeConfigNotTracked",
+  // Spec #190 / ticket #194: the mode-less MIGRATION surface stays CLI- and
+  // runtime-internal for the same reason. Promoting it would freeze the
+  // migration PLAN shape, the manifest-derived ignore classification, the
+  // index-only removal bookkeeping (including the captured index entries a
+  // rollback restores), and the RESULT envelope into a public API — and a public
+  // "give my installation a sharing mode" helper would let a library caller
+  // stage Git index removals without the receipt authentication, the runtime
+  // identity boundary, the doctor gate, and the rollback that
+  // `poiesis migrate install-mode` provides. The migration is reached by naming
+  // the target mode on that route, and by nothing else.
+  "planInstallModeMigration",
+  "assertMigrationCaptureIdentity",
+  "migrationConfigWithMode",
+  "untrackMigrationPaths",
+  "restoreTrackedPaths",
+  "runInstallModeMigrationTransaction",
+  "migrateInstallMode",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache
@@ -254,9 +354,93 @@ const forbiddenFunctions = [
   // the Specialist agent `permission.bash` strip) into a public
   // API before the v1.2 surface stabilizes.
   "predecessorProjectionV113V114",
+  // Spec #139 / ticket #142: the `local` tracker's store layout, lock
+  // protocol, and strict-validation contract live in `src/local-tracker.ts`
+  // and MUST NOT reach the package root. Only the `createLocalTrackerAdapter`
+  // factory is public (mirroring the forge / fixture factories), so a caller
+  // gets a complete `TrackerAdapter` without the on-disk store shape, the
+  // lock envelope, and the refusal codes freezing into a public surface.
+  "resolveLocalTrackerStoreLocation",
+  "resolveLocalTrackerStoreLocationSync",
+  "parseLocalTrackerStore",
+  "acquireLocalTrackerLock",
+  "acquireLocalTrackerLockWithTimeout",
+  "releaseLocalTrackerLock",
+  "assertLocalTrackerStoreUsable",
+  "LOCAL_TRACKER_STORE_DIRECTORY",
+  "LOCAL_TRACKER_STORE_SCHEMA",
+  "LOCAL_TRACKER_STORE_PROVIDER",
+  "LOCAL_TRACKER_LOCK_VERSION",
+  "LOCAL_TRACKER_LOCK_TIMEOUT_MS",
+  // Spec #139 / ticket #159: the total serialized-store ceiling is a bound on
+  // ONE internal store layout, not a contract a caller tunes. Promoting it
+  // through `src/index.ts` would freeze the number, the trailing newline it
+  // counts, and the `LOCAL_TRACKER_STORE_TOO_LARGE` refusal's inert
+  // `path` / `sizeBytes` / `maxBytes` details into a public API, and would let
+  // a caller raise a bound that exists precisely because Poiesis does not read
+  // an unbounded document on its behalf.
+  "LOCAL_TRACKER_STORE_MAX_BYTES",
+  // Spec #139 / ticket #141: the Linear adapter lives in
+  // `src/linear-tracker.ts` and stays module-internal, and it is reached
+  // through the EXISTING public `createTrackerAdapter` factory rather than a
+  // second bespoke public entry point. The credential variable names, the
+  // official endpoint, the pagination / retry ceilings, the injected
+  // transport-clock-sleep-UUID seams, and the authorization probe are the
+  // implementation of one provider, not a contract downstream code should
+  // depend on.
+  "createLinearTrackerAdapter",
+  "verifyLinearTrackerAuthorized",
+  "LINEAR_GRAPHQL_ENDPOINT",
+  "LINEAR_API_KEY_VARIABLE",
+  "LINEAR_OAUTH_TOKEN_VARIABLE",
+  "LINEAR_PAGE_SIZE",
+  "LINEAR_MAX_PAGES",
+  "LINEAR_MAX_ATTEMPTS",
+  "LINEAR_MAX_RETRY_DELAY_MS",
+  "LINEAR_MAX_RETRY_WAIT_MS",
+  "LINEAR_DEFAULT_RETRY_DELAY_MS",
+  // Ticket #167: the three response bounds (the byte ceiling, the
+  // per-diagnostic bound, and the GraphQL error-count bound) and the bounded
+  // capture seam are one internal contract. Promoting them would freeze the
+  // ceilings into a public API AND, worse, hand a caller the capture type
+  // whose `truncated` flag the adapter's own refusals are derived from: a
+  // caller able to shape a response could declare an answer whole when it is
+  // not. The tests in `tests/linear-response-bounds.test.ts` reach them
+  // through the source module directly.
+  "LINEAR_MAX_RESPONSE_BYTES",
+  "LINEAR_MAX_DIAGNOSTIC_BYTES",
+  "LINEAR_MAX_GRAPHQL_ERRORS",
+  "captureLinearResponseBody",
+  // Ticket #141: the Poiesis tracker metadata envelope and the tracker item
+  // helpers were extracted from `src/adapters.ts` into `src/tracker-item.ts`
+  // so every adapter — including Linear — shares ONE implementation of the
+  // persisted description format. The envelope helpers stay internal:
+  // promoting them would lock the on-the-wire format into a public API. The
+  // item and comment TYPES remain public and unchanged.
+  "decorateBody",
+  "parseBody",
+  "trackerItem",
+  "metadataFromItem",
+  "assertKind",
+  "isRecord",
+  "requiredText",
+  // Spec #139 / ticket #162: the generated delivery runtime is Poiesis-owned
+  // DERIVED state whose exact layout, ignore rule, and destructive removal
+  // contract live in `src/delivery-runtime.ts`. None of it may reach the
+  // package root: promoting the paths would lock the on-disk layout into a
+  // public API, and promoting the removal seam would make a
+  // recursive-delete entry point callable by a library consumer. It is
+  // reached only through the generated delivery target, the init / update /
+  // bootstrap ignore transaction, and `poiesis uninstall`.
+  "DELIVERY_RUNTIME_CONTAINER",
+  "DELIVERY_RUNTIME_OWNED_ENTRY",
+  "DELIVERY_RUNTIME_RELATIVE",
+  "DELIVERY_RUNTIME_IGNORE_RULE",
+  "removeValidatedDeliveryRuntime",
 ] as const;
 
 const forbiddenTypes = [
+  "DeliveryRuntimeRemovalResult",
   "UpdateWriterHooks",
   "UpdateTransactionHooks",
   "UpdateBootstrapTransactionHooks",
@@ -385,6 +569,36 @@ const forbiddenTypes = [
   "RefreshLockContent",
   "RefreshGuardContent",
   "REFRESH_LOCK_CONTENT_VERSION",
+// Spec #190 / ticket #193: the transition PLAN shape and the shared-profile
+  // file bookkeeping type stay internal with the read-only planner that owns
+  // them, so the plan a caller receives can never be constructed outside the
+  // transaction that wrote it.
+  "InstallModeTransitionPlan",
+  "TransitionProfileFile",
+  // Ticket #142: the `local` tracker store document, item / comment / history
+  // records, lock envelope, and store-location shape are module-internal for
+  // the same reason. Every currently-leaked name is enumerated so a future
+  // re-export regresses immediately.
+  "LocalTrackerStore",
+  "LocalTrackerStoreLocation",
+  "LocalTrackerItemRecord",
+  "LocalTrackerItemFile",
+  "LocalTrackerCommentRecord",
+  "LocalTrackerHistoryEntry",
+  "LocalTrackerLockContent",
+  "LocalTrackerState",
+  "LocalTrackerOperation",
+  // Ticket #167: the capture shape a Linear response carries and the
+  // structural body stream the capture reads are module-internal. The
+  // capture is what the adapter's `LINEAR_RESPONSE_TOO_LARGE` refusal is
+  // derived from, so its `truncated` flag must not be settable from outside
+  // the module; the body stream is a reader and a cancel, not a capability.
+  "LinearBodyCapture",
+  "LinearResponseBodyStream",
+  // Tickets #149 / #167: the complete-UTF-8-prefix rule is shared by the
+  // subprocess capture and the Linear capture and has one implementation in
+  // `src/utf8-prefix.ts`. It is a decoding rule, not a public helper.
+  "completeUtf8PrefixLength",
 ] as const;
 
 // -- Ticket #46: optional properties on the exported
@@ -448,6 +662,12 @@ describe("public API declarations (type-level)", () => {
   for (const name of forbiddenTypes) {
     it(`PublicApi does not re-export type \`${name}\``, () => {
       const assertion: AssertNotExported<typeof name> = true;
+      void assertion;
+    });
+  }
+  for (const name of uncheckedDeliveryConstructionSeams) {
+    it(`the unchecked delivery seam \`${name}\` stays module-internal`, () => {
+      const assertion: AssertNotModuleExported<typeof name> = true;
       void assertion;
     });
   }

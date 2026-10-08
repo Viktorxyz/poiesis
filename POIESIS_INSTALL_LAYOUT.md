@@ -8,6 +8,16 @@ The canonical design document is `POIESIS_FOUNDATION_v1.2.md` (kept in the GitHu
 
 The Repository Intelligence cache is owned Poiesis local state under `.poiesis/cache/repository-intelligence/`. The directory is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. Foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
 
+The generated delivery runtime is owned Poiesis local state under `.poiesis/runtime/delivery/`. The `.gitignore` rule Poiesis reconciles is exactly `.poiesis/runtime/delivery/` — never the whole `.poiesis/runtime/` container — through the same transaction on `init`, `update`, and the explicit `update --bootstrap-legacy-ownership`, and it is never recorded as a manifest file or a durable tracked path. `poiesis uninstall` removes the owned subtree and an empty `.poiesis/runtime/` parent, preserves foreign siblings under the container, and refuses to traverse or delete a symlinked container, delivery root, or delivery descendant.
+
+## Tracker and delivery shapes a supported install may add
+
+Three install shapes add state outside the table above, and none is a manifest record:
+
+- A `local` tracker stores Spec and ticket state in `poiesis-tracker-v1` beneath the Git common directory (`git rev-parse --git-common-dir`), as a `0700` directory of `0600` files. It is outside every working tree, so it is never foreign work, is never a candidate for a commit, is shared by every linked worktree of the clone, and is preserved across `uninstall` and reinstall. It is created lazily by the first `poiesis tracker` mutation; `init` verifies the location is usable and creates nothing.
+- A **configured** delivery install generates `scripts/poiesis-{preview,staging,production}.mjs` for every target the project does not already have, never overwriting an existing script. A `deferred` install (`"delivery": { "mode": "deferred" }`) generates none of them, because there is no delivery command to run; the deferred state is recorded in `.poiesis/config.jsonc` and changed later only through `poiesis update --config`.
+- A **generated** delivery target writes its run artifact to `.poiesis/runtime/delivery/<target>/<sha>/delivery.json` beneath the workspace it runs in, so a linked worktree's delivery leaves its own ignored, Poiesis-owned derived state. The rule, the path, and the removal contract are one owner: `src/delivery-runtime.ts`.
+
 ## Canonical Poiesis files
 
 These source files are projected into the consumer repo by the runtime (`src/templates.ts::templateMappings` and the `init`/`update`/`update --config` transactions). They are also included in the published `poiesis-cli` package per `package.json::files[]`.

@@ -156,8 +156,45 @@ Production-capable tracker adapters:
 
 - GitHub through `gh`
 - GitLab through `glab`
+- Linear through its GraphQL API
+- Local, clone-local, with no external service
+
+The tracker choice and the delivery choice are independent: any production tracker can be combined with configured delivery or with `"delivery": { "mode": "deferred" }`.
+
+#### GitHub and GitLab
+
+`gh` and `glab` must be installed and authenticated for the target project. `tracker.project` is `<owner>/<repository>` for GitHub and the nested `group/subgroup/project` path for GitLab. A coordinate may be inferred from a recognized `github.com` or `gitlab.com` remote when the config does not state one.
+
+#### Linear
+
+Linear is a first-class tracker, reached over `https://api.linear.app/graphql`. Its coordinates are a required `tracker.team` (key or name) plus an optional `tracker.project`. Poiesis never invents a team: an empty `tracker.team` fails closed with `INVALID_TRACKER_CONFIG`.
+
+The credential is environment-only. Set exactly one of:
+
+- `LINEAR_API_KEY` — a personal API key, sent as the raw `Authorization` value.
+- `LINEAR_OAUTH_TOKEN` — an OAuth access token, sent as `Authorization: Bearer <token>`.
+
+Both set fails closed with `LINEAR_AUTH_AMBIGUOUS`; neither set fails closed with `LINEAR_AUTH_MISSING`. The credential is never stored in the Poiesis config, never placed in a tracker item, never logged, and never echoed into an error message or an error's `details` — every byte that could reach an error goes through the redactor first.
+
+#### Local
+
+`local` needs no CLI, no service, no network call, no credential, and no project coordinate. It is a production tracker, not a test fixture.
+
+State lives in `poiesis-tracker-v1` beneath the Git common directory (`git rev-parse --git-common-dir`), which keeps it outside every working tree and shared by every linked worktree of the clone. The store is created as a `0700` directory holding `0600` regular files. Items carry monotonic `LOCAL-<n>` identities. Validation is strict and fails closed: a non-JSON store, an unknown schema version or provider, a non-positive or colliding next id, a non-`LOCAL` identifier, a symlinked or world-readable file, or a symlinked store directory or lock path is refused rather than repaired. Cross-process writers serialize on a token-checked lock, so a live foreign lock is never stolen and a stale lock left by a dead process is reclaimed only within a bounded wait.
+
+That canonical lock is mutated only under a sibling `store.lock.guard` acquired with an exclusive create, and the runtime never reclaims a guard: a guard left behind by a crash stays on disk and fails every later acquisition with `LOCAL_TRACKER_LOCK_TIMEOUT` after the bounded wait. That error names both paths and the ordered procedure — first verify that no Poiesis process is accessing the clone, then remove only the exact `store.lock.guard` artifact and retry — and the canonical `store.lock` is never a removal target, because the ordinary holder-PID and ownership-token check already reclaims a stale one within the bounded wait. The exact guard path travels as a field on that error, and the procedure is stated in prose that names the two artifacts rather than printing a command to run. A clone directory name Poiesis did not choose can never become an argument or a substitution in a command an operator copies out of an error message. A `store.lock` that is present but unreadable or malformed is a separate case: it is corruption, the runtime never unlinks unknown bytes, and clearing it is the operator's decision rather than part of the guard procedure.
+
+The store is bounded, because it is the whole history and the whole history only ever grows. The canonical document is one complete snapshot of every Spec, Ticket, comment, and history entry, and that snapshot is bounded: the total serialized store, including its trailing newline, may not exceed 16,777,216 UTF-8 bytes. History is retained in full, so the file only ever grows and an operator reaches the ceiling by recording more work rather than by losing any. One bounded load serves the lock-free read, the mutation, and the `poiesis doctor` tracker check, so a bound cannot exist on one path and be missing from another. A read consumes at most one byte more than that ceiling and refuses with `LOCAL_TRACKER_STORE_TOO_LARGE` before it parses anything, so a file that keeps growing under a reader stays a bounded read. A mutation serializes its candidate once, measures those bytes, and refuses before the durable replace, so a refused write leaves the canonical bytes, the history, the lock, and the file mode exactly as they were. A later mutation that does fit still commits, so a refusal never wedges the protocol and never denies a writer the store. The refusal carries only the store `path`, the bytes actually consumed as `sizeBytes`, and the ceiling as `maxBytes`, and it states no procedure at all, because the two numbers say everything an operator can act on and a path this module did not choose must never become part of a command. Nothing is pruned to fit and nothing is repaired automatically: an over-ceiling store is left byte-for-byte as it is, and reducing it is the operator's decision about their own work.
+
+#### fixture
 
 `fixture` is test-only, requires `--allow-fixtures` at `init` time, and writes outside the repository root.
+
+### Publishing coordinates
+
+Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host, otherwise the test-only `fixture` tracker's `tracker.project`, and otherwise fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. A `github` or `gitlab` tracker never supplies coordinates, and `linear` and `local` never appear as the `provider` of Publish evidence. A remote URL that carries userinfo is parsed as the remote it is, with the credential stripped from every coordinate, report, error detail, and log line Poiesis emits.
+
+A fork is a different repository, not a shortcut to its upstream. A remote naming a fork is a recognized host, so the change request is opened against that fork's own integration branch, and Publish fails closed if the resulting change request is owned by a different repository than the coordinates Poiesis resolved. A self-hosted host or a filesystem remote is not a recognized host and yields no coordinates.
 
 ### Delivery
 
@@ -166,6 +203,32 @@ Delivery uses an argv-only command adapter. The command consumes the exact candi
 Production authorization is JSON bound to the candidate SHA/tree, Staging artifact identity, integration SHA, explicit approval, and Author identity. Production fetches `repository.remote` / `repository.integrationBranch`, requires the integration SHA to be the exact remote head, and verifies its actual Git tree before invoking the delivery command.
 
 Fixture delivery is test-only, requires `--allow-fixtures`, and writes outside the repository root.
+
+### Deferred delivery
+
+`"delivery": { "mode": "deferred" }` is an explicit, healthy product state, not a defect. `poiesis doctor` reports it as a nonblocking `warn` on the `delivery` check and keeps `report.ok` true. `init` writes no `scripts/poiesis-{preview,staging,production}.mjs` for a deferred install.
+
+One central policy guard reads the installed config — with no auto-resolution, no subprocess, and no network — and every gated operation calls it before its first side effect. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with `DELIVERY_DEFERRED`, naming the blocked operation and its remediation, before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, or worktree removal. The four `poiesis` commands that read the installed config (`publish`, `preview`, `promote`, `integrate`) additionally run one shared preflight before that read: runtime identity first, then this same policy guard, so the CLI reports the same code and details the library seam does, ahead of config auto-resolution and publishing-coordinate resolution. `poiesis preview` and `poiesis promote` therefore refuse at that preflight, before there is any delivery adapter to construct. On a CONFIGURED install, `poiesis publish` still refuses with `PUBLISH_PROVIDER_UNRESOLVED` when the configured remote is not a recognized forge; that is a separate, equally fail-closed condition and produces the same zero remote side effects.
+
+That same guard also decides the installed state. A gated operation runs only where Poiesis is actually installed, so once the runtime identity guard has confirmed the manifest exists and its version matches, a project with no `.poiesis/config.jsonc` is an incomplete install rather than an exemption: those operations fail closed with `CONFIG_NOT_INSTALLED`, naming the missing managed path and the managed remediation, before any caller-supplied delivery config is turned into an adapter and before the first side effect. A missing manifest keeps its existing precedence and still reports `RUNTIME_VERSION_MISMATCH` with `details.project: null`.
+
+That installed-state decision is not the first decision every gated operation makes, and the compatibility contract names which one is. Only `poiesis workspace cleanup` resolves workspace ownership before it reads an installation, and its command is the one with no preflight of its own, so its ownership decision is the first one an operator reaches. `poiesis publish` and `poiesis integrate` reach workspace ownership only after the shared preflight has accepted the installed state, so their commands invoked from an unowned working directory report the installed-state code the preflight decided, never `WORKSPACE_OWNERSHIP_UNKNOWN`. Workspace ownership comes first for cleanup: `poiesis workspace cleanup` proves it owns the workspace before it reads any installation, so a cleanup invoked outside a workspace Poiesis can prove it owns is refused with `WORKSPACE_OWNERSHIP_UNKNOWN` and never reaches the installed-state decision. `poiesis workspace cleanup` invoked outside a workspace Poiesis can prove it owns never reports a delivery code at all: on a fully installed deferred project it reports `WORKSPACE_OWNERSHIP_UNKNOWN` rather than `DELIVERY_DEFERRED`. The primary checkout and a linked worktree Poiesis never prepared are each such a cwd; a directory that is not inside a Git repository at all is refused even earlier, with `NOT_GIT_REPOSITORY`. Inside an owned workspace the precedence is unchanged and strictly ordered: `RUNTIME_VERSION_MISMATCH` when the installed version does not match, then `CONFIG_NOT_INSTALLED` naming the PRIMARY checkout's `.poiesis/config.jsonc` when that installed config is missing, then `DELIVERY_DEFERRED` when it states the deferred mode. `poiesis preview` and `poiesis promote` have no workspace to prove, so they report the installed-state failure from the primary installation authority from any directory of the clone. Every one of those refusals is decided before the first lifecycle side effect: before any side-effecting subprocess, before any remote branch deletion, before any worktree removal, before any local ref deletion, and before any change to the immutable workspace ownership marker. The read-only `git rev-parse` calls that locate a root, read the common directory, and read the ownership markers complete before the refusal is raised; what is guaranteed is that nothing that mutates has run.
+
+Both `delivery` branches are forward compatible: unknown outer extension keys on the configured block and on `{ "mode": "deferred" }`, and unknown keys nested inside a target adapter, survive parse and serialize, so a runtime that does not recognize a key never deletes it from the managed config. The semantic rejections are unchanged — a partial target set, an unknown `delivery.mode`, and a deferred block that also carries a target are still typed `INVALID_DELIVERY_CONFIG` failures.
+
+Delivery is configured later through `poiesis update --config`, never by hand-editing the managed config. The change is atomic and leaves the `tracker` block untouched.
+
+An omitted `delivery` block is a fresh-install default, never an update default: `poiesis init --config` resolves it to the three generated command targets, and `poiesis update --config` refuses it. `poiesis update --config` refuses a proposed config that omits `delivery` with `INVALID_DELIVERY_CONFIG` and details `{ field: "delivery", operation: "update --config" }`, before any default resolution, probe, journal, or write, so an installation's recorded delivery decision is never replaced by a default its Author did not choose. The `field` and `operation` details are what separate this refusal from the partial-block rejection above: an omitted block is not an incomplete answer, it is no answer. The rule is contextual and does not tighten the schema — `delivery` remains optional, so `init --config` keeps its legacy generated default and a stated `"delivery": null` keeps the schema's own `INVALID_CONFIG` verdict. `poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands.
+
+### Installation authority and linked worktrees
+
+Poiesis installs into the PRIMARY checkout of a clone, and that installation is the authority for every guarded operation in every linked worktree of the same clone. A linked worktree carries none of the primary's managed Poiesis state, so an operation launched from one is judged by the install that governs the clone, not by the worktree's silence.
+
+The authority is DERIVED, never supplied. `previewDelivery` and `promoteDelivery` read one `git rev-parse --absolute-git-dir --git-common-dir` and reconcile it themselves: two equal paths are a primary checkout that owns its own installation, two different paths are a linked worktree whose common directory is the primary's `.git`, and a report that cannot produce two paths, or that names a filesystem root, leaves the invocation root standing rather than a guess. No caller supplies an authority root, and no guard decides by searching for a config file, because a project whose installed config is missing is exactly the case the installed-state guard has to diagnose. The reconciliation is one side-effect-free subprocess: it never touches the network, a remote, or the working tree.
+
+A configured linked worktree therefore previews and promotes against the PRIMARY install — the runtime-identity guard, the installed-state check, and the delivery-policy guard read the primary's `manifest.poiesisVersion`, `.poiesis/config.jsonc`, and `delivery` block — while the delivery still EXECUTES where it was invoked: the candidate is resolved and the delivery command runs in the linked worktree, so the worktree's own candidate and evidence are the ones the operation is about. A worktree that declares a deferred install of its own does not displace the primary either; the shared authority is the primary's. The `poiesis` CLI and the library seam reach the same decision from the same worktree, so a library caller and an operator see the same code, the same details, and the same delivered artifact.
+
+The derivation uses the platform's own path semantics rather than a POSIX-only string rule. The primary checkout is the directory above the common directory, and the same rule answers for both flavors: `/srv/primary/.git` gives `/srv/primary` and `C:\primary\.git` gives `C:\primary`. Stripping a trailing separator and the last `/`-delimited segment is correct on POSIX and inert on Windows: a Windows path has no `/` in it, so that rule strips nothing, returns its own input, and resolves a linked worktree to itself — which is precisely the authority split this derivation exists to prevent.
 
 ## Repository Intelligence (v1.2)
 
@@ -202,6 +265,16 @@ The runtime owns the pin; moving the pin in a future Poiesis release is an `upda
 
 The derived cache lives under `.poiesis/cache/` (Poiesis-owned local state). It is gitignored by `poiesis init` through the same `.gitignore` transaction the manifest and workspaces rules use, and it is never recorded as a manifest file. The directory is owned by Poiesis only at `.poiesis/cache/repository-intelligence/`; foreign siblings under `.poiesis/cache/` are preserved by `poiesis uninstall`.
 
+### Generated delivery runtime
+
+A delivery target records its artifact under `.poiesis/runtime/delivery/<target>/<sha>/delivery.json` (Poiesis-owned derived state). The ownership is exact and one-directional:
+
+- The `.gitignore` rule is `.poiesis/runtime/delivery/`. `poiesis init`, the receipt-authenticated `poiesis update`, and the explicit `poiesis update --bootstrap-legacy-ownership` each reconcile that one rule, transactionally with a byte-exact rollback; `poiesis update --config` intentionally does not touch `.gitignore`. The rule is the owned subtree, never the whole `.poiesis/runtime/` container, so state Poiesis does not own stays visible.
+- The runtime is never a manifest file and never a durable (tracked) path, so nothing under it is hash-gated managed state.
+- A generated target run therefore leaves `git status` byte-identical to its pre-run value, including in a linked worktree, so `poiesis workspace cleanup` is never blocked by delivery residue (`DIRTY_WORKSPACE_CLEANUP_FORBIDDEN`).
+- `poiesis uninstall` removes the complete owned `.poiesis/runtime/delivery/` subtree and the `.poiesis/runtime/` parent when nothing else remains. A foreign sibling under `.poiesis/runtime/` survives byte-for-byte, is reported as `preserved`, and keeps the uninstall incomplete with the ownership receipt retained.
+- A symlinked runtime container, a symlinked `delivery` root, or a symlink at any depth inside the owned subtree is never traversed or deleted: the removal is refused with `DELIVERY_RUNTIME_UNSAFE` (or `DELIVERY_RUNTIME_UNOWNED` for a non-directory target), reported as `preserved`, and the installation stays intact.
+
 ## Process execution
 
 All external command execution is bounded:
@@ -213,6 +286,9 @@ All external command execution is bounded:
 - `stdoutTruncated`/`stderrTruncated` flags recorded when bound is hit;
 - bounded SIGTERM then SIGKILL termination of the managed process group, on the platforms where the group can still be attributed to the lease (see below).
 
+### Verification command execution
+
+`verification.commands` and `verification.postIntegrationCommands` are shell command strings, not argument vectors, and both run through the same interpreter: Poiesis executes each one as `/bin/sh -c <command>`, with the working directory set to the canonical Git root of the exact candidate it is proving — the repository root for `poiesis verify`, and the temporary detached worktree Poiesis creates for the integrated commit for post-integration verification. The interpreter is that exact path: there is no PowerShell, `cmd.exe`, or `sh`-on-`PATH` route, so a host without `/bin/sh` cannot run verification and the requirement is documented in the README rather than declared as a `package.json` `os` restriction. Nothing else about the execution is host-dependent: the per-command timeout, the bounded stdout/stderr evidence, the exact-SHA clean assertions before and after, and the merged environment are identical on every host.
 ### Group-local cleanup: what a platform must be able to prove
 
 A managed process group is addressed as a group or not at all. Poiesis never enumerates it: there is no process-table walk, no member snapshot, no per-PID signal, and therefore no survivor list to report. The group may be signalled only while the leased leader that gave the group its id can still be re-confirmed by exact **process-start identity** and exact process-group id — the Linux model, read from the kernel's per-PID process table. Group liveness proves absence, never ownership: once the leader is gone, the group id is a PID that any later process may be handed.

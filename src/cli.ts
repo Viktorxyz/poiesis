@@ -2,10 +2,11 @@
 import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { readUtf8 } from "./fs.js";
-import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
+import { parseJsonc, requireConfiguredDelivery, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
+import { assertRuntimeVersionMatchesProject, init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, resolveInstallationRoot, resolvePublishCoordinates, installAuthorizedCapability, updateFromConfig, migrateInstallMode, setModel, type ModelClassName } from "./maintenance.js";
+import { assertDeliveryPolicyAllows, DEFERRED_BLOCKED_OPERATIONS, type DeferredBlockedOperation } from "./lifecycle-policy.js";
 import {
   checkpoint,
   integrate,
@@ -43,12 +44,14 @@ const HELP = `Poiesis deterministic runtime
 
 Usage:
   poiesis bootstrap --print                            # print the one paste-able prompt that installs Poiesis into a project
-  poiesis init                                          # default: interactive TTY discovery; --config <file> only required for non-interactive / CI use
-  poiesis init --config <file> [--allow-fixtures]
+  poiesis init                                          # default: interactive TTY discovery; asks Private/local vs Team/shared first, then the rest of the guided configuration
+  poiesis init --config <file> [--allow-fixtures]       # non-interactive: the config MUST state "mode": "private" | "team"
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
-  poiesis uninstall
+  poiesis migrate install-mode --to private|team   # Spec #190 / ticket #194 — the EXPLICIT migration of a released installation that records no sharing mode onto private/local or team/shared. Not reachable through \`update --config\`, which keeps refusing an explicit mode against a mode-less manifest, and never a side effect of any other command. It appends the ONE visible Poiesis-managed ignore block, records it in the manifest, writes the same mode into the local config, and for \`team\` publishes only the accepted declarative project profile. Artifacts such a release used to TRACK are removed from the Git INDEX only — the worktree bytes stay, every staged removal is reported in the result, and Poiesis never commits and never pushes.
+poiesis uninstall
+  poiesis uninstall --purge-history [--yes]                 # Spec #190 / ticket #195 — the ONLY operation that destroys Local tracker history. Ordinary \`uninstall\` removes every safely attributable artifact and RETURNS the recorded Local tracker history as user data (reported under \`retained\`, and never a reason the runtime uninstall is incomplete). This flag removes that retained history too, and only after an interactive confirmation naming exactly what is destroyed and what is not, or after the explicit non-interactive confirmation flag \`--yes\` — without a TTY and without \`--yes\` the command refuses before touching anything. The purge removes ONLY a validated, repository-bound Local tracker store (the canonical \`<git-common-dir>/poiesis-tracker-v1\` document) and works against a tracker-only remainder: an installation that is already fully uninstalled needs no manifest for this to run. A symlink, an unknown entry, foreign content, a held store lock, or a store that does not resolve to this repository's canonical path is refused without deleting anything. Git history, remote tracker issues, pull/merge requests, releases, and deployment state are never purge targets.
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
   poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
@@ -127,6 +130,8 @@ async function main(argv: string[], signal?: AbortSignal): Promise<void> {
       return commandSession(rest);
     case "repository":
       return commandRepository(rest);
+    case "migrate":
+      return commandMigrate(rest);
     default:
       throw new PoiesisError("UNKNOWN_COMMAND", `Unknown command: ${command}`, { command });
   }
@@ -219,6 +224,16 @@ export async function commandInit(args: string[]): Promise<void> {
   if (typeof configArg === "string" && configArg.trim().length > 0) {
     const configPath = resolve(cwd, configArg);
     const config = validateConfig(parseJsonc(await readUtf8(configPath), configPath), configPath);
+    // Spec #190 / ticket #191 — non-interactive init requires an explicit
+    // mode. Reported here, at the flag surface, so an operator sees which
+    // file is missing the decision before any repository state is touched.
+    if (config.mode === undefined) {
+      throw new PoiesisError(
+        "INVALID_INSTALL_MODE",
+        "Non-interactive `poiesis init` requires an explicit installation mode in the config; add `\"mode\": \"private\"` (or \"team\")",
+        { path: configPath, supported: ["private", "team"] },
+      );
+    }
     writeSuccess(
       "init",
       await init(root, config, {
@@ -336,10 +351,161 @@ export async function commandUpdate(args: string[]): Promise<void> {
   );
 }
 
-async function commandUninstall(args: string[]): Promise<void> {
-  const values = options(args, { cwd: { type: "string" } });
+/**
+ * Spec #190 / ticket #195 — the ONE confirmation an operator can give for
+ * destroying Local tracker history.
+ *
+ * Recorded history is the Author's work, so `uninstall` keeps it by default and
+ * destroying it is a separate, named decision. This function is where that
+ * decision is actually made, and it is deliberately the only place:
+ *
+ *   - WITHOUT a TTY there is nobody to ask, so the operation is refused and the
+ *     refusal names the non-interactive confirmation flag. A destructive step
+ *     that cannot ask is not one a flag alone may authorise.
+ *   - WITH a TTY the operator must type the exact word. "y", "yes please", and an
+ *     empty line are all declines: a keystroke a runaway script or a
+ *     half-attentive operator produces must not read as consent to irreversible
+ *     deletion.
+ *   - Closing the prompt is a cancellation, not a confirmation.
+ *
+ * The prompt states the exact scope, including what is NOT affected, so the
+ * answer is informed: Git history, remote tracker issues, pull/merge requests,
+ * releases, and deployment state are not in this store and are never touched.
+ *
+ * The IO seam mirrors `createProductionInteractiveInitIO`: production binds the
+ * real stdin/stderr, tests script the answers, and neither can drift from the
+ * question actually asked.
+ */
+export const PURGE_HISTORY_CONFIRMATION_WORD = "purge-local-tracker-history";
+
+export interface UninstallConfirmationIO {
+  readonly isTTY: boolean;
+  promptLine(prompt: string): Promise<string>;
+}
+
+export function createProductionUninstallConfirmationIO(): UninstallConfirmationIO {
+  const isTTY = Boolean((process.stdin as { isTTY?: boolean }).isTTY);
+  return {
+    isTTY,
+    promptLine: async (prompt: string) =>
+      (await import("./prompt-line.js")).settleOnceLinePrompt({
+        prompt,
+        input: process.stdin,
+        output: process.stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "PURGE_HISTORY_CANCELLED",
+          "Local tracker history purge cancelled before it started",
+          {},
+          130,
+        ),
+      }),
+  };
+}
+
+export async function confirmLocalTrackerHistoryPurge(
+  root: string,
+  io: UninstallConfirmationIO = createProductionUninstallConfirmationIO(),
+): Promise<void> {
+  if (!io.isTTY) {
+    throw new PoiesisError(
+      "PURGE_HISTORY_CONFIRMATION_REQUIRED",
+      "poiesis uninstall --purge-history cannot ask for confirmation without a TTY",
+      {
+        root,
+        confirmationWord: PURGE_HISTORY_CONFIRMATION_WORD,
+        hint: "re-run inside a TTY, or pass `--yes` to confirm the Local tracker history purge non-interactively",
+      },
+    );
+  }
+  let answer: string;
+  try {
+    answer = await io.promptLine(
+      `Permanently delete this repository's Local tracker history (every Poiesis Spec, ticket, comment, and history entry)? Git history, remote tracker issues, pull requests, releases, and deployment state are NOT affected. Type "${PURGE_HISTORY_CONFIRMATION_WORD}" to confirm`,
+    );
+  } catch (error) {
+    if (error instanceof PoiesisError && error.code === "PURGE_HISTORY_CANCELLED") throw error;
+    throw new PoiesisError(
+      "PURGE_HISTORY_CANCELLED",
+      "Local tracker history purge cancelled before it started",
+      { root, cause: error instanceof Error ? error.message : String(error) },
+      130,
+    );
+  }
+  if (answer.trim() !== PURGE_HISTORY_CONFIRMATION_WORD) {
+    throw new PoiesisError(
+      "PURGE_HISTORY_DECLINED",
+      "Local tracker history purge declined; uninstall keeps the recorded history as user data",
+      { root, confirmationWord: PURGE_HISTORY_CONFIRMATION_WORD },
+    );
+  }
+}
+
+export async function commandUninstall(args: string[]): Promise<void> {
+  const values = options(args, {
+    "purge-history": { type: "boolean" },
+    yes: { type: "boolean" },
+    cwd: { type: "string" },
+  });
+  const purgeHistory = boolean(values, "purge-history");
+  const confirmed = boolean(values, "yes");
+  // `--yes` names a confirmation, so accepting it on its own would let a habit
+  // of appending it silently authorise nothing while implying it authorised
+  // something. Fail closed instead.
+  if (confirmed && !purgeHistory) {
+    throw new PoiesisError(
+      "INCOMPATIBLE_UNINSTALL_OPTIONS",
+      "poiesis uninstall --yes is only meaningful together with --purge-history",
+      { yes: true, purgeHistory: false },
+    );
+  }
   const root = await resolveGitRoot(cwdOf(values));
-  writeSuccess("uninstall", await uninstall(root));
+  // Confirm BEFORE any repository state is touched, so a declined purge leaves
+  // the installation exactly as it was rather than uninstalling it and then
+  // asking.
+  if (purgeHistory && !confirmed) await confirmLocalTrackerHistoryPurge(root);
+  writeSuccess("uninstall", await uninstall(root, { purgeHistory }));
+}
+
+/**
+ * Spec #190 / ticket #194 — the explicit MIGRATION of a released, mode-less
+ * installation onto an explicit sharing mode.
+ *
+ * A dedicated route, not a flag on `update`, because two different decisions are
+ * involved and an operator must be able to see which one they are making:
+ *
+ *   - `poiesis update` reconciles the installation an Author already has and
+ *     NEVER decides how it shares. Stating a `mode` in a config it does not
+ *     already carry stays refused for an installation that records none, so a
+ *     reconcile can never double as a migration.
+ *   - `poiesis migrate install-mode --to private|team` IS the migration: it is
+ *     reachable only by naming the target mode here, it appends the ONE managed
+ *     `.gitignore` block, records it in the manifest, writes the same mode into
+ *     the local config, publishes the shared project profile for `team`, and —
+ *     for artifacts a released installation used to TRACK — stages an index-only
+ *     removal so the new policy is actually effective.
+ *
+ * Those removals are the one thing this command does to the repository's Git
+ * state, so they are stated at the flag surface: worktree bytes are preserved,
+ * every staged removal is reported in the result, and Poiesis never commits and
+ * never pushes.
+ */
+async function commandMigrate(args: string[]): Promise<void> {
+  const operation = args[0];
+  if (operation !== "install-mode") {
+    throw new PoiesisError("UNKNOWN_COMMAND", `Unknown migrate subcommand: ${operation ?? ""}`, {
+      subcommand: operation ?? "",
+      supported: ["install-mode"],
+    });
+  }
+  const values = options(args.slice(1), {
+    to: { type: "string" },
+    cwd: { type: "string" },
+  });
+  const root = await resolveGitRoot(cwdOf(values));
+  const { parseInstallModeAnswer } = await import("./install-mode.js");
+  const mode = parseInstallModeAnswer(required(values, "to"), "poiesis migrate install-mode --to");
+  writeSuccess("migrate.install-mode", await migrateInstallMode(root, mode));
 }
 
 async function commandInspect(args: string[]): Promise<void> {
@@ -906,7 +1072,86 @@ function boundedInteger(values: Values, key: string): number {
   return parsed;
 }
 
-async function commandPublish(args: string[]): Promise<void> {
+/**
+ * Ticket #152 — the canonical CLI operation names of the six
+ * delivery-integrated operations, taken from the lifecycle policy's own
+ * declaration so the CLI can never name an operation the guard does not
+ * know. `DEFERRED_BLOCKED_OPERATIONS` stays the single source of truth.
+ */
+const PREFLIGHT_OPERATIONS = {
+  publish: DEFERRED_BLOCKED_OPERATIONS[0],
+  preview: DEFERRED_BLOCKED_OPERATIONS[1],
+  staging: DEFERRED_BLOCKED_OPERATIONS[2],
+  production: DEFERRED_BLOCKED_OPERATIONS[3],
+  integrate: DEFERRED_BLOCKED_OPERATIONS[4],
+} as const;
+
+/**
+ * Ticket #152 — the ONE CLI preflight every delivery-integrated command runs.
+ *
+ * The four command wrappers used to read the installed config FIRST, so a
+ * project Poiesis had not installed failed with an opaque file-read error
+ * instead of the typed installed-state failure, and a deferred install was
+ * refused by each wrapper's own argument-time delivery check rather than by
+ * the central policy. Both are now decided here, before any config load, any
+ * publishing-coordinate resolution, and any remote or subprocess work:
+ *
+ *   1. `resolveGitRoot` / `resolveInstallationRoot` locate the two roots. The
+ *      OPERATOR root is the Git root of `--cwd` (what the operation acts on,
+ *      including a linked worktree); the CONFIG root is the root that owns the
+ *      installation, resolved STRUCTURALLY from the Git directory layout. A
+ *      linked worktree therefore reports the PRIMARY checkout — where the
+ *      manifest and the installed config actually live — instead of falling
+ *      back to the invocation root when the installed config is missing, so
+ *      the decision can never report a false missing config (or a false
+ *      uninstalled project) for a workspace invocation.
+ *   2. The runtime identity guard runs FIRST, so an uninstalled project (no
+ *      manifest) and a version-mismatched project keep their existing
+ *      `RUNTIME_VERSION_MISMATCH` failure ahead of every other refusal.
+ *   3. The central lifecycle-policy guard then decides the installed state
+ *      and the delivery policy, in that order, from the installed config
+ *      alone. This is the SAME seam the operation itself calls, so the CLI
+ *      and the library report the same code, the same `details.operation`,
+ *      and the same remediation. The wrappers keep no delivery logic of
+ *      their own: `requireConfiguredDelivery` is retained below only to
+ *      narrow the parsed union to a configured target.
+ *
+ * The operation's own guards still run afterwards (they are what protect
+ * library callers), and both are side-effect free reads, so the duplicate
+ * check costs one manifest read and one config read and changes no outcome.
+ *
+ * Spec #168 / ticket #169 — the same preflight also resolves the SHARED
+ * LIFECYCLE AUTHORITY, because every one of these four dispatches has to hand
+ * its operation an owned-candidate `cwd` (`authority.candidateRoot`) and read
+ * the authoritative installed config from the primary
+ * (`authority.primaryRoot`). Resolving it here rather than in each wrapper
+ * keeps this the ONE preflight: the decision order above is unchanged, so a
+ * deferred install and an uninstalled project keep their existing typed
+ * refusals ahead of the candidate-authority refusals, and the authority's own
+ * runtime identity guard is a second side-effect-free read of the same
+ * manifest this function has already read.
+ */
+async function preflightDeliveryOperation(
+  cwd: string,
+  operation: DeferredBlockedOperation,
+): Promise<{ authority: LifecycleAuthority; repoRoot: string; configRoot: string }> {
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveInstallationRoot(repoRoot);
+  await assertRuntimeVersionMatchesProject(configRoot);
+  await assertDeliveryPolicyAllows(configRoot, operation);
+  const authority = await resolveLifecycleAuthority(repoRoot);
+  return { authority, repoRoot, configRoot };
+}
+
+/**
+ * Spec #139 / ticket #152 — the four delivery-integrated command wrappers.
+ * Exported as a library seam (matching the `commandInit` / `commandUpdate` /
+ * `commandModel` / `commandTracker` pattern) so the shared preflight's
+ * operator-visible failure can be tested directly, without packing a
+ * tarball to reach it. They are intentionally NOT re-exported by
+ * `src/index.ts`; the public surface is the `poiesis` bin.
+ */
+export async function commandPublish(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -916,8 +1161,18 @@ async function commandPublish(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight decides runtime identity and
+  // then the central delivery policy, before the installed config is read and
+  // before publishing coordinates are resolved. It also resolves the Spec #168
+  // shared lifecycle authority, so `publish` runs in the owned candidate
+  // workspace and reads the authoritative config from the primary.
+  const { authority, repoRoot, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.publish);
+  const config = await resolveConfigForRoot(configRoot);
+  // Spec #139 / ticket #140: publishing coordinates come from the
+  // configured Git remote, never from tracker identity. A Linear or
+  // clone-local tracker still publishes to the repository its remote
+  // points at, and an unresolvable remote fails closed before any push.
+  const coordinates = await resolvePublishCoordinates(repoRoot, config);
   writeSuccess(
     "publish",
     await publish({
@@ -926,8 +1181,8 @@ async function commandPublish(args: string[]): Promise<void> {
       integrationBranch: config.repository.integrationBranch,
       candidateSha: required(values, "sha"),
       candidateTree: required(values, "candidate-tree"),
-      provider: config.tracker.provider,
-      project: config.tracker.project,
+      provider: coordinates.provider,
+      project: coordinates.project,
       title: required(values, "title"),
       body: required(values, "body"),
       proof: json<ProofPayload>(required(values, "proof"), "proof"),
@@ -936,7 +1191,7 @@ async function commandPublish(args: string[]): Promise<void> {
   );
 }
 
-async function commandPreview(args: string[]): Promise<void> {
+export async function commandPreview(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -944,12 +1199,18 @@ async function commandPreview(args: string[]): Promise<void> {
     publish: { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight decides runtime identity and
+  // then the central delivery policy, before the installed config is read and
+  // before any delivery adapter could be constructed. It also resolves the
+  // Spec #168 shared lifecycle authority the dispatch forwards below.
+  const { authority, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.preview);
+  const config = await resolveConfigForRoot(configRoot);
   writeSuccess(
     "preview",
     await previewDelivery(
-      config.delivery.preview,
+      // Narrowing only: the preflight has already established that delivery
+      // is not deferred, so this cannot be the failure an Author sees.
+      requireConfiguredDelivery(config.delivery, PREFLIGHT_OPERATIONS.preview).preview,
       {
         sha: required(values, "sha"),
         candidateTree: required(values, "candidate-tree"),
@@ -1000,8 +1261,12 @@ export async function commandIntegrate(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight, before the installed config
+  // is read and before the integration is attempted. It also resolves the
+  // Spec #168 shared lifecycle authority, so `integrate` runs in the owned
+  // candidate workspace and reads the authoritative config from the primary.
+  const { authority, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.integrate);
+  const config = await resolveConfigForRoot(configRoot);
   // Spec #168 / ticket #174: `postIntegrationCommands` is OPT-IN and is the
   // ONLY source. There is deliberately no `?? config.verification.commands`:
   // the whole-change proof already ran that plan once, in the owned candidate,
@@ -1030,7 +1295,7 @@ export async function commandIntegrate(args: string[]): Promise<void> {
   );
 }
 
-async function commandPromote(args: string[]): Promise<void> {
+export async function commandPromote(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -1041,25 +1306,42 @@ async function commandPromote(args: string[]): Promise<void> {
     proof: { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
-  const target = required(values, "target");
+const target = required(values, "target");
   if (target !== "staging" && target !== "production") {
     throw new PoiesisError("INVALID_DELIVERY_TARGET", "Promotion target must be staging or production", { target });
   }
+  // Spec #139 / ticket #152: the shared preflight, naming the exact promotion
+  // target, before the installed config is read and before any delivery
+  // adapter could be constructed. It also resolves the Spec #168 shared
+  // lifecycle authority that owns the promotion below.
+  const { authority, configRoot } = await preflightDeliveryOperation(
+    cwdOf(values),
+    target === "staging" ? PREFLIGHT_OPERATIONS.staging : PREFLIGHT_OPERATIONS.production,
+  );
+  const config = await resolveConfigForRoot(configRoot);
   const identity = json<DeliveryIdentity>(required(values, "identity"), "identity");
   const sha = required(values, "sha");
   const candidateTree = required(values, "candidate-tree");
+  // Narrowing only: the preflight has already established that delivery is not
+  // deferred for this exact target, so this cannot be the failure an Author
+  // sees.
+  const delivery = requireConfiguredDelivery(config.delivery, PREFLIGHT_OPERATIONS[target]);
   if (target === "staging") {
-    writeSuccess("promote", await promoteDelivery(config.delivery.staging, {
+    writeSuccess("promote", await promoteDelivery(delivery.staging, {
       sha,
       target,
       candidateTree,
       identity,
-    }, authority.primaryRoot));
+      // The CANDIDATE workspace, exactly like the Preview dispatch above. Every
+      // authority, receipt, installed-state, and delivery-policy decision was
+      // already made from the PRIMARY installation in the shared preflight; the
+      // execution root is where the candidate and the evidence being promoted
+      // live (Spec #139 / ticket #157), so the CLI and the library seam produce
+      // the same identities AND the same execution directory.
+    }, authority.candidateRoot));
     return;
   }
-  writeSuccess("promote", await promoteDelivery(config.delivery.production, {
+  writeSuccess("promote", await promoteDelivery(delivery.production, {
     sha,
     target,
     candidateTree,
@@ -1069,7 +1351,7 @@ async function commandPromote(args: string[]): Promise<void> {
     integrationBranch: config.repository.integrationBranch,
     proof: json<ProofPayload>(required(values, "proof"), "proof"),
     integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
-  }, authority.primaryRoot));
+  }, authority.candidateRoot));
 }
 
 /**
