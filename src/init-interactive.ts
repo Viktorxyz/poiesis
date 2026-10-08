@@ -38,7 +38,7 @@
  *   - Auth probe failures short-circuit BEFORE `init()` runs and include
  *     the exact auth login command in the error message.
  */
-import { isDeferredDelivery, trackerProjectOf, DEFERRED_DELIVERY_MODE, type ConfiguredDeliveryConfig, type PoiesisConfig } from "./config.js";
+import { isDeferredDelivery, trackerExtensionKeys, trackerProjectOf, DEFERRED_DELIVERY_MODE, type ConfiguredDeliveryConfig, type PoiesisConfig } from "./config.js";
 import { defaultDeliveryAdapter } from "./delivery-defaults.js";
 import { PoiesisError } from "./errors.js";
 import {
@@ -463,6 +463,15 @@ async function resolveAuthorChoices(
   // offered as a visible default (empty Enter accepts it); an unrecognized
   // remote host offers NO default, so the composer still cannot guess a
   // tracker for a host it does not understand.
+  //
+  // Spec #139 / ticket #153 — every rebuild below REPLACES the block from the
+  // coordinates alone, and the replacement is what `init` serializes into
+  // `.poiesis/config.jsonc`. Each one therefore carries the block's
+  // non-reserved, non-secret extension keys from the shared
+  // `trackerExtensionKeys` partition, with the known coordinates written LAST
+  // so an extension still cannot introduce or complete a coordinate the
+  // chosen provider owns. A coordinate belonging to a DIFFERENT provider is
+  // still dropped — that is #144's cross-provider rule, unchanged.
   if (discovery.unresolved.includes("tracker.provider")) {
     const inferred = discovery.detections.tracker.provider;
     const answer = (await io.promptLine(trackerProviderPrompt(inferred))).trim();
@@ -474,7 +483,7 @@ async function resolveAuthorChoices(
         { provider: answer, supported: [...TRACKER_CHOICES] },
       );
     }
-    next.tracker = { provider };
+    next.tracker = { ...trackerExtensionKeys(next.tracker), provider };
   }
 
   // Coordinates follow the CHOSEN provider, never the inferred one. Each
@@ -485,7 +494,7 @@ async function resolveAuthorChoices(
   if (chosen === "local") {
     // Spec #139: Local needs no remote coordinates at all. Its only state is
     // the clone-local store the repository already owns.
-    next.tracker = { provider: "local" };
+    next.tracker = { ...trackerExtensionKeys(next.tracker), provider: "local" };
   } else if (chosen === "linear") {
     const team = declaredTeam(next.tracker) ?? (await promptRequired(io, LINEAR_TEAM_PROMPT));
     // The Linear project is OPTIONAL, and a draft that already names one is
@@ -493,6 +502,7 @@ async function resolveAuthorChoices(
     // blank answer keeps the block project-free rather than inventing one.
     const project = declaredProject(next.tracker) ?? (await promptOptional(io, LINEAR_PROJECT_PROMPT));
     next.tracker = {
+      ...trackerExtensionKeys(next.tracker),
       provider: "linear",
       team,
       ...(project.length === 0 ? {} : { project }),
@@ -508,7 +518,7 @@ async function resolveAuthorChoices(
         : undefined;
     const project =
       declaredProject(next.tracker) ?? detected ?? (await promptRequired(io, "Tracker project"));
-    next.tracker = { provider: chosen, project };
+    next.tracker = { ...trackerExtensionKeys(next.tracker), provider: chosen, project };
   }
 
   // Spec #139 / ticket #144 — delivery readiness is asked ONCE, before any

@@ -296,6 +296,19 @@ const PROMPTS = {
   production: "Production command>",
 } as const;
 
+/**
+ * Spec #139 / ticket #153 — an unknown, non-secret `tracker` extension key,
+ * exactly as a newer runtime's annotation or an Author's own note would look.
+ * No key name here is credential-bearing under #188's rule, which is the
+ * point: Poiesis has no opinion about this key, so it may only carry it and
+ * never judge or delete it. Nested and array-valued so a shallow-only carry
+ * cannot pass.
+ */
+const TRACKER_EXTENSION: Record<string, unknown> = {
+  extensionHead: { nested: { states: ["triage", "doing"] }, retries: 2 },
+  extensionTail: "author annotation",
+};
+
 async function newRepository(remote?: "github" | "gitlab" | "local"): Promise<TestRepository> {
   const repository = await createTestRepository();
   repositories.push(repository);
@@ -584,6 +597,73 @@ describe("interactive init records an explicit tracker choice", () => {
     await expect(interactiveTest.resolveAuthorChoices(io, discovery, undefined)).rejects.toMatchObject({
       code: "INVALID_TRACKER_PROVIDER",
     });
+  });
+
+  it("carries a draft's non-reserved tracker extension through every provider rebuild", async () => {
+    // Break: each provider branch here REPLACED the tracker block from the
+    // coordinates alone, and that replacement is what `init` serializes into
+    // `.poiesis/config.jsonc`. An unknown, non-secret key the schema had
+    // already accepted was therefore deleted from the Author's own config by
+    // the very flow meant to record their choices.
+    //
+    // The reserved coordinates are untouched: a coordinate belonging to
+    // another provider is still dropped (#144), and the extension can neither
+    // supply nor replace one. Nested and array-valued on purpose, so a
+    // shallow-only carry cannot pass.
+    const cases: readonly {
+      provider: "github" | "gitlab" | "linear" | "local";
+      stated: Record<string, unknown>;
+      answers: Record<string, string>;
+      expected: Record<string, unknown>;
+    }[] = [
+      {
+        provider: "github",
+        stated: { provider: "github", project: "owner/repo" },
+        answers: {},
+        expected: { provider: "github", project: "owner/repo" },
+      },
+      {
+        provider: "gitlab",
+        stated: { provider: "gitlab", project: "group/project" },
+        answers: {},
+        expected: { provider: "gitlab", project: "group/project" },
+      },
+      {
+        provider: "linear",
+        stated: { provider: "linear", team: "ENG" },
+        // A blank optional Linear project keeps the block project-free.
+        answers: { [PROMPTS.linearProject]: "" },
+        expected: { provider: "linear", team: "ENG" },
+      },
+      {
+        provider: "local",
+        stated: { provider: "local" },
+        answers: {},
+        expected: { provider: "local" },
+      },
+    ];
+
+    for (const { stated, answers, expected } of cases) {
+      const repository = await newRepository("github");
+      const extension = { ...TRACKER_EXTENSION };
+      const draft: PoiesisConfig = {
+        schema: 1,
+        models: { reasoning: "", execution: "" },
+        tracker: { ...extension, ...stated } as PoiesisConfig["tracker"],
+        delivery: { mode: DEFERRED_DELIVERY_MODE },
+        verification: { commands: ["test -f README.md"] },
+      };
+      const discovery = await composeInitDiscovery(repository.root, draft);
+      const io = new ScriptedIO({
+        inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
+        answers,
+      });
+      const next = await interactiveTest.resolveAuthorChoices(io, discovery, draft);
+      expect(next.tracker, `provider ${String(stated["provider"])} lost the extension`).toEqual({
+        ...extension,
+        ...expected,
+      });
+    }
   });
 });
 

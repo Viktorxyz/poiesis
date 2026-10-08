@@ -10,6 +10,7 @@ import {
   parseJsonc,
   requireConfiguredDelivery,
   serializeConfig,
+  trackerExtensionKeys,
   trackerProjectOf,
   validateConfig,
   type ConfiguredDeliveryConfig,
@@ -462,16 +463,26 @@ export async function autoResolveConfigDefaults(
     );
   }
 
+  // Spec #139 / ticket #153 — the resolved tracker is the ONE seam between the
+  // `tracker` block an Author states and the value `init`, `update`, and
+  // `update --config` serialize into `.poiesis/config.jsonc`. It rebuilt every
+  // branch from the known coordinates alone, so an unknown non-secret key the
+  // schema accepted was silently deleted by the next managed rewrite. The
+  // extension keys ride through from the shared `trackerExtensionKeys`
+  // partition, and the known coordinates are written LAST, so an extension can
+  // never supply, replace, nor complete a coordinate Poiesis owns.
+  const trackerExtensions = trackerExtensionKeys(config.tracker);
   const resolvedTracker: ResolvedTrackerConfig =
     trackerProvider === "local"
-      ? { provider: "local" }
+      ? { ...trackerExtensions, provider: "local" }
       : trackerProvider === "linear"
         ? {
+            ...trackerExtensions,
             provider: "linear",
             team: trackerTeam,
             ...(trackerProject.trim().length === 0 ? {} : { project: trackerProject }),
           }
-        : { provider: trackerProvider, project: trackerProject };
+        : { ...trackerExtensions, provider: trackerProvider, project: trackerProject };
 
   const resolved: ResolvedPoiesisConfig = {
     schema: 1,

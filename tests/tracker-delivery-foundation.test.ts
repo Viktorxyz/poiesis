@@ -18,10 +18,10 @@
  *      tracker must still publish to the GitHub repository the remote
  *      points at, and a tracker-only coordinate must never be invented.
  */
-import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFERRED_DELIVERY_MODE,
   TRACKER_PROVIDERS,
@@ -35,15 +35,18 @@ import {
   type PoiesisConfig,
   type ResolvedDeliveryConfig,
   type ResolvedPoiesisConfig,
+  type ResolvedTrackerConfig,
 } from "../src/config.js";
 import {
   autoResolveConfigDefaults,
   init,
   resolvePublishCoordinates,
+  update,
   updateFromConfig,
   verifyDeliveryConfiguration,
   verifyTracker,
 } from "../src/maintenance.js";
+import { commandInit, commandUpdate } from "../src/cli.js";
 import { createTrackerAdapter } from "../src/adapters.js";
 import { PoiesisError } from "../src/errors.js";
 import { run } from "../src/process.js";
@@ -67,6 +70,39 @@ function completeDelivery(): ConfiguredDeliveryConfig {
     staging: { adapter: "command", command: ["echo", "staging", "{sha}"] },
     production: { adapter: "command", command: ["echo", "production", "{sha}"] },
   };
+}
+
+/**
+ * Spec #139 / ticket #153 (tracker half) — the extension keys the tracker
+ * block must carry. Neither these key names nor the nested ones contain a
+ * credential-bearing form, which is the point: this is a key Poiesis has no
+ * opinion about and must therefore neither judge nor delete. Nested and
+ * array-valued on purpose, so a shallow-only carry cannot pass.
+ */
+const EXTENSION_HEAD_KEY = "extensionHead";
+const EXTENSION_TAIL_KEY = "extensionTail";
+const EXTENSION_TAIL_VALUE = "author annotation";
+
+function trackerExtension(): Record<string, unknown> {
+  return {
+    [EXTENSION_HEAD_KEY]: { nested: { states: ["triage", "doing"] }, retries: 2 },
+    [EXTENSION_TAIL_KEY]: EXTENSION_TAIL_VALUE,
+  };
+}
+
+/**
+ * The tracker extension keys' own bytes inside a `serializeConfig`-shaped
+ * document, verbatim. They are a contiguous run in BOTH the offered document
+ * and the installed one (the candidate states them adjacently and resolution
+ * carries the same partition adjacently), so this compares what was offered
+ * against what was installed without depending on where the reserved keys sit
+ * around them.
+ */
+function trackerExtensionBytes(text: string): string {
+  const tail = `"${EXTENSION_TAIL_KEY}": ${JSON.stringify(EXTENSION_TAIL_VALUE)}`;
+  const start = text.indexOf(`"${EXTENSION_HEAD_KEY}"`);
+  const end = text.indexOf(tail);
+  return start < 0 || end < 0 ? "" : text.slice(start, end + tail.length);
 }
 
 /**
@@ -877,6 +913,325 @@ describe("delivery extension keys survive a managed init and update --config rew
     const written = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
     expect(JSON.parse(written).delivery).toEqual(delivery);
   }, 90_000);
+});
+
+/**
+ * Spec #139 / ticket #153 (tracker half) — the managed rewrite dropped an
+ * unknown, non-secret tracker key that the schema had already accepted.
+ *
+ * `src/config.ts` claimed such a key survives a managed rewrite for EVERY
+ * tracker branch (the `.loose()` on each provider schema), and the outer
+ * `delivery` block had actually been given that guarantee — `deliveryExtensionKeys`
+ * plus `resolveDelivery` carry it through init, `update`, `update --config`, and
+ * the init-discovery final overlay. The tracker block had no equivalent:
+ * `autoResolveConfigDefaults`, the ONE seam between the block an Author states
+ * and the bytes `init`, `update`, and `update --config` write into
+ * `.poiesis/config.jsonc`, rebuilt every branch from the known coordinates
+ * alone, and the interactive flow's per-provider rebuilds did the same.
+ *
+ * These drive the two managed rewrites through their real command surfaces
+ * rather than stopping at `validateConfig` / `serializeConfig`: a unit
+ * assertion would still pass if the WRITE path dropped the key a second time.
+ *
+ *   1. a non-secret extension survives BOTH rewrites byte-for-byte in the
+ *      installed `.poiesis/config.jsonc`;
+ *   2. the known coordinates stay RESERVED — an extension can never supply,
+ *      replace, or complete a coordinate Poiesis owns;
+ *   3. the Linear credential refusal (ticket #188) is UNCHANGED and still
+ *      fails closed with ZERO WRITES on both surfaces. Carrying extensions
+ *      forward must never become carrying a secret forward.
+ */
+describe("tracker extension keys survive a managed init --config and update --config rewrite", () => {
+  const repositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+  let restoreGh: (() => void) | undefined;
+  let restoreStdout: (() => void) | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+    // `commandInit` / `commandUpdate` emit the structured success envelope on
+    // stdout. The assertions below are about bytes on disk, not the envelope.
+    const stdoutSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    restoreStdout = () => stdoutSpy.mockRestore();
+  });
+
+  afterEach(async () => {
+    restoreStdout?.();
+    restoreStdout = undefined;
+    restoreGh?.();
+    restoreGh = undefined;
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  it("installs a non-secret tracker extension byte-for-byte through init --config", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const candidatePath = join(repository.parent, "init-config.jsonc");
+    const candidate = serializeConfig({
+      ...baseConfig(),
+      tracker: { ...trackerExtension(), provider: "github", project: "owner/repo" },
+      delivery: completeDelivery(),
+    });
+    await writeFile(candidatePath, candidate);
+
+    await commandInit(["--config", candidatePath, "--cwd", repository.root]);
+
+    const installed = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(installed).tracker).toEqual({
+      ...trackerExtension(),
+      provider: "github",
+      project: "owner/repo",
+    });
+    // BYTE-FOR-BYTE: the extension region of the installed file is the exact
+    // bytes of the extension region the Author offered. A structural equality
+    // above would also pass if the value were re-derived rather than carried.
+    expect(trackerExtensionBytes(installed)).toBe(trackerExtensionBytes(candidate));
+    expect(trackerExtensionBytes(installed)).not.toBe("");
+  }, 90_000);
+
+  it("installs a non-secret tracker extension byte-for-byte through update --config", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery: completeDelivery(),
+      },
+      { skipSkills: true },
+    );
+
+    const candidatePath = join(repository.parent, "update-config.jsonc");
+    const candidate = serializeConfig({
+      ...baseConfig(),
+      tracker: { ...trackerExtension(), provider: "github", project: "owner/repo" },
+      delivery: completeDelivery(),
+    });
+    await writeFile(candidatePath, candidate);
+
+    await commandUpdate(["--config", candidatePath, "--cwd", repository.root]);
+
+    const installed = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(installed).tracker).toEqual({
+      ...trackerExtension(),
+      provider: "github",
+      project: "owner/repo",
+    });
+    expect(trackerExtensionBytes(installed)).toBe(trackerExtensionBytes(candidate));
+    expect(trackerExtensionBytes(installed)).not.toBe("");
+  }, 90_000);
+
+  it("keeps the extension through an ordinary update rewrite too", async () => {
+    // `update` without `--config` serializes the same resolved config through
+    // `resolveConfigForRoot`, so it is the same seam reached without a
+    // candidate document. Named explicitly because it is a third writer.
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...baseConfig(),
+        tracker: { ...trackerExtension(), provider: "github", project: "owner/repo" },
+        delivery: completeDelivery(),
+      },
+      { skipSkills: true },
+    );
+
+    await update(repository.root);
+
+    const installed = await readFile(join(repository.root, CONFIG_ROOT), "utf8");
+    expect(JSON.parse(installed).tracker).toEqual({
+      ...trackerExtension(),
+      provider: "github",
+      project: "owner/repo",
+    });
+    expect(trackerExtensionBytes(installed)).not.toBe("");
+  }, 90_000);
+
+  it("refuses a secret-shaped tracker key through init --config with zero writes", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const candidatePath = join(repository.parent, "credential-config.jsonc");
+    // Hand-written, exactly as an Author or a Linear dashboard copy-paste
+    // produces it. NOT built with `serializeConfig`, because serializing such a
+    // config is itself refused — which is the point being pinned.
+    await writeFile(
+      candidatePath,
+      JSON.stringify(
+        {
+          ...baseConfig(),
+          tracker: { provider: "linear", team: "ENG", apiKey: "lin_key" },
+          delivery: completeDelivery(),
+        },
+        null,
+        2,
+      ),
+    );
+
+    await expect(commandInit(["--config", candidatePath, "--cwd", repository.root])).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+      details: { provider: "linear", credentialFields: ["tracker.apiKey"], environmentOnly: true },
+    });
+
+    // ZERO WRITES: the refusal lands before init creates anything at all, and
+    // the credential itself was never echoed into a message or a detail.
+    await expect(stat(join(repository.root, ".poiesis"))).rejects.toMatchObject({ code: "ENOENT" });
+  }, 90_000);
+
+  it("refuses a secret-shaped tracker key through update --config with zero writes", async () => {
+    restoreGh = await installFakeGh();
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await init(
+      repository.root,
+      {
+        ...baseConfig(),
+        tracker: { provider: "github", project: "owner/repo" },
+        delivery: completeDelivery(),
+      },
+      { skipSkills: true },
+    );
+    const configPath = join(repository.root, CONFIG_ROOT);
+    const manifestPath = join(repository.root, ".poiesis/manifest.json");
+    const configBefore = await readFile(configPath);
+    const manifestBefore = await readFile(manifestPath);
+
+    const candidatePath = join(repository.parent, "credential-update.jsonc");
+    await writeFile(
+      candidatePath,
+      JSON.stringify(
+        {
+          ...baseConfig(),
+          tracker: { provider: "linear", team: "ENG", oauthToken: "lin_token" },
+          delivery: completeDelivery(),
+        },
+        null,
+        2,
+      ),
+    );
+
+    await expect(commandUpdate(["--config", candidatePath, "--cwd", repository.root])).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+      details: { provider: "linear", credentialFields: ["tracker.oauthToken"], environmentOnly: true },
+    });
+
+    // ZERO WRITES: the installed config and the manifest are byte-identical to
+    // their pre-attempt state, so the refusal left no half-applied transition.
+    expect(Buffer.compare(await readFile(configPath), configBefore)).toBe(0);
+    expect(Buffer.compare(await readFile(manifestPath), manifestBefore)).toBe(0);
+  }, 90_000);
+});
+
+/**
+ * Spec #139 / ticket #153 (tracker half) — the resolution seam itself. The
+ * end-to-end rewrite cases above prove the key REACHES `.poiesis/config.jsonc`;
+ * these pin the partition itself, so a future reconstruction elsewhere cannot
+ * re-derive the reserved set differently.
+ */
+describe("tracker extension keys survive config resolution and stay reserved against it", () => {
+  it("keeps the extension on the resolution and serialization every managed rewrite runs", async () => {
+    const repository = await createTestRepository();
+    try {
+      // The chain the rewrites actually run: `validateConfig` (which accepts an
+      // extension key) then `autoResolveConfigDefaults` (which used to drop it).
+      // Resolution is never called with a raw unvalidated literal.
+      const validated = validateConfig(
+        { ...baseConfig(), tracker: { ...trackerExtension(), provider: "github", project: "owner/repo" } },
+        "test",
+      );
+      const { config } = await autoResolveConfigDefaults(repository.root, validated);
+      const expected = { ...trackerExtension(), provider: "github", project: "owner/repo" };
+      expect(config.tracker).toEqual(expected);
+      expect(JSON.parse(serializeConfig(config)).tracker).toEqual(expected);
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a Linear block's extension beside its resolved coordinates", async () => {
+    const repository = await createTestRepository();
+    try {
+      const validated = validateConfig(
+        { ...baseConfig(), tracker: { ...trackerExtension(), provider: "linear", team: "ENG" } },
+        "test",
+      );
+      const { config } = await autoResolveConfigDefaults(repository.root, validated);
+      // `project` stays absent rather than invented, and the extension rides
+      // through unchanged alongside the coordinate the Author stated.
+      expect(config.tracker).toEqual({ ...trackerExtension(), provider: "linear", team: "ENG" });
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("never lets a reserved coordinate name ride through as an extension", async () => {
+    const repository = await createTestRepository();
+    try {
+      // `team` and `project` are reserved for the whole union, not for one
+      // provider: a Local block that happens to carry them must resolve to the
+      // provider alone, so an extension can neither inject a coordinate into a
+      // provider that owns none nor smuggle a cross-provider coordinate in.
+      const { config } = await autoResolveConfigDefaults(repository.root, {
+        ...baseConfig(),
+        tracker: { provider: "local", team: "injected", project: "injected/repo" },
+      });
+      expect(config.tracker).toEqual({ provider: "local" });
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("still narrows only the linear branch once the block is resolved and rewritten", async () => {
+    const repository = await createTestRepository();
+    try {
+      // The partition does NOT re-derive #188's credential rule. `github`'s
+      // `token` and `gitlab`'s `password` are that provider's own contract; a
+      // runtime that dropped them here would delete a key the pinned contract
+      // says must survive. The Linear branch is refused upstream instead.
+      for (const [tracker, expected] of [
+        [
+          { provider: "github", project: "owner/repo", token: "forge-coordinates" },
+          { provider: "github", project: "owner/repo", token: "forge-coordinates" },
+        ],
+        [
+          { provider: "gitlab", project: "group/project", password: "host-account" },
+          { provider: "gitlab", project: "group/project", password: "host-account" },
+        ],
+      ] as const satisfies readonly (readonly [PoiesisConfig["tracker"], PoiesisConfig["tracker"]])[]) {
+        const validated = validateConfig({ ...baseConfig(), tracker }, "test");
+        const { config } = await autoResolveConfigDefaults(repository.root, validated);
+        expect(JSON.parse(serializeConfig(config)).tracker).toEqual(expected);
+      }
+    } finally {
+      await rm(repository.parent, { recursive: true, force: true });
+    }
+  });
+
+  it("represents an extension key in every resolved tracker branch", () => {
+    // Compile-time evidence, asserted at runtime as well. If the resolved
+    // tracker types stop representing an extension key, `pnpm run check` fails
+    // here even when every runtime assertion above still passes.
+    const forge: ResolvedTrackerConfig = { provider: "github", project: "owner/repo", ...trackerExtension() };
+    const linear: ResolvedTrackerConfig = { provider: "linear", team: "ENG", ...trackerExtension() };
+    const local: ResolvedTrackerConfig = { provider: "local", ...trackerExtension() };
+    const fixture: ResolvedTrackerConfig = { provider: "fixture", project: "/tmp/p", ...trackerExtension() };
+    for (const tracker of [forge, linear, local, fixture]) {
+      expect(tracker[EXTENSION_HEAD_KEY]).toEqual({ nested: { states: ["triage", "doing"] }, retries: 2 });
+      expect(tracker[EXTENSION_TAIL_KEY]).toBe("author annotation");
+    }
+    // The extension does not weaken a coordinate's type: a project is still a
+    // string and a Linear team is still a string.
+    const project: string = forge.project;
+    const team: string = linear.team;
+    expect(project).toBe("owner/repo");
+    expect(team).toBe("ENG");
+  });
 });
 
 /**

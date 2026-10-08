@@ -116,15 +116,75 @@ export type ConfiguredDeliveryConfig = {
 export type ResolvedDeliveryConfig = DeferredDeliveryConfig | ConfiguredDeliveryConfig;
 
 /**
+ * Spec #139 / ticket #153 — the extension keys a `tracker` block may carry:
+ * anything Poiesis does not own, exactly as `DeliveryExtensions` states for
+ * the outer `delivery` block.
+ *
+ * The zod tracker schemas are `.loose()`, so `PoiesisConfig` already REPRESENTS
+ * an unknown tracker key on the way in (ticket #152, kept by ticket #188's
+ * semantic credential refusal). The resolved types had to represent it too, or
+ * the value `init` / `update` / `update --config` serialize was typed as if it
+ * had already lost the key and every reconstruction seam was told it was safe
+ * to drop it. `unknown` is the honest value: Poiesis neither interprets nor
+ * validates an extension, it only carries it.
+ */
+export type TrackerExtensions = { readonly [key: string]: unknown };
+
+/**
  * The resolved tracker is a discriminated union too, so every consumer
  * that needs a repository coordinate has to narrow the provider instead of
  * reading an optional field that may silently be absent.
+ *
+ * Every branch is EXTENSIBLE for the same reason the outer `delivery` block
+ * is: an extension key must survive the managed rewrites that serialize this
+ * value into `.poiesis/config.jsonc`, or a runtime that does not recognize a
+ * key silently deletes it from the Author's managed config.
  */
 export type ResolvedTrackerConfig =
-  | { provider: "github" | "gitlab"; project: string }
-  | { provider: "linear"; team: string; project?: string }
-  | { provider: "local" }
-  | { provider: "fixture"; project: string };
+  | ({ provider: "github" | "gitlab"; project: string } & TrackerExtensions)
+  | ({ provider: "linear"; team: string; project?: string } & TrackerExtensions)
+  | ({ provider: "local" } & TrackerExtensions)
+  | ({ provider: "fixture"; project: string } & TrackerExtensions);
+
+/**
+ * Spec #139 / ticket #153 — the tracker keys Poiesis OWNS and therefore
+ * normalizes itself: the provider discriminator and the two coordinates the
+ * provider union can state. Everything else at the tracker level is an
+ * extension key. The reserved set is keyed by PROPERTY NAME, not by provider,
+ * because a key is reserved the moment Poiesis has an opinion about it — an
+ * extension may never supply, replace, nor complete a coordinate.
+ *
+ * This is the ONE definition of "which tracker key is an extension", the same
+ * way `deliveryExtensionKeys` is the one definition for `delivery`, so every
+ * seam that rebuilds a tracker block partitions with the same contract.
+ */
+const RESERVED_TRACKER_KEYS: ReadonlySet<string> = new Set<string>(["provider", "project", "team"]);
+
+/**
+ * Spec #139 / ticket #153 — the extension keys of a `tracker` block, carried
+ * forward unexamined. This is the fix for the silently-dropped key: the schema
+ * admits an unknown tracker key (ticket #152), and the value that `init` /
+ * `update` / `update --config` serialize must still hold it, because a runtime
+ * that cannot act on a key must not delete it from the Author's managed
+ * config.
+ *
+ * "Non-secret" is not re-derived here. A CREDENTIAL-shaped key inside a
+ * `linear` block is refused by `assertLinearTrackerCredentials` — before
+ * validation is reported and again at serialization — so no credential can
+ * ever reach this partition on the linear path. The other providers' blocks
+ * are a separate contract that rule does not judge, and narrowing them here
+ * would delete a key the pinned #188 contract says must survive
+ * (`github`'s `token`, `gitlab`'s `password`).
+ */
+export function trackerExtensionKeys(tracker: PoiesisConfig["tracker"]): TrackerExtensions {
+  const extensions: Record<string, unknown> = {};
+  if (tracker === undefined) return extensions;
+  for (const [key, value] of Object.entries(tracker as Record<string, unknown>)) {
+    if (RESERVED_TRACKER_KEYS.has(key)) continue;
+    extensions[key] = value;
+  }
+  return extensions;
+}
 
 export function isDeferredDelivery(
   delivery: ResolvedDeliveryConfig | PoiesisConfig["delivery"],
