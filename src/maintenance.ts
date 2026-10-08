@@ -15,6 +15,10 @@ import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { runUpdateConfigTransaction } from "./update-config-internal.js";
 import {
+  runInstallModeMigrationTransaction,
+  type InstallModeMigrationResult,
+} from "./install-mode-migration-internal.js";
+import {
   runUpdateTransaction,
   runBootstrapLegacyOwnershipTransaction,
 } from "./update-internal.js";
@@ -2496,6 +2500,28 @@ export async function updateFromConfig(
   options: UpdateConfigOptions = {},
 ): Promise<UpdateResult> {
   return runUpdateConfigTransaction(root, configPath, options, {});
+}
+
+/**
+ * Spec #190 / ticket #194 — the explicit mode-less → `private` / `team`
+ * migration of a RELEASED installation, and the ONLY public entry point to the
+ * transaction that performs it.
+ *
+ * Thin wrapper, exactly as `updateFromConfig` is for `update --config`: the
+ * implementation lives in a sibling module `src/index.ts` does NOT re-export,
+ * so the security-sensitive fault-injection surface stays confined to the repo
+ * and never appears in the packed `dist/index.d.ts` declaration.
+ *
+ * Reaching a mode-less installation is deliberately not possible through
+ * `updateFromConfig` (which keeps refusing an explicit mode against one) or
+ * through any automatic lifecycle step: choosing a sharing policy is an
+ * explicit decision, and a reconcile must never make it.
+ */
+export async function migrateInstallMode(
+  root: string,
+  mode: InstallMode,
+): Promise<InstallModeMigrationResult> {
+  return runInstallModeMigrationTransaction(root, mode, {});
 }
 
 /**

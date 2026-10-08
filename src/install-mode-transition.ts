@@ -83,8 +83,12 @@ const MANIFEST_RELATIVE_PATH = ".poiesis/manifest.json";
  * parent would let a transition write through a link to somewhere outside
  * the repository, which is the one shape a byte-preserving rewrite must never
  * have.
+ *
+ * Ticket #194 reuses it for the same reason on the migration route: that
+ * surface appends a block, creates a shared profile, and rewrites the local
+ * config, and none of those may traverse a symlinked parent.
  */
-async function assertNoSymlinkedParents(root: string, destination: string): Promise<void> {
+export async function assertNoSymlinkedParents(root: string, destination: string): Promise<void> {
   const parts = relative(root, destination).split(sep).slice(0, -1);
   let current = root;
   for (const part of parts) {

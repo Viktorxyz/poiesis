@@ -5,7 +5,7 @@ import { readUtf8 } from "./fs.js";
 import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
+import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, migrateInstallMode, setModel, type ModelClassName } from "./maintenance.js";
 import {
   checkpoint,
   integrate,
@@ -48,6 +48,7 @@ Usage:
   poiesis doctor
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
+  poiesis migrate install-mode --to private|team   # Spec #190 / ticket #194 — the EXPLICIT migration of a released installation that records no sharing mode onto private/local or team/shared. Not reachable through \`update --config\`, which keeps refusing an explicit mode against a mode-less manifest, and never a side effect of any other command. It appends the ONE visible Poiesis-managed ignore block, records it in the manifest, writes the same mode into the local config, and for \`team\` publishes only the accepted declarative project profile. Artifacts such a release used to TRACK are removed from the Git INDEX only — the worktree bytes stay, every staged removal is reported in the result, and Poiesis never commits and never pushes.
   poiesis uninstall
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
@@ -127,6 +128,8 @@ async function main(argv: string[], signal?: AbortSignal): Promise<void> {
       return commandSession(rest);
     case "repository":
       return commandRepository(rest);
+    case "migrate":
+      return commandMigrate(rest);
     default:
       throw new PoiesisError("UNKNOWN_COMMAND", `Unknown command: ${command}`, { command });
   }
@@ -350,6 +353,47 @@ async function commandUninstall(args: string[]): Promise<void> {
   const values = options(args, { cwd: { type: "string" } });
   const root = await resolveGitRoot(cwdOf(values));
   writeSuccess("uninstall", await uninstall(root));
+}
+
+/**
+ * Spec #190 / ticket #194 — the explicit MIGRATION of a released, mode-less
+ * installation onto an explicit sharing mode.
+ *
+ * A dedicated route, not a flag on `update`, because two different decisions are
+ * involved and an operator must be able to see which one they are making:
+ *
+ *   - `poiesis update` reconciles the installation an Author already has and
+ *     NEVER decides how it shares. Stating a `mode` in a config it does not
+ *     already carry stays refused for an installation that records none, so a
+ *     reconcile can never double as a migration.
+ *   - `poiesis migrate install-mode --to private|team` IS the migration: it is
+ *     reachable only by naming the target mode here, it appends the ONE managed
+ *     `.gitignore` block, records it in the manifest, writes the same mode into
+ *     the local config, publishes the shared project profile for `team`, and —
+ *     for artifacts a released installation used to TRACK — stages an index-only
+ *     removal so the new policy is actually effective.
+ *
+ * Those removals are the one thing this command does to the repository's Git
+ * state, so they are stated at the flag surface: worktree bytes are preserved,
+ * every staged removal is reported in the result, and Poiesis never commits and
+ * never pushes.
+ */
+async function commandMigrate(args: string[]): Promise<void> {
+  const operation = args[0];
+  if (operation !== "install-mode") {
+    throw new PoiesisError("UNKNOWN_COMMAND", `Unknown migrate subcommand: ${operation ?? ""}`, {
+      subcommand: operation ?? "",
+      supported: ["install-mode"],
+    });
+  }
+  const values = options(args.slice(1), {
+    to: { type: "string" },
+    cwd: { type: "string" },
+  });
+  const root = await resolveGitRoot(cwdOf(values));
+  const { parseInstallModeAnswer } = await import("./install-mode.js");
+  const mode = parseInstallModeAnswer(required(values, "to"), "poiesis migrate install-mode --to");
+  writeSuccess("migrate.install-mode", await migrateInstallMode(root, mode));
 }
 
 async function commandInspect(args: string[]): Promise<void> {

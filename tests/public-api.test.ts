@@ -222,6 +222,23 @@ const forbiddenFunctions = [
   "ensureTransitionProfileParents",
   "removeEmptyTransitionDirectories",
   "assertOpenCodeConfigNotTracked",
+  // Spec #190 / ticket #194: the mode-less MIGRATION surface stays CLI- and
+  // runtime-internal for the same reason. Promoting it would freeze the
+  // migration PLAN shape, the manifest-derived ignore classification, the
+  // index-only removal bookkeeping (including the captured index entries a
+  // rollback restores), and the RESULT envelope into a public API — and a public
+  // "give my installation a sharing mode" helper would let a library caller
+  // stage Git index removals without the receipt authentication, the runtime
+  // identity boundary, the doctor gate, and the rollback that
+  // `poiesis migrate install-mode` provides. The migration is reached by naming
+  // the target mode on that route, and by nothing else.
+  "planInstallModeMigration",
+  "assertMigrationCaptureIdentity",
+  "migrationConfigWithMode",
+  "untrackMigrationPaths",
+  "restoreTrackedPaths",
+  "runInstallModeMigrationTransaction",
+  "migrateInstallMode",
   // Ticket #121 (reviewer FAIL fix): the ENTIRE Repository Intelligence
   // capability stays internal to the CLI / runtime. No value, no
   // constant, no helper, no status probe, and no destructive cache
