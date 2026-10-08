@@ -26,7 +26,7 @@ import { buildIsolatedPackage, removeOwnedBuildRoot, type IsolatedPackageBuild }
  *
  * This suite used to build into the repository-wide `dist/` with
  * `tsup --clean` and then recursively delete that same `dist/` in `afterAll`.
- * `dist/` is not private: `tests/release-contract-v1.4.2.test.ts` runs
+ * `dist/` is not private: `tests/release-contract-v1.5.0.test.ts` runs
  * `pnpm build` (`tsup ... --clean` into `dist/`) and `pnpm pack` against it
  * while the pool runs several forks concurrently, so this suite was deleting
  * and half-rewriting a directory another running suite was building and

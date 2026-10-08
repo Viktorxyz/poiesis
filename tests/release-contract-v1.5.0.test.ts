@@ -1,46 +1,47 @@
 /**
- * Poiesis 1.4.2 release / update contract.
+ * Poiesis 1.5.0 release / update contract.
  *
- * Spec #168 / ticket #184 — the 1.4.2 release carries the finding-triage
- * convergence guidance (POIESIS_METHOD.md §10, the Poiesis / Worker / Reviewer
- * roles, and the thin OpenCode projections) forward unchanged at the package
- * and migration seams, and advances the exact-version launcher route from the
- * `1.4.1` release to `1.4.2`.
+ * Spec #200 / ticket #201 — the 1.5.0 release publishes the Private/Team
+ * install and Local/deferred tracker capabilities that landed on `main`, and
+ * advances the exact-version launcher route from the `1.4.2` release to
+ * `1.5.0`. No product behavior changes here: the release moves the package and
+ * release-contract identity only, so every capability the runtime already
+ * exposes is carried forward unchanged at the package and migration seams.
  *
- * The 1.4.1 migration needs NO new admitted predecessor. The strict gate is
+ * The 1.4.2 migration needs NO new admitted predecessor. The strict gate is
  * keyed off the MANIFEST's own `poiesisVersion`, and
- * `desiredOpenCodePatches(config, "1.4.1")` is version-parameterized, so an
- * authentic 1.4.1 projection satisfies the ordinary strict manifest-version
- * check before any exceptional predecessor tolerance is reached. `"1.4.1"` is
+ * `desiredOpenCodePatches(config, "1.4.2")` is version-parameterized, so an
+ * authentic 1.4.2 projection satisfies the ordinary strict manifest-version
+ * check before any exceptional predecessor tolerance is reached. `"1.4.2"` is
  * therefore deliberately absent from the accepted predecessor set: admitting it
  * would grant an exceptional migration path to a projection the strict path
  * already accepts, and would widen what drift can reach.
  *
- * This file proves the 1.4.2 release contract at the seams the runtime already
+ * This file proves the 1.5.0 release contract at the seams the runtime already
  * exposes for the same version-bounded invariants:
  *
  *   - `package.json::version` and `packageVersion()` (the runtime identity
- *     seam) are the 1.4.2 release. This is the durable half of the runtime
+ *     seam) are the 1.5.0 release. This is the durable half of the runtime
  *     identity boundary the OpenCode projection keys off
  *     (`pnpm dlx poiesis-cli@<manifest.poiesisVersion>`).
  *
  *   - the published artifact parity: `pnpm pack --json` (offline-only, no
- *     publish, no network) reports the tarball as the `1.4.2` release whose
+ *     publish, no network) reports the tarball as the `1.5.0` release whose
  *     name/version agree with `package.json`, and packs the same canonical
  *     surface the runtime contract promises. A regression in the `files` array,
  *     in the on-disk canonical surface (e.g. a deleted role file), or in the
  *     artifact version is caught here before any real publish.
  *
- *   - the receipt-gated `update` transitions an authentic `1.4.1` install onto
- *     `1.4.2`, re-keys the exact-version launcher, grants no broad /
+ *   - the receipt-gated `update` transitions an authentic `1.4.2` install onto
+ *     `1.5.0`, re-keys the exact-version launcher, grants no broad /
  *     `@latest` / unversioned route, and advances the receipt by exactly one.
  *
- *   - the same-version reconciliation contract still holds at 1.4.2: a
- *     receipt-authenticated `update` on a 1.4.2 install stamps
- *     `manifest.poiesisVersion = "1.4.2"`.
+ *   - the same-version reconciliation contract still holds at 1.5.0: a
+ *     receipt-authenticated `update` on a 1.5.0 install stamps
+ *     `manifest.poiesisVersion = "1.5.0"`.
  *
  *   - historical predecessors stay exactly as they were: a 1.2.1 install still
- *     updates under the 1.4.2 runtime WITHOUT 1.2.1 joining the accepted
+ *     updates under the 1.5.0 runtime WITHOUT 1.2.1 joining the accepted
  *     predecessor set, and the 1.4.0 pre-focused-check projection remains the
  *     only same-release migration. (Covered by
  *     `tests/authority-1.1.x-predecessor.test.ts` and
@@ -77,15 +78,15 @@ const execFileAsync = promisify(execFile);
 const REPO_ROOT = join(import.meta.dirname, "..");
 
 /** The release this contract pins. `packageVersion()` must agree with it. */
-const RELEASE_VERSION = "1.4.2";
+const RELEASE_VERSION = "1.5.0";
 
 /**
- * The published predecessor release the 1.4.2 update must absorb. It is NOT an
- * accepted predecessor: an authentic 1.4.1 projection is admitted by the
+ * The published predecessor release the 1.5.0 update must absorb. It is NOT an
+ * accepted predecessor: an authentic 1.4.2 projection is admitted by the
  * ordinary strict manifest-version check because the strict projection is
  * keyed off the manifest's own `poiesisVersion`.
  */
-const PREDECESSOR_VERSION = "1.4.1";
+const PREDECESSOR_VERSION = "1.4.2";
 
 interface FakeUvEnvironment {
   parent: string;
@@ -223,13 +224,13 @@ const FORBIDDEN_PACKED_PATHS = [
   "node_modules/",
 ] as const;
 
-describe("Poiesis 1.4.2 release / update contract", () => {
-  it("package.json version is the 1.4.2 release", async () => {
+describe("Poiesis 1.5.0 release / update contract", () => {
+  it("package.json version is the 1.5.0 release", async () => {
     const pkg = await readPackageJson();
     expect(pkg.version).toBe(RELEASE_VERSION);
   });
 
-  it("packageVersion() runtime seam returns the 1.4.2 release", async () => {
+  it("packageVersion() runtime seam returns the 1.5.0 release", async () => {
     expect(await packageVersion()).toBe(RELEASE_VERSION);
   });
 
@@ -371,11 +372,11 @@ describe("Poiesis 1.4.2 release / update contract", () => {
   });
 
   it(
-    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.4.2 and advances the receipt once",
+    "same-version reconciliation on a v1.2 install stamps manifest.poiesisVersion = 1.5.0 and advances the receipt once",
     async () => {
       // The receipt-authenticated ordinary `update` is the same-version
       // reconciliation path. A successful run on a v1.2 install must
-      // stamp the manifest with the current package version (1.4.2)
+      // stamp the manifest with the current package version (1.5.0)
       // and advance the receipt generation by exactly one. This is the
       // deterministic contract the OpenCode projection's
       // `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` allow key
@@ -431,14 +432,14 @@ describe("Poiesis 1.4.2 release / update contract", () => {
   );
 
   it(
-    "a 1.2.1 install updates under the 1.4.2 runtime without joining the accepted predecessor set",
+    "a 1.2.1 install updates under the 1.5.0 runtime without joining the accepted predecessor set",
     async () => {
       // Spec #133 / ticket #136 — the migration claim, proven rather than
       // assumed. `assertManifestAuthorityToleratingPredecessor` builds
       // its strict projection with `desiredOpenCodePatches(config,
       // manifest.poiesisVersion)`, so a manifest that says 1.2.1 is
       // compared against the 1.2.1 strict surface, NOT against the
-      // 1.4.2 runtime. That is why "1.2.1" does NOT need to be added to
+      // 1.5.0 runtime. That is why "1.2.1" does NOT need to be added to
       // the accepted predecessor set in `runLockedUpdateTransaction`.
       const fakeOpenCodeEnv: FakeOpenCodeEnvironment = await installFakeOpenCode();
       const fakeUvEnv: FakeUvEnvironment = await installFakeUv();
@@ -468,9 +469,9 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         const { assertManifestAuthorityToleratingPredecessor } = await import("../src/authority.js");
         const productionSet = ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"] as const;
         expect([...productionSet]).not.toContain("1.2.1");
-        // Spec #168 / ticket #184 — the 1.4.2 release adds no accepted
+        // Spec #200 / ticket #201 — the 1.5.0 release adds no accepted
         // predecessor either: the historical set is byte-for-byte unchanged,
-        // and neither "1.2.1" nor the published "1.4.1" joined it.
+        // and neither "1.2.1" nor the published "1.4.2" joined it.
         expect([...productionSet]).not.toContain(PREDECESSOR_VERSION);
         // It resolves without throwing: the strict path already matches.
         await expect(
@@ -485,7 +486,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         const beforeReceipt = await readOwnershipReceipt(repository.root);
         const result = await update(repository.root, { skipSkills: true });
 
-        // The crossing succeeds and the manifest advances to 1.4.2.
+        // The crossing succeeds and the manifest advances to 1.5.0.
         expect(result.manifest.poiesisVersion).toBe(RELEASE_VERSION);
         expect((await loadManifest(repository.root)).poiesisVersion).toBe(RELEASE_VERSION);
 
@@ -495,7 +496,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         );
 
         // The exact-version launcher is re-keyed off the NEW runtime
-        // version, and the old key is gone: `pnpm dlx poiesis-cli@1.4.2 *`
+        // version, and the old key is gone: `pnpm dlx poiesis-cli@1.5.0 *`
         // and nothing else on the primary agent.
         const primaryAfter = result.manifest.configPatches.find((patch) => patch.path[1] === "poiesis")!;
         const bashAfter = (primaryAfter.installed as { permission: { bash: Record<string, string> } })
@@ -505,7 +506,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         expect(bashAfter["pnpm dlx poiesis-cli@*"]).toBe("deny");
         expect(bashAfter["pnpm dlx poiesis-cli *"]).toBe("deny");
 
-        // The on-disk OpenCode config carries the 1.4.2 key too, not just
+        // The on-disk OpenCode config carries the 1.5.0 key too, not just
         // the manifest record.
         const onDisk = await readFile(join(repository.root, "opencode.jsonc"), "utf8");
         expect(onDisk).toContain(`"pnpm dlx poiesis-cli@${RELEASE_VERSION} *"`);
@@ -520,12 +521,12 @@ describe("Poiesis 1.4.2 release / update contract", () => {
   );
 
   it(
-    "the authentic 1.4.1 projection passes the strict manifest-version check and never reaches predecessor tolerance",
+    "the authentic 1.4.2 projection passes the strict manifest-version check and never reaches predecessor tolerance",
     async () => {
-      // Spec #168 / ticket #184 — the 1.4.1 → 1.4.2 crossing needs NO new
+      // Spec #200 / ticket #201 — the 1.4.2 → 1.5.0 crossing needs NO new
       // accepted predecessor. The strict gate builds its projection from the
-      // MANIFEST's own `poiesisVersion`, so an authentic 1.4.1 manifest
-      // matches the 1.4.1 strict surface and is admitted by the ordinary
+      // MANIFEST's own `poiesisVersion`, so an authentic 1.4.2 manifest
+      // matches the 1.4.2 strict surface and is admitted by the ordinary
       // strict path, before any exceptional tolerance is consulted.
       const fakeOpenCodeEnv: FakeOpenCodeEnvironment = await installFakeOpenCode();
       const fakeUvEnv: FakeUvEnvironment = await installFakeUv();
@@ -540,7 +541,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         const predecessorManifest = await asVersionedManifest(repository, PREDECESSOR_VERSION);
         expect(predecessorManifest.poiesisVersion).toBe(PREDECESSOR_VERSION);
 
-        // The authentic 1.4.1 projection really is keyed off 1.4.1.
+        // The authentic 1.4.2 projection really is keyed off 1.4.2.
         const primaryBefore = predecessorManifest.configPatches.find((patch) => patch.path[1] === "poiesis")!;
         const bashBefore = (primaryBefore.installed as { permission: { bash: Record<string, string> } })
           .permission.bash;
@@ -554,7 +555,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
         ).resolves.toBeUndefined();
 
         // And the migration gate resolves with the PRODUCTION predecessor
-        // set, which deliberately does NOT contain "1.4.1". A version the
+        // set, which deliberately does NOT contain "1.4.2". A version the
         // strict path already admits gains nothing from an exceptional
         // predecessor entry, and adding one would widen what drift can reach.
         const { assertManifestAuthorityToleratingPredecessor } = await import("../src/authority.js");
@@ -578,7 +579,7 @@ describe("Poiesis 1.4.2 release / update contract", () => {
   );
 
   it(
-    "the receipt-gated update migrates an authentic 1.4.1 install onto 1.4.2 and re-keys the launcher without widening it",
+    "the receipt-gated update migrates an authentic 1.4.2 install onto 1.5.0 and re-keys the launcher without widening it",
     async () => {
       const fakeOpenCodeEnv: FakeOpenCodeEnvironment = await installFakeOpenCode();
       const fakeUvEnv: FakeUvEnvironment = await installFakeUv();
@@ -658,10 +659,10 @@ describe("Poiesis 1.4.2 release / update contract", () => {
   );
 
   it(
-    "arbitrary projection drift on a 1.4.1 install still fails closed",
+    "arbitrary projection drift on a 1.4.2 install still fails closed",
     async () => {
-      // The 1.4.1 migration is admitted through the STRICT path, not through
-      // an exceptional predecessor entry, so a drifted 1.4.1 manifest is
+      // The 1.4.2 migration is admitted through the STRICT path, not through
+      // an exceptional predecessor entry, so a drifted 1.4.2 manifest is
       // simply not that projection: it fails closed everywhere, including the
       // receipt-gated update.
       const { desiredOpenCodePatches } = await import("../src/opencode.js");
@@ -679,8 +680,8 @@ describe("Poiesis 1.4.2 release / update contract", () => {
           allowFixtureAdapters: true,
         });
         const authentic = desiredOpenCodePatches(testConfig(repository), PREDECESSOR_VERSION);
-        // Foreign edit inside the 1.4.1 surface: the Worker keeps the exact
-        // 1.4.1 route and additionally gains a broad wildcard. That is drift,
+        // Foreign edit inside the 1.4.2 surface: the Worker keeps the exact
+        // 1.4.2 route and additionally gains a broad wildcard. That is drift,
         // never a predecessor.
         const driftedProjection = authentic.map((patch) => {
           if (patch.path.length !== 2 || patch.path[1] !== "poiesis-worker") return patch;
