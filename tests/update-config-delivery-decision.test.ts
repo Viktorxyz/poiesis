@@ -67,10 +67,16 @@ const CONFIG_ROOT = ".poiesis/config.jsonc";
  * A config document that states EVERYTHING except the delivery decision. This
  * is the input the refusal is about: it is a complete, valid config under
  * `init --config`, and under `update --config` it is an unanswered question.
+ *
+ * Spec #190 / ticket #191: `mode` is required and is never inferred, so this
+ * document states `private` — the sharing decision is incidental to what the
+ * suite under test is about, and the mode has to be a real, installable one or
+ * `init` refuses before the delivery question is ever reached.
  */
 function configWithoutDelivery(repository: TestRepository): PoiesisConfig {
   return {
     schema: 1,
+    mode: "private",
     models: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
     repository: { remote: "origin", integrationBranch: "main" },
     tracker: { provider: "fixture", project: join(repository.fixtures, "tracker") },
@@ -99,7 +105,7 @@ async function readInstalledConfig(repository: TestRepository): Promise<PoiesisC
   return parseJsonc<PoiesisConfig>(await readFile(path, "utf8"), path);
 }
 
-/** Every byte `update --config` could mutate, plus the script surface. */
+/** Every byte `update --config` could mutate. */
 interface PreservedState {
   poiesisConfig: Buffer;
   openCodeConfig: Buffer;
@@ -108,7 +114,6 @@ interface PreservedState {
   receiptGeneration: number;
   receiptManifestDigest: number | string;
   packageJson: Buffer | null;
-  packagePoiesisScript: unknown;
   deliveryScripts: Map<string, Buffer | null>;
   mutationLockPresent: boolean;
 }
@@ -131,9 +136,6 @@ async function snapshotPreservedState(repository: TestRepository): Promise<Prese
     receiptGeneration: receipt.generation,
     receiptManifestDigest: receipt.manifestDigest,
     packageJson,
-    packagePoiesisScript: packageJson === null
-      ? undefined
-      : (JSON.parse(packageJson.toString("utf8")) as { scripts?: Record<string, string> }).scripts?.poiesis,
     deliveryScripts,
     mutationLockPresent: existsSync(`${receiptPath}.mutation.lock`),
   };
@@ -149,9 +151,11 @@ function expectPreserved(before: PreservedState, after: PreservedState): void {
   if (before.packageJson === null) {
     expect(after.packageJson, "package.json was created").toBeNull();
   } else {
+    // Spec #190 / ticket #191 removed the `package.json` script entirely, so
+    // byte identity is the whole contract: `update --config` must not touch
+    // this file at all.
     expect(Buffer.compare(after.packageJson!, before.packageJson), "package.json bytes changed").toBe(0);
   }
-  expect(after.packagePoiesisScript, "the pnpm poiesis package script changed").toBe(before.packagePoiesisScript);
   for (const [target, bytes] of before.deliveryScripts) {
     const now = after.deliveryScripts.get(target)!;
     if (bytes === null) {

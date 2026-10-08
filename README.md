@@ -110,42 +110,63 @@ pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --bootstrap-lega
 
 After that command succeeds, later `doctor`, `update`, `uninstall`, and capability installation use the normal receipt-backed rules. The flag is rejected if a receipt already exists or the installation is not exactly 1.0.0.
 
-### Everyday commands: `pnpm poiesis <command>`
+### Everyday commands
 
-Once a project is installed, you rarely need to spell out a launcher at
-all. `poiesis init` and `poiesis update` maintain a single `poiesis`
-script in the project's own `package.json`, so the everyday human command
-surface is:
+Poiesis installs no project script. `init` never writes a `poiesis` entry into your `package.json`, `update` never adds one, and no command maintains one — so there is nothing for a version to drift on and nothing for a stale cache to break. Every command is a `poiesis <command>` invocation through a launcher.
+
+After `init`, the everyday human surface is the exact-version route:
 
 ```bash
-pnpm poiesis doctor
-pnpm poiesis model set reasoning openai/gpt-5.6-sol
-pnpm poiesis update
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> model set reasoning openai/gpt-5.6-sol
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
-Poiesis writes exactly one entry, and never overwrites a `poiesis` script
-you defined yourself — a conflicting script fails `init` closed instead:
+`<manifest.poiesisVersion>` is the `poiesisVersion` recorded in `.poiesis/manifest.json`: the single durable runtime identity. That exact-version route is the one the projected agent permissions admit, and every version-qualified and `@latest` `dlx` variant is denied, so the runtime identity an agent runs under is never ambiguous. When you deliberately want the current published release instead of the recorded one, use the fresh-latest `update` form documented above; that is the intentional human upgrade, and it is a different command from the same-version reconciliation above.
 
-```json
-"scripts": {
-  "poiesis": "pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest"
-}
+`init` itself installs no launcher on `PATH` either. `poiesis uninstall` removes what it installed, and reinstalling is `init` again.
+
+### Private/local or Team/shared
+
+`init` asks which of these two you want before it asks anything else, and it never picks for you. In a non-TTY `--config` document the same decision is `"mode": "private"` or `"mode": "team"`; a config that omits it fails closed with `INVALID_INSTALL_MODE` rather than installing a sharing policy you did not choose.
+
+| | `"mode": "private"` | `"mode": "team"` |
+|---|---|---|
+| What Git sees of Poiesis | the one marked `.gitignore` block, and nothing else | the same block, plus the shareable profile it deliberately does not ignore |
+| A teammate's fresh clone | gets no Poiesis state and hydrates nothing | gets the profile and hydrates its own local projections from it |
+| Sharing policy changes later | explicit `update --config` with a different `"mode"` | explicit `update --config` with a different `"mode"` |
+
+The mode is stable. An ordinary `update`, an ordinary `doctor`, and a capability install keep whatever the manifest records; none of them re-decide it. The only ways it changes are the explicit ones: `update --config` with a different `mode` for an installation this release installed, and `poiesis migrate install-mode --to private|team` for one installed by a release that recorded no mode at all. Both refuse a block that is missing, relabelled, duplicated, malformed, or edited, they touch only paths the manifest can attribute to this installation, and both run inside the same transaction as every other install mutation — a failure restores your `.gitignore` and every other touched byte.
+
+**The visible `.gitignore` contract.** Poiesis manages exactly ONE uniquely delimited, mode-labelled block in your `.gitignore`, and that block is the only Poiesis surface Git is ever meant to see:
+
+```gitignore
+# >>> poiesis-managed-ignore mode=team >>>
+...
+# <<< poiesis-managed-ignore mode=team <<<
 ```
 
-The value is deliberately `@latest`, not a pinned version: you are never
-asked to remember or type one. It also carries
-`--config.dlx-cache-max-age=0` so the command bypasses pnpm's 1440-minute
-`dlx` resolution cache and always resolves the newest published release —
-without that flag a `pnpm poiesis update` could silently run a stale
-cached version. The flag lives in `package.json`, so you never type it.
+It is a real file in your repository, it is reviewable in a diff, and it is not a hidden mechanism: there is no `.git/info/exclude` fallback and no other activation of any kind. The block names `.poiesis/` (Poiesis's own canon, config, manifest, receipts, runtime state, caches, workspaces, locks, and logs), then adds the individual generated OpenCode agent projections, the delivery scripts this installation generated, and the skills this installation installed. Generated agent projections are listed one by one rather than as a `.opencode/` wildcard because `.opencode/` is yours; the OpenCode config is named only when Poiesis created it; and a skill directory you already had is never broadly ignored, because you own it.
 
-This is the **human** route only. The exact-version route
-`pnpm dlx poiesis-cli@<X>` (where `X` is the sole durable
-`manifest.poiesisVersion`) remains the runtime identity the OpenCode
-config projection admits, and the projected agent permissions still deny
-every version-qualified and `@latest` `dlx` variant. The script is
-inert after `uninstall` — it reports that the project is not installed,
-which is also how you reinstall.
+The classification is closed in BOTH modes, which is what makes sharing safe: changing the mode never widens or narrows what is hidden, only what Poiesis writes outside the block. A second block, a block that starts and ends under different labels, an orphan delimiter, or a line that merely mentions the marker all fail closed with `GITIGNORE_BLOCK_DUPLICATE` / `GITIGNORE_BLOCK_MALFORMED` rather than merging into a policy you did not write. `uninstall` removes the exact unchanged block it recorded and preserves a block you edited, reporting it instead — a deletion on the strength of a hash Poiesis no longer recognises would destroy your edit.
+
+Repeated `init` / `update` / `doctor` cycles converge: a block that already states what the installation owns is left byte-for-byte alone, so a no-op cycle changes no file, no hash, and nothing an uninstall later has to reconcile.
+
+**What a team shares.** In `team` mode Poiesis publishes exactly one directory, `.opencode/poiesis/`, and the block says so in words rather than inventing a negation rule:
+
+- `.opencode/poiesis/config.jsonc` — a portable projection of your resolved configuration (models, repository, tracker, delivery, verification policy), validated before a single byte is written and refused outright if it contains a machine path or a credential;
+- `.opencode/poiesis/skills.lock.json` — the selected skills with their locked source, revision, and integrity hash;
+- `.opencode/poiesis/overrides/` — project-created instruction and role overrides.
+
+It sits outside `.poiesis/` on purpose: Git cannot re-include a file whose parent directory is excluded, and `uninstall` treats unknown content under `.poiesis/` as preserved-and-reported. Everything else Poiesis writes — the `.poiesis/` tree, the generated OpenCode projections, the OpenCode config it created, the generated delivery scripts, the installed skills — is derived from package canon plus that profile and is regenerated, never committed. The profile is not a manifest record, so `uninstall` never claims it: going team → private removes nothing from it, and `uninstall` preserves it as your content.
+
+A teammate hydrates from it with ordinary `init` and nothing else:
+
+```bash
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init --config .opencode/poiesis/config.jsonc
+```
+
+The committed profile is adopted rather than rewritten, every ignored local projection is regenerated, and ordinary `opencode` discovery works from the standard project-relative files with no launcher and no environment setup. A profile that contradicts the local configuration, or that is not portable, fails closed with nothing written.
 
 ### Command execution, containment, and cancellation
 
@@ -315,6 +336,11 @@ those combinations with `INCOMPATIBLE_UPDATE_OPTIONS` before reaching the
 maintenance surface. The transaction is config-only: it does not bootstrap
 legacy ownership, install skills, or accept fixture adapters.
 
+Stating a different `"mode"` in that document is the one structural change it
+performs, and only because the sharing decision is Author-owned: it is the
+explicit Private ⇄ Team transition, covered under
+[Private/local or Team/shared](#privatelocal-or-teamshared) above.
+
 If the intended serialized Poiesis config bytes equal the bytes currently on
 disk for `.poiesis/config.jsonc` AND the intended projected OpenCode config
 bytes equal the bytes currently on disk for the OpenCode config, `update
@@ -346,6 +372,20 @@ pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
 
 That includes Poiesis-owned derived state: the Repository Intelligence cache under `.poiesis/cache/repository-intelligence/`, and the generated delivery runtime under `.poiesis/runtime/delivery/`. Ownership of each is exact — Poiesis owns the `repository-intelligence/` entry under `.poiesis/cache/`, and the `delivery/` entry under `.poiesis/runtime/` — and every other sibling in those containers is yours. `uninstall` removes only the owned entry, `rmdir`s the container only when it is empty, and reports anything it preserved. A symlinked container, a symlinked owned entry, or a symlink anywhere inside one is never traversed or deleted: the removal is refused, reported as `preserved`, and the rest of the uninstall proceeds.
 
+**Uninstall is not a history purge.** An ordinary `uninstall` removes every safely attributable Poiesis artifact and then hands back the rest as your data. Three things in particular are never touched by it:
+
+- the ONE Poiesis-managed `.gitignore` block is removed only when it is byte-for-byte the block the manifest recorded; if you edited inside it, `uninstall` preserves it and reports it, because deleting it on the strength of a hash Poiesis no longer recognises would destroy your edit;
+- a committed `.opencode/poiesis/` team profile is your content, not a manifest record, so `uninstall` preserves it and ordinary `update` never rewrites it;
+- with the `local` tracker, the recorded Spec and ticket history under `poiesis-tracker-v1` beside your Git objects is retained user data. It is reported under `retained`, and it is never a reason for the runtime uninstall to be called incomplete.
+
+Exactly one operation destroys that Local tracker history:
+
+```bash
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall --purge-history --yes
+```
+
+It removes only a validated, repository-bound Local tracker store, and only after an interactive confirmation naming what is destroyed and what is not — or the explicit non-interactive `--yes`. Without a TTY and without `--yes` it refuses before touching anything. A symlink, an unknown entry, foreign content, a held store lock, or a store that does not resolve to this repository's canonical path is refused without deleting anything. Git history, remote tracker issues, pull/merge requests, releases, and deployment state are never purge targets — those are not Poiesis's to destroy.
+
 ## What `init` produces
 
 `init` cannot run from nothing because every project makes a real choice that only the Author owns. The interactive flow discovers everything it can and asks only for the Author-owned decisions. The successful install writes a resolved `.poiesis/config.jsonc` shaped like:
@@ -353,6 +393,7 @@ That includes Poiesis-owned derived state: the Repository Intelligence cache und
 ```jsonc
 {
   "schema": 1,
+  "mode": "private",
   "models": {
     "reasoning": "<provider/model>",
     "execution": "<provider/model>"
@@ -368,6 +409,10 @@ That includes Poiesis-owned derived state: the Repository Intelligence cache und
   }
 }
 ```
+
+`mode` is required and is never inferred: `private` (this clone only) or
+`team` (this clone plus the shareable project profile). See
+[Private/local or Team/shared](#privatelocal-or-teamshared).
 
 The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init), with one difference: an `update --config` document must also state its `delivery` decision, because it configures an installation that already recorded one. `repository.remote` and `repository.integrationBranch` are auto-discovered from the Git repository; `verification.commands` are auto-derived from the project's package manager and test scripts.
 

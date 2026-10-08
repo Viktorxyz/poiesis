@@ -520,8 +520,10 @@ beforeAll(async () => {
   await symlink(join(packageRoot, "dist", "cli.js"), binPath);
 
   // 3. A real Git repository with a real (filesystem) remote. The project
-  //    needs a `package.json` because `init` maintains the `pnpm poiesis`
-  //    script there.
+  //    needs a `package.json` because `init` derives `verification.commands`
+  //    from the project's own package manager and test scripts. Spec #190 /
+  //    ticket #191 removed the `pnpm poiesis` package script, so `init` no
+  //    longer writes anything into this file and leaves it byte-identical.
   const projectDir = join(scratch, "project");
   const repoRoot = join(projectDir, "repo");
   const remote = join(projectDir, "remote.git");

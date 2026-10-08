@@ -22,10 +22,10 @@
  *   3. CLEAN EXECUTION — running the installed default command for each
  *      target creates the artifact while `git status` is byte-identical to
  *      its pre-run value. Break: an unignored artifact is untracked work.
- *   4. LINKED WORKSPACE — the same execution inside a linked worktree whose
- *      branch carries the rule leaves `git status` empty, which is the
- *      exact predicate `workspace cleanup` gates on. The negative control
- *      proves the assertion is not vacuous.
+ *   4. LINKED WORKSPACE — the same execution inside a linked worktree that
+ *      carries the rule leaves `git status` empty, which is the exact
+ *      predicate `workspace cleanup` gates on. The negative control proves
+ *      the assertion is not vacuous.
  *   5. OWNED-ONLY UNINSTALL — uninstall removes the complete owned delivery
  *      subtree and an empty runtime parent.
  *   6. FOREIGN SIBLINGS — a foreign `.poiesis/runtime/` sibling survives
@@ -48,6 +48,7 @@ import {
   removeValidatedDeliveryRuntime,
 } from "../src/delivery-runtime.js";
 import { loadManifest } from "../src/manifest.js";
+import { parseManagedIgnoreBlocks } from "../src/install-mode.js";
 import { readOwnershipReceipt, manifestDigest, ownershipReceiptExists } from "../src/receipt.js";
 import { resolveTree } from "../src/git.js";
 import { run } from "../src/process.js";
@@ -150,6 +151,44 @@ async function stripDeliveryRuntimeRule(root: string): Promise<void> {
     .filter((line) => line.trim() !== EXPECTED_IGNORE_RULE)
     .filter((line) => !line.includes("generated delivery runtime state"));
   await writeFile(path, kept.join("\n"));
+}
+
+/**
+ * Spec #190 / ticket #196 — remove the WHOLE Poiesis-managed ignore block and
+ * nothing else, located through the product's own parser so the helper cannot
+ * drift from the delimiters the block really uses.
+ *
+ * This is NOT what `stripDeliveryRuntimeRule` does, and the difference is the
+ * whole point of the negative control below: the #190 classification is closed
+ * over `.poiesis/`, so a block that still states `.poiesis/` keeps hiding
+ * delivery residue even with the one owned-subtree rule deleted. A branch that
+ * carries no Poiesis policy at all is the state in which generated state IS
+ * untracked work.
+ */
+async function stripManagedIgnoreBlock(root: string): Promise<void> {
+  const path = join(root, ".gitignore");
+  const content = await readFile(path, "utf8");
+  const [block] = parseManagedIgnoreBlocks(content);
+  if (block === undefined) throw new Error(`expected exactly one Poiesis-managed ignore block at ${path}`);
+  const lines = content.split("\n");
+  lines.splice(block.startIndex, block.endIndex - block.startIndex + 1);
+  await writeFile(path, lines.join("\n"));
+}
+
+/**
+ * Spec #190: the ONE managed block ignores the whole `.poiesis/` root, so a
+ * linked worktree of an installed branch is a checkout of the shared
+ * Git-visible surface only — exactly what a teammate's fresh clone receives.
+ * It gets its own installation the way that clone does, by running `init`
+ * there: Poiesis installs into the checkout it is invoked in, and the
+ * ownership receipt is keyed by workspace real path, so this is an ordinary
+ * first-class installation rather than a copy of the primary's records.
+ */
+async function installLinkedWorkspace(repository: TestRepository, root: string): Promise<void> {
+  await init(root, testConfig(repository, { withDelivery: false }), {
+    skipSkills: true,
+    allowFixtureAdapters: true,
+  });
 }
 
 /**
@@ -355,7 +394,7 @@ describe("generated delivery runtime ownership", () => {
     expect(ghInvocations).not.toContain("pr create");
   }, 60_000);
 
-  it("leaves a linked workspace clean after a delivery run, and refuses to when the rule is absent", async () => {
+  it("leaves a linked workspace clean after a delivery run, and dirties it when the ignore policy is absent", async () => {
     // Break: `workspace cleanup` gates on `git status --porcelain -z
     // --untracked-files=all` being empty. Runtime residue made that
     // impossible, so a delivered workspace could never be cleaned up.
@@ -364,25 +403,38 @@ describe("generated delivery runtime ownership", () => {
     const foreign = await installForeignBinStubs();
     foreignBins.push(foreign);
     await installWithGeneratedTargets(repository);
+    // Spec #190: the ONLY thing this install stages is the managed ignore
+    // block, so a linked worktree of this branch carries no `.poiesis/` at
+    // all — the same starting point a teammate's fresh clone gets.
     await run("git", ["add", "-A"], { cwd: repository.root });
     await run("git", ["commit", "--quiet", "-m", "install"], { cwd: repository.root });
 
     const owned = join(repository.parent, "linked-owned");
     await run("git", ["worktree", "add", "--quiet", "-b", "poiesis/owned", owned], { cwd: repository.root });
+    expect(await pathExists(join(owned, EXPECTED_RUNTIME_CONTAINER))).toBe(false);
+    await installLinkedWorkspace(repository, owned);
+    // Installing into the linked worktree is invisible to Git there too: the
+    // committed block is the whole Poiesis surface, so the policy is proven
+    // to hold for a workspace Poiesis did not create the block in.
+    expect(await gitStatusPorcelain(owned)).toBe("");
     expect(await runInstalledTarget(owned, "preview", repository.baseSha)).toMatchObject({ exitCode: 0 });
     expect(await gitStatusPorcelain(owned)).toBe("");
 
-    // Negative control: the same execution on a branch that does NOT carry
-    // the rule dirties the workspace, so the clean assertion above is not
-    // vacuously true.
-    await stripDeliveryRuntimeRule(repository.root);
-    await run("git", ["add", "-A"], { cwd: repository.root });
-    await run("git", ["commit", "--quiet", "-m", "drop the runtime rule"], { cwd: repository.root });
+    // Negative control: the same execution on a branch that carries NO
+    // Poiesis-managed ignore block dirties the workspace, so the clean
+    // assertion above is not vacuously true. The installation is kept (and
+    // force-tracked, the way a pre-#190 checkout carried it), so the ONLY
+    // difference from the owned worktree is the ignore policy itself.
     const unguarded = join(repository.parent, "linked-unguarded");
     await run("git", ["worktree", "add", "--quiet", "-b", "poiesis/unguarded", unguarded], { cwd: repository.root });
+    await installLinkedWorkspace(repository, unguarded);
+    await stripManagedIgnoreBlock(unguarded);
+    await run("git", ["add", "-f", "-A"], { cwd: unguarded });
+    await run("git", ["commit", "--quiet", "-m", "drop the ignore policy"], { cwd: unguarded });
+    expect(await gitStatusPorcelain(unguarded)).toBe("");
     expect(await runInstalledTarget(unguarded, "preview", repository.baseSha)).toMatchObject({ exitCode: 0 });
     expect(await gitStatusPorcelain(unguarded)).toContain(EXPECTED_RUNTIME_RELATIVE);
-  }, 60_000);
+  }, 120_000);
 });
 
 // =========================================================================
