@@ -634,3 +634,75 @@ export async function acquireWorkspaceMutationLock(root: string): Promise<Worksp
     },
   };
 }
+/**
+ * Spec #190 / ticket #195 — what a surviving mutation lock says, for a caller
+ * that is deciding whether it may REMOVE it.
+ *
+ * `describeMutationLockHolder` is the one classifier in the runtime, and it is
+ * reused rather than re-derived: a second liveness probe would be a second
+ * opinion about the same bytes, and the two could disagree. The three
+ * classifications therefore carry the same meaning they carry to a blocked
+ * mutation.
+ */
+export interface WorkspaceMutationLockTeardown {
+  /** Absolute path of this workspace's mutation lock. */
+  path: string;
+  /** `true` when the lock file is absent — nothing to reclaim. */
+  absent: boolean;
+  /** The one classification, or `null` when no lock file exists. */
+  holder: MutationLockHolder | null;
+  /** `true` only for a STALE lock: a Poiesis token whose holder is gone. */
+  reclaimable: boolean;
+}
+
+/** Inspect this workspace's mutation lock without touching it. */
+export async function inspectWorkspaceMutationLock(root: string): Promise<WorkspaceMutationLockTeardown> {
+  const path = `${await ownershipReceiptLocation(root)}.mutation.lock`;
+  let present: boolean;
+  try {
+    await lstat(path);
+    present = true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    present = false;
+  }
+  if (!present) return { path, absent: true, holder: null, reclaimable: false };
+  const holder = await describeMutationLockHolder(path);
+  return { path, absent: false, holder, reclaimable: holder.holderRunning === false };
+}
+
+/**
+ * Spec #190 / ticket #195 — reclaim ONE stale mutation lock during uninstall.
+ *
+ * A lock survives its holder: a session that dies mid-mutation leaves a file no
+ * runtime will ever reclaim, and an installation whose lock that is can never be
+ * fully uninstalled. Uninstall is the one operator-driven teardown in the
+ * runtime, so it removes the STALE case and only the stale case:
+ *
+ *   - a Poiesis lock token whose recorded pid is gone: removed. Nothing can be
+ *     using it, and `process.kill(pid, 0)` already answered the only question
+ *     that decides it.
+ *   - a LIVE Poiesis lock: preserved with the holder's own recovery prose.
+ *     Removing it would hand a second concurrent mutation the right to start
+ *     while the first is still writing.
+ *   - bytes that are not a Poiesis lock token: preserved. Poiesis cannot say who
+ *     owns them, so it does not delete them.
+ *
+ * Nothing else is removed, no directory is swept, and there is no parameter
+ * through which a caller could widen this to another workspace's lock.
+ */
+export async function removeStaleWorkspaceMutationLock(
+  root: string,
+): Promise<{ removed: boolean; path: string; retainedReason: string | null }> {
+  const inspection = await inspectWorkspaceMutationLock(root);
+  if (inspection.absent) return { removed: false, path: inspection.path, retainedReason: null };
+  if (!inspection.reclaimable || inspection.holder === null) {
+    return {
+      removed: false,
+      path: inspection.path,
+      retainedReason: inspection.holder?.recovery ?? "The mutation lock was present and Poiesis could not prove it stale",
+    };
+  }
+  await rm(inspection.path, { force: true });
+  return { removed: true, path: inspection.path, retainedReason: null };
+}

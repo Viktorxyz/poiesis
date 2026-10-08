@@ -31,7 +31,8 @@
  * Verify run and resolves them against the existing lifecycle authority.
  */
 import { randomUUID } from "node:crypto";
-import { chmod, mkdir, readFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, readdir, readFile, rmdir, unlink } from "node:fs/promises";
+import type { Stats } from "node:fs";
 import { join } from "node:path";
 import type { ResolvedPoiesisConfig } from "./config.js";
 import { PoiesisError, invariant } from "./errors.js";
@@ -526,6 +527,131 @@ export async function resolveLiveVerificationPlan(primaryRoot: string): Promise<
 
 function samePlan(left: readonly string[], right: readonly string[]): boolean {
   return left.length === right.length && left.every((command, index) => command === right[index]);
+}
+
+/**
+ * Spec #190 / ticket #195 — remove the verification receipts THIS installation
+ * recorded, and nothing else.
+ *
+ * A receipt is proof-scope evidence bound to one installation: it records the
+ * `installationId` from the ownership receipt, the `manifestDigest` and
+ * `generation` it was minted under, and the `commonDir` it lives beside. That
+ * binding is the whole ownership proof, so the removal sweeps the directory and
+ * removes exactly the entries carrying this installation's id — an entry that
+ * belongs to a sibling installation of the same repository, or that cannot be
+ * parsed at all, is FOREIGN and is preserved with its exact path.
+ *
+ * Two shapes are refused outright rather than skipped, because skipping them
+ * would leave the operator believing the directory is clean:
+ *
+ *   - a symlinked receipt DIRECTORY, or a symlinked / non-regular entry inside
+ *     it: nothing is traversed and nothing is deleted, so no removal can follow
+ *     a link out of the Git common directory;
+ *   - an entry whose name is not `<id>.json` and not an abandoned
+ *     `<id>.json.<uuid>.tmp` temporary: an unrecognised name is somebody else's
+ *     data under a Poiesis-chosen directory name, and "it is under the receipt
+ *     directory" is not ownership.
+ *
+ * The directory itself is `rmdir`-ed only when it is left empty, so a foreign
+ * receipt (or an operator's own file) keeps its parent.
+ */
+export interface OwnedVerificationReceiptRemoval {
+  /** Receipt ids this installation recorded and that were removed. */
+  removed: string[];
+  /** Absolute paths left intact because Poiesis could not prove it owned them. */
+  foreignPreserved: string[];
+}
+
+const RECEIPT_TEMPORARY_PATTERN =
+  /^.+\.json\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+export async function removeOwnedVerificationReceipts(
+  commonDir: string,
+  installationId: string,
+): Promise<OwnedVerificationReceiptRemoval> {
+  const directory = join(commonDir, VERIFICATION_RECEIPT_DIRECTORY);
+  let details: Stats | null;
+  try {
+    details = await lstat(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { removed: [], foreignPreserved: [] };
+    throw error;
+  }
+  if (details.isSymbolicLink()) {
+    throw new PoiesisError(
+      "VERIFICATION_RECEIPT_STORE_UNSAFE",
+      "Refusing to remove receipts from a symlinked verification receipt directory",
+      { path: directory },
+    );
+  }
+  if (!details.isDirectory()) {
+    throw new PoiesisError(
+      "VERIFICATION_RECEIPT_STORE_UNSAFE",
+      "Refusing to remove receipts from a non-directory verification receipt path",
+      { path: directory },
+    );
+  }
+
+  const removed: string[] = [];
+  const foreignPreserved: string[] = [];
+  for (const entry of (await readdir(directory)).sort()) {
+    const path = join(directory, entry);
+    const isTemporary = RECEIPT_TEMPORARY_PATTERN.test(entry);
+    if (!isTemporary && !entry.endsWith(".json")) {
+      throw new PoiesisError(
+        "VERIFICATION_RECEIPT_STORE_UNSAFE",
+        "Refusing to remove receipts: the receipt directory holds an entry this store layout never issues",
+        { path, entry },
+      );
+    }
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new PoiesisError(
+        "VERIFICATION_RECEIPT_STORE_UNSAFE",
+        "Refusing to remove receipts: a receipt entry is a symlink or not a regular file",
+        { path },
+      );
+    }
+    if (isTemporary) {
+      // An abandoned atomic-write temporary. It is not evidence, it is not
+      // referenced by anything, and it is never readable to another user, so it
+      // is temporary state rather than foreign content.
+      await unlink(path);
+      continue;
+    }
+    const receipt = await readOwnedReceiptId(path);
+    if (receipt !== installationId) {
+      foreignPreserved.push(path);
+      continue;
+    }
+    await unlink(path);
+    removed.push(entry.slice(0, -".json".length));
+  }
+
+  try {
+    if ((await readdir(directory)).length === 0) await rmdir(directory);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return { removed, foreignPreserved };
+}
+
+/**
+ * The `installationId` a stored receipt claims, or `null` when the document
+ * cannot be read as one. A malformed receipt is not this installation's, so it
+ * is preserved — never repaired, never deleted on a guess.
+ */
+async function readOwnedReceiptId(path: string): Promise<string | null> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8"));
+  } catch {
+    return null;
+  }
+  if (!isRecord(value)) return null;
+  return typeof value.installationId === "string" && value.installationId.length > 0
+    ? value.installationId
+    : null;
 }
 
 function parseVerificationReceipt(value: unknown, path: string): VerificationReceiptV1 {

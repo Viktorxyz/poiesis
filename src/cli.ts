@@ -50,7 +50,8 @@ Usage:
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
   poiesis migrate install-mode --to private|team   # Spec #190 / ticket #194 — the EXPLICIT migration of a released installation that records no sharing mode onto private/local or team/shared. Not reachable through \`update --config\`, which keeps refusing an explicit mode against a mode-less manifest, and never a side effect of any other command. It appends the ONE visible Poiesis-managed ignore block, records it in the manifest, writes the same mode into the local config, and for \`team\` publishes only the accepted declarative project profile. Artifacts such a release used to TRACK are removed from the Git INDEX only — the worktree bytes stay, every staged removal is reported in the result, and Poiesis never commits and never pushes.
-  poiesis uninstall
+poiesis uninstall
+  poiesis uninstall --purge-history [--yes]                 # Spec #190 / ticket #195 — the ONLY operation that destroys Local tracker history. Ordinary \`uninstall\` removes every safely attributable artifact and RETURNS the recorded Local tracker history as user data (reported under \`retained\`, and never a reason the runtime uninstall is incomplete). This flag removes that retained history too, and only after an interactive confirmation naming exactly what is destroyed and what is not, or after the explicit non-interactive confirmation flag \`--yes\` — without a TTY and without \`--yes\` the command refuses before touching anything. The purge removes ONLY a validated, repository-bound Local tracker store (the canonical \`<git-common-dir>/poiesis-tracker-v1\` document) and works against a tracker-only remainder: an installation that is already fully uninstalled needs no manifest for this to run. A symlink, an unknown entry, foreign content, a held store lock, or a store that does not resolve to this repository's canonical path is refused without deleting anything. Git history, remote tracker issues, pull/merge requests, releases, and deployment state are never purge targets.
   poiesis inspect
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
   poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
@@ -350,10 +351,120 @@ export async function commandUpdate(args: string[]): Promise<void> {
   );
 }
 
-async function commandUninstall(args: string[]): Promise<void> {
-  const values = options(args, { cwd: { type: "string" } });
+/**
+ * Spec #190 / ticket #195 — the ONE confirmation an operator can give for
+ * destroying Local tracker history.
+ *
+ * Recorded history is the Author's work, so `uninstall` keeps it by default and
+ * destroying it is a separate, named decision. This function is where that
+ * decision is actually made, and it is deliberately the only place:
+ *
+ *   - WITHOUT a TTY there is nobody to ask, so the operation is refused and the
+ *     refusal names the non-interactive confirmation flag. A destructive step
+ *     that cannot ask is not one a flag alone may authorise.
+ *   - WITH a TTY the operator must type the exact word. "y", "yes please", and an
+ *     empty line are all declines: a keystroke a runaway script or a
+ *     half-attentive operator produces must not read as consent to irreversible
+ *     deletion.
+ *   - Closing the prompt is a cancellation, not a confirmation.
+ *
+ * The prompt states the exact scope, including what is NOT affected, so the
+ * answer is informed: Git history, remote tracker issues, pull/merge requests,
+ * releases, and deployment state are not in this store and are never touched.
+ *
+ * The IO seam mirrors `createProductionInteractiveInitIO`: production binds the
+ * real stdin/stderr, tests script the answers, and neither can drift from the
+ * question actually asked.
+ */
+export const PURGE_HISTORY_CONFIRMATION_WORD = "purge-local-tracker-history";
+
+export interface UninstallConfirmationIO {
+  readonly isTTY: boolean;
+  promptLine(prompt: string): Promise<string>;
+}
+
+export function createProductionUninstallConfirmationIO(): UninstallConfirmationIO {
+  const isTTY = Boolean((process.stdin as { isTTY?: boolean }).isTTY);
+  return {
+    isTTY,
+    promptLine: async (prompt: string) =>
+      (await import("./prompt-line.js")).settleOnceLinePrompt({
+        prompt,
+        input: process.stdin,
+        output: process.stderr,
+        isTTY,
+        cancellationError: new PoiesisError(
+          "PURGE_HISTORY_CANCELLED",
+          "Local tracker history purge cancelled before it started",
+          {},
+          130,
+        ),
+      }),
+  };
+}
+
+export async function confirmLocalTrackerHistoryPurge(
+  root: string,
+  io: UninstallConfirmationIO = createProductionUninstallConfirmationIO(),
+): Promise<void> {
+  if (!io.isTTY) {
+    throw new PoiesisError(
+      "PURGE_HISTORY_CONFIRMATION_REQUIRED",
+      "poiesis uninstall --purge-history cannot ask for confirmation without a TTY",
+      {
+        root,
+        confirmationWord: PURGE_HISTORY_CONFIRMATION_WORD,
+        hint: "re-run inside a TTY, or pass `--yes` to confirm the Local tracker history purge non-interactively",
+      },
+    );
+  }
+  let answer: string;
+  try {
+    answer = await io.promptLine(
+      `Permanently delete this repository's Local tracker history (every Poiesis Spec, ticket, comment, and history entry)? Git history, remote tracker issues, pull requests, releases, and deployment state are NOT affected. Type "${PURGE_HISTORY_CONFIRMATION_WORD}" to confirm`,
+    );
+  } catch (error) {
+    if (error instanceof PoiesisError && error.code === "PURGE_HISTORY_CANCELLED") throw error;
+    throw new PoiesisError(
+      "PURGE_HISTORY_CANCELLED",
+      "Local tracker history purge cancelled before it started",
+      { root, cause: error instanceof Error ? error.message : String(error) },
+      130,
+    );
+  }
+  if (answer.trim() !== PURGE_HISTORY_CONFIRMATION_WORD) {
+    throw new PoiesisError(
+      "PURGE_HISTORY_DECLINED",
+      "Local tracker history purge declined; uninstall keeps the recorded history as user data",
+      { root, confirmationWord: PURGE_HISTORY_CONFIRMATION_WORD },
+    );
+  }
+}
+
+export async function commandUninstall(args: string[]): Promise<void> {
+  const values = options(args, {
+    "purge-history": { type: "boolean" },
+    yes: { type: "boolean" },
+    cwd: { type: "string" },
+  });
+  const purgeHistory = boolean(values, "purge-history");
+  const confirmed = boolean(values, "yes");
+  // `--yes` names a confirmation, so accepting it on its own would let a habit
+  // of appending it silently authorise nothing while implying it authorised
+  // something. Fail closed instead.
+  if (confirmed && !purgeHistory) {
+    throw new PoiesisError(
+      "INCOMPATIBLE_UNINSTALL_OPTIONS",
+      "poiesis uninstall --yes is only meaningful together with --purge-history",
+      { yes: true, purgeHistory: false },
+    );
+  }
   const root = await resolveGitRoot(cwdOf(values));
-  writeSuccess("uninstall", await uninstall(root));
+  // Confirm BEFORE any repository state is touched, so a declined purge leaves
+  // the installation exactly as it was rather than uninstalling it and then
+  // asking.
+  if (purgeHistory && !confirmed) await confirmLocalTrackerHistoryPurge(root);
+  writeSuccess("uninstall", await uninstall(root, { purgeHistory }));
 }
 
 /**

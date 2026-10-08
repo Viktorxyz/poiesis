@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { Buffer } from "node:buffer";
 import { realpathSync } from "node:fs";
+import type { Stats } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { PoiesisError, invariant } from "./errors.js";
 import { discoverGitCommonDir } from "./git-common-dir.js";
@@ -1439,4 +1440,198 @@ export async function assertLocalTrackerStoreUsable(location: LocalTrackerStoreL
   // Strictly loaded and then discarded: the validator is the check, and it
   // throws rather than repairing, so a malformed document is a typed refusal.
   await loadLocalTrackerStore(location);
+}
+
+// -- Spec #190 / ticket #195: retained history and the explicit purge ---------
+
+/**
+ * Spec #190 / ticket #195 — what a Local tracker store holds, reported WITHOUT
+ * touching it.
+ *
+ * An ordinary `uninstall` removes every artifact it can attribute to itself and
+ * deliberately RETAINS this store, because it is the Author's own recorded work
+ * (Specs, tickets, comments, history) rather than an installation artifact. The
+ * retained history must still be REPORTED, and — the property this function
+ * exists to keep honest — it must never be a reason to call an otherwise
+ * complete runtime uninstall incomplete.
+ *
+ * Everything here is read-only and bounded: the same ONE bounded loader the
+ * read and mutation paths use, so a store over the ceiling reports `null`
+ * counts instead of being read whole. An UNREADABLE store is still retained user
+ * data, so a parse failure reports presence with `null` counts rather than
+ * pretending nothing is there.
+ */
+export interface LocalTrackerHistoryReport {
+  /** `true` when a store directory exists at the canonical location. */
+  present: boolean;
+  /** The store directory, or `null` when nothing is recorded. */
+  path: string | null;
+  /** Specs recorded, or `null` when the store could not be read. */
+  specs: number | null;
+  /** Tickets recorded, or `null` when the store could not be read. */
+  tickets: number | null;
+}
+
+export async function inspectLocalTrackerHistory(cwd: string): Promise<LocalTrackerHistoryReport> {
+  let location: LocalTrackerStoreLocation;
+  try {
+    location = resolveLocalTrackerStoreLocationSync(cwd);
+  } catch {
+    // Not a Git checkout (or Git is unavailable): there is no repository-bound
+    // store to retain or report, and that is not an uninstall failure.
+    return { present: false, path: null, specs: null, tickets: null };
+  }
+  if ((await lstatOrNull(location.directory)) === null) {
+    return { present: false, path: location.directory, specs: null, tickets: null };
+  }
+  try {
+    const store = await loadLocalTrackerStore(location);
+    const items = Object.values(store.items).map((file) => file.item);
+    return {
+      present: true,
+      path: location.directory,
+      specs: items.filter((item) => item.kind === "spec").length,
+      tickets: items.filter((item) => item.kind === "ticket").length,
+    };
+  } catch {
+    return { present: true, path: location.directory, specs: null, tickets: null };
+  }
+}
+
+/**
+ * `lstat` that maps absence to `null` instead of throwing, and never follows a
+ * link. The purge has to tell "not there" from "there but not what I expected"
+ * without ever resolving a symlink to whatever it points at.
+ */
+async function lstatOrNull(path: string): Promise<Stats | null> {
+  try {
+    return await lstat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/** `true` for exactly the names this store layout is allowed to contain. */
+function isKnownStoreEntry(name: string): boolean {
+  return (
+    name === LOCAL_TRACKER_STORE_FILENAME ||
+    name === LOCAL_TRACKER_LOCK_FILENAME ||
+    name === LOCAL_TRACKER_LOCK_GUARD_FILENAME ||
+    TEMPORARY_PATTERN.test(name)
+  );
+}
+
+export type LocalTrackerPurgeOutcome =
+  | { purged: false; path: string; reason: "absent" | "no-store-document" }
+  | { purged: true; path: string };
+
+/**
+ * Spec #190 / ticket #195 — the EXPLICIT, confirmed destruction of the Local
+ * tracker history.
+ *
+ * Ordinary `uninstall` never calls this. It runs only behind an interactive
+ * confirmation or the non-interactive confirmation flag, and it is the ONLY
+ * operation in the runtime that deletes recorded tracker history.
+ *
+ * The validation is exhaustive and happens BEFORE the first unlink, because
+ * every one of these refusals has to leave the store exactly as it was:
+ *
+ *   1. REPOSITORY IDENTITY. The store is bound to THIS repository's Git common
+ *      directory. The directory must be a real directory at its canonical path:
+ *      a symlinked store, or one that `realpath` resolves to some other path,
+ *      means the bytes Poiesis is about to delete are not provably the ones this
+ *      repository recorded. That is the "repository-identity mismatch" refusal.
+ *   2. SYMLINKS. The store directory, `store.json`, `store.lock`,
+ *      `store.lock.guard`, and every abandoned temporary must each be a
+ *      non-symlinked regular file. A symlink anywhere refuses the WHOLE purge,
+ *      because a later `rm --recursive` that met one would be deleting through
+ *      it.
+ *   3. UNKNOWN ENTRIES. Every name in the store directory must be one this
+ *      layout issues. An unrecognised name is somebody else's data that happens
+ *      to live under a Poiesis-chosen directory name, and deleting it "because
+ *      it is under the store" is exactly the broad deletion this refuses.
+ *   4. FOREIGN CONTENT. `store.json` must strictly validate as THIS tracker's
+ *      document (`schema` + `provider` + the whole item map). A document another
+ *      tool wrote, or a corrupt one, is refused rather than deleted.
+ *   5. LOCKS. A `store.lock` or `store.lock.guard` means a process may be inside
+ *      the read-decide-write critical section right now. This module never
+ *      reclaims a guard at any age (see the module header), and destroying the
+ *      store under a live holder would lose a committed write, so both refuse.
+ *
+ * Nothing else is ever a target. This function names one directory; it has no
+ * parameter through which a caller could widen it, and it never touches Git
+ * objects, refs, remotes, pull/merge requests, releases, or deployment state —
+ * none of which live in this store and none of which this module can reach.
+ */
+export async function purgeValidatedLocalTrackerHistory(cwd: string): Promise<LocalTrackerPurgeOutcome> {
+  const location = resolveLocalTrackerStoreLocationSync(cwd);
+  const directory = await lstatOrNull(location.directory);
+  if (directory === null) return { purged: false, path: location.directory, reason: "absent" };
+  if (directory.isSymbolicLink() || !directory.isDirectory()) {
+    throw unsafe(location.directory, "the store directory is a symlink or not a directory", {
+      kind: directory.isSymbolicLink() ? "symlink" : "non-directory",
+    });
+  }
+  // Repository-identity proof: the store must resolve to the exact canonical
+  // path under THIS repository's canonical Git common directory.
+  const canonicalGitCommonDir = realpathSync(location.gitCommonDir);
+  const canonicalDirectory = realpathSync(location.directory);
+  if (
+    canonicalDirectory !== location.directory ||
+    dirname(canonicalDirectory) !== canonicalGitCommonDir ||
+    basename(canonicalDirectory) !== LOCAL_TRACKER_STORE_DIRECTORY
+  ) {
+    throw new PoiesisError(
+      "LOCAL_TRACKER_HISTORY_IDENTITY_MISMATCH",
+      "Refusing to purge Local tracker history: the store does not resolve to this repository's canonical store path",
+      { path: location.directory, resolved: canonicalDirectory, gitCommonDir: canonicalGitCommonDir },
+    );
+  }
+
+  const entries = await readdir(location.directory);
+  const unknownEntries = entries.filter((entry) => !isKnownStoreEntry(entry)).sort();
+  if (unknownEntries.length > 0) {
+    throw new PoiesisError(
+      "LOCAL_TRACKER_HISTORY_UNSAFE",
+      "Refusing to purge Local tracker history: the store directory holds entries this store layout never issues",
+      { path: location.directory, unknownEntries },
+    );
+  }
+  for (const entry of entries) {
+    const details = await lstatOrNull(join(location.directory, entry));
+    if (details === null) continue;
+    if (details.isSymbolicLink() || !details.isFile()) {
+      throw unsafe(location.directory, `the store entry ${entry} is a symlink or not a regular file`, {
+        entry,
+        kind: details.isSymbolicLink() ? "symlink" : "non-regular",
+      });
+    }
+  }
+
+  const lockNames = entries.filter(
+    (entry) => entry === LOCAL_TRACKER_LOCK_FILENAME || entry === LOCAL_TRACKER_LOCK_GUARD_FILENAME,
+  );
+  if (lockNames.length > 0) {
+    throw new PoiesisError(
+      "LOCAL_TRACKER_HISTORY_LOCKED",
+      "Refusing to purge Local tracker history: the store lock is present, so a tracker operation may be in flight",
+      { path: location.directory, lockNames },
+    );
+  }
+
+  const storeDocument = await lstatOrNull(location.storePath);
+  if (storeDocument === null) {
+    // No document means no recorded history to destroy. Poiesis does not delete
+    // the directory to "tidy up": without a validated document it cannot prove
+    // the remaining bytes are its own, which is the same rule every other
+    // refusal here applies.
+    return { purged: false, path: location.directory, reason: "no-store-document" };
+  }
+  // Throws `INVALID_LOCAL_TRACKER_STORE` / `LOCAL_TRACKER_STORE_TOO_LARGE` for
+  // foreign or corrupt content. Either way nothing has been deleted.
+  parseLocalTrackerStore(await readStoreBytesBounded(location.storePath));
+
+  await rm(location.directory, { recursive: true, force: true });
+  return { purged: true, path: location.directory };
 }

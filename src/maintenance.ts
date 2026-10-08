@@ -47,6 +47,16 @@ import {
   removeValidatedDeliveryRuntime,
 } from "./delivery-runtime.js";
 import {
+  WORKSPACE_CONTAINER,
+  removeSafeInactiveOwnedWorkspaces,
+} from "./git.js";
+import { removeStaleWorkspaceMutationLock } from "./mutation-transaction.js";
+import { removeOwnedVerificationReceipts } from "./verification-receipt.js";
+import {
+  inspectLocalTrackerHistory,
+  purgeValidatedLocalTrackerHistory,
+} from "./local-tracker.js";
+import {
   assertConsumedManifestAuthority,
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -164,12 +174,59 @@ export interface DoctorReport {
   checks: DoctorCheck[];
 }
 
+/**
+ * Spec #190 / ticket #195 — the explicitly confirmed Local tracker history
+ * purge, as reported.
+ *
+ * `purged` is the ONLY field that decides whether recorded tracker history was
+ * destroyed. Every other reason names itself in `reason`, and a refusal leaves
+ * the store exactly as it was.
+ */
+export interface UninstallHistoryPurge {
+  /** `true` when the caller explicitly asked for the purge. */
+  requested: boolean;
+  /** `true` only when a validated, repository-bound store was actually removed. */
+  purged: boolean;
+  /** The store directory this operation concerned, when one was resolved. */
+  path: string | null;
+  /** Why nothing was purged, or `null` on a successful purge. */
+  reason: string | null;
+}
+
 export interface UninstallResult {
   complete: boolean;
   manifestRemoved: boolean;
   removed: string[];
   revertedConfigPatches: number;
   preserved: Array<{ path: string; reason: string }>;
+  /**
+   * Spec #190 / ticket #195 — the Author's own recorded data an ordinary
+   * uninstall deliberately RETAINS.
+   *
+   * This is a different list from `preserved` on purpose. `preserved` is
+   * unresolved Poiesis state and it keeps `complete` false, because Poiesis
+   * still owes that Author a cleanup it could not finish. `retained` is data Poiesis
+   * has DECIDED to keep — Local tracker history above all — so it is reported
+   * for the operator and never makes an otherwise complete runtime uninstall
+   * incomplete.
+   */
+  retained: Array<{ path: string; reason: string }>;
+  /** Spec #190 / ticket #195 — the explicit Local tracker history purge. */
+  historyPurge: UninstallHistoryPurge;
+}
+
+/** Spec #190 / ticket #195 — what an uninstall caller may additionally ask for. */
+export interface UninstallOptions {
+  /**
+   * The EXPLICIT, already-confirmed Local tracker history purge.
+   *
+   * Confirmation deliberately does NOT live here. `maintenance.ts` cannot ask a
+   * question, and a caller that set this flag has already had the operator say
+   * yes — interactively or through the non-interactive confirmation flag — so
+   * the destructive step is reached exactly once and only from the CLI surface
+   * that owns the question.
+   */
+  purgeHistory?: boolean;
 }
 
 export interface UpdateResult {
@@ -2617,6 +2674,13 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   // `removeValidatedDeliveryRuntime`, which preserves foreign siblings.
   known.add(DELIVERY_RUNTIME_CONTAINER);
   known.add(DELIVERY_RUNTIME_RELATIVE);
+  // Spec #190 / ticket #195: the in-project workspace container holds owned
+  // WORKSPACES, not unknown content. Ownership of each one is proved by its
+  // immutable marker plus Git's worktree registry (see
+  // `removeSafeInactiveOwnedWorkspaces`), and a container left empty because
+  // everything in it was removed is not "content that appeared during
+  // uninstall".
+  known.add(WORKSPACE_CONTAINER);
   for (const file of manifest.files) {
     if (!file.path.startsWith(".poiesis/")) continue;
     known.add(file.path);
@@ -3047,8 +3111,74 @@ export async function setModel(
   }
 }
 
-export async function uninstall(root: string): Promise<UninstallResult> {
+/**
+ * Spec #190 / ticket #195 — the abandoned atomic-write temporaries
+ * `atomicWrite` / `atomicCreate` leave behind when a process dies mid-write.
+ *
+ * The pattern is exact — `<owned path>.<uuid>.tmp`, the same shape `src/fs.ts`
+ * writes — and the BASE path must itself be one Poiesis owns. A temporary of an
+ * owned path is Poiesis's own residue; a temporary of anything else is the
+ * Author's and is left alone. Anything under the Poiesis root that is neither is
+ * foreign content and keeps the existing "unknown content under .poiesis"
+ * report, so this helper narrows the classification rather than widening it.
+ */
+const POIESIS_TEMPORARY_PATTERN = /^(.*)\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.tmp$/;
+
+/** The owned path an abandoned temporary belongs to, or `null`. */
+function poiesisTemporaryBase(path: string): string | null {
+  const match = POIESIS_TEMPORARY_PATTERN.exec(path);
+  return match === null ? null : match[1]!;
+}
+
+/**
+ * Spec #190 / ticket #195 — tear the installation down, optionally following it
+ * with the EXPLICIT, already-confirmed Local tracker history purge.
+ *
+ * The two halves answer different questions and are kept visibly separate:
+ *
+ *   - the ORDINARY teardown removes every artifact it can attribute to this
+ *     installation and reports everything it deliberately keeps. Retained user
+ *     data — Local tracker history above all — is REPORTED through `retained`
+ *     and never blocks `complete`, because the runtime really is gone.
+ *   - the PURGE removes recorded Local tracker history. It runs only when
+ *     `options.purgeHistory` is set, and it works against a TRACKER-ONLY
+ *     REMAINDER: an installation that is already fully uninstalled has no
+ *     manifest to authenticate, so there is nothing for the ordinary teardown
+ *     to do and the purge still does its work rather than failing closed on a
+ *     project that is no longer installed.
+ */
+export async function uninstall(root: string, options: UninstallOptions = {}): Promise<UninstallResult> {
   const resolvedRoot = resolve(root);
+  const purgeHistory = options.purgeHistory === true;
+
+  // Spec #190 / ticket #195 — the TRACKER-ONLY REMAINDER. An installation that
+  // an earlier run (or an earlier `--purge-history`) already fully removed has
+  // no `.poiesis/manifest.json`, so the runtime-identity guard and the whole
+  // receipt-authenticated teardown have nothing to authenticate. That is not a
+  // failure when the ONLY thing left is user data the operator explicitly asked
+  // to purge, and it is still the existing fail-closed refusal otherwise.
+  if (purgeHistory && !(await exists(poiesisPath(resolvedRoot, "manifest.json")))) {
+    const history = await inspectLocalTrackerHistory(resolvedRoot);
+    const result: UninstallResult = {
+      complete: true,
+      manifestRemoved: false,
+      removed: [],
+      revertedConfigPatches: 0,
+      preserved: [],
+      retained: history.present
+        ? [
+            {
+              path: history.path ?? "",
+              reason: "Local tracker history recorded by the Author; retained as user data by uninstall",
+            },
+          ]
+        : [],
+      historyPurge: { requested: true, purged: false, path: history.path, reason: null },
+    };
+    await applyHistoryPurge(resolvedRoot, result);
+    return result;
+  }
+
   // Spec #104 / ticket #106: pre-mutation runtime identity guard.
   // Fails closed with `RUNTIME_VERSION_MISMATCH` before any other
   // authority / receipt / config / marker check runs.
@@ -3083,6 +3213,8 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     removed: [],
     revertedConfigPatches: 0,
     preserved: [],
+    retained: [],
+    historyPurge: { requested: purgeHistory, purged: false, path: null, reason: null },
   };
   // Spec #190 / ticket #191 — ownership this run actually RESOLVED, so a
   // partial uninstall does not keep claiming it. See the retained-manifest
@@ -3113,6 +3245,25 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     // `removeValidatedDeliveryRuntime` below, which preserves foreign
     // siblings and reports them with the canonical "foreign content" reason.
     if (path === DELIVERY_RUNTIME_CONTAINER || path.startsWith(`${DELIVERY_RUNTIME_CONTAINER}/`)) continue;
+    // Spec #190 / ticket #195: the Poiesis-owned in-project workspace
+    // container. Its contents are owned WORKSPACES, each with an immutable
+    // ownership marker and a Git worktree registration, so reporting them as
+    // "unknown content under .poiesis" would both misdescribe them and make the
+    // installation permanently uninstallable. Teardown is owned by
+    // `removeSafeInactiveOwnedWorkspaces` below, which removes the safe inactive
+    // ones and reports every active, unsafe, or foreign one with its own reason.
+    if (path === WORKSPACE_CONTAINER || path.startsWith(`${WORKSPACE_CONTAINER}/`)) continue;
+    // Spec #190 / ticket #195: an ABANDONED atomic-write temporary of a path
+    // Poiesis owns is Poiesis's own residue from a process that died mid-write,
+    // not content anybody authored. It is removed and reported as removed; a
+    // temporary of anything else falls through to the foreign-content report
+    // below, because `<name>.tmp` under `.poiesis/` is not ownership evidence.
+    const temporaryBase = poiesisTemporaryBase(path);
+    if (temporaryBase !== null && known.has(temporaryBase)) {
+      await unlink(join(resolvedRoot, path));
+      result.removed.push(path);
+      continue;
+    }
     if (!known.has(path)) result.preserved.push({ path, reason: "unknown content under .poiesis" });
   }
 
@@ -3339,6 +3490,99 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     });
   }
 
+  // Spec #190 / ticket #195 — owned WORKSPACES. Every workspace this
+  // installation prepared is torn down only when it is provably safe and
+  // inactive; an active or unsafe one is preserved and REPORTED with its own
+  // path-specific reason, which is what keeps the retained manifest honest about
+  // the work still standing.
+  //
+  // The teardown runs BEFORE the completeness decision because a removed
+  // workspace and its now-empty container must not be visible to the
+  // "content appeared during uninstall" sweep below.
+  try {
+    const teardown = await removeSafeInactiveOwnedWorkspaces(resolvedRoot);
+    for (const path of teardown.removed) result.removed.push(relative(resolvedRoot, path));
+    result.preserved.push(...teardown.active, ...teardown.unsafe);
+    for (const entry of teardown.foreignPreserved) {
+      result.preserved.push({
+        path: entry,
+        reason: "foreign content under the Poiesis-owned workspace container; uninstall only removes owned workspaces",
+      });
+    }
+  } catch (error) {
+    // A teardown that cannot even enumerate markers must not abort the rest of
+    // the uninstall, and it must not report a path it never proved.
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({ path: `${WORKSPACE_CONTAINER}/`, reason: `workspace teardown refused removal: ${message}` });
+  }
+
+  // Spec #190 / ticket #195 — this installation's VERIFICATION RECEIPTS.
+  // Proof-scope evidence is bound to the installation by `installationId`, so
+  // exactly the receipts this installation minted are removed.
+  //
+  // Two different kinds of "left behind" are reported through two different
+  // lists, because they mean different things:
+  //
+  //   - a receipt Poiesis could NOT remove — a symlinked directory, an unknown
+  //     entry, a non-regular file — is UNRESOLVED Poiesis state. It goes into
+  //     `preserved`, so the installation stays honestly reportable as not fully
+  //     uninstalled and the retained manifest keeps the authority to retry.
+  //   - a receipt that is not THIS installation's (a sibling installation of the
+  //     same clone, or a document that cannot be read as a receipt at all) is
+  //     deliberately KEPT evidence for somebody else. It goes into `retained`,
+  //     which is reported but never blocks `complete`: requiring an operator to
+  //     delete another installation's proof in order to uninstall this one would
+  //     make a two-installation clone uninstallable from either side.
+  //
+  // This runs before `removeOwnershipReceipt`, because the ownership receipt is
+  // where the `installationId` comes from.
+  try {
+    const receipts = await removeOwnedVerificationReceipts(receipt.commonDir, receipt.installationId);
+    for (const id of receipts.removed) result.removed.push(`verification receipt ${id}`);
+    for (const path of receipts.foreignPreserved) {
+      result.retained.push({
+        path,
+        reason: "verification receipt this installation did not record; retained rather than removed on someone else's authority",
+      });
+    }
+  } catch (error) {
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({ path: "verification receipts", reason: `receipt validation refused removal: ${message}` });
+  }
+
+  // Spec #190 / ticket #195 — this workspace's MUTATION LOCK. A lock whose
+  // holder is gone is residue from a session that died and is reclaimed; a LIVE
+  // lock, or bytes that are not a Poiesis lock token, are preserved with the
+  // holder's own recovery prose. Nothing here sweeps a directory.
+  try {
+    const reclaimed = await removeStaleWorkspaceMutationLock(resolvedRoot);
+    if (reclaimed.removed) result.removed.push(relative(resolvedRoot, reclaimed.path));
+    else if (reclaimed.retainedReason !== null) {
+      result.preserved.push({ path: "workspace mutation lock", reason: reclaimed.retainedReason });
+    }
+  } catch (error) {
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({ path: "workspace mutation lock", reason: `mutation lock could not be reclaimed: ${message}` });
+  }
+
+  // Spec #190 / ticket #195 — RETAINED USER DATA. The Local tracker store holds
+  // the Author's own recorded Specs, tickets, comments, and history. An
+  // ordinary uninstall deliberately keeps it — and it is reported here, through
+  // `retained`, precisely so that keeping it is a decision the operator can see
+  // rather than a silent gap in `removed`.
+  //
+  // It is NOT pushed into `preserved`: `preserved` is unresolved Poiesis state
+  // that keeps `complete` false, and retained user data is not something Poiesis
+  // still owes the Author a cleanup of. An otherwise complete runtime uninstall
+  // is complete with this history still on disk.
+  const history = await inspectLocalTrackerHistory(resolvedRoot);
+  if (history.present) {
+    result.retained.push({
+      path: history.path ?? "",
+      reason: "Local tracker history recorded by the Author; retained as user data by uninstall (destroy it only with an explicit confirmed `uninstall --purge-history`)",
+    });
+  }
+
   if (result.preserved.length === 0) {
     const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
     const remaining = (await listTree(resolvedRoot, poiesisPath(resolvedRoot))).filter(
@@ -3400,5 +3644,42 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), serializeManifest(retained));
     await replaceOwnershipReceipt(resolvedRoot, retained, receipt);
   }
+
+  // Spec #190 / ticket #195 — the EXPLICIT, confirmed Local tracker history
+  // purge runs LAST, after the runtime teardown has settled and the ownership
+  // receipt that authenticated it is gone. That order matters: the purge targets
+  // the Author's recorded history, and an operator who asked for it must not be
+  // left with a half-removed installation AND a destroyed history because the
+  // runtime failed to complete first. On the tracker-only remainder path above
+  // there is nothing to settle, so this is the only step that runs.
+  if (purgeHistory) await applyHistoryPurge(resolvedRoot, result);
   return result;
+}
+
+/**
+ * Spec #190 / ticket #195 — run the validated Local tracker history purge and
+ * record the outcome on the result.
+ *
+ * A refusal is REPORTED, not thrown: `uninstall --purge-history` is still an
+ * uninstall, and the runtime teardown it just performed succeeded. The operator
+ * gets both facts — the runtime is gone, and the history was NOT destroyed
+ * because the store could not be validated — instead of one replacing the other.
+ */
+async function applyHistoryPurge(root: string, result: UninstallResult): Promise<void> {
+  const history = await inspectLocalTrackerHistory(root);
+  result.historyPurge.path = history.path;
+  try {
+    const outcome = await purgeValidatedLocalTrackerHistory(root);
+    result.historyPurge.purged = outcome.purged;
+    result.historyPurge.reason =
+      outcome.purged ? null : outcome.reason === "absent" ? "no Local tracker store exists for this repository" : "the store directory holds no validated Local tracker document";
+    if (outcome.purged) {
+      result.retained = result.retained.filter((entry) => entry.path !== outcome.path);
+      result.removed.push(relative(root, outcome.path));
+    }
+  } catch (error) {
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.historyPurge.purged = false;
+    result.historyPurge.reason = message;
+  }
 }

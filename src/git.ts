@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm, rmdir } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
@@ -2672,4 +2672,195 @@ function sanitizeWorkspaceIdSegment(value: string, field: string): string {
     { field, value },
   );
   return safe;
+}
+
+// -- Spec #190 / ticket #195: uninstall teardown of owned workspaces ----------
+
+/**
+ * The Poiesis-owned in-project workspace container, relative to the project
+ * root. `deriveDefaultWorkspacePath` places every default workspace here, and
+ * `workspace prepare --path` may place an exceptional one elsewhere, so the
+ * teardown proves ownership from the MARKER plus Git's own worktree registry
+ * rather than from this path.
+ */
+export const WORKSPACE_CONTAINER = ".poiesis/workspaces";
+
+interface MarkerEntry {
+  markerPath: string;
+  name: string;
+  marker: OwnershipMarker | null;
+  error: string | null;
+}
+
+/**
+ * Enumerate ownership markers WITHOUT ever throwing.
+ *
+ * `readMarkers` is the strict resolver: one unknown entry or one invalid
+ * document refuses the whole operation, which is right for a lifecycle mutation
+ * that is about to act on a workspace. Uninstall is the opposite case — it must
+ * PRESERVE and REPORT whatever it cannot prove it owns, one path at a time — so
+ * it reads the directory through this variant, which keeps the same strictness
+ * per entry and records the refusal instead of propagating it.
+ */
+async function readMarkerEntries(commonDir: string): Promise<MarkerEntry[]> {
+  const directory = join(commonDir, MARKER_DIRECTORY);
+  if (!(await pathExists(directory))) return [];
+  const entries: MarkerEntry[] = [];
+  for (const entry of (await readdir(directory)).sort()) {
+    const markerPath = join(directory, entry);
+    let stats: Awaited<ReturnType<typeof lstat>>;
+    try {
+      stats = await lstat(markerPath);
+    } catch (error) {
+      entries.push({ markerPath, name: entry, marker: null, error: errorForEvidence(error) });
+      continue;
+    }
+    if (stats.isSymbolicLink() || !stats.isFile() || !entry.endsWith(".json")) {
+      entries.push({ markerPath, name: entry, marker: null, error: "not a regular ownership marker file" });
+      continue;
+    }
+    let value: unknown;
+    try {
+      value = JSON.parse(await readFile(markerPath, "utf8"));
+    } catch (error) {
+      entries.push({ markerPath, name: entry, marker: null, error: errorForEvidence(error) });
+      continue;
+    }
+    // The name must agree with the Spec the document claims, exactly as the
+    // strict resolver requires, so a renamed marker cannot be attributed to a
+    // workspace the marker directory never issued.
+    const marker = isOwnershipMarker(value) && entry === `${hashMarkerKey(value.specId)}.json` ? value : null;
+    entries.push({ markerPath, name: entry, marker, error: marker === null ? "invalid ownership marker" : null });
+  }
+  return entries;
+}
+
+export interface OwnedWorkspaceTeardown {
+  /** Workspace paths removed, with their ownership markers. */
+  removed: string[];
+  /** Owned workspaces Poiesis left alone because something is still using them. */
+  active: Array<{ path: string; reason: string }>;
+  /** Owned workspaces Poiesis could not prove were safe to remove. */
+  unsafe: Array<{ path: string; reason: string }>;
+  /** Foreign entries under `.poiesis/workspaces/`, left byte-for-byte. */
+  foreignPreserved: string[];
+}
+
+/**
+ * Spec #190 / ticket #195 — remove the owned workspaces an uninstall can
+ * prove are safe and inactive, and report every one it cannot.
+ *
+ * A workspace is removed only when ALL of these hold:
+ *
+ *   - its ownership marker is a well-formed, correctly named Poiesis marker
+ *     whose `repositoryRoot` IS this checkout. A marker naming another
+ *     repository is somebody else's work; removing it from here would be a
+ *     deletion Poiesis has no standing to make.
+ *   - the workspace path is a real directory that resolves to itself. A
+ *     symlinked workspace path is refused rather than followed.
+ *   - Git's own worktree registry still lists it as a worktree of THIS
+ *     repository. `git worktree remove` will refuse anything else, and a path
+ *     that merely happens to sit where a marker points is not a workspace.
+ *   - it is INACTIVE: no live Poiesis mutation lock is held for it, and its
+ *     worktree is clean — no uncommitted, unstaged, staged, or untracked work.
+ *
+ * What the teardown deliberately does NOT do is the rest of `workspace
+ * cleanup`: it deletes no remote branch, no local ref, and no integrated
+ * commit. Git history is not Poiesis state, and `uninstall` preserves it by
+ * contract, so the branch a removed workspace was on stays where Git put it.
+ */
+export async function removeSafeInactiveOwnedWorkspaces(primaryRoot: string): Promise<OwnedWorkspaceTeardown> {
+  const root = await canonicalGitRoot(primaryRoot);
+  const commonDir = await gitCommonDir(root);
+  const worktrees = await listWorktrees(root);
+  const teardown: OwnedWorkspaceTeardown = { removed: [], active: [], unsafe: [], foreignPreserved: [] };
+  // The canonical paths this run actually removed, so the container sweep below
+  // can tell "a workspace I removed" from "a foreign directory the Author made".
+  const removedContainers = new Set<string>();
+
+  for (const entry of await readMarkerEntries(commonDir)) {
+    const reported = relative(root, entry.markerPath) || entry.markerPath;
+    if (entry.marker === null) {
+      teardown.unsafe.push({
+        path: reported,
+        reason: `workspace ownership marker is not a valid Poiesis ownership marker: ${entry.error ?? "unknown"}`,
+      });
+      continue;
+    }
+    const marker = entry.marker;
+    if ((await canonicalExistingPath(marker.repositoryRoot)) !== (await canonicalExistingPath(root))) {
+      teardown.unsafe.push({
+        path: marker.workspacePath,
+        reason: "workspace ownership marker belongs to a different repository checkout",
+      });
+      continue;
+    }
+    const workspacePath = await canonicalProspectivePath(marker.workspacePath);
+    if (relative(root, workspacePath).startsWith(`..${sep}`) || isAbsolute(relative(root, workspacePath))) {
+      teardown.unsafe.push({ path: marker.workspacePath, reason: "workspace path escapes this repository checkout" });
+      continue;
+    }
+    const stats = await lstat(workspacePath).catch(() => null);
+    if (stats === null || stats.isSymbolicLink() || !stats.isDirectory()) {
+      teardown.unsafe.push({
+        path: marker.workspacePath,
+        reason: "owned workspace path is missing or is not a real directory",
+      });
+      continue;
+    }
+    if (!worktrees.some((worktree) => worktree.path === workspacePath)) {
+      teardown.unsafe.push({
+        path: marker.workspacePath,
+        reason: "owned workspace is not registered as a Git worktree of this repository",
+      });
+      continue;
+    }
+
+    // INACTIVE means nothing is using it right now. The mutation lock is the
+    // only cross-process signal Poiesis owns that says a mutation is running,
+    // and it is checked before `git status` because a live holder may still be
+    // mid-write.
+    const { inspectWorkspaceMutationLock } = await import("./mutation-transaction.js");
+    const lock = await inspectWorkspaceMutationLock(workspacePath).catch(() => null);
+    if (lock !== null && !lock.absent && lock.holder?.holderRunning === true) {
+      teardown.active.push({
+        path: marker.workspacePath,
+        reason: "a Poiesis mutation is active for this owned workspace",
+      });
+      continue;
+    }
+    const status = await gitStatus(workspacePath);
+    if (status.length > 0) {
+      teardown.active.push({
+        path: marker.workspacePath,
+        reason: "owned workspace has uncommitted, staged, or untracked work",
+      });
+      continue;
+    }
+
+    await run("git", ["worktree", "remove", workspacePath], { cwd: root });
+    await rm(entry.markerPath, { force: true });
+    removedContainers.add(workspacePath);
+    teardown.removed.push(marker.workspacePath);
+  }
+
+  // Foreign entries under the in-project container are the Author's, and the
+  // container is only removable when nothing of theirs is left in it.
+  const container = join(root, ".poiesis", "workspaces");
+  if (await pathExists(container)) {
+    for (const entry of await readdir(container)) {
+      if ([...removedContainers].some((removedPath) => dirname(removedPath) === container && basename(removedPath) === entry)) {
+        continue;
+      }
+      teardown.foreignPreserved.push(join(WORKSPACE_CONTAINER, entry));
+    }
+    if (teardown.foreignPreserved.length === 0) {
+      try {
+        if ((await readdir(container)).length === 0) await rmdir(container);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    }
+  }
+  return teardown;
 }
