@@ -41,8 +41,8 @@
  * manifest ownership; the actual write still uses `applyOpenCodeConfig`
  * (which carries its own `expectedContent` pre-write guard and the
  * `onWritten` callback that binds `transactionWrittenIdentity`). The
- * transactional `.gitignore` rule keeps its own hash-gated atomic update
- * + rollback helper because it is not a Poiesis-owned artifact under
+ * transactional `.gitignore` rules keep their own hash-gated atomic update
+ * + rollback helper because the file is not a Poiesis-owned artifact under
  * the journal's contract.
  */
 import { exists, atomicWrite } from "./fs.js";
@@ -75,6 +75,7 @@ import {
 } from "./receipt.js";
 import { installDefaultSkills } from "./skills.js";
 import { templateMappings } from "./templates.js";
+import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
@@ -112,6 +113,27 @@ function assertUpdateDoctorGate(report: DoctorReport, skipSkills: boolean): void
 const POIESIS_DEFAULT_PATH_GITIGNORE_HEADER =
   "# Hide the default-path workspace area (Poiesis-managed local state; transactional update/bootstrap line)";
 const POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
+
+/**
+ * Spec #139 / ticket #162: the generated delivery runtime is derived local
+ * state too. A delivery run must never leave the Author's project dirty, so
+ * the receipt-authenticated `update` and the explicit 1.0.0 `bootstrap`
+ * reconcile the SAME rule `init` writes: the owned
+ * `.poiesis/runtime/delivery/` subtree and never the whole container.
+ */
+const POIESIS_DELIVERY_RUNTIME_GITIGNORE_HEADER =
+  "# Hide Poiesis-owned generated delivery runtime state (derived artifacts; transactional update/bootstrap line)";
+
+/**
+ * The transactional ignore rules, in reconciliation order. Each pair is
+ * idempotent: a pair whose header and pattern are both already present is
+ * skipped, so an update that changed nothing writes nothing and the
+ * snapshot/written-hash rollback stays a no-op.
+ */
+const POIESIS_TRANSACTIONAL_GITIGNORE_RULES: readonly { header: string; pattern: string }[] = [
+  { header: POIESIS_DEFAULT_PATH_GITIGNORE_HEADER, pattern: POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN },
+  { header: POIESIS_DELIVERY_RUNTIME_GITIGNORE_HEADER, pattern: DELIVERY_RUNTIME_IGNORE_RULE },
+];
 
 /**
  * Captured state for the transactional `.gitignore` rule so the
@@ -193,9 +215,9 @@ export interface UpdateBootstrapTransactionHooks {
   preOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately AFTER the new OpenCode projection has been written. */
   postOpenCodeApply?: () => void | Promise<void>;
-  /** Called immediately before the default-path `.gitignore` rule is appended. */
+  /** Called immediately before the transactional `.gitignore` rules are appended. */
   preDefaultPathGitignoreEnsure?: () => void | Promise<void>;
-  /** Called immediately AFTER the default-path `.gitignore` rule has been appended. */
+  /** Called immediately AFTER the transactional `.gitignore` rules have been appended. */
   postDefaultPathGitignoreEnsure?: () => void | Promise<void>;
   /**
    * Called immediately BEFORE the `pnpm poiesis` package script is
@@ -220,6 +242,17 @@ export interface UpdateBootstrapTransactionHooks {
   postReceiptReplace?: () => void | Promise<void>;
 }
 
+/**
+ * Reconcile every transactional `.gitignore` rule in ONE write, so the
+ * snapshot / written-hash rollback above reverses all of them atomically.
+ * The function name keeps its original seam name because the hooks it is
+ * driven through (`preDefaultPathGitignoreEnsure` /
+ * `postDefaultPathGitignoreEnsure`) and their test seam are unchanged.
+ *
+ * Drift is checked only when a write is actually needed, and a foreign
+ * replacement of `.gitignore` between the snapshot and this call fails
+ * closed with `POIESIS_GITIGNORE_CHANGED` before any byte is written.
+ */
 async function ensureDefaultPathGitignore(
   root: string,
   expected: Buffer | null,
@@ -230,13 +263,16 @@ async function ensureDefaultPathGitignore(
     content = (await readFile(path)).toString("utf8");
   }
   const lines = content.split(/\r?\n/);
-  const headerPresent = lines.includes(POIESIS_DEFAULT_PATH_GITIGNORE_HEADER);
-  const patternPresent = lines.includes(POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN);
-  if (headerPresent && patternPresent) return { writtenHash: undefined };
   const merged = [...lines];
-  if (merged.length > 0 && merged[merged.length - 1] === "") merged.pop();
-  merged.push(POIESIS_DEFAULT_PATH_GITIGNORE_HEADER);
-  merged.push(POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN);
+  let appended = false;
+  for (const rule of POIESIS_TRANSACTIONAL_GITIGNORE_RULES) {
+    if (lines.includes(rule.header) && lines.includes(rule.pattern)) continue;
+    if (merged.length > 0 && merged[merged.length - 1] === "") merged.pop();
+    merged.push(rule.header);
+    merged.push(rule.pattern);
+    appended = true;
+  }
+  if (!appended) return { writtenHash: undefined };
   const next = merged.join("\n") + "\n";
   if (expected !== null && Buffer.compare(Buffer.from(content, "utf8"), expected) !== 0) {
     throw new PoiesisError("POIESIS_GITIGNORE_CHANGED", "Gitignore changed before default-path ensure");

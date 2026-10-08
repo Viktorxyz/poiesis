@@ -2,10 +2,11 @@
 import { parseArgs } from "node:util";
 import { resolve } from "node:path";
 import { readUtf8 } from "./fs.js";
-import { parseJsonc, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
+import { parseJsonc, requireConfiguredDelivery, validateConfig, loadConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
 import { writeFailure, writeSuccess } from "./output.js";
 import { packageRoot, resolveGitRoot } from "./paths.js";
-import { init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
+import { assertRuntimeVersionMatchesProject, init, doctor, update, uninstall, resolveConfigForRoot, resolveConfigRoot, resolveInstallationRoot, resolvePublishCoordinates, installAuthorizedCapability, updateFromConfig, setModel, type ModelClassName } from "./maintenance.js";
+import { assertDeliveryPolicyAllows, DEFERRED_BLOCKED_OPERATIONS, type DeferredBlockedOperation } from "./lifecycle-policy.js";
 import {
   checkpoint,
   integrate,
@@ -906,7 +907,86 @@ function boundedInteger(values: Values, key: string): number {
   return parsed;
 }
 
-async function commandPublish(args: string[]): Promise<void> {
+/**
+ * Ticket #152 — the canonical CLI operation names of the six
+ * delivery-integrated operations, taken from the lifecycle policy's own
+ * declaration so the CLI can never name an operation the guard does not
+ * know. `DEFERRED_BLOCKED_OPERATIONS` stays the single source of truth.
+ */
+const PREFLIGHT_OPERATIONS = {
+  publish: DEFERRED_BLOCKED_OPERATIONS[0],
+  preview: DEFERRED_BLOCKED_OPERATIONS[1],
+  staging: DEFERRED_BLOCKED_OPERATIONS[2],
+  production: DEFERRED_BLOCKED_OPERATIONS[3],
+  integrate: DEFERRED_BLOCKED_OPERATIONS[4],
+} as const;
+
+/**
+ * Ticket #152 — the ONE CLI preflight every delivery-integrated command runs.
+ *
+ * The four command wrappers used to read the installed config FIRST, so a
+ * project Poiesis had not installed failed with an opaque file-read error
+ * instead of the typed installed-state failure, and a deferred install was
+ * refused by each wrapper's own argument-time delivery check rather than by
+ * the central policy. Both are now decided here, before any config load, any
+ * publishing-coordinate resolution, and any remote or subprocess work:
+ *
+ *   1. `resolveGitRoot` / `resolveInstallationRoot` locate the two roots. The
+ *      OPERATOR root is the Git root of `--cwd` (what the operation acts on,
+ *      including a linked worktree); the CONFIG root is the root that owns the
+ *      installation, resolved STRUCTURALLY from the Git directory layout. A
+ *      linked worktree therefore reports the PRIMARY checkout — where the
+ *      manifest and the installed config actually live — instead of falling
+ *      back to the invocation root when the installed config is missing, so
+ *      the decision can never report a false missing config (or a false
+ *      uninstalled project) for a workspace invocation.
+ *   2. The runtime identity guard runs FIRST, so an uninstalled project (no
+ *      manifest) and a version-mismatched project keep their existing
+ *      `RUNTIME_VERSION_MISMATCH` failure ahead of every other refusal.
+ *   3. The central lifecycle-policy guard then decides the installed state
+ *      and the delivery policy, in that order, from the installed config
+ *      alone. This is the SAME seam the operation itself calls, so the CLI
+ *      and the library report the same code, the same `details.operation`,
+ *      and the same remediation. The wrappers keep no delivery logic of
+ *      their own: `requireConfiguredDelivery` is retained below only to
+ *      narrow the parsed union to a configured target.
+ *
+ * The operation's own guards still run afterwards (they are what protect
+ * library callers), and both are side-effect free reads, so the duplicate
+ * check costs one manifest read and one config read and changes no outcome.
+ *
+ * Spec #168 / ticket #169 — the same preflight also resolves the SHARED
+ * LIFECYCLE AUTHORITY, because every one of these four dispatches has to hand
+ * its operation an owned-candidate `cwd` (`authority.candidateRoot`) and read
+ * the authoritative installed config from the primary
+ * (`authority.primaryRoot`). Resolving it here rather than in each wrapper
+ * keeps this the ONE preflight: the decision order above is unchanged, so a
+ * deferred install and an uninstalled project keep their existing typed
+ * refusals ahead of the candidate-authority refusals, and the authority's own
+ * runtime identity guard is a second side-effect-free read of the same
+ * manifest this function has already read.
+ */
+async function preflightDeliveryOperation(
+  cwd: string,
+  operation: DeferredBlockedOperation,
+): Promise<{ authority: LifecycleAuthority; repoRoot: string; configRoot: string }> {
+  const repoRoot = await resolveGitRoot(cwd);
+  const configRoot = await resolveInstallationRoot(repoRoot);
+  await assertRuntimeVersionMatchesProject(configRoot);
+  await assertDeliveryPolicyAllows(configRoot, operation);
+  const authority = await resolveLifecycleAuthority(repoRoot);
+  return { authority, repoRoot, configRoot };
+}
+
+/**
+ * Spec #139 / ticket #152 — the four delivery-integrated command wrappers.
+ * Exported as a library seam (matching the `commandInit` / `commandUpdate` /
+ * `commandModel` / `commandTracker` pattern) so the shared preflight's
+ * operator-visible failure can be tested directly, without packing a
+ * tarball to reach it. They are intentionally NOT re-exported by
+ * `src/index.ts`; the public surface is the `poiesis` bin.
+ */
+export async function commandPublish(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -916,8 +996,18 @@ async function commandPublish(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight decides runtime identity and
+  // then the central delivery policy, before the installed config is read and
+  // before publishing coordinates are resolved. It also resolves the Spec #168
+  // shared lifecycle authority, so `publish` runs in the owned candidate
+  // workspace and reads the authoritative config from the primary.
+  const { authority, repoRoot, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.publish);
+  const config = await resolveConfigForRoot(configRoot);
+  // Spec #139 / ticket #140: publishing coordinates come from the
+  // configured Git remote, never from tracker identity. A Linear or
+  // clone-local tracker still publishes to the repository its remote
+  // points at, and an unresolvable remote fails closed before any push.
+  const coordinates = await resolvePublishCoordinates(repoRoot, config);
   writeSuccess(
     "publish",
     await publish({
@@ -926,8 +1016,8 @@ async function commandPublish(args: string[]): Promise<void> {
       integrationBranch: config.repository.integrationBranch,
       candidateSha: required(values, "sha"),
       candidateTree: required(values, "candidate-tree"),
-      provider: config.tracker.provider,
-      project: config.tracker.project,
+      provider: coordinates.provider,
+      project: coordinates.project,
       title: required(values, "title"),
       body: required(values, "body"),
       proof: json<ProofPayload>(required(values, "proof"), "proof"),
@@ -936,7 +1026,7 @@ async function commandPublish(args: string[]): Promise<void> {
   );
 }
 
-async function commandPreview(args: string[]): Promise<void> {
+export async function commandPreview(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -944,12 +1034,18 @@ async function commandPreview(args: string[]): Promise<void> {
     publish: { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight decides runtime identity and
+  // then the central delivery policy, before the installed config is read and
+  // before any delivery adapter could be constructed. It also resolves the
+  // Spec #168 shared lifecycle authority the dispatch forwards below.
+  const { authority, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.preview);
+  const config = await resolveConfigForRoot(configRoot);
   writeSuccess(
     "preview",
     await previewDelivery(
-      config.delivery.preview,
+      // Narrowing only: the preflight has already established that delivery
+      // is not deferred, so this cannot be the failure an Author sees.
+      requireConfiguredDelivery(config.delivery, PREFLIGHT_OPERATIONS.preview).preview,
       {
         sha: required(values, "sha"),
         candidateTree: required(values, "candidate-tree"),
@@ -1000,8 +1096,12 @@ export async function commandIntegrate(args: string[]): Promise<void> {
     "ownership-id": { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
+// Spec #139 / ticket #152: the shared preflight, before the installed config
+  // is read and before the integration is attempted. It also resolves the
+  // Spec #168 shared lifecycle authority, so `integrate` runs in the owned
+  // candidate workspace and reads the authoritative config from the primary.
+  const { authority, configRoot } = await preflightDeliveryOperation(cwdOf(values), PREFLIGHT_OPERATIONS.integrate);
+  const config = await resolveConfigForRoot(configRoot);
   // Spec #168 / ticket #174: `postIntegrationCommands` is OPT-IN and is the
   // ONLY source. There is deliberately no `?? config.verification.commands`:
   // the whole-change proof already ran that plan once, in the owned candidate,
@@ -1030,7 +1130,7 @@ export async function commandIntegrate(args: string[]): Promise<void> {
   );
 }
 
-async function commandPromote(args: string[]): Promise<void> {
+export async function commandPromote(args: string[]): Promise<void> {
   const values = options(args, {
     sha: { type: "string" },
     "candidate-tree": { type: "string" },
@@ -1041,25 +1141,42 @@ async function commandPromote(args: string[]): Promise<void> {
     proof: { type: "string" },
     cwd: { type: "string" },
   });
-  const authority = await lifecycleAuthority(cwdOf(values));
-  const config = await resolveConfigForRoot(authority.primaryRoot);
-  const target = required(values, "target");
+const target = required(values, "target");
   if (target !== "staging" && target !== "production") {
     throw new PoiesisError("INVALID_DELIVERY_TARGET", "Promotion target must be staging or production", { target });
   }
+  // Spec #139 / ticket #152: the shared preflight, naming the exact promotion
+  // target, before the installed config is read and before any delivery
+  // adapter could be constructed. It also resolves the Spec #168 shared
+  // lifecycle authority that owns the promotion below.
+  const { authority, configRoot } = await preflightDeliveryOperation(
+    cwdOf(values),
+    target === "staging" ? PREFLIGHT_OPERATIONS.staging : PREFLIGHT_OPERATIONS.production,
+  );
+  const config = await resolveConfigForRoot(configRoot);
   const identity = json<DeliveryIdentity>(required(values, "identity"), "identity");
   const sha = required(values, "sha");
   const candidateTree = required(values, "candidate-tree");
+  // Narrowing only: the preflight has already established that delivery is not
+  // deferred for this exact target, so this cannot be the failure an Author
+  // sees.
+  const delivery = requireConfiguredDelivery(config.delivery, PREFLIGHT_OPERATIONS[target]);
   if (target === "staging") {
-    writeSuccess("promote", await promoteDelivery(config.delivery.staging, {
+    writeSuccess("promote", await promoteDelivery(delivery.staging, {
       sha,
       target,
       candidateTree,
       identity,
-    }, authority.primaryRoot));
+      // The CANDIDATE workspace, exactly like the Preview dispatch above. Every
+      // authority, receipt, installed-state, and delivery-policy decision was
+      // already made from the PRIMARY installation in the shared preflight; the
+      // execution root is where the candidate and the evidence being promoted
+      // live (Spec #139 / ticket #157), so the CLI and the library seam produce
+      // the same identities AND the same execution directory.
+    }, authority.candidateRoot));
     return;
   }
-  writeSuccess("promote", await promoteDelivery(config.delivery.production, {
+  writeSuccess("promote", await promoteDelivery(delivery.production, {
     sha,
     target,
     candidateTree,
@@ -1069,7 +1186,7 @@ async function commandPromote(args: string[]): Promise<void> {
     integrationBranch: config.repository.integrationBranch,
     proof: json<ProofPayload>(required(values, "proof"), "proof"),
     integration: json<IntegrationEvidence>(required(values, "integration"), "integration"),
-  }, authority.primaryRoot));
+  }, authority.candidateRoot));
 }
 
 /**

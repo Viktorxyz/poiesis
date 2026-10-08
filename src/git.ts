@@ -3,6 +3,8 @@ import { chmod, lstat, mkdir, open, readFile, readdir, realpath, rm } from "node
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
+import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
 import { bounded, boundedOutput, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
 import { runManagedShellCommand } from "./managed-shell.js";
 import { exists } from "./fs.js";
@@ -422,10 +424,13 @@ export async function inspect(options: InspectOptions): Promise<InspectResult> {
   for (const name of nonemptyLines(remoteList.stdout)) {
     const fetchUrls = await run("git", ["remote", "get-url", "--all", name], { cwd: root });
     const pushUrls = await run("git", ["remote", "get-url", "--push", "--all", name], { cwd: root });
+    // Spec #139 / ticket #146: an inspection is printed as JSON by
+    // `poiesis inspect`, so the URLs are sanitized here — one seam, and the
+    // credential stays out of the report and any log that records it.
     remotes.push({
       name,
-      fetchUrls: nonemptyLines(fetchUrls.stdout),
-      pushUrls: nonemptyLines(pushUrls.stdout),
+      fetchUrls: nonemptyLines(fetchUrls.stdout).map(sanitizeGitRemoteUrl),
+      pushUrls: nonemptyLines(pushUrls.stdout).map(sanitizeGitRemoteUrl),
     });
   }
 
@@ -1004,11 +1009,32 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateText(options.title, "title");
   validateText(options.body, "body");
   validateSha(options.candidateSha, "candidateSha");
+// Spec #139 / ticket #140: publishing coordinates belong to the Git
+  // remote, never to tracker identity. A tracker-only identity that
+  // reaches this seam (from untyped input) is refused before any push,
+  // change request, or evidence construction rather than being routed
+  // through the generic command path.
+  const requestedProvider: string = options.provider;
+  invariant(
+    requestedProvider !== "linear" && requestedProvider !== "local",
+    "PUBLISH_PROVIDER_UNSUPPORTED",
+    "Publishing provider is derived from the configured Git remote, not from tracker identity",
+    { provider: options.provider },
+  );
   // Spec #168 / ticket #169: the shared lifecycle authority. Validates the
   // immutable ownership marker, then the PRIMARY receipt-authenticated
   // manifest / receipt / runtime identity, before any push or
-  // change-request side effect.
+  // change-request side effect. It subsumes the Spec #104 / ticket #106
+  // pre-mutation runtime identity guard, which it runs first as the
+  // fail-closed diagnostic, so that guard is not repeated here.
   const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. Explicitly
+  // deferred delivery is a healthy local state, so it stops here — before
+  // the push, before the remote revalidation, before any change request, and
+  // before a single field of Publish evidence exists. It reads the installed
+  // config owned by the marker's repository root, which the shared authority
+  // has already proven to be an installation.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis publish");
   const branch = await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Publish remote does not match workspace ownership", {
     expected: owned.marker.remote,
@@ -1089,6 +1115,14 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     );
   }
 
+  // Spec #139 / ticket #146 — the change-request URL is the last URL that
+  // leaves this operation, and it leaves twice: in the evidence an Author
+  // pastes into Preview, and in the CLI JSON result. It therefore passes the
+  // same redaction seam as a remote URL. A forge API does not normally
+  // return userinfo; the guarantee is that a credential cannot ride along
+  // when one does.
+  const requestUrl = providerCompletion.requestUrl === null ? null : sanitizeGitRemoteUrl(providerCompletion.requestUrl);
+
   const evidence: PublishEvidence = {
     candidateSha,
     candidateTree,
@@ -1100,7 +1134,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     action: providerCompletion.action,
     changeRequest: {
       id: providerCompletion.requestId,
-      url: providerCompletion.requestUrl,
+      url: requestUrl,
     },
     // The receipt identity is re-derived from the STORED document Publish just
     // resolved, so the evidence a caller forwards to Preview names exactly
@@ -1119,7 +1153,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     remoteRef,
     publishedHeadSha: publishedSha,
     requestId: providerCompletion.requestId,
-    requestUrl: providerCompletion.requestUrl,
+    requestUrl,
     action: providerCompletion.action,
   };
 }
@@ -1135,11 +1169,17 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateSha(options.candidateSha, "candidateSha");
   validateText(options.message, "message");
   validateText(options.authorAcceptance, "authorAcceptance");
-  // Spec #168 / ticket #169: the shared lifecycle authority resolves the
+// Spec #168 / ticket #169: the shared lifecycle authority resolves the
   // immutable ownership marker plus the PRIMARY receipt-authenticated
   // manifest / receipt / runtime identity before any commit-tree /
-  // fetch-base / push integration side effect.
+  // fetch-base / push integration side effect. It subsumes the Spec #104 /
+  // ticket #106 pre-mutation runtime identity guard, which it runs first as
+  // the fail-closed diagnostic, so that guard is not repeated here.
   const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of the
+  // fetch-base / commit-tree / push integration side effects and before any
+  // Integration evidence is built.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis integrate");
   await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Integration remote does not match workspace ownership");
   invariant(
@@ -1250,11 +1290,20 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
 }
 
 export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promise<WorkspaceCleanupResult> {
-  // Spec #168 / ticket #169: the shared lifecycle authority resolves the
+// Spec #168 / ticket #169: the shared lifecycle authority resolves the
   // immutable ownership marker plus the PRIMARY receipt-authenticated
   // manifest / receipt / runtime identity before any branch / marker /
-  // worktree teardown runs.
+  // worktree teardown runs. It subsumes the Spec #104 / ticket #106
+  // pre-mutation runtime identity guard for the owned-cleanup surface, which
+  // it runs first as the fail-closed diagnostic, so that guard is not
+  // repeated here.
   const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. Cleanup
+  // proves a delivered tree and then deletes the remote change branch and the
+  // owned worktree, so a deferred install — which can never have delivered
+  // anything — is refused before the fetch, before the remote branch
+  // deletion, and before the worktree is removed.
+  await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis workspace cleanup");
   invariant(
     owned.marker.branch !== owned.marker.integrationBranch,
     "INTEGRATION_WORKSPACE_CLEANUP_FORBIDDEN",

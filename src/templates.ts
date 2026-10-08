@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { PoiesisError } from "./errors.js";
 import { packageRoot } from "./paths.js";
+import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 
 export interface TemplateMapping {
   source: string;
@@ -49,6 +50,17 @@ export const POIESIS_LOCAL_STATE_PATHS: readonly string[] = [
   // already use, so uninstall / update never observe drift between
   // the source list and the on-disk `.gitignore`.
   ".poiesis/cache/",
+  // Spec #139 / ticket #162: the generated delivery targets record their
+  // artifact under `.poiesis/runtime/delivery/`. That subtree is derived
+  // local state (reproducible from the next target run), so it must never
+  // appear as untracked work in the Author's project. The rule is the
+  // OWNED subtree, never the whole `.poiesis/runtime/` container: an ignore
+  // of the container would hide state Poiesis does not own and could not
+  // restore, and would make the container's foreign siblings invisible.
+  // `src/delivery-runtime.ts` is the single owner of both the path and the
+  // removal contract, so the rule, the generated script, and uninstall can
+  // never disagree about what is owned.
+  DELIVERY_RUNTIME_IGNORE_RULE,
 ];
 
 export async function ensureGitignore(root: string, lines: string[], expected?: Buffer | null): Promise<string | undefined> {

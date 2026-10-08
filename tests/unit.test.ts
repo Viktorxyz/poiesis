@@ -1,7 +1,7 @@
 import { access, chmod, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { inspectProject } from "../src/inspect.js";
 import {
   validateIntegrationEvidence,
@@ -13,10 +13,12 @@ import {
 } from "../src/evidence.js";
 import { createCommandDeliveryAdapter } from "../src/adapters.js";
 import { resolveTree } from "../src/git.js";
+import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
 import { atomicCreate } from "../src/fs.js";
 import { ensureGitignore } from "../src/templates.js";
-import { createTestRepository, proofShell, publishEvidence } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 const fixtures: string[] = [];
 afterEach(async () => {
@@ -165,9 +167,36 @@ describe("evidence validation", () => {
 });
 
 describe("CommandDeliveryAdapter", () => {
-  it("substitutes {sha} and {target} and forwards candidate identity to the delivery command", async () => {
+  /**
+   * Spec #139 / ticket #188 — `createCommandDeliveryAdapter` is a
+   * PACKAGE-PUBLIC factory, so the adapter it returns carries the delivery
+   * authority guard and these tests run against an installation Poiesis owns.
+   * The receipt contract under test is unchanged; it is now exercised on the
+   * adapter a consumer actually receives. The refusal half of the same
+   * contract — a deferred or uninstalled project refused through this very
+   * factory, before any subprocess or artifact — is pinned in
+   * `tests/deferred-delivery-lifecycle.test.ts`.
+   */
+  let openCode: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    openCode = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    openCode?.restore();
+    openCode = undefined;
+  });
+
+  async function installedTestRepository(): Promise<TestRepository> {
     const repository = await createTestRepository();
     fixtures.push(repository.parent);
+    await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
+    return repository;
+  }
+
+  it("substitutes {sha} and {target} and forwards candidate identity to the delivery command", async () => {
+    const repository = await installedTestRepository();
     const parent = repository.parent;
     const root = repository.root;
     const sha = repository.baseSha;
@@ -187,8 +216,7 @@ describe("CommandDeliveryAdapter", () => {
   });
 
   it("rejects incomplete or inconsistent command receipts", async () => {
-    const repository = await createTestRepository();
-    fixtures.push(repository.parent);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const branch = "poiesis/unit-cmd-receipts";
@@ -212,8 +240,7 @@ describe("CommandDeliveryAdapter", () => {
   });
 
   it("never invokes the Production command for invalid authorization or integration evidence", async () => {
-    const repository = await createTestRepository();
-    fixtures.push(repository.parent);
+    const repository = await installedTestRepository();
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
     const sentinel = join(repository.parent, "production-invoked");

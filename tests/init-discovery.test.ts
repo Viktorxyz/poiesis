@@ -3,10 +3,23 @@ import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { run } from "../src/process.js";
 import { composeInitDiscovery } from "../src/init-discovery.js";
-import type { PoiesisConfig } from "../src/config.js";
+import { requireConfiguredDelivery } from "../src/config.js";
+import type { PoiesisConfig, ResolvedPoiesisConfig } from "../src/config.js";
 import { createTestRepository, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode } from "./fake-opencode.js";
 import { autoResolveConfigDefaults } from "../src/maintenance.js";
+
+/**
+ * Ticket #140: the resolved `delivery` block is a discriminated union —
+ * three complete targets, or the explicit `{ mode: "deferred" }` state.
+ * Every assertion below inspects the complete branch, so it narrows
+ * through the same fail-closed helper the runtime uses rather than
+ * assuming the property always exists.
+ */
+function configuredDelivery(config: ResolvedPoiesisConfig | undefined) {
+  if (config === undefined) throw new Error("expected a resolved discovery config");
+  return requireConfiguredDelivery(config.delivery, "init discovery test");
+}
 
 const repositories: TestRepository[] = [];
 afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
@@ -95,7 +108,7 @@ describe("composeInitDiscovery", () => {
     expect(result.config!.tracker).toEqual({ provider: "github", project: "poiesis-test/init-discovery" });
     expect(result.config!.verification.commands).toEqual(["test -f README.md"]);
     // The resolved config carries the user's concrete argv; delivery stays explicit.
-    expect(result.config!.delivery.preview).toEqual({ adapter: "command", command: ["./delivery-runner", "preview", "{sha}"] });
+    expect(configuredDelivery(result.config).preview).toEqual({ adapter: "command", command: ["./delivery-runner", "preview", "{sha}"] });
     expect(result.detections.remote.source).toBe("git-origin");
     expect(result.detections.integrationBranch.source).toBe("git-local-main");
     expect(result.detections.tracker.source).toBe("explicit");
@@ -122,9 +135,9 @@ describe("composeInitDiscovery", () => {
     const result = await composeInitDiscovery(repository.root, baseDraft());
     expect(result.unresolved).toEqual([]);
     expect(result.config).toBeDefined();
-    expect(result.config!.delivery.preview).toEqual({ adapter: "command", command: ["scripts/poiesis-preview", "{sha}"] });
-    expect(result.config!.delivery.staging).toEqual({ adapter: "command", command: ["scripts/poiesis-staging", "{sha}"] });
-    expect(result.config!.delivery.production).toEqual({ adapter: "command", command: ["scripts/poiesis-production", "{sha}"] });
+    expect(configuredDelivery(result.config).preview).toEqual({ adapter: "command", command: ["scripts/poiesis-preview", "{sha}"] });
+    expect(configuredDelivery(result.config).staging).toEqual({ adapter: "command", command: ["scripts/poiesis-staging", "{sha}"] });
+    expect(configuredDelivery(result.config).production).toEqual({ adapter: "command", command: ["scripts/poiesis-production", "{sha}"] });
     expect(result.detections.delivery.preview?.source).toEqual({ kind: "script", path: "scripts/poiesis-preview" });
   });
 
@@ -200,6 +213,83 @@ describe("composeInitDiscovery", () => {
     expect(result.detections.verification.source).toBe("package-scripts");
   });
 
+  /**
+   * Ticket #160 — the composer OWNS `verification.commands` when the
+   * package scripts supply them, and it OWNS nothing else. A draft may
+   * legitimately state `postIntegrationCommands` without stating
+   * `commands`; the discovered commands then complete that block instead of
+   * replacing it, so an Author's separate post-integration verification is
+   * never silently deleted on the way into the managed config.
+   */
+  it("overlays discovered commands onto the resolved verification block, preserving a draft's postIntegrationCommands", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true", lint: "echo lint" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      // Only the post-integration half is stated; the pre-integration half is
+      // the package scripts' to answer.
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.config?.verification).toEqual({
+      commands: ["true", "echo lint"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    expect(result.detections.verification.source).toBe("package-scripts");
+  });
+
+  it("keeps a draft's explicit verification block semantically unchanged (commands AND postIntegrationCommands)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true", lint: "echo lint" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      verification: {
+        commands: ["test -f README.md"],
+        postIntegrationCommands: ["pnpm release:notes"],
+      },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    // An explicit draft is the Author's own record: neither half is
+    // replaced by the package scripts.
+    expect(result.config?.verification).toEqual({
+      commands: ["test -f README.md"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    expect(result.detections.verification.source).toBe("explicit");
+  });
+
+  it("preserves both verification halves for a deferred draft and leaves delivery deferred", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    await writeFile(
+      join(repository.root, "package.json"),
+      JSON.stringify({ name: "fixture", version: "0.0.0", scripts: { test: "true" } }),
+    );
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      delivery: { mode: "deferred" },
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.config?.verification).toEqual({
+      commands: ["true"],
+      postIntegrationCommands: ["pnpm release:notes"],
+    });
+    // The verification overlay is the only seam that changes; the deferred
+    // delivery state is carried through untouched.
+    expect(result.config?.delivery).toEqual({ mode: "deferred" });
+    expect(result.unresolved).not.toContain("delivery.mode");
+    expect(result.unresolved).not.toContain("delivery.preview");
+  });
+
   it("prefills command delivery adapters from scripts/poiesis-preview|staging|production hints", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
@@ -220,15 +310,15 @@ describe("composeInitDiscovery", () => {
     };
     const result = await composeInitDiscovery(repository.root, draft);
     expect(result.config).toBeDefined();
-    expect(result.config!.delivery.preview).toEqual({
+    expect(configuredDelivery(result.config).preview).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-preview", "{sha}"],
     });
-    expect(result.config!.delivery.staging).toEqual({
+    expect(configuredDelivery(result.config).staging).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-staging", "{sha}"],
     });
-    expect(result.config!.delivery.production).toEqual({
+    expect(configuredDelivery(result.config).production).toEqual({
       adapter: "command",
       command: ["scripts/poiesis-production", "{sha}"],
     });
@@ -262,7 +352,7 @@ describe("composeInitDiscovery", () => {
     // The forbidden adapter families never appear in the resolved config either.
     if (result.config !== undefined) {
       for (const target of ["preview", "staging", "production"] as const) {
-        const adapter = result.config.delivery[target].adapter;
+        const adapter = configuredDelivery(result.config)[target].adapter;
         expect(adapter).not.toBe("vercel");
         expect(adapter).not.toBe("netlify");
         expect(adapter).not.toBe("cloudflare");
@@ -288,7 +378,7 @@ describe("composeInitDiscovery", () => {
       },
     };
     const result = await composeInitDiscovery(repository.root, draft);
-    expect(result.config?.delivery.preview).toEqual({
+    expect(configuredDelivery(result.config).preview).toEqual({
       adapter: "command",
       command: ["./custom-preview", "{sha}"],
     });
@@ -337,30 +427,31 @@ describe("composeInitDiscovery", () => {
     expect(result.unresolved).toContain("tracker.provider");
   });
 
-  it("discovers tracker provider+project from a github.com remote WITHOUT a draft (flagless init)", async () => {
+  it("discovers tracker provider+project from a github.com remote WITHOUT a draft, and reports it as a default rather than a decision (flagless init)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless.git"], { cwd: repository.root });
     // No draft at all — flagless invocation.
     const result = await composeInitDiscovery(repository.root);
-    // The composer must NOT mark `tracker.provider` unresolved when it has
-    // already discovered the provider from the remote URL.
-    expect(result.unresolved).not.toContain("tracker.provider");
+    // Spec #139 / ticket #144: the tracker choice belongs to the Author, so a
+    // provider inferred from the remote is a DEFAULT the TTY offers, not a
+    // recorded decision. The composer therefore still marks the provider
+    // unresolved for a github.com remote — but it keeps reporting the
+    // inference, which is what makes it a usable default.
+    expect(result.unresolved).toContain("tracker.provider");
     // The discovered detection carries both provider and project.
     expect(result.detections.tracker.provider).toBe("github");
     expect(result.detections.tracker.project).toBe("poiesis-test/flagless");
     expect(result.detections.tracker.source).toBe("remote-github");
   });
 
-  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft (flagless init)", async () => {
+  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft, and reports it as a default (flagless init)", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     await run("git", ["remote", "set-url", "origin", "https://gitlab.com/poiesis-test/flagless-gitlab.git"], { cwd: repository.root });
     // No draft at all — flagless invocation.
     const result = await composeInitDiscovery(repository.root);
-    // The composer must NOT mark `tracker.provider` unresolved when it has
-    // already discovered gitlab from the remote URL.
-    expect(result.unresolved).not.toContain("tracker.provider");
+    expect(result.unresolved).toContain("tracker.provider");
     // The discovered detection carries gitlab + the discovered project.
     expect(result.detections.tracker.provider).toBe("gitlab");
     expect(result.detections.tracker.project).toBe("poiesis-test/flagless-gitlab");
@@ -379,6 +470,34 @@ describe("composeInitDiscovery", () => {
     expect(result.unresolved).toContain("tracker.provider");
     expect(result.detections.tracker.provider).toBeUndefined();
     expect(result.detections.tracker.source).toBe("missing");
+  });
+
+  it("does not ask the tracker question again for a draft that already states the provider (ticket #144)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // A github.com remote, but the draft already records `local` — an
+    // explicit, unrelated choice. Detection must not second-guess it and the
+    // composer must not ask again.
+    await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless.git"], { cwd: repository.root });
+    const draft: PoiesisConfig = {
+      ...resolvedDraft(),
+      tracker: { provider: "local" },
+    };
+    const result = await composeInitDiscovery(repository.root, draft);
+    expect(result.unresolved).not.toContain("tracker.provider");
+    expect(result.unresolved).not.toContain("tracker.project");
+    expect(result.detections.tracker.source).toBe("explicit");
+  });
+
+  it("does not ask the delivery-readiness question for a draft that already states a state (ticket #144)", async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    // `baseDraft()` states three configured targets; the omitted block is the
+    // only shape that must raise the readiness question.
+    expect((await composeInitDiscovery(repository.root, baseDraft())).unresolved).not.toContain("delivery.mode");
+    // An omitted delivery block must raise it, because only a human can answer.
+    const { delivery: _omitted, ...withoutDelivery } = baseDraft();
+    expect((await composeInitDiscovery(repository.root, withoutDelivery as PoiesisConfig)).unresolved).toContain("delivery.mode");
   });
 
   it("honors an explicit tracker.project and reports source=explicit", async () => {

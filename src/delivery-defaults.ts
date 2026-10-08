@@ -1,7 +1,8 @@
 /**
  * Spec #138: working delivery targets for a project that has none.
+ * Spec #139 / ticket #165: and each one answers with a real delivery receipt.
  *
- * Before this, a fresh project had to hand-write three delivery commands
+ * Before #138, a fresh project had to hand-write three delivery commands
  * before `poiesis init` would even start; a missing `{sha}` token was a
  * hard `INVALID_DELIVERY_CONFIG` failure. That is exactly the friction the
  * Author asked to remove: install should infer or default, never block.
@@ -10,8 +11,46 @@
  * target is absent, never records them in the manifest, and never rewrites
  * them on update - so the first Author edit is the moment Poiesis stops
  * touching them, with no ownership bookkeeping required.
+ *
+ * #165 is about what those scripts ANSWER. They used to record a local
+ * `delivery.json` and print `{ target, candidateSha, candidateTree, artifact }`,
+ * which is an inspection record, not a delivery receipt:
+ * `CommandDeliveryAdapter.execute` requires the exact `sha`, the exact
+ * `candidateTree`, the exact `target`, `verified: true`, a non-empty
+ * `artifactIdentity`, and a string `id` / `url` / `artifact` equal to it. So
+ * a project that adopted Poiesis' own recommended defaults got a `poiesis
+ * preview` that failed closed with `DELIVERY_IDENTITY_MISMATCH` - Poiesis
+ * refusing its own artifact. The validator is NOT relaxed here. It is the
+ * authority; the generated target is brought up to it, and what that means:
+ *
+ *   1. ONE CANDIDATE. `sha` and `candidateSha` are the same canonical SHA
+ *      the argv named, and the tree is the one the repository resolves for
+ *      it. The target and the candidate are asserted against the argv AND the
+ *      runtime's environment BEFORE the record is written and before `gh` is
+ *      ever resolved, so a refusal leaves nothing on disk.
+ *   2. ONE IDENTITY PER TARGET. Preview and Staging mint a deterministic,
+ *      target-specific identity (`poiesis:<target>:<sha>`), so a re-run is
+ *      recognizably the same delivery rather than a new one. Production
+ *      mints nothing: it preserves the verified Staging `artifactIdentity`
+ *      byte-for-byte and exposes it as `id`, while its OWN record lives at
+ *      `artifact`.
+ *   3. NO NULL IN A RECOGNIZED FIELD. `id`, `url` and `artifact` are
+ *      non-empty strings or absent. `url: null` is how a target that produced
+ *      something reads as a target that produced nothing.
+ *   4. THE RECORD BEFORE THE REMOTE STEP. The Preview record and receipt
+ *      exist on disk before the optional best-effort `gh` draft-PR step runs,
+ *      and an opened change request is recorded ALONGSIDE the fixed identity
+ *      rather than becoming it.
+ *
+ * A real project replaces these with its own deploy; the point is that a
+ * fresh install is complete, deliverable, and inspectable rather than
+ * unfinished.
+ *
+ * Spec #139 / ticket #162: the artifact path is owned state, not a literal
+ * repeated here. `src/delivery-runtime.ts` states the exact subtree, the
+ * exact ignore rule, and the removal contract, and the generated script
+ * derives its path from that single owner.
  */
-
 export const DELIVERY_TARGETS = ["preview", "staging", "production"] as const;
 export type DeliveryTarget = (typeof DELIVERY_TARGETS)[number];
 
@@ -26,11 +65,16 @@ export const deliveryScriptPath = (target: DeliveryTarget): string =>
  * is the canonical thing an Author can look at. Without `gh` it still produces
  * a concrete local artifact so the target is never a no-op stub.
  *
- * `staging` and `production` record a release identity under
- * `.poiesis/runtime/delivery/`. A real project replaces these with its own
- * deploy; the point is that a fresh install is complete and inspectable
- * rather than unfinished.
+ * `staging` extends a Preview identity with a new one of its own, and
+ * `production` extends a Staging identity without replacing it. A real project
+ * replaces these with its own deploy; the point is that a fresh install is
+ * complete and inspectable rather than unfinished.
+ *
+ * The body is deliberately written in plain string concatenation rather than
+ * template literals: it is emitted from one, and every backtick and `${` in a
+ * generated file is an escape that can only be got wrong once.
  */
+import { DELIVERY_RUNTIME_RELATIVE } from "./delivery-runtime.js";
 const SCRIPT_BODY = `#!/usr/bin/env node
 /**
  * Poiesis delivery target: __TARGET__.
@@ -43,118 +87,227 @@ const SCRIPT_BODY = `#!/usr/bin/env node
  * It must print a single JSON object on stdout describing what it produced.
  */
 import { spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 
-const [, , sha, target] = process.argv;
-if (!sha || !target) {
+// The one target this file delivers. Every assertion below is made against it.
+const TARGET = "__TARGET__";
+
+const [, , shaArg, targetArg] = process.argv;
+if (!shaArg || !targetArg) {
   process.stderr.write("usage: poiesis-__TARGET__.mjs <sha> <target>\\n");
   process.exit(64);
+}
+
+function refuse(message, code) {
+  process.stderr.write(TARGET + ": " + message + "\\n");
+  process.exit(code);
 }
 
 function git(args) {
   return spawnSync("git", args, { encoding: "utf8" });
 }
 
-const rev = git(["rev-parse", "--verify", \`\${sha}^{commit}\`]);
-if (rev.status !== 0) {
-  process.stderr.write(\`unknown candidate sha: \${sha}\\n\${rev.stderr}\`);
-  process.exit(rev.status ?? 1);
+// -- 1. The contract, settled before anything is written or opened ---------
+//
+// The runtime names the target and the candidate three ways: baked into this
+// file, substituted into argv, and exported as environment. Disagreement means
+// a receipt is about to claim a target or a candidate nobody proved, so it is
+// refused here - before the record exists and before \`gh\` is ever resolved.
+if (targetArg !== TARGET) {
+  refuse('argv target "' + targetArg + '" is not the target this script delivers (' + TARGET + ")", 78);
 }
-const tree = git(["rev-parse", \`\${sha}^{tree}\`]);
+const environmentTarget = process.env.POIESIS_DELIVERY_TARGET;
+if (environmentTarget !== undefined && environmentTarget !== TARGET) {
+  refuse('POIESIS_DELIVERY_TARGET "' + environmentTarget + '" is not the target this script delivers (' + TARGET + ")", 78);
+}
+const environmentSha = process.env.POIESIS_CANDIDATE_SHA;
+if (environmentSha !== undefined && environmentSha !== shaArg) {
+  refuse('POIESIS_CANDIDATE_SHA "' + environmentSha + '" is not the candidate sha "' + shaArg + '"', 78);
+}
+
+const commit = git(["rev-parse", "--verify", shaArg + "^{commit}"]);
+if (commit.status !== 0) {
+  refuse("unknown candidate sha: " + shaArg + "\\n" + commit.stderr, 66);
+}
+const tree = git(["rev-parse", "--verify", shaArg + "^{tree}"]);
 if (tree.status !== 0) {
-  process.stderr.write(\`unable to resolve candidate tree for \${sha}\\n\${tree.stderr}\`);
-  process.exit(tree.status ?? 1);
+  refuse("unable to resolve candidate tree for " + shaArg + "\\n" + tree.stderr, 66);
 }
 const candidateTree = tree.stdout.trim();
+const environmentTree = process.env.POIESIS_CANDIDATE_TREE;
+if (environmentTree !== undefined && environmentTree !== candidateTree) {
+  refuse('POIESIS_CANDIDATE_TREE "' + environmentTree + '" is not the candidate tree of ' + shaArg, 78);
+}
 
+__SOURCE_BODY__
+
+// -- 2. The identity ------------------------------------------------------
+//
+// Deterministic and target-specific: the same candidate delivered to the same
+// target names the same artifact on every machine and on every run, so a
+// receipt stays promotable and a re-run is recognizably the same delivery.
+const artifactIdentity = __IDENTITY__;
+
+// -- 3. The record, established before the optional remote-facing step ------
+//
 // The delivery artifact always exists on disk, so the target is inspectable
-// even when the remote-facing step below cannot run.
-const artifactRoot = resolve(process.cwd(), ".poiesis/runtime/delivery", target, sha);
+// even when the remote-facing step below cannot run. The path is the
+// Poiesis-owned runtime subtree: ignored by the init/update transaction, never
+// a manifest record, and removed only by the validated owned-subtree removal
+// on uninstall.
+const artifactRoot = resolve(process.cwd(), ${JSON.stringify(DELIVERY_RUNTIME_RELATIVE)}, TARGET, shaArg);
+const recordPath = resolve(artifactRoot, "delivery.json");
 mkdirSync(artifactRoot, { recursive: true });
 
 let commitMessage = "";
-const subject = git(["log", "-1", "--format=%s", sha]);
+const subject = git(["log", "-1", "--format=%s", shaArg]);
 if (subject.status === 0) commitMessage = subject.stdout.trim();
 
-__PREVIEW_BODY__
+// Set only by the optional change-request step below. Absent, never null.
+let changeRequest = null;
 
-writeFileSync(
-  resolve(artifactRoot, "delivery.json"),
-  \`\${JSON.stringify(
-    {
-      target,
-      candidateSha: sha,
-      candidateTree,
-      commitMessage,
-      recordedAt: new Date().toISOString(),
-      __RESULT_FIELDS__
-    },
-    null,
-    2,
-  )}\\n\`,
-);
+// Every field the runtime reads out of a receipt. A recognized field is a
+// non-empty string or is ABSENT: \`url: null\` reads as a delivery that
+// produced nothing rather than an optional step that did not run.
+function currentReceipt() {
+  return {
+    sha: shaArg,
+    candidateSha: shaArg,
+    candidateTree,
+    target: TARGET,
+    verified: true,
+    status: "created",
+    artifactIdentity,
+    id: artifactIdentity,
+    artifact: recordPath,
+    // The opened change request is a second carrier the runtime already
+    // recognises, so an authenticated \`gh\` is visible as a real \`url\` on the
+    // receipt instead of disappearing behind the fixed identity.
+    ...(changeRequest === null ? {} : { url: changeRequest.url, changeRequest }),
+    ...(source === null ? {} : { promotedFrom: { target: source.target, artifactIdentity: source.artifactIdentity } }),
+    commitMessage,
+    recordedAt: new Date().toISOString(),
+  };
+}
 
-process.stdout.write(\`\${JSON.stringify({
-  target,
-  candidateSha: sha,
-  candidateTree,
-  artifact: \`\${artifactRoot}/delivery.json\`,
-  __RESULT_FIELDS__
-})}\\n\`);
+function writeReceipt() {
+  writeFileSync(recordPath, JSON.stringify(currentReceipt(), null, 2) + "\\n");
+}
+
+writeReceipt();
+
+__REMOTE_BODY__
+
+process.stdout.write(JSON.stringify(currentReceipt()) + "\\n");
 `;
+
+/**
+ * The source-identity step. A Preview is the root of the chain, so it has
+ * nothing to extend; a promotion is only meaningful against the receipt it
+ * extends, and a promotion that cannot name that exact receipt refuses before
+ * it writes anything.
+ */
+const PREVIEW_SOURCE_BODY = `// A Preview is the root of the chain: there is no source identity to extend.
+const source = null;
+`;
+
+const SOURCE_BODY = (required: string): string => `// Promotion extends a receipt that already exists, so the source identity is
+// required - and it is validated here, before the record exists and before
+// \`gh\` is resolved, so a promotion that cannot name the exact artifact it
+// extends leaves nothing behind at all.
+const SOURCE_TARGET = "${required}";
+const rawSource = process.env.POIESIS_DELIVERY_IDENTITY;
+if (rawSource === undefined || rawSource.trim() === "") {
+  refuse("promotion requires the " + SOURCE_TARGET + " identity in POIESIS_DELIVERY_IDENTITY", 78);
+}
+let source;
+try {
+  source = JSON.parse(rawSource);
+} catch (error) {
+  refuse("POIESIS_DELIVERY_IDENTITY is not valid JSON: " + error.message, 65);
+}
+if (source === null || typeof source !== "object" || Array.isArray(source)) {
+  refuse("POIESIS_DELIVERY_IDENTITY must be a JSON object", 65);
+}
+if (source.sha !== shaArg || source.candidateSha !== shaArg) {
+  refuse("the " + SOURCE_TARGET + " identity belongs to a different candidate than " + shaArg, 65);
+}
+if (source.candidateTree !== candidateTree) {
+  refuse("the " + SOURCE_TARGET + " identity belongs to a different candidate tree than " + candidateTree, 65);
+}
+if (source.target !== SOURCE_TARGET) {
+  refuse(
+    "POIESIS_DELIVERY_IDENTITY is a " + JSON.stringify(source.target) + " identity; a " + SOURCE_TARGET + " identity is required",
+    65,
+  );
+}
+if (source.verified !== true) {
+  refuse("the " + SOURCE_TARGET + " identity has not been verified", 65);
+}
+if (typeof source.artifactIdentity !== "string" || source.artifactIdentity.trim() === "") {
+  refuse("the " + SOURCE_TARGET + " identity carries no artifact identity", 65);
+}
+`;
+
+/**
+ * The identity each target mints. Preview and Staging mint a deterministic one
+ * of their own; Production mints nothing, because the verified Staging
+ * artifact identity is what Production authorization is bound to.
+ */
+function identityBody(target: DeliveryTarget): string {
+  return target === "production" ? "source.artifactIdentity" : '"poiesis:" + TARGET + ":" + shaArg';
+}
 
 /**
  * The preview-specific step. Kept separate so the three generated targets
  * share one body and one contract.
  */
-const PREVIEW_BODY = `
-// A draft PR is the one thing an Author can actually open and try, so that
-// is what a generated preview attempts. It is strictly best-effort: a
-// project without a remote, without \`gh\`, or without an authenticated
-// \`gh\` still produces the local artifact above.
-let changeRequest = null;
+const PREVIEW_REMOTE_BODY = `// A draft pull request is the one thing an Author can actually open and try, so
+// that is what a generated preview attempts. It is strictly best-effort and
+// strictly AFTER the record above exists: a project without a remote, without
+// \`gh\`, or without an authenticated \`gh\` still has its artifact and its
+// receipt. The identity is already fixed, so an opened change request is
+// recorded alongside it and never becomes it.
 const remote = git(["remote", "get-url", "origin"]);
 if (remote.status === 0) {
-  const gh = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
-  if (gh.status === 0) {
-    const title = \`draft: \${commitMessage || "poiesis preview"}\`.slice(0, 200);
-    const pr = spawnSync(
+  const auth = spawnSync("gh", ["auth", "status"], { encoding: "utf8" });
+  if (auth.status === 0) {
+    const title = ("draft: " + (commitMessage || "poiesis preview")).slice(0, 200);
+    const request = spawnSync(
       "gh",
       [
         "pr", "create",
         "--draft",
         "--title", title,
         "--body",
-        \`Poiesis preview for \${sha}\\n\\ncandidate tree: \${candidateTree}\\n\\nChange Request: Draft Preview\\n\`,
+        "Poiesis preview for " + shaArg + "\\n\\ncandidate tree: " + candidateTree + "\\n\\nChange Request: Draft Preview\\n",
       ],
       { encoding: "utf8" },
     );
-    if (pr.status === 0) {
-      const url = (pr.stdout || "").trim().split("\\n").pop() || "";
-      changeRequest = { id: url || null, url: url || null, state: "draft" };
+    const url = request.status === 0 ? (request.stdout || "").trim().split("\\n").pop() || "" : "";
+    if (url !== "") {
+      changeRequest = { state: "draft", url };
+      writeReceipt();
     }
   }
 }
 `;
 
-const RECORD_BODY = `
-// A real project replaces this with its own deploy step. The identity is
-// recorded so the target is complete, inspectable, and never a silent no-op.
-const release = { released: true, recordedAt: new Date().toISOString() };
-`;
-
 /** The full generated script for one target. */
 export function renderDefaultDeliveryScript(target: DeliveryTarget, installedAt: string): string {
-  return SCRIPT_BODY.split("__TARGET__").join(target)
+  const rendered = SCRIPT_BODY.split("__TARGET__").join(target)
     .split("__INSTALLED_AT__").join(installedAt)
-    .split("__PREVIEW_BODY__").join(target === "preview" ? PREVIEW_BODY : RECORD_BODY)
-    .split("__RESULT_FIELDS__")
-    .join(
-      target === "preview"
-        ? "changeRequest: changeRequest ?? null,"
-        : "release,",
-    );
+    .split("__SOURCE_BODY__")
+    .join(target === "preview" ? PREVIEW_SOURCE_BODY : SOURCE_BODY(target === "staging" ? "preview" : "staging"))
+    .split("__IDENTITY__").join(identityBody(target))
+    .split("__REMOTE_BODY__").join(target === "preview" ? PREVIEW_REMOTE_BODY : "");
+  // A placeholder that renders empty (the Preview has no source identity, a
+  // promotion has no change request) leaves behind the blank line it was
+  // written on, so the Author — who is invited to edit this file — would read
+  // two blank lines where an absent step belongs. One blank line is the
+  // separator; more is noise.
+  return rendered.replace(/\n{3,}/g, "\n\n");
 }
 
 /** The delivery adapter the generated script corresponds to. */

@@ -4,15 +4,25 @@ import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { applyEdits, modify } from "jsonc-parser";
 import {
+  DEFERRED_DELIVERY_MODE,
+  isDeferredDelivery,
   loadConfig,
   parseJsonc,
+  requireConfiguredDelivery,
   serializeConfig,
+  trackerExtensionKeys,
+  trackerProjectOf,
   validateConfig,
+  type ConfiguredDeliveryConfig,
   type PoiesisConfig,
+  type ResolvedDeliveryConfig,
   type ResolvedPoiesisConfig,
+  type ResolvedTrackerConfig,
+  type TrackerProviderId,
 } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { runUpdateConfigTransaction } from "./update-config-internal.js";
 import {
   runUpdateTransaction,
@@ -26,6 +36,11 @@ import {
   deliveryScriptPath,
   renderDefaultDeliveryScript,
 } from "./delivery-defaults.js";
+import {
+  DELIVERY_RUNTIME_CONTAINER,
+  DELIVERY_RUNTIME_RELATIVE,
+  removeValidatedDeliveryRuntime,
+} from "./delivery-runtime.js";
 import {
   assertManifestAuthority,
   assertManifestAuthorityToleratingPredecessor,
@@ -62,6 +77,7 @@ import {
   validateOpenCodeConfig,
 } from "./opencode.js";
 import { ownedPath, packageRoot, poiesisPath } from "./paths.js";
+import { hostPathFlavor, type PathFlavor } from "./path-flavor.js";
 import {
   assertPoiesisScriptAvailable,
   ensurePoiesisScriptRefusing,
@@ -86,6 +102,17 @@ import {
   templateMappings,
 } from "./templates.js";
 import { createDeliveryAdapter } from "./adapters.js";
+import { verifyLinearTrackerConfigured } from "./linear-tracker.js";
+import { assertLocalTrackerStoreUsable, resolveLocalTrackerStoreLocation } from "./local-tracker.js";
+import type { PublishProvider } from "./evidence.js";
+
+/**
+ * Spec #139 / ticket #140 — the tracker providers that carry NO Git
+ * repository coordinate. Their identity is stated in the config, never
+ * inferred from the remote, and they can never stand in for a Git host
+ * when publishing.
+ */
+const TRACKER_PROVIDERS_WITHOUT_REPOSITORY: ReadonlySet<TrackerProviderId> = new Set(["linear", "local"]);
 
 export interface MaintenanceOptions {
   skipSkills?: boolean;
@@ -372,42 +399,46 @@ export async function autoResolveConfigDefaults(
   }
 
   let discoveredTracker = false;
-  let trackerProvider = config.tracker?.provider;
-  let trackerProject = config.tracker?.project ?? "";
-  // Spec #138: this block also runs when the provider is still unknown, which
-  // is the whole point - a fresh config has no `tracker` block at all, and the
-  // remote is what tells us the provider and the project.
-  if (
+  const configuredTracker = config.tracker;
+  let trackerProvider: TrackerProviderId | undefined = configuredTracker?.provider;
+  let trackerProject = (configuredTracker === undefined ? undefined : trackerProjectOf(configuredTracker)) ?? "";
+  let trackerTeam =
+    configuredTracker?.provider === "linear" &&
+    typeof (configuredTracker as { team?: unknown }).team === "string"
+      ? (configuredTracker as { team: string }).team
+      : "";
+  // Spec #138 / #139: a repository coordinate is inferred from the Git
+  // remote only for a provider that IS a Git host. `linear` and `local`
+  // are explicitly NOT inferred from the remote — that is the whole point
+  // of making tracker identity independent from Git hosting — so their
+  // coordinates come from the config alone.
+  const infersProjectFromRemote =
+    trackerProvider !== undefined &&
     trackerProvider !== "fixture" &&
-    (trackerProvider === undefined || trackerProject.trim().length === 0) &&
-    remote !== undefined
-  ) {
+    !TRACKER_PROVIDERS_WITHOUT_REPOSITORY.has(trackerProvider);
+  if (infersProjectFromRemote && trackerProject.trim().length === 0 && remote !== undefined) {
     const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
     const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
     if (url !== undefined) {
       const parsed = parseTrackerFromUrl(url);
-      if (parsed !== null) {
-        // Spec #138: infer BOTH the provider and the project from the remote.
-        // The previous condition only accepted a URL whose provider already
-        // matched the configured one, so a fresh config with no `tracker` block
-        // could never resolve either field - the Author was asked to supply,
-        // by hand, facts the Git remote already states.
-        if (trackerProvider === undefined) {
-          trackerProvider = parsed.provider;
-        }
-        if (parsed.provider === trackerProvider && trackerProject.trim().length === 0) {
-          trackerProject = parsed.project;
-          discoveredTracker = true;
-        }
+      if (parsed !== null && parsed.provider === trackerProvider) {
+        trackerProject = parsed.project;
+        discoveredTracker = true;
       }
     }
   }
-  if (trackerProject.trim().length === 0) {
-    throw new PoiesisError(
-      "INVALID_TRACKER_CONFIG",
-      "Cannot resolve tracker project; please set tracker.project in the config or configure a recognized Git remote",
-      { provider: trackerProvider },
-    );
+  // Spec #138: a config with NO `tracker` block still resolves both the
+  // provider and the project from the remote, so a fresh project does not
+  // have to hand-state facts Git already records.
+  if (trackerProvider === undefined && remote !== undefined) {
+    const remotes = await run("git", ["remote", "get-url", "--all", remote], { cwd: root });
+    const url = remotes.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
+    const parsed = url === undefined ? null : parseTrackerFromUrl(url);
+    if (parsed !== null) {
+      trackerProvider = parsed.provider;
+      trackerProject = parsed.project;
+      discoveredTracker = true;
+    }
   }
 
   if (trackerProvider === undefined) {
@@ -417,17 +448,53 @@ export async function autoResolveConfigDefaults(
       {},
     );
   }
-  const resolvedTrackerProvider: ResolvedPoiesisConfig["tracker"]["provider"] = trackerProvider;
+  if (trackerProvider === "linear" && trackerTeam.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "A linear tracker requires a non-empty tracker.team; Linear credentials are read from the environment and must never be stored in the Poiesis config",
+      { provider: trackerProvider, field: "tracker.team" },
+    );
+  }
+  if (!TRACKER_PROVIDERS_WITHOUT_REPOSITORY.has(trackerProvider) && trackerProject.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "Cannot resolve tracker project; please set tracker.project in the config or configure a recognized Git remote",
+      { provider: trackerProvider },
+    );
+  }
+
+  // Spec #139 / ticket #153 — the resolved tracker is the ONE seam between the
+  // `tracker` block an Author states and the value `init`, `update`, and
+  // `update --config` serialize into `.poiesis/config.jsonc`. It rebuilt every
+  // branch from the known coordinates alone, so an unknown non-secret key the
+  // schema accepted was silently deleted by the next managed rewrite. The
+  // extension keys ride through from the shared `trackerExtensionKeys`
+  // partition, and the known coordinates are written LAST, so an extension can
+  // never supply, replace, nor complete a coordinate Poiesis owns.
+  const trackerExtensions = trackerExtensionKeys(config.tracker);
+  const resolvedTracker: ResolvedTrackerConfig =
+    trackerProvider === "local"
+      ? { ...trackerExtensions, provider: "local" }
+      : trackerProvider === "linear"
+        ? {
+            ...trackerExtensions,
+            provider: "linear",
+            team: trackerTeam,
+            ...(trackerProject.trim().length === 0 ? {} : { project: trackerProject }),
+          }
+        : { ...trackerExtensions, provider: trackerProvider, project: trackerProject };
 
   const resolved: ResolvedPoiesisConfig = {
     schema: 1,
     models: { reasoning: config.models.reasoning, execution: config.models.execution, ...(config.models.roles === undefined ? {} : { roles: config.models.roles }) },
     repository: { remote: remote!, integrationBranch: integrationBranch! },
-    tracker: { provider: resolvedTrackerProvider, project: trackerProject },
+    tracker: resolvedTracker,
     // Spec #138: a config with no `delivery` block is a normal fresh-project
     // config, not an error. init writes `scripts/poiesis-<target>.mjs` for the
     // targets that are missing, so the resolved config points at real, working
     // files. An Author who supplies their own delivery block keeps it.
+    // Spec #139: an explicitly deferred install resolves to the deferred
+    // mode, which never becomes a generated command target.
     delivery: resolveDelivery(config.delivery),
     verification: {
       commands: verificationCommands,
@@ -468,8 +535,15 @@ async function discoverVerificationCommands(root: string): Promise<string[]> {
   return out;
 }
 
+/**
+ * Spec #139 / ticket #146 — the forge parsers sanitize the remote URL before
+ * they match it, so a supported HTTPS remote that carries userinfo still
+ * resolves to its repository coordinate while the credential is never
+ * retained. Sanitizing first (rather than matching userinfo and dropping it
+ * later) means there is exactly one place that understands a Git remote URL.
+ */
 export function parseGitHubProject(url: string): string | null {
-  const trimmed = url.trim();
+  const trimmed = sanitizeGitRemoteUrl(url);
   const sshMatch = trimmed.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/);
   if (sshMatch !== null && sshMatch[1] !== undefined && sshMatch[2] !== undefined) {
     return `${sshMatch[1]}/${sshMatch[2]}`;
@@ -482,7 +556,7 @@ export function parseGitHubProject(url: string): string | null {
 }
 
 export function parseGitLabProject(url: string): string | null {
-  const trimmed = url.trim();
+  const trimmed = sanitizeGitRemoteUrl(url);
   // SSH: `git@gitlab.com:<group-path>` (with optional `.git` suffix).
   // Group path may contain nested groups separated by `/`, and must
   // contain at least two non-empty segments (group + project).
@@ -654,25 +728,196 @@ export async function validateOpenCodeConfigPayload(content: string): Promise<vo
 }
 
 
+/**
+ * Spec #139 / ticket #144 — the internal seam that lets the suite drive
+ * `verifyTracker`'s Linear branch against a fake transport instead of the
+ * live Linear API.
+ *
+ * It mirrors the existing `setRuntimePackageVersionOverrideForTest` precedent:
+ * module-scoped, deliberately NOT re-exported from `src/index.ts`, and reset
+ * to `null` by the caller. Production always passes `null`, so the real
+ * `process.env` credential and the real `fetch` transport are used.
+ */
+let linearTrackerSeamsForTest: Parameters<typeof verifyLinearTrackerConfigured>[1] | null = null;
+
+export function setLinearTrackerSeamsForTest(seams: Parameters<typeof verifyLinearTrackerConfigured>[1] | null): void {
+  linearTrackerSeamsForTest = seams;
+}
+
 export async function verifyTracker(root: string, config: ResolvedPoiesisConfig): Promise<"verified" | "fixture"> {
-  if (config.tracker.provider === "fixture") return "fixture";
+  return (await inspectTracker(root, config)).mode;
+}
+
+/**
+ * Spec #139 / ticket #144 — the outcome of a tracker check, including the
+ * identities a provider actually RESOLVED.
+ *
+ * `init` and `update` only need the mode, so `verifyTracker` stays the
+ * boolean-ish seam they use. Doctor additionally reports which team or
+ * project the workspace resolves to, because a health report that only
+ * echoes the configuration back tells an operator nothing they did not
+ * already type.
+ */
+export interface TrackerInspection {
+  readonly mode: "verified" | "fixture";
+  /**
+   * The identity the provider resolved for the configured coordinate, or
+   * `undefined` for a provider that has no separate resolution step.
+   */
+  readonly resolved?: { readonly team?: string; readonly project?: string };
+}
+
+export async function inspectTracker(root: string, config: ResolvedPoiesisConfig): Promise<TrackerInspection> {
+  if (config.tracker.provider === "fixture") return { mode: "fixture" };
+  // Spec #139 / ticket #142: `local` is a first-class tracker whose only
+  // credential is the Git common directory the repository already has. There
+  // is no host CLI to authenticate against and no network to reach, so
+  // verification is a path-usability check: it fails closed on a symlinked,
+  // nonregular, or world-readable store and deliberately creates nothing, so
+  // `poiesis init` does not materialize tracker state as a side effect.
+  if (config.tracker.provider === "local") {
+    await assertLocalTrackerStoreUsable(await resolveLocalTrackerStoreLocation(root));
+    return { mode: "verified" };
+  }
+  // Spec #139 / ticket #141: Linear authenticates with a credential from the
+  // environment, not with a host CLI. Verification is therefore one real
+  // authenticated read against Linear plus a resolution of the CONFIGURED
+  // team (and project when one is configured): a missing, doubled, or refused
+  // credential fails closed here, next to its cause, instead of surfacing
+  // later as an unexplained 401 during the first tracker mutation — and a
+  // mistyped coordinate fails here too, instead of being reported as a
+  // healthy tracker and failing later at the first create.
+  if (config.tracker.provider === "linear") {
+    const verified = await verifyLinearTrackerConfigured(
+      {
+        team: config.tracker.team,
+        ...(config.tracker.project === undefined ? {} : { project: config.tracker.project }),
+      },
+      linearTrackerSeamsForTest ?? {},
+    );
+    return {
+      mode: "verified",
+      resolved: {
+        team: verified.team.key,
+        ...(verified.project === undefined ? {} : { project: verified.project.name }),
+      },
+    };
+  }
   if (config.tracker.provider === "github") {
     await run("gh", ["auth", "status"], { cwd: root });
     await run("gh", ["repo", "view", config.tracker.project, "--json", "nameWithOwner"], { cwd: root });
-    return "verified";
+    return { mode: "verified" };
   }
   await run("glab", ["auth", "status"], { cwd: root });
   await run("glab", ["api", `projects/${encodeURIComponent(config.tracker.project)}`], { cwd: root });
-  return "verified";
+  return { mode: "verified" };
 }
 
-export function verifyDeliveryConfiguration(root: string, config: ResolvedPoiesisConfig): "verified" | "fixture" {
+/**
+ * Spec #139 / ticket #144 — the coordinate detail of a tracker, reported per
+ * provider. A Git host has a repository project, Linear has a team plus an
+ * optional project, and Local has neither; collapsing all three into one
+ * `project` field is what let a mistyped Linear team read as healthy.
+ */
+function describeTrackerDetails(tracker: ResolvedPoiesisConfig["tracker"]): Record<string, unknown> {
+  if (tracker.provider === "local") return { provider: "local", coordinates: "none (clone-local store)" };
+  if (tracker.provider === "linear") {
+    return {
+      provider: "linear",
+      team: tracker.team,
+      ...(tracker.project === undefined ? {} : { project: tracker.project }),
+    };
+  }
+  return { provider: tracker.provider, project: tracker.project };
+}
+
+/** Provider-accurate one-line health summary, naming the configured coordinates. */
+function describeTrackerHealth(tracker: ResolvedPoiesisConfig["tracker"]): string {
+  if (tracker.provider === "local") return "Local clone-local tracker store is available";
+  if (tracker.provider === "linear") {
+    const project = tracker.project === undefined ? "" : ` and project ${tracker.project}`;
+    return `Linear team ${tracker.team}${project} is available`;
+  }
+  return "Tracker authentication and project are available";
+}
+
+export function verifyDeliveryConfiguration(
+  root: string,
+  config: ResolvedPoiesisConfig,
+): "verified" | "fixture" | "deferred" {
+  if (isDeferredDelivery(config.delivery)) return "deferred";
+  const delivery = requireConfiguredDelivery(config.delivery, "delivery configuration");
   let fixture = false;
-  for (const target of ["preview", "staging", "production"] as const) {
-    const adapter = createDeliveryAdapter(config.delivery[target], root);
+  for (const target of DELIVERY_TARGETS) {
+    const adapter = createDeliveryAdapter(delivery[target], root);
     if (adapter.kind === "fixture") fixture = true;
   }
   return fixture ? "fixture" : "verified";
+}
+
+/**
+ * Spec #139 / ticket #140 — publishing coordinates.
+ *
+ * The provider and repository a change request is opened against are a
+ * property of the configured **Git remote**, never of the tracker. A
+ * project that keeps its work in Linear or in a clone-local store still
+ * publishes to the GitHub or GitLab repository its remote points at, so
+ * `provider: "linear"` / `"local"` can never leak into Publish evidence
+ * or into a publishing call.
+ *
+ * Spec #139 / ticket #146 — that independence is total. A `github` or
+ * `gitlab` tracker used to supply the coordinates when the remote was not
+ * a recognized forge, which quietly re-coupled publishing to tracker
+ * identity: the tracker block became a second, invisible source of truth
+ * for where a change request is opened. The only surviving fallback is the
+ * test-only `fixture` tracker, and it can only ever yield `provider:
+ * "fixture"` coordinates. For every other tracker an unrecognized remote
+ * (a local path, a self-hosted host) fails closed rather than inventing a
+ * repository.
+ *
+ * The reported `remoteUrl` is the sanitized one, so a credential embedded
+ * in the remote never reaches an error envelope, a log line, or a CI
+ * transcript.
+ */
+export interface PublishCoordinates {
+  provider: PublishProvider;
+  project: string;
+  source: "git-remote" | "fixture-tracker";
+}
+
+export async function resolvePublishCoordinates(
+  root: string,
+  config: ResolvedPoiesisConfig,
+): Promise<PublishCoordinates> {
+  const remotes = await run("git", ["remote", "get-url", "--all", config.repository.remote], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const remoteUrl = remotes.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+  if (remoteUrl === undefined) {
+    throw new PoiesisError(
+      "GIT_REMOTE_UNAVAILABLE",
+      "Publishing coordinates are derived from the configured Git remote, which is unavailable",
+      { remote: config.repository.remote },
+    );
+  }
+  const fromRemote = parseTrackerFromUrl(remoteUrl);
+  if (fromRemote !== null) {
+    return { provider: fromRemote.provider, project: fromRemote.project, source: "git-remote" };
+  }
+  const trackerProvider = config.tracker.provider;
+  const trackerProject = trackerProjectOf(config.tracker);
+  if (trackerProvider === "fixture" && trackerProject !== undefined && trackerProject.trim().length > 0) {
+    return { provider: "fixture", project: trackerProject, source: "fixture-tracker" };
+  }
+  throw new PoiesisError(
+    "PUBLISH_PROVIDER_UNRESOLVED",
+    "Publishing coordinates are derived from the configured Git remote, and this remote is not a recognized GitHub or GitLab host; point the remote at a recognized host — tracker identity never supplies publishing coordinates",
+    { provider: trackerProvider, remote: config.repository.remote, remoteUrl: sanitizeGitRemoteUrl(remoteUrl) },
+  );
 }
 
 async function assertInitDestinationsAbsent(root: string, files: Array<{ path: string }>): Promise<void> {
@@ -901,24 +1146,71 @@ async function rollbackDefaultPathGitignore(
 export const DEFAULT_VERIFICATION_COMMAND = "git rev-parse --git-dir";
 
 /**
+ * Spec #139 / ticket #153 — the OUTER delivery keys Poiesis owns and
+ * therefore normalizes itself: the `mode` marker and the three targets.
+ * Everything else at the outer level is an extension key. The reserved set
+ * is keyed by PROPERTY NAME (`mode`), not by the deferred mode's value.
+ *
+ * `assertDeliveryShape` has already refused a block that mixes the two
+ * honest states, so this partition is a naming of the contract, not a new
+ * rule: an extension key can neither introduce, replace, nor complete a
+ * field Poiesis owns.
+ */
+const RESERVED_DELIVERY_KEYS: ReadonlySet<string> = new Set<string>(["mode", ...DELIVERY_TARGETS]);
+
+/**
+ * Spec #139 / ticket #153 — the extension keys of an outer `delivery` block,
+ * carried forward unexamined. This is the fix for the accepted-then-deleted
+ * key: the schema admits an unknown outer key (ticket #152), and the value
+ * that `init` / `update --config` serialize must still hold it, because a
+ * runtime that cannot act on a key must not delete it from the Author's
+ * managed config.
+ *
+ * Spec #139 / ticket #154: the partition is the ONE definition of which outer
+ * key is an extension, so the init-discovery final overlay reuses it instead of
+ * re-deriving the reserved set. Exported for that internal caller only —
+ * `src/index.ts` does NOT re-export it, so it stays out of `dist/index.d.ts`.
+ */
+export function deliveryExtensionKeys(delivery: PoiesisConfig["delivery"]): Record<string, unknown> {
+  const extensions: Record<string, unknown> = {};
+  if (delivery === undefined) return extensions;
+  for (const [key, value] of Object.entries(delivery as Record<string, unknown>)) {
+    if (RESERVED_DELIVERY_KEYS.has(key)) continue;
+    extensions[key] = value;
+  }
+  return extensions;
+}
+
+/**
  * Spec #138: fill an absent `delivery` block from the generated delivery
  * scripts. init creates `scripts/poiesis-<target>.mjs` for any target the
  * project lacks, so the default resolves to a file that will exist by the
  * time the transaction finishes.
+ *
+ * Spec #139 / ticket #140: an explicitly deferred install resolves to
+ * `{ mode: "deferred" }` and is NEVER completed with generated command
+ * targets. A complete block is returned unchanged, so an existing
+ * installation's serialized bytes are untouched.
+ *
+ * Spec #139 / ticket #153: BOTH branches carry the block's extension keys
+ * through unchanged. The known fields are written last, so a reserved key
+ * can never be supplied or rewritten by an extension, and a block with no
+ * extension key resolves to exactly the bytes it did before.
  */
-function resolveDelivery(
-  delivery: PoiesisConfig["delivery"],
-): NonNullable<PoiesisConfig["delivery"]> {
-  const generated = {
+function resolveDelivery(delivery: PoiesisConfig["delivery"]): ResolvedDeliveryConfig {
+  const extensions = deliveryExtensionKeys(delivery);
+  if (isDeferredDelivery(delivery)) return { ...extensions, mode: DEFERRED_DELIVERY_MODE };
+  const generated: ConfiguredDeliveryConfig = {
     preview: defaultDeliveryAdapter("preview"),
     staging: defaultDeliveryAdapter("staging"),
     production: defaultDeliveryAdapter("production"),
   };
   if (delivery === undefined) return generated;
   return {
-    preview: delivery.preview ?? generated.preview,
-    staging: delivery.staging ?? generated.staging,
-    production: delivery.production ?? generated.production,
+    ...extensions,
+    preview: delivery.preview,
+    staging: delivery.staging,
+    production: delivery.production,
   };
 }
 
@@ -1147,15 +1439,20 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     // Spec #138: write a working delivery script for every target the project
     // does not already have. Never overwrites - an existing script belongs to
     // the Author, which is what makes "edit it freely" a real promise.
-    for (const target of DELIVERY_TARGETS) {
-      const rel = deliveryScriptPath(target);
-      if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
-        continue;
+    // Spec #139 / ticket #140: a deferred install generates NOTHING. Writing
+    // a placeholder script would be exactly the fake adapter the Spec
+    // forbids.
+    if (deliveryMode !== "deferred") {
+      for (const target of DELIVERY_TARGETS) {
+        const rel = deliveryScriptPath(target);
+        if (initialDeliverySnapshots.get(rel) !== undefined && initialDeliverySnapshots.get(rel) !== null) {
+          continue;
+        }
+        const abs = join(resolvedRoot, rel);
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
+        writtenDeliveryScripts.push(rel);
       }
-      const abs = join(resolvedRoot, rel);
-      await mkdir(dirname(abs), { recursive: true });
-      await writeFile(abs, renderDefaultDeliveryScript(target, new Date().toISOString()), { flag: "wx" });
-      writtenDeliveryScripts.push(rel);
     }
 
     const writtenPackageJson = await ensurePoiesisScriptRefusing(resolvedRoot, initialPackageJsonSnapshot);
@@ -1431,11 +1728,109 @@ export async function resolveConfigRoot(cwd: string): Promise<string> {
   const resolvedCommonDir = commonDirResult.exitCode === 0
     ? resolve(isAbsolute(commonDirResult.stdout) ? commonDirResult.stdout : resolve(cwd, commonDirResult.stdout))
     : resolve(cwd);
-  const parent = resolvedCommonDir.replace(/\/$/, "").replace(/\/[^/]+$/, "");
-  if (parent === "" || parent === resolvedCommonDir) return resolve(cwd);
+  const parent = primaryCheckoutOfCommonDir(resolvedCommonDir);
+  if (parent === null) return resolve(cwd);
   const configPath = join(parent, ".poiesis", "config.jsonc");
   if (await exists(configPath)) return parent;
   return resolve(cwd);
+}
+
+/**
+ * Spec #139 / ticket #156 — the primary checkout that OWNS a Git common
+ * directory, derived with the platform's own `dirname`.
+ *
+ * The common directory of a primary checkout IS that checkout's `.git`
+ * directory, so the checkout is the directory above it. This used to be spelled
+ * `replace(/\/$/, "").replace(/\/[^/]+$/, "")`, which is correct on POSIX and
+ * silently inert on Windows: `C:\primary\.git` contains no `/`, nothing was
+ * stripped, the result equalled its input, and a linked worktree on a Windows
+ * host therefore resolved the INSTALLATION ROOT to itself — after which the
+ * runtime-identity and lifecycle-policy guards read the worktree's config
+ * instead of the primary's. The authority this function protects is the whole
+ * reason it cannot be spelled with a POSIX-only regex.
+ *
+ * `dirname` also handles the trailing separator (`/a/.git/` and `/a/` both
+ * answer `/a`) and the filesystem root (`dirname("/") === "/"`, so a root
+ * common directory reports no parent rather than an empty string).
+ *
+ * Returns `null` — never a guess — when there is no parent to name: a root
+ * common directory, or a report that is not absolute for this flavor. Callers
+ * fall back to their invocation root.
+ */
+export function primaryCheckoutOfCommonDir(
+  commonDir: string,
+  flavor: PathFlavor = hostPathFlavor(),
+): string | null {
+  const normalized = flavor.normalize(commonDir);
+  if (!flavor.isAbsolute(normalized)) return null;
+  const parent = flavor.dirname(normalized);
+  return parent.length === 0 || parent === normalized ? null : parent;
+}
+
+/**
+ * Spec #139 / ticket #156 — the installation-root derivation, split from the
+ * subprocess so the PATH question is answerable on any host.
+ *
+ * `git rev-parse --absolute-git-dir --git-common-dir` prints the two paths in
+ * one call. In a primary checkout they are the same path and the checkout owns
+ * the installation; in a linked worktree they differ, and the common directory
+ * is the PRIMARY checkout's `.git`. The reconciliation is therefore one
+ * side-effect-free subprocess, and this pure function is what it reconciles
+ * into: a caller (and a test) can drive the answer for a Windows report from a
+ * Linux host by passing the Windows flavor.
+ */
+export function deriveInstallationRoot(
+  repoRoot: string,
+  reported: readonly string[],
+  flavor: PathFlavor = hostPathFlavor(),
+): string {
+  const root = flavor.resolve(repoRoot);
+  const [gitDirLine, commonDirLine] = reported;
+  if (gitDirLine === undefined || commonDirLine === undefined) return root;
+  // The FLAVOR decides what "absolute" means, not the host. Reading these two
+  // lines with the host's own `isAbsolute` is the same POSIX-only mistake one
+  // layer down: on a Linux host asked about `C:\primary\.git` the host reports
+  // it as RELATIVE and the derivation anchors it under the Linux root, so a
+  // Windows answer could never be reached even with the Windows flavor in hand.
+  const absolute = (line: string): string => flavor.resolve(flavor.isAbsolute(line) ? line : flavor.resolve(root, line));
+  // Git reports the same path twice in a primary checkout. That equality IS
+  // the primary/worktree discriminator, so a report that cannot produce two
+  // absolute paths, or that reports them as equal, keeps the invocation root
+  // rather than being derived into something.
+  if (absolute(gitDirLine) === absolute(commonDirLine)) return root;
+  return primaryCheckoutOfCommonDir(absolute(commonDirLine), flavor) ?? root;
+}
+
+/**
+ * Spec #139 / ticket #152 — the root that OWNS the installation, answered
+ * STRUCTURALLY rather than by looking for a config file.
+ *
+ * `resolveConfigRoot` answers "where is the installed config I should read?"
+ * and may legitimately fall back to the invocation root when no config is
+ * there. The runtime identity and lifecycle-policy guards cannot use that
+ * answer: a project whose installed config is missing is precisely the case
+ * they must diagnose, so a resolver that looks for the config cannot be the
+ * one that decides whether it is present.
+ *
+ * The answer is therefore structural. Poiesis installs into the PRIMARY
+ * checkout. Git reports `--absolute-git-dir` and `--git-common-dir` as the
+ * same path in a primary checkout, and as different paths in a linked
+ * worktree, where the common dir is the primary checkout's `.git` directory.
+ * Both facts are read in ONE `git rev-parse` call, so the reconciliation
+ * costs a single side-effect-free subprocess and never touches the network, a
+ * remote, or the working tree.
+ */
+export async function resolveInstallationRoot(repoRoot: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--absolute-git-dir", "--git-common-dir"], {
+    cwd: repoRoot,
+    allowFailure: true,
+  });
+  if (result.exitCode !== 0) return resolve(repoRoot);
+  const reported = result.stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
+  return deriveInstallationRoot(repoRoot, reported);
 }
 
 export async function doctor(root: string): Promise<DoctorReport> {
@@ -1640,7 +2035,10 @@ export async function doctor(root: string): Promise<DoctorReport> {
     try {
       const remote = await run("git", ["remote", "get-url", config.repository.remote], { cwd: resolvedRoot, allowFailure: true });
       if (remote.exitCode !== 0 || remote.stdout.length === 0) throw new PoiesisError("GIT_REMOTE_UNAVAILABLE", "Configured remote is unavailable");
-      checks.push({ id: "git-remote", status: "pass", message: "Configured Git remote is available", details: { name: config.repository.remote, url: remote.stdout } });
+      // Spec #139 / ticket #146: the reported URL is the sanitized one, so a
+      // credential embedded in the remote never reaches the doctor report an
+      // Author pastes into an issue.
+      checks.push({ id: "git-remote", status: "pass", message: "Configured Git remote is available", details: { name: config.repository.remote, url: sanitizeGitRemoteUrl(remote.stdout) } });
     } catch (error) {
       checks.push({ id: "git-remote", status: "fail", message: "Configured Git remote check failed", details: errorDetails(error) });
     }
@@ -1651,27 +2049,51 @@ export async function doctor(root: string): Promise<DoctorReport> {
       checks.push({ id: "git-base", status: "fail", message: "Configured integration branch check failed", details: errorDetails(error) });
     }
     try {
-      const mode = await verifyTracker(resolvedRoot, config);
+      const inspection = await inspectTracker(resolvedRoot, config);
       checks.push({
         id: "tracker",
-        status: mode === "fixture" ? "warn" : "pass",
-        message: mode === "fixture" ? "Test-only fixture tracker is configured" : "Tracker authentication and project are available",
-        details: { provider: config.tracker.provider, project: config.tracker.project },
+        status: inspection.mode === "fixture" ? "warn" : "pass",
+        message: inspection.mode === "fixture" ? "Test-only fixture tracker is configured" : describeTrackerHealth(config.tracker),
+        details: {
+          ...describeTrackerDetails(config.tracker),
+          ...(inspection.resolved === undefined
+            ? {}
+            : {
+                ...(inspection.resolved.team === undefined ? {} : { resolvedTeamKey: inspection.resolved.team }),
+                ...(inspection.resolved.project === undefined ? {} : { resolvedProject: inspection.resolved.project }),
+              }),
+        },
       });
     } catch (error) {
-      checks.push({ id: "tracker", status: "fail", message: "Tracker authentication or project check failed", details: errorDetails(error) });
+      checks.push({
+        id: "tracker",
+        status: "fail",
+        message: `Tracker authentication or coordinate check failed for ${config.tracker.provider}`,
+        details: { provider: config.tracker.provider, ...describeTrackerDetails(config.tracker), ...errorDetails(error) },
+      });
     }
     try {
       const mode = verifyDeliveryConfiguration(resolvedRoot, config);
       checks.push({
         id: "delivery",
-        status: mode === "fixture" ? "warn" : "pass",
-        message: mode === "fixture" ? "Test-only fixture delivery is configured" : "Preview, staging, and production adapters are valid",
-        details: {
-          preview: config.delivery.preview.adapter,
-          staging: config.delivery.staging.adapter,
-          production: config.delivery.production.adapter,
-        },
+        // Spec #139: deferred delivery is an intentional operator choice,
+        // not a defect. It is reported as a nonblocking warning so the
+        // doctor gate keeps passing while the state stays visible.
+        status: mode === "fixture" || mode === "deferred" ? "warn" : "pass",
+        message:
+          mode === "fixture"
+            ? "Test-only fixture delivery is configured"
+            : mode === "deferred"
+              ? "Delivery is explicitly deferred; preview, staging, and production are not configured"
+              : "Preview, staging, and production adapters are valid",
+        details:
+          mode === "deferred"
+            ? { mode: DEFERRED_DELIVERY_MODE }
+            : {
+                preview: requireConfiguredDelivery(config.delivery, "doctor").preview.adapter,
+                staging: requireConfiguredDelivery(config.delivery, "doctor").staging.adapter,
+                production: requireConfiguredDelivery(config.delivery, "doctor").production.adapter,
+              },
       });
     } catch (error) {
       checks.push({ id: "delivery", status: "fail", message: "Delivery adapter configuration is invalid", details: errorDetails(error) });
@@ -1841,6 +2263,15 @@ function knownPoiesisPaths(manifest: Manifest): Set<string> {
   // for cache directories the runtime owns.
   known.add(".poiesis/cache");
   known.add(".poiesis/cache/repository-intelligence");
+  // Spec #139 / ticket #162: the generated delivery runtime is the
+  // Poiesis-owned `.poiesis/runtime/delivery/` subtree. It is non-canonical
+  // derived local state (never recorded in the manifest), but the uninstall
+  // walker still considers the container and its owned entry known so an
+  // operator does not see "unknown content under .poiesis" for derived
+  // artifacts the runtime owns. Removal is owned by
+  // `removeValidatedDeliveryRuntime`, which preserves foreign siblings.
+  known.add(DELIVERY_RUNTIME_CONTAINER);
+  known.add(DELIVERY_RUNTIME_RELATIVE);
   for (const file of manifest.files) {
     if (!file.path.startsWith(".poiesis/")) continue;
     known.add(file.path);
@@ -2277,6 +2708,13 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     // which preserves foreign siblings and reports them via
     // `foreignPreserved` with the canonical "foreign content" reason.
     if (path === ".poiesis/cache" || path.startsWith(".poiesis/cache/")) continue;
+    // Spec #139 / ticket #162: the Poiesis-owned generated delivery runtime
+    // (`.poiesis/runtime/delivery/`) is derived local state, so the walker
+    // must not report it (or a foreign sibling of it) as "unknown content
+    // under .poiesis". Owned removal is owned by
+    // `removeValidatedDeliveryRuntime` below, which preserves foreign
+    // siblings and reports them with the canonical "foreign content" reason.
+    if (path === DELIVERY_RUNTIME_CONTAINER || path.startsWith(`${DELIVERY_RUNTIME_CONTAINER}/`)) continue;
     if (!known.has(path)) result.preserved.push({ path, reason: "unknown content under .poiesis" });
   }
 
@@ -2360,6 +2798,32 @@ export async function uninstall(root: string): Promise<UninstallResult> {
     // the canonical manifest paths.
     const message = error instanceof PoiesisError ? error.message : String(error);
     result.preserved.push({ path: ".poiesis/cache/", reason: `cache validation refused removal: ${message}` });
+  }
+
+  // Spec #139 / ticket #162: generated delivery runtime cleanup. The
+  // helper validates the owned `.poiesis/runtime/delivery/` subtree
+  // before it removes anything and refuses a symlinked container, a
+  // symlinked delivery root, or a symlink at any depth inside it, so no
+  // traversal and no recursive removal can follow a link out of the
+  // project. Foreign `.poiesis/runtime/` siblings survive byte-for-byte
+  // and are reported as preserved, which keeps uninstall incomplete with
+  // the ownership receipt retained.
+  try {
+    const runtimeRemoval = await removeValidatedDeliveryRuntime(resolvedRoot);
+    if (runtimeRemoval.removed) result.removed.push(DELIVERY_RUNTIME_RELATIVE);
+    for (const entry of runtimeRemoval.foreignPreserved) {
+      result.preserved.push({
+        path: `${DELIVERY_RUNTIME_CONTAINER}/${entry}`,
+        reason:
+          "foreign content under the Poiesis-owned runtime container; uninstall only removes the owned delivery subtree",
+      });
+    }
+  } catch (error) {
+    const message = error instanceof PoiesisError ? error.message : String(error);
+    result.preserved.push({
+      path: `${DELIVERY_RUNTIME_CONTAINER}/`,
+      reason: `delivery runtime validation refused removal: ${message}`,
+    });
   }
 
   if (result.preserved.length === 0) {
