@@ -1,6 +1,5 @@
 import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
 import { PoiesisError, asPoiesisError } from "./errors.js";
 import { completeUtf8PrefixLength } from "./utf8-prefix.js";
 import { sanitizeSubprocessOutput } from "./url-userinfo.js";

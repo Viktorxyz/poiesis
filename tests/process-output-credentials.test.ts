@@ -34,14 +34,16 @@
  * TypeScript source — is the surface an Author sees.
  */
 import { existsSync } from "node:fs";
-import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { asPoiesisError } from "../src/errors.js";
+import { loadManifest } from "../src/manifest.js";
 import { run } from "../src/process.js";
+import { createOwnershipReceipt } from "../src/receipt.js";
 import { sanitizeSubprocessOutput } from "../src/url-userinfo.js";
-import { createTestRepository, type TestRepository } from "./helpers.js";
+import { createTestRepository, describeManagedExecution, type TestRepository } from "./helpers.js";
 
 /** A credential that exists only in this test file. */
 const SENTINEL_SECRET = "ghp_POIESIS_T149_SENTINEL_c7e2b48f0a1d";
@@ -106,6 +108,17 @@ async function repositoryWithCredentialRemote(): Promise<TestRepository> {
  * that reports the remote and then fails against it, so the failure
  * envelope an Author sees is built from real Git output — and that output
  * is what carries the credential-bearing URL.
+ *
+ * The fixture is an AUTHENTICATED INSTALLED PROJECT, not a bare repository:
+ * Spec #168 / ticket #169 routes `poiesis verify` through the shared
+ * lifecycle authority, which resolves the manifest, the runtime identity
+ * and the receipt-authenticated ownership proof from the PRIMARY
+ * installation before any verification command runs. Without that
+ * authority the built CLI fails closed one step earlier with
+ * `RUNTIME_VERSION_MISMATCH` (no manifest) or `OWNERSHIP_RECEIPT_MISSING`,
+ * and the redaction assertions below would never reach the surface this
+ * ticket exists to pin. Neither fact mentions the remote, so the failure
+ * they still observe is the verification command's own — unchanged.
  */
 async function writePushVerificationConfig(root: string): Promise<string> {
   await mkdir(join(root, ".poiesis"), { recursive: true });
@@ -123,11 +136,38 @@ async function writePushVerificationConfig(root: string): Promise<string> {
       2,
     )}\n`,
   );
-  // The config is part of the candidate the command verifies, so it is
-  // committed: an uncommitted file would fail the clean-workspace gate
-  // before the verification command ever ran.
-  await run("git", ["add", ".poiesis/config.jsonc"], { cwd: root });
+  // The manifest records the EXECUTING runtime version, so the runtime
+  // identity guard recognises this project as installed by the very runtime
+  // that is running it. A version read from this repository's own
+  // `package.json` is that runtime, because the built bundle resolves its
+  // version from the same file.
+  const { version } = JSON.parse(await readFile(join(import.meta.dirname, "..", "package.json"), "utf8")) as {
+    version: string;
+  };
+  await writeFile(
+    join(root, ".poiesis", "manifest.json"),
+    `${JSON.stringify(
+      {
+        schema: 1,
+        poiesisVersion: version,
+        adapter: { harness: "opencode", adapterVersion: "test", supportedVersion: version },
+        files: [],
+        skills: [],
+        configPatches: [],
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  // Both installed files are part of the candidate the command verifies, so
+  // they are committed: an uncommitted file would fail the clean-workspace
+  // gate before the verification command ever ran.
+  await run("git", ["add", ".poiesis/config.jsonc", ".poiesis/manifest.json"], { cwd: root });
   await run("git", ["commit", "-q", "-m", "verification config"], { cwd: root });
+  // The ownership proof the lifecycle authority authenticates the manifest
+  // with. It is written into the repository's Git common directory, never
+  // into the candidate tree, so it cannot disturb the exact-SHA clean gate.
+  await createOwnershipReceipt(root, await loadManifest(root));
   return (await run("git", ["rev-parse", "HEAD"], { cwd: root })).stdout;
 }
 
@@ -408,8 +448,17 @@ describe("real Git output", () => {
  * runs, so a source-only guarantee would leave the CLI free to print the
  * credential. The bundle is built into a dedicated out-dir so it cannot
  * race the suites that own `dist/`.
+ *
+ * Spec #168 / ticket #176: `poiesis verify` executes the configured
+ * command TEXT, so on a host with no strong containment the built CLI
+ * refuses with `PROCESS_CONTAINMENT_UNAVAILABLE` before spawning anything.
+ * That is the HOST's capability, not this code, so the whole suite takes
+ * the one shared capability gate and skips there — the same gate
+ * `tests/cli-cancellation.test.ts` uses for the same reason. The
+ * redaction assertions themselves are untouched and still run wherever the
+ * gate lets them run.
  */
-describe("the built package never prints a subprocess credential", () => {
+describeManagedExecution("the built package never prints a subprocess credential", () => {
   const outDir = "dist-ticket-149";
   let cliPath: string | undefined;
 
