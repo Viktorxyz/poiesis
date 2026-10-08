@@ -17,6 +17,16 @@
  *
  * The contract these tests hold:
  *
+ *   0. THE CANDIDATE IS OWNED, AND ITS PROOF IS AUTHENTICATED. Spec #168 /
+ *      ticket #169 fails a delivery operation closed unless Poiesis can prove
+ *      it owns the workspace it was handed, and ticket #171 / #186 bind the
+ *      forwarded proof and Publish evidence to the runtime-owned verification
+ *      receipt that Publish resolved for that exact candidate. So the linked
+ *      worktree below is prepared as a Poiesis-owned candidate workspace and
+ *      the fixture carries the REAL receipt pair rather than a structurally
+ *      valid stand-in. Neither is an extra hurdle #139 added: both are the
+ *      current production contract, and satisfying it here is what lets these
+ *      assertions below be about the thing #139 is actually about.
  *   1. AUTHORITY IS DERIVED, NOT SUPPLIED. The delivery seams derive the
  *      installation root structurally, from Git's own two-path report, and no
  *      caller can pass an authority in. A configured linked worktree therefore
@@ -49,18 +59,18 @@ import {
   type PreviewDeliveryInput,
   type PreviewDeliveryResult,
   type ProductionPromotionInput,
+  type ProofPayload,
   type StagingPromotionInput,
 } from "../src/adapters.js";
+import type { PublishEvidence } from "../src/evidence.js";
 import { commandPreview, commandPromote } from "../src/cli.js";
-import { resolveTree } from "../src/git.js";
+import { publish, resolveTree, workspacePrepare } from "../src/git.js";
 import { assertDeliveryPolicyAllows } from "../src/lifecycle-policy.js";
 import { init, resolveInstallationRoot } from "../src/maintenance.js";
-import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 
 const REPO_ROOT = join(import.meta.dirname, "..");
-const CHANGE_BRANCH = "poiesis/linked-change";
 const WORKTREE_BRANCH = "poiesis/linked-worktree";
 
 /** One delivery subprocess, as the probe recorded it. */
@@ -74,11 +84,16 @@ interface DeliveryRun {
 
 interface LinkedDeliveryFixture {
   repository: TestRepository;
-  /** The linked worktree of the same clone: no `.poiesis` state of its own. */
+  /** The linked worktree of the same clone: no `.poiesis` install state of its own. */
   worktree: string;
-  changeBranch: string;
+  /** The Poiesis ownership identity of that candidate workspace. */
+  ownershipId: string;
   sha: string;
   tree: string;
+  /** Proof carrying the runtime-owned verification receipt Publish resolved. */
+  proof: ProofPayload;
+  /** Canonical Publish evidence, bound to that same receipt. */
+  publish: PublishEvidence;
   delivery: { adapter: "command"; command: string[] };
   logPath: string;
 }
@@ -109,25 +124,63 @@ async function configuredInstall(): Promise<LinkedDeliveryFixture> {
   const logPath = join(repository.parent, "delivery-runs.jsonl");
   await writeFile(script, probeScript(logPath), "utf8");
   const delivery = { adapter: "command" as const, command: ["node", script, "{sha}", "{target}"] };
-  // The Publish evidence the preview revalidates against the remote.
-  await run("git", ["push", "--quiet", "origin", `${repository.baseSha}:refs/heads/${CHANGE_BRANCH}`], {
-    cwd: repository.root,
-  });
   await init(
     repository.root,
     { ...testConfig(repository), delivery: { preview: delivery, staging: delivery, production: delivery } },
     { skipSkills: true, allowFixtureAdapters: true },
   );
   const worktree = join(repository.parent, "linked");
-  await run("git", ["worktree", "add", "--quiet", "--no-track", "-b", WORKTREE_BRANCH, worktree], {
+  // Spec #168 / ticket #169: the linked worktree is a Poiesis-OWNED candidate
+  // workspace, prepared at an explicit path outside the project root so it
+  // stays a real linked worktree of the primary clone. Ownership is what the
+  // shared lifecycle authority proves before any delivery operation runs, so
+  // the worktree Poiesis never prepared is refused with
+  // `WORKSPACE_OWNERSHIP_UNKNOWN` rather than being allowed to inherit the
+  // primary's authority. It still carries NONE of the primary's install state:
+  // no manifest and no config of its own.
+  const workspace = await workspacePrepare({
     cwd: repository.root,
+    remote: "origin",
+    integrationBranch: "main",
+    branch: WORKTREE_BRANCH,
+    specId: "spec-linked-worktree",
+    workspacePath: worktree,
+  });
+
+  const sha = repository.baseSha;
+  const tree = await resolveTree(repository.root, sha);
+  // Spec #168 / ticket #171 + #186: a forwarded proof and the Publish evidence
+  // Preview receives must both name the SAME runtime-owned verification
+  // receipt, resolved against this owned candidate's authority and the primary
+  // installation's live plan. A structurally valid but synthetic reference
+  // cannot stand in: Preview authenticates it against the stored receipt.
+  const proof = await verifiedProof({
+    cwd: workspace.path,
+    ownershipId: workspace.ownershipId,
+    candidateSha: sha,
+    candidateTree: tree,
+  });
+  const published = await publish({
+    cwd: workspace.path,
+    ownershipId: workspace.ownershipId,
+    remote: "origin",
+    integrationBranch: "main",
+    candidateSha: sha,
+    candidateTree: tree,
+    provider: "fixture",
+    project: repository.fixtures,
+    title: "Linked worktree candidate",
+    body: "body",
+    proof,
   });
   return {
     repository,
     worktree,
-    changeBranch: CHANGE_BRANCH,
-    sha: repository.baseSha,
-    tree: await resolveTree(repository.root, repository.baseSha),
+    ownershipId: workspace.ownershipId,
+    sha,
+    tree,
+    proof,
+    publish: published.evidence,
     delivery,
     logPath,
   };
@@ -154,8 +207,8 @@ function previewInput(fixture: LinkedDeliveryFixture): PreviewDeliveryInput {
   return {
     sha: fixture.sha,
     candidateTree: fixture.tree,
-    proof: proofShell(fixture.sha, fixture.tree),
-    publish: publishEvidence(fixture.sha, fixture.tree, fixture.changeBranch),
+    proof: fixture.proof,
+    publish: fixture.publish,
     remote: "origin",
   };
 }
@@ -180,7 +233,7 @@ function productionInput(fixture: LinkedDeliveryFixture, identity: DeliveryIdent
     },
     integrationRemote: "origin",
     integrationBranch: "main",
-    proof: proofShell(fixture.sha, fixture.tree),
+    proof: fixture.proof,
     integration: {
       candidateSha: fixture.sha,
       candidateTree: fixture.tree,
@@ -284,18 +337,24 @@ describe("a configured linked worktree is guarded by the primary install and del
     await expectRunInside(fixture.worktree, runs[2]!, "the Production delivery command");
   }, 120_000);
 
-  it("still guards and delivers in the primary checkout when the primary is the root", async () => {
+  it("is still governed by the primary install when the primary is the root, not treated as uninstalled", async () => {
     const fixture = await configuredInstall();
-    const { preview, runs } = await deliverChain(fixture.repository.root, fixture);
+    // The primary checkout is not a delivery AUTHORITY root: Publish is a
+    // candidate-workspace mutation, so the runtime receipt and the canonical
+    // Publish evidence Preview authenticates are bound to the OWNED candidate
+    // and its ownership identity, and invoking the primary cannot present
+    // evidence about itself. What must not regress is the defect this Spec
+    // fixed: a root that carries none of the primary's install state used to be
+    // refused as an UNINSTALLED PROJECT with `RUNTIME_VERSION_MISMATCH` /
+    // `CONFIG_NOT_INSTALLED`, naming a managed path the Author never had. The
+    // primary is read as the primary installation here, and the refusal is the
+    // workspace binding alone.
+    await expect(
+      previewDelivery(fixture.delivery, previewInput(fixture), fixture.repository.root),
+    ).rejects.toMatchObject({ code: "VERIFICATION_RECEIPT_WORKSPACE_MISMATCH" });
 
-    expect(preview.target).toBe("preview");
-    expect(runs.map((entry) => entry.target)).toEqual(["preview", "staging", "production"]);
-    expect(runs.map((entry) => entry.artifactIdentity)).toEqual([
-      `artifact-preview-${fixture.sha}`,
-      `artifact-staging-${fixture.sha}`,
-      `artifact-staging-${fixture.sha}`,
-    ]);
-    for (const entry of runs) await expectRunInside(fixture.repository.root, entry, "the primary delivery command");
+    // The refusal precedes every delivery effect, from either root.
+    expect(deliveryRuns(fixture)).toHaveLength(0);
   }, 120_000);
 });
 
@@ -354,9 +413,9 @@ describe("the delivery library seam and the poiesis CLI decide alike", () => {
       await commandPreview([
         ...candidate,
         "--proof",
-        JSON.stringify(proofShell(fixture.sha, fixture.tree)),
+        JSON.stringify(fixture.proof),
         "--publish",
-        JSON.stringify(publishEvidence(fixture.sha, fixture.tree, fixture.changeBranch)),
+        JSON.stringify(fixture.publish),
       ]);
       // The CLI consumes the operation-produced receipts, exactly as an
       // operator would hand them over.
@@ -370,7 +429,7 @@ describe("the delivery library seam and the poiesis CLI decide alike", () => {
         "--authorization",
         JSON.stringify(productionInput(fixture, staging).productionAuthorization),
         "--proof",
-        JSON.stringify(proofShell(fixture.sha, fixture.tree)),
+        JSON.stringify(fixture.proof),
         "--integration",
         JSON.stringify(productionInput(fixture, staging).integration),
       ]);

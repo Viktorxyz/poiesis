@@ -40,7 +40,35 @@ export interface RollbackDiagnostic {
   expected?: ArtifactIdentity;
   actual?: ArtifactIdentity;
   error?: string;
+  /**
+   * Spec #168 / ticket #178 — where the preimage still exists when the
+   * destination could not be restored.
+   *
+   * A restoration that fails leaves its preimage where an operator can recover
+   * it, and this names that location. It is never a path the journal then
+   * removes: deleting the only remaining copy would turn a reported
+   * incomplete rollback into unrecoverable data loss.
+   */
+  preimageRecoveredAt?: string;
 }
+
+/**
+ * Spec #168 / ticket #178 — the seams the directory-mode restoration reads the
+ * host through.
+ *
+ * `moveRestorationCandidate` defaults to `rename`. It exists because the failure
+ * this redesign exists to survive is a DEVICE failure, and a test machine whose
+ * `os.tmpdir()` shares the workspace's filesystem would never produce one. The
+ * seam changes WHAT the restore calls, never WHAT it accepts: the production
+ * default is the real `rename`, and an injected `EXDEV` only makes the
+ * same-device guarantee fail the way a real cross-device host does.
+ */
+export interface ArtifactJournalOptions {
+  moveRestorationCandidate?: (from: string, to: string) => Promise<void>;
+}
+
+/** Prefix of the transient, Poiesis-owned directory a preimage is staged into. */
+const RESTORE_STAGING_PREFIX = ".poiesis-restore-";
 
 async function identity(path: string): Promise<ArtifactIdentity> {
   try {
@@ -103,8 +131,14 @@ function identitiesEqual(left: ArtifactIdentity, right: ArtifactIdentity): boole
 export class ArtifactJournal {
   readonly entries: ArtifactJournalEntry[] = [];
   private backupRoot: string | undefined;
+  private readonly options: ArtifactJournalOptions;
 
-  constructor(private readonly limit: number) {}
+  constructor(
+    private readonly limit: number,
+    options: ArtifactJournalOptions = {},
+  ) {
+    this.options = options;
+  }
 
   private async ensureBackupRoot(): Promise<string> {
     if (this.backupRoot !== undefined) return this.backupRoot;
@@ -318,30 +352,136 @@ export class ArtifactJournal {
       await this.cleanupBackup(entry);
       return;
     }
-    try {
-      if (entry.physicalExists) {
-        if (entry.preimageBackup === undefined) {
-          diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: "preimage backup missing" });
-          return;
-        }
-        // The transaction-owned directory still matches the journal's
-        // transaction-written identity, so the foreign-write window is
-        // closed: rename the preimage backup back to the destination.
-        // This atomically overwrites the transaction-authored tree and
-        // is the byte-for-byte preimage restored by the journal.
+    if (!entry.physicalExists) {
+      // The destination did not exist before the transaction. Roll
+      // back by removing the transaction-authored directory.
+      try {
         await rm(entry.path, { recursive: true, force: true });
-        await rename(entry.preimageBackup, entry.path);
-      } else {
-        // The destination did not exist before the transaction. Roll
-        // back by removing the transaction-authored directory.
-        await rm(entry.path, { recursive: true, force: true });
+      } catch (error) {
+        diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: String(error) });
       }
-    } catch (error) {
-      diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: String(error) });
+      await this.cleanupBackup(entry);
+      return;
     }
+    if (entry.preimageBackup === undefined) {
+      diagnostics.push({ path: entry.path, reason: "restore-failed", expected, actual, error: "preimage backup missing" });
+      return;
+    }
+    // Spec #168 / ticket #178: the preimage is COPIED onto the destination's
+    // own filesystem FIRST. The journal's backup lives under `os.tmpdir()`,
+    // which is routinely a different device from the workspace it protects, so
+    // the `rename(backup -> destination)` this path used to perform could fail
+    // `EXDEV` — after the transaction-written destination had already been
+    // removed — and the backup was then cleaned up as though the restoration
+    // had worked. That destroyed the only copy of the preimage while the run
+    // merely reported an incomplete rollback.
+    //
+    // Copying first removes the device dependency from the move that matters:
+    // `cp` reads across devices by definition, and the staged candidate then
+    // shares a filesystem with the destination. Nothing is removed until that
+    // candidate exists, and the backup survives every step that follows, so a
+    // failure can only ever leave a recoverable copy behind — never none.
+    let staged: string;
+    try {
+      staged = await this.stageRestorationCandidate(entry);
+    } catch (error) {
+      // The destination is untouched at this point, and the backup is retained:
+      // a failed restoration must cost the operator nothing.
+      diagnostics.push({
+        path: entry.path,
+        reason: "restore-failed",
+        expected,
+        actual,
+        error: `the preimage could not be staged on the destination filesystem: ${String(error)}`,
+        preimageRecoveredAt: entry.preimageBackup,
+      });
+      return;
+    }
+    try {
+      await rm(entry.path, { recursive: true, force: true });
+      await (this.options.moveRestorationCandidate ?? rename)(staged, entry.path);
+    } catch (error) {
+      // Either the destination could not be removed or the same-device move
+      // failed. The staged candidate still holds the preimage and is named, so
+      // the operator can recover it; the backup is retained alongside it.
+      diagnostics.push({
+        path: entry.path,
+        reason: "restore-failed",
+        expected,
+        actual,
+        error: String(error),
+        preimageRecoveredAt: staged,
+      });
+      return;
+    }
+    // The preimage is back in place, so the backup has done its job.
     await this.cleanupBackup(entry);
   }
 
+  /**
+   * Spec #168 / ticket #178 — put a byte-for-byte copy of the preimage on the
+   * DESTINATION's own filesystem, and prove it is that preimage.
+   *
+   * The same identity and symlink safety the journal already applies to the
+   * destination is applied to the candidate before anything is removed: it must
+   * be a real directory (never a symlink or a device) and, whenever the capture
+   * recorded a preimage hash, it must hash to exactly that. A candidate that
+   * fails either check is removed immediately and the caller keeps the backup —
+   * so a wrong or unsafe candidate can never become the restored tree.
+   */
+  private async stageRestorationCandidate(entry: ArtifactJournalEntry): Promise<string> {
+    const backup = entry.preimageBackup;
+    if (backup === undefined) {
+      throw new PoiesisError("ARTIFACT_JOURNAL_BACKUP_MISSING", "Directory rollback has no preimage backup", {
+        path: entry.path,
+      });
+    }
+    const staged = `${dirname(entry.path)}/${RESTORE_STAGING_PREFIX}${randomUUID()}`;
+    try {
+      await cp(backup, staged, { recursive: true, errorOnExist: true, force: false });
+    } catch (error) {
+      await rm(staged, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+    try {
+      const stats = await lstat(staged);
+      if (!stats.isDirectory() || stats.isSymbolicLink()) {
+        throw new PoiesisError("ARTIFACT_IDENTITY_INVALID", "Staged restoration candidate is not a real directory", {
+          path: staged,
+        });
+      }
+      const stagedIdentity: ArtifactIdentity = {
+        exists: true,
+        kind: "directory",
+        hash: await hashDirectoryTree(staged),
+      };
+      if (
+        entry.expectedPreWriteIdentity.hash !== undefined &&
+        stagedIdentity.hash !== entry.expectedPreWriteIdentity.hash
+      ) {
+        throw new PoiesisError("ARTIFACT_IDENTITY_DRIFT", "Staged restoration candidate is not the captured preimage", {
+          path: staged,
+          expected: entry.expectedPreWriteIdentity,
+          actual: stagedIdentity,
+        });
+      }
+      return staged;
+    } catch (error) {
+      await rm(staged, { recursive: true, force: true }).catch(() => undefined);
+      throw error;
+    }
+  }
+
+  /**
+   * Remove a backup whose preimage no longer needs protecting: the transaction
+   * committed, the destination did not exist before it, or the journal declined
+   * to overwrite a foreign write.
+   *
+   * Spec #168 / ticket #178: this is deliberately NOT reached from a
+   * restoration that failed. A backup is the only copy of a preimage that
+   * failed to come back, so it is retained and named in the diagnostic
+   * instead — a rollback that cannot restore must not also delete.
+   */
   private async cleanupBackup(entry: ArtifactJournalEntry): Promise<void> {
     if (entry.preimageBackup === undefined) return;
     await rm(entry.preimageBackup, { recursive: true, force: true }).catch(() => undefined);
@@ -351,6 +491,111 @@ export class ArtifactJournal {
 export interface WorkspaceMutationLock {
   path: string;
   release(): Promise<void>;
+}
+
+/** Spec #168 / ticket #174 — what the lock file says about its holder. */
+interface MutationLockHolder extends Record<string, unknown> {
+  /** The pid recorded in the lock token, or `null` when it cannot be attributed. */
+  holderPid: number | null;
+  /** `true` / `false` when the holder is attributable, `null` when it is not. */
+  holderRunning: boolean | null;
+  /** Stable machine-readable classification of the blocked state. */
+  hint: "live-mutation-lock" | "stale-mutation-lock" | "unattributable-mutation-lock";
+  /** The one recovery that is correct for this exact state. */
+  recovery: string;
+}
+
+/**
+ * `process.kill(pid, 0)` is the only portable liveness probe available here,
+ * and it is a probe, not a claim of identity: it answers "does a process with
+ * this pid exist right now", never "is it still the Poiesis session that wrote
+ * the lock". The diagnostic therefore reports liveness as evidence and never
+ * lets it decide anything on its own.
+ *
+ * `EPERM` means the process exists but is owned by another user, which still
+ * answers `true`. Every other error (notably `ESRCH`) means it is gone.
+ */
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+/**
+ * Spec #168 / ticket #174 — turn a held lock into an ACTIONABLE refusal.
+ *
+ * A lock survives its holder: when a Poiesis session dies without releasing
+ * it, the next mutation finds a file whose owner is gone. Reporting only the
+ * path leaves the operator unable to answer the two questions that matter
+ * ("is something actually running?" and "what do I do now?"), and the
+ * tempting wrong answer — deleting the lock — is precisely the bypass this
+ * path must never take, because a LIVE concurrent mutation would be stolen.
+ *
+ * So the refusal names the holder, states whether it is still running, and
+ * gives the one recovery valid for that state:
+ *
+ *   - live holder → wait for it, then re-run. Never remove a live lock.
+ *   - stale holder → confirm no Poiesis mutation is running, then remove this
+ *     one file and re-run. Never reclaimed automatically.
+ *   - unattributable holder → the bytes are not a Poiesis lock token, so
+ *     Poiesis refuses to guess who owns them; inspect the file, then remove it
+ *     and re-run.
+ *
+ * Every branch still refuses. Nothing here writes, removes, or rewrites the
+ * lock, and the caller still gets the same `POIESIS_MUTATION_LOCKED` code it
+ * has always handled.
+ */
+async function describeMutationLockHolder(path: string): Promise<MutationLockHolder> {
+  let token: string;
+  try {
+    token = await readFile(path, "utf8");
+  } catch {
+    // The holder released between our create attempt and this read. The
+    // mutation is still refused — a lock this race-y is not one Poiesis may
+    // assume it owns — but the operator is told the state is unattributable.
+    return {
+      path,
+      holderPid: null,
+      holderRunning: null,
+      hint: "unattributable-mutation-lock",
+      recovery: `Another Poiesis mutation may be finishing for this workspace. Re-run the same command; if it keeps failing, confirm no Poiesis mutation is running, then remove ${path} and re-run.`,
+    };
+  }
+  // The token is exactly `<pid>:<uuid>\n`. A positive-integer pid is required,
+  // not cosmetic: `process.kill(0, 0)` addresses a whole process group, so a
+  // `0` pid would probe something other than a single holder. Anything that is
+  // not a well-formed token — including a pid Poiesis would refuse to probe —
+  // is unattributable, which is the fail-closed answer.
+  const match = /^([1-9][0-9]*):[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n?$/.exec(token);
+  if (match === null) {
+    return {
+      path,
+      holderPid: null,
+      holderRunning: null,
+      hint: "unattributable-mutation-lock",
+      recovery: `${path} is held by bytes that are not a Poiesis mutation lock, so Poiesis cannot tell who owns them. Inspect the file, then remove ${path} and re-run the same command.`,
+    };
+  }
+  const holderPid = Number.parseInt(match[1]!, 10);
+  if (isProcessAlive(holderPid)) {
+    return {
+      path,
+      holderPid,
+      holderRunning: true,
+      hint: "live-mutation-lock",
+      recovery: `A Poiesis mutation is running for this workspace (pid ${holderPid}). Wait for it to finish, then re-run the same command. Do NOT remove ${path}: the running mutation still owns it.`,
+    };
+  }
+  return {
+    path,
+    holderPid,
+    holderRunning: false,
+    hint: "stale-mutation-lock",
+    recovery: `${path} is a stale lock: the Poiesis mutation that wrote it (pid ${holderPid}) is no longer running. Poiesis will not reclaim it automatically. Confirm no Poiesis mutation is running, then remove ${path} and re-run the same command.`,
+  };
 }
 
 /** Acquire one fail-fast, cooperating mutation lock for the canonical workspace receipt key. */
@@ -363,7 +608,8 @@ export async function acquireWorkspaceMutationLock(root: string): Promise<Worksp
     await atomicCreate(path, token);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new PoiesisError("POIESIS_MUTATION_LOCKED", "Another Poiesis mutation is active for this workspace", { path });
+      const holder = await describeMutationLockHolder(path);
+      throw new PoiesisError("POIESIS_MUTATION_LOCKED", "Another Poiesis mutation is active for this workspace", holder);
     }
     throw error;
   }

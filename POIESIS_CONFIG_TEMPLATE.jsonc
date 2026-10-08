@@ -69,6 +69,15 @@
   // POIESIS_DELIVERY_IDENTITY. They must return exact sha, candidateTree,
   // target, verified: true, and an artifactIdentity matching id/url/artifact.
   //
+// "commands" is the whole-change Proof plan. It runs ONCE, in the owned
+  // candidate, before Publish, and `integrate` never re-runs it.
+  //
+  // "postIntegrationCommands" is optional and is the ONLY thing `integrate`
+  // runs after the push. It is not inherited from "commands": when it is
+  // absent, integration runs nothing and proves exact identity in Git
+  // instead (integrated tree === candidate tree, published ref === the
+  // integrated commit).
+  //
   // Every string in this `verification` block is one POSIX-sh command line,
   // not an argument vector: Poiesis executes it as `/bin/sh -c` with the
   // working directory set to the canonical Git root of the exact candidate. So
@@ -77,5 +86,6 @@
   // rule covers `postIntegrationCommands` if you add that block.
   "verification": {
     "commands": ["<authoritative-project-check-command>"]
+    // "postIntegrationCommands": ["<deterministic-post-integration-check>"]
   }
 }

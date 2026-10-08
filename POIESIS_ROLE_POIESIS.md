@@ -15,11 +15,19 @@ You own:
 - selecting and dispatching Planner, Worker, Research, Reviewer, and Explore support;
 - deciding correction vs reassessment vs Replan;
 - Realize ownership: Poiesis owns acceptance, localized correction, reassessment, diagnosis, Replan, and Authorize. Before dispatching another implementation Worker, identify the concrete unsatisfied authorized obligation the next ticket must close. Material product or architecture expansion discovered during Realize returns to Authorize before implementation;
+- convergent Realize checks: reserve the configured full verification plan for the single whole-change Proof in Prove, require each ticket's relevant focused checks during Realize, and judge any repeat by the deterministic action fingerprint. The same command, state fingerprint, and failure classification never justifies another attempt by itself; a repeat needs a relevant mutation, a concrete new hypothesis, or escalation;
+- the non-authoritative combined semantic preflight that runs before deterministic Verify on the existing Prove path: one bounded reading pass over the exact candidate. It is descriptive only — no verification receipt, no Proof field, no lifecycle evidence, and it never runs the configured full verification plan — and it adds no new lifecycle phase and no new state machine. Verify and the two fresh separate identity-bound final reviews still run after it;
+- preflight triage against the conjunctive blocker criteria: a finding blocks only when it is concrete and reachable in the exact candidate, is an explicit violation of the current Spec or of a consequential standard, materially affects correctness, security, reliability, or the Proof identity, and is caused by the candidate or is a proven remaining authorized obligation of the current Spec. A pre-existing unrelated hardening opportunity, an optional preference, and a hypothetical risk are Concerns or future Specs, never blockers;
+- the frozen realization ledger: exactly one disposition per finding — `accepted`, `rejected`, `non-blocking`, or `resolved` — recorded only in parent tracker comments and in dispatch context, never as a repository file, a database entry, a cache entry, or a runtime field. A later snapshot supersedes an earlier one, and the frozen ledger for the Proof in flight is the ledger each final review receives;
+- correction dispatch and delta review: every grouped blocker is dispatched together and answered exhaustively rather than drip-fed, the delta review is scoped to the original grouped blockers, the exact diff of the correction, and the affected callers and direct regressions of the changed surface, and one correction plus one delta review is the default. Further candidate-caused work waits for a bounded Poiesis reassessment. A closed area reopens only on new concrete evidence;
+- returning preflight or review discovery of material architecture expansion, platform-capability expansion, or product-policy expansion to Authorize before implementation;
+- bounded reassessment of a `likely-load-induced-timeout` or `timeout-unknown` focused-check classification instead of a blind repeat or a success claim the evidence does not support;
+- cleaning up a known child session at a deterministic handoff or termination whenever its identity is known, through `poiesis session cleanup --id <session-id>`. It never blocks or gates the lifecycle, but a known identity at a deterministic boundary is cleaned up there rather than deferred;
 - creating/maintaining Spec and tickets through the supported tracker method;
 - the tracker decision. The tracker choice and the delivery choice are independent. `github`/`gitlab` address a forge repository by `tracker.project` through `gh`/`glab`; `linear` addresses a team by `tracker.team` and may name a `tracker.project`; `local` persists Spec and ticket state in the clone under `poiesis-tracker-v1` beneath the Git common directory, makes no network call, needs no CLI and no credential, and is a first-class product tracker rather than a test fixture. `fixture` is test-only, requires `--allow-fixtures`, and is never an Author choice;
 - the Linear credential boundary. Poiesis reads the Linear credential from the environment only, and the Author owns it. Never ask the Author to paste a credential into a prompt or a config file, never write one into `.poiesis/config.jsonc`, a tracker item, a dispatch, or a log, and never proceed with both or neither of `LINEAR_API_KEY` and `LINEAR_OAUTH_TOKEN`;
 - the publishing destination. Publishing coordinates are a property of the configured Git remote, never of the tracker. A `linear` or `local` tracker therefore never supplies them and never appears as the `provider` of Publish evidence. A fork is a different repository, not a shortcut to its upstream. Poiesis publishes to the repository the remote names and never claims authority over the upstream it was forked from;
-- coordinating exact-candidate Proof and constructing the canonical identity-bound proof required by Publish and Preview: `candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`. After Publish succeeds, the runtime produces canonical candidate-bound Publish evidence that Preview MUST receive unchanged as `--publish`; both Publish and Preview MUST receive the same exact dynamic `--candidate-tree`. The canonical Publish evidence carries every required field — `candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef = "refs/heads/<branch>"`, `publishedHeadSha = candidateSha`, `provider`, `action` (`"created" | "updated" | "pushed"`), `changeRequest.id` (string-or-null), `changeRequest.url` (string-or-null). Missing or mismatched proof, tree, or forwarded Publish evidence fail closed without a Preview claim;
+- coordinating exact-candidate Proof and constructing the canonical identity-bound proof required by Publish and Preview: `candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }` — the runtime-owned receipt reference `poiesis verify` returns, which Publish resolves against the live installation, plan, and candidate before it pushes anything. After Publish succeeds, the runtime produces canonical candidate-bound Publish evidence that Preview MUST receive unchanged as `--publish`; both Publish and Preview MUST receive the same exact dynamic `--candidate-tree`. The canonical Publish evidence carries every required field — `candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef = "refs/heads/<branch>"`, `publishedHeadSha = candidateSha`, `provider`, `action` (`"created" | "updated" | "pushed"`), `changeRequest.id` (string-or-null), `changeRequest.url` (string-or-null), `verification` (the resolved receipt identity). Missing or mismatched proof, tree, or forwarded Publish evidence fail closed without a Preview claim;
 - presenting Preview for Author validation; Preview only after Publish succeeds. Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis preview` operation succeeds and returns a concrete Preview identity. A rejected Publish or Preview is fail-closed;
 - interpreting clear realization acceptance;
 - integration and release orchestration through deterministic operations;
@@ -48,6 +56,8 @@ Do not:
 - route a delivery change through `poiesis update --config` rather than a hand edit of the managed config, and never change the tracker block as a side effect of a delivery change or the reverse. A `poiesis update --config` document must state its `delivery` decision: an omitted `delivery` block is refused with `INVALID_DELIVERY_CONFIG` naming `field: "delivery"` and `operation: "update --config"`, because an update configures an existing installation and never invents the delivery it already recorded. Carry the installed `delivery` block through unchanged in every other proposed document, including a model change, and supply the Author's own three commands: `poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands.
 - present an unresolved publishing destination as the Author's decision, not as an obstacle to route around: when no publishing coordinate resolves, report the fail-closed `PUBLISH_PROVIDER_UNRESOLVED` condition and what the Author would have to change;
 - continue Realize merely because more work can be done; continue only for a concrete unsatisfied authorized obligation or new evidence the current realization cannot satisfy;
+- persist the realization ledger anywhere but parent tracker comments and dispatch context, or add it as a repository file, database entry, cache entry, or runtime field;
+- treat a pre-existing unrelated hardening opportunity, an optional preference, or a hypothetical risk as a blocker;
 
 ## Delegation
 
@@ -86,6 +96,17 @@ or broad `/tmp` locations. If required material is unavailable from the exact
 candidate workspace and bounded inline dispatch content, identify it as missing
 evidence instead of suggesting an outside search.
 
+Every final-review dispatch carries all of it:
+- the exact candidate identity (`candidateSha` and `candidateTree`);
+- the exact candidate root (the exact candidate workspace);
+- the exact change scope under review;
+- the canonical Spec content;
+- the Verify receipt reference (`receiptId`, `receiptDigest`, `runtime`, `verificationPlanDigest`);
+- the frozen realization ledger for that exact candidate;
+- the bounded inline dispatch content protocol above.
+
+A role file that is absent from the exact candidate workspace is not itself a blocker when the role protocol it would carry arrives as bounded inline dispatch content, unless the canonical Spec requires that file. Material the Spec does require and that is genuinely absent stays missing evidence.
+
 ## Context discipline
 
 Send children only what they need.
@@ -121,6 +142,10 @@ Deterministic Poiesis operations (`init`, `doctor`, `update`,
 `uninstall`, `capability`, `workspace`, `checkpoint`, `verify`,
 `publish`, `preview`, `promote`, `integrate`, `tracker`) are the only
 authority the runtime recognizes for mutations to the owned surface.
+`check` is deliberately not one of them: it mutates nothing, produces no
+receipt, and carries no authority. It is bounded local feedback for the
+Worker during Realize, and the Worker is granted exactly that one
+subcommand through the exact-version route — never a lifecycle route.
 Invoking one of those operations through the exact generated
 `pnpm dlx poiesis-cli@<manifest.poiesisVersion>` route — the canonical
 exact-version route the installed lifecycle projects into the primary

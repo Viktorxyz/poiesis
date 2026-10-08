@@ -59,17 +59,19 @@ import {
   type DeliveryIdentity,
   type DeliveryResult,
   type ProductionPromotionInput,
+  type ProofPayload,
   type StagingPromotionInput,
 } from "../src/adapters.js";
-import { DELIVERY_TARGETS, renderDefaultDeliveryScript, type DeliveryTarget } from "../src/delivery-defaults.js";
+import { DELIVERY_TARGETS, deliveryScriptPath, renderDefaultDeliveryScript, type DeliveryTarget } from "../src/delivery-defaults.js";
 import { parseJsonc } from "../src/config.js";
+import type { PublishEvidence } from "../src/evidence.js";
 import { readUtf8 } from "../src/fs.js";
-import { resolveTree } from "../src/git.js";
+import { publish, resolveTree, workspacePrepare } from "../src/git.js";
 import { init } from "../src/maintenance.js";
 import { loadManifest } from "../src/manifest.js";
 import { run } from "../src/process.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
-import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, verifiedProof, type TestRepository } from "./helpers.js";
 
 /**
  * The Poiesis-owned runtime subtree, written as a LITERAL so a drifted
@@ -555,7 +557,10 @@ describe("the delivery adapter accepts the generated receipt and still refuses a
     expect(staging.artifactIdentity).not.toBe(preview.artifactIdentity);
 
     const production = await adapter("production").promote(
-      productionInput(sha, tree, staging),
+      // The delivery ADAPTER is driven directly here rather than through
+      // `promoteDelivery`, so the forwarded proof is the adapter's own delivery
+      // contract and is not receipt-authenticated; it stays the structural shell.
+      productionInput(sha, tree, staging, proofShell(sha, tree)),
     );
     // Production carries the verified Staging artifact forward, exposes it as
     // its id, and keeps its own record at `artifact`.
@@ -611,6 +616,65 @@ process.stdout.write(
 // 3. Through the PUBLIC API: the whole chain against a local bare remote.
 // =========================================================================
 
+/**
+ * Spec #168 / ticket #169 + #171 + #186 — a project-bound delivery operation
+ * runs in a Poiesis-OWNED candidate workspace, and the proof and Publish
+ * evidence it forwards must name the SAME runtime-owned verification receipt
+ * that Publish resolved for that exact candidate.
+ *
+ * This does not change what the two tests below are about. They exercise the
+ * GENERATED delivery defaults — the targets, the records each one writes, and
+ * the change-request handling — and every one of those assertions is reached
+ * exactly as before; the operation simply reaches them the way production
+ * reaches them. The generated targets are copied into the candidate because
+ * `init` invokes them as a RELATIVE `scripts/...` path resolved against the
+ * delivery execution root, and the candidate must therefore carry the same
+ * generated targets the primary got.
+ */
+async function ownedDeliveryCandidate(repository: TestRepository): Promise<{
+  root: string;
+  proof: ProofPayload;
+  publish: PublishEvidence;
+}> {
+  const workspace = await workspacePrepare({
+    cwd: repository.root,
+    remote: "origin",
+    integrationBranch: "main",
+    branch: "poiesis/generated-delivery",
+    specId: "spec-generated-delivery",
+  });
+  const sha = repository.baseSha;
+  const tree = await resolveTree(repository.root, sha);
+  const proof = await verifiedProof({
+    cwd: workspace.path,
+    ownershipId: workspace.ownershipId,
+    candidateSha: sha,
+    candidateTree: tree,
+  });
+  const published = await publish({
+    cwd: workspace.path,
+    ownershipId: workspace.ownershipId,
+    remote: "origin",
+    integrationBranch: "main",
+    candidateSha: sha,
+    candidateTree: tree,
+    provider: "fixture",
+    project: repository.fixtures,
+    title: "Generated delivery candidate",
+    body: "body",
+    proof,
+  });
+  await mkdir(join(workspace.path, "scripts"), { recursive: true });
+  for (const target of DELIVERY_TARGETS) {
+    await writeFile(
+      join(workspace.path, deliveryScriptPath(target)),
+      await readFile(join(repository.root, deliveryScriptPath(target)), "utf8"),
+      "utf8",
+    );
+  }
+  return { root: workspace.path, proof, publish: published.evidence };
+}
+
 describe("a project that took the generated defaults delivers preview, staging and production", () => {
   it("carries one candidate from a local bare remote through all three targets", async () => {
     const repository = await newRepository();
@@ -622,17 +686,18 @@ describe("a project that took the generated defaults delivers preview, staging a
     const delivery = await installedDelivery(repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const candidate = await ownedDeliveryCandidate(repository);
 
     const preview = await previewDelivery(
       delivery.preview,
       {
         sha,
         candidateTree: tree,
-        proof: proofShell(sha, tree),
-        publish: publishEvidence(sha, tree, "main"),
+        proof: candidate.proof,
+        publish: candidate.publish,
         remote: "origin",
       },
-      repository.root,
+      candidate.root,
     );
     expect(preview).toMatchObject({
       sha,
@@ -648,23 +713,27 @@ describe("a project that took the generated defaults delivers preview, staging a
     const staging = await promoteDelivery(
       delivery.staging,
       { sha, target: "staging", candidateTree: tree, identity: preview } satisfies StagingPromotionInput,
-      repository.root,
+      candidate.root,
     );
     expect(staging).toMatchObject({ target: "staging", verified: true, artifactIdentity: `poiesis:staging:${sha}` });
 
-    const production = await promoteDelivery(delivery.production, productionInput(sha, tree, staging), repository.root);
+    const production = await promoteDelivery(
+      delivery.production,
+      productionInput(sha, tree, staging, candidate.proof),
+      candidate.root,
+    );
     expect(production).toMatchObject({
       target: "production",
       verified: true,
       artifactIdentity: staging.artifactIdentity,
       id: staging.artifactIdentity,
     });
-    expect(production.artifact).toBe(await recordPath(repository.root, "production", sha));
+    expect(production.artifact).toBe(await recordPath(candidate.root, "production", sha));
 
     // Each target left its own inspectable record, and the ownership boundary
     // is unchanged: derived state, never a manifest record.
     for (const target of DELIVERY_TARGETS) {
-      expect(existsSync(await recordPath(repository.root, target, sha)), target).toBe(true);
+      expect(existsSync(await recordPath(candidate.root, target, sha)), target).toBe(true);
     }
     const manifest = await loadManifest(repository.root);
     expect(manifest.files.map((file) => file.path)).not.toContain("scripts/poiesis-preview.mjs");
@@ -683,20 +752,21 @@ describe("a project that took the generated defaults delivers preview, staging a
     const delivery = await installedDelivery(repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
+    const candidate = await ownedDeliveryCandidate(repository);
     const input = {
       sha,
       candidateTree: tree,
-      proof: proofShell(sha, tree),
-      publish: publishEvidence(sha, tree, "main"),
+      proof: candidate.proof,
+      publish: candidate.publish,
       remote: "origin",
     };
 
-    const withoutGh = await previewDelivery(delivery.preview, input, repository.root);
+    const withoutGh = await previewDelivery(delivery.preview, input, candidate.root);
     expect(withoutGh.url).toBeUndefined();
     expect(withoutGh.artifactIdentity).toBe(`poiesis:preview:${sha}`);
 
     gh.authenticate();
-    const withGh = await previewDelivery(delivery.preview, input, repository.root);
+    const withGh = await previewDelivery(delivery.preview, input, candidate.root);
 
     expect(withGh.url).toBe(FORGE_URL);
     expect(withGh.artifactIdentity).toBe(withoutGh.artifactIdentity);
@@ -713,7 +783,12 @@ async function installedDelivery(root: string): Promise<Record<DeliveryTarget, {
   return parsed.delivery;
 }
 
-function productionInput(sha: string, tree: string, staging: DeliveryIdentity): ProductionPromotionInput {
+function productionInput(
+  sha: string,
+  tree: string,
+  staging: DeliveryIdentity,
+  proof: ProofPayload,
+): ProductionPromotionInput {
   return {
     sha,
     target: "production",
@@ -729,7 +804,7 @@ function productionInput(sha: string, tree: string, staging: DeliveryIdentity): 
     },
     integrationRemote: "origin",
     integrationBranch: "main",
-    proof: proofShell(sha, tree),
+    proof,
     integration: {
       candidateSha: sha,
       candidateTree: tree,

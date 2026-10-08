@@ -39,6 +39,8 @@ import { asPoiesisError } from "../src/errors.js";
 import { inspect } from "../src/git.js";
 import { sanitizeGitRemoteUrl } from "../src/git-remote-url.js";
 import { composeInitDiscovery } from "../src/init-discovery.js";
+import { loadManifest } from "../src/manifest.js";
+import { createOwnershipReceipt } from "../src/receipt.js";
 import {
   autoResolveConfigDefaults,
   doctor,
@@ -345,6 +347,15 @@ describe("the built package never prints a remote credential", () => {
     const repository = await repositoryWithRemote(CREDENTIAL_REMOTE_UNRECOGNIZED);
     await writeMinimalConfig(repository.root);
     await writeMatchingManifest(repository.root);
+    // Spec #168 / ticket #169: every project-bound Publish resolves the shared
+    // lifecycle authority through the PRIMARY RECEIPT-AUTHENTICATED
+    // installation, so this hand-built install carries the ownership receipt
+    // that authority requires. Without it the operation fails closed one step
+    // earlier with `OWNERSHIP_RECEIPT_MISSING`, and the redaction assertions
+    // below would never reach the surface this ticket exists to pin. The receipt
+    // says nothing about the remote, so the refusal they still observe remains
+    // the coordinate resolution this test is about.
+    await createOwnershipReceipt(repository.root, await loadManifest(repository.root));
 
     const inspection = await run("node", [cli, "inspect"], { cwd: repository.root, allowFailure: true });
     expect(inspection.exitCode).toBe(0);

@@ -381,6 +381,10 @@ const forbiddenTypes = [
   "RollbackDiagnostic",
   "ArtifactIdentity",
   "ArtifactJournalEntry",
+  // Spec #168 / ticket #178: the restore seam that makes the directory-mode
+  // rollback's device independence testable stays internal with the journal it
+  // belongs to.
+  "ArtifactJournalOptions",
   "hashDirectoryTree",
   // Ticket #47: the capability-install transaction seam stays internal.
   "CapabilityInstallTransactionHooks",

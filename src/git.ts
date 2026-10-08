@@ -5,8 +5,21 @@ import { tmpdir } from "node:os";
 import { PoiesisError, invariant } from "./errors.js";
 import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { assertDeliveryPolicyAllows } from "./lifecycle-policy.js";
-import { bounded, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
-import { resolveGitRoot } from "./paths.js";
+import { bounded, boundedOutput, DEFAULT_VERIFY_TIMEOUT_MS, run, type RunResult } from "./process.js";
+import { runManagedShellCommand } from "./managed-shell.js";
+import { exists } from "./fs.js";
+import { poiesisPath, resolveGitRoot } from "./paths.js";
+import { loadManifest, type Manifest } from "./manifest.js";
+import { assertOwnershipReceipt, type OwnershipReceipt } from "./receipt.js";
+import {
+  createVerificationReceipt,
+  resolveLiveVerificationPlan,
+  resolveVerificationReceipt,
+  verificationEvidenceFrom,
+  type VerificationCommandClassification,
+  type VerificationCommandEvidenceV1,
+  type VerificationEvidence,
+} from "./verification-receipt.js";
 import {
   validateProofEvidence,
   validatePublishEvidence,
@@ -118,9 +131,26 @@ export interface VerifyOptions {
   cwd: string;
   candidateSha: string;
   commands: string[];
+  /**
+   * Spec #168 / ticket #169 — the Poiesis ownership identity of the
+   * candidate workspace. When supplied, the shared lifecycle authority
+   * must resolve a marker with exactly this ownership id or fail closed
+   * with `WORKSPACE_OWNERSHIP_ID_MISMATCH`.
+   */
+  ownershipId?: string;
   timeoutMs?: number;
   outputLimit?: number;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Spec #168 / ticket #176 — the caller's cancellation intent.
+   *
+   * The CLI dispatch owns one invocation-scoped controller and passes it here,
+   * so an operator's SIGINT/SIGTERM settles the managed commands instead of
+   * cutting the process off. A library caller may supply its own signal, or
+   * none at all: nothing is installed on its behalf and its own cancellation
+   * stays exactly as it declared it.
+   */
+  signal?: AbortSignal;
 }
 
 export interface VerifyCommandResult {
@@ -135,6 +165,17 @@ export interface VerifyResult {
   cleanBefore: true;
   cleanAfter: true;
   commands: VerifyCommandResult[];
+  /**
+   * Spec #168 / ticket #171 — the runtime-owned whole-change Verify evidence.
+   *
+   * A proof-scope Verify persists an immutable `VerificationReceiptV1` under
+   * the repository's shared Git common directory and returns the reference a
+   * caller forwards in `--proof`. `null` ONLY on the non-project-bound
+   * compatibility surface (a repository that never installed Poiesis), where
+   * there is no runtime / installation identity to bind a receipt to and no
+   * Publish can follow.
+   */
+  verification: VerificationEvidence | null;
 }
 
 export interface PublishOptions {
@@ -212,7 +253,7 @@ export interface WorkspaceCleanupResult {
   delivery: "integrated-tree";
 }
 
-interface OwnershipMarker {
+export interface OwnershipMarker {
   schema: 1;
   owner: "poiesis";
   ownershipId: string;
@@ -225,11 +266,139 @@ interface OwnershipMarker {
   baseSha: string;
 }
 
-interface OwnedWorkspace {
-  root: string;
+/**
+ * Spec #168 / ticket #169 — the shared lifecycle authority result.
+ *
+ * Every project-bound lifecycle operation on a prepared, Poiesis-owned
+ * candidate workspace resolves its authoritative manifest / config / runtime
+ * identity through the PRIMARY receipt-authenticated installation, never
+ * through the candidate's own generated `.poiesis/config.jsonc` (which is
+ * stale the moment the workspace is prepared and may even be committed into
+ * the candidate tree).
+ *
+ * `candidateRoot` is the canonical workspace the command executes in; every
+ * other field is the PRIMARY installation's authority. `marker` is `null`
+ * exactly when `candidateRoot` IS the primary checkout — the primary owns no
+ * Poiesis workspace marker, which is the pre-existing primary-checkout
+ * compatibility surface.
+ */
+export interface LifecycleAuthority {
+  /** Canonical workspace the command executes in. */
+  candidateRoot: string;
+  /** Canonical shared Git common directory of the repository. */
   commonDir: string;
+  /** Absolute path of the immutable ownership marker, or `null` on the primary checkout. */
+  markerPath: string | null;
+  /** The immutable ownership marker record, or `null` on the primary checkout. */
+  marker: OwnershipMarker | null;
+  /** Canonical primary checkout that owns the installation. */
+  primaryRoot: string;
+  /** Receipt-authenticated ownership receipt of the PRIMARY installation. */
+  receipt: OwnershipReceipt;
+  /** Receipt-authenticated manifest of the PRIMARY installation. */
+  manifest: Manifest;
+  /** Runtime identity the PRIMARY installation is bound to. */
+  runtime: string;
+}
+
+/** A `LifecycleAuthority` that is proven to own a Poiesis candidate workspace. */
+interface OwnedCandidateAuthority extends LifecycleAuthority {
   markerPath: string;
   marker: OwnershipMarker;
+}
+
+/**
+ * Spec #168 / ticket #172 — the observable, read-only state of a workspace
+ * a check ran against. Every field is evidence: `null` means "could not be
+ * proven", never "absent".
+ */
+export interface WorktreeStateFingerprint {
+  /** Canonical workspace the reading was taken from. */
+  root: string;
+  head: string | null;
+  tree: string | null;
+  dirty: boolean;
+  changedFiles: string[];
+  /**
+   * The changed-path LIST was bounded for evidence. A different fact from
+   * {@link statusCaptureTruncated}: everything below was read, and only this
+   * list was shortened.
+   */
+  changedFilesTruncated: boolean;
+  /**
+   * Spec #168 / ticket #179 — the status BYTES themselves were cut short by the
+   * process runner's capture bound, so the workspace was not read whole and
+   * more changed paths exist beyond this reading than the list can show.
+   *
+   * This is the only field of the three that means "state nobody observed".
+   * `changedFiles` and `pathDigests` below are derived exclusively from whole
+   * porcelain records, so neither can contain a path the bound cut in half.
+   */
+  statusCaptureTruncated: boolean;
+  /**
+   * Bounded per-path content digests for the changed paths.
+   *
+   * Without these, editing the CONTENTS of an already-dirty file leaves
+   * `head`, `tree`, `dirty`, and `changedFiles` all identical, so a changed
+   * state would be indistinguishable from an unchanged one.
+   */
+  pathDigests: WorktreePathDigest[];
+  /**
+   * The digest LIST was bounded by its own path count, not by how much of the
+   * status was read.
+   */
+  pathDigestsTruncated: boolean;
+}
+
+/**
+ * One changed path's content digest.
+ *
+ * `blob` is Git's own object id for the path's CURRENT worktree contents —
+ * the same digest family Git already stores in the index, trees, and the
+ * #171 verification receipt's `candidateTree`. It is a content digest, not
+ * content: it reveals no file bytes and no secret, and it is stable for
+ * identical bytes and different for different bytes.
+ *
+ * `absent` marks a changed path that no longer exists on disk (a deletion).
+ * It is deliberately NOT a valid object id, so a deleted path can never
+ * collide with a present one and two distinct states cannot collapse into one
+ * fingerprint input.
+ */
+export interface WorktreePathDigest {
+  path: string;
+  blob: string;
+}
+
+/**
+ * How many changed paths get a content digest.
+ *
+ * Bounded on purpose: each digest costs one Git invocation, and a state
+ * fingerprint is evidence, not an exhaustive manifest. Beyond this bound the
+ * digests are partial and `pathDigestsTruncated` says so, so a caller can
+ * tell "unchanged" from "not fully observed".
+ */
+const MAX_PATH_DIGESTS = 16;
+
+/** Digest recorded for a changed path that does not exist on disk. */
+const ABSENT_PATH_DIGEST = "absent";
+
+/**
+ * Read one changed path's content digest.
+ *
+ * `--no-filters` keeps the digest a pure function of the bytes on disk, so a
+ * `.gitattributes` clean/smudge filter can never make the fingerprint depend
+ * on the local Git configuration. The path is passed after `--`, so a
+ * repository-supplied path can never be read as an option. A path Git
+ * refuses (deleted, unreadable) records the explicit `absent` sentinel rather
+ * than an empty string, which would collide with other states.
+ */
+async function readPathContentDigest(root: string, path: string): Promise<string> {
+  const result = await run("git", ["hash-object", "--no-filters", "--", path], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const blob = result.exitCode === 0 ? result.stdout.trim() : "";
+  return SHA_PATTERN.test(blob) ? blob : ABSENT_PATH_DIGEST;
 }
 
 export async function inspect(options: InspectOptions): Promise<InspectResult> {
@@ -464,18 +633,18 @@ export async function workspacePrepare(options: WorkspacePrepareOptions): Promis
 export async function checkpoint(options: CheckpointOptions): Promise<CheckpointResult> {
   validateAcceptedReview(options.review);
   validateText(options.message, "message");
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // The receipt-authenticated manifest lives under the primary
-  // checkout that owns this workspace (`owned.marker.repositoryRoot`).
-  // The dynamic import keeps the top-level module graph acyclic.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority. The immutable
+  // ownership marker identifies the PRIMARY checkout that owns this
+  // workspace; the manifest / receipt / runtime identity all come from
+  // there, never from the candidate's own generated config. The staging
+  // and commit still happen in the candidate workspace itself.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   const branch = await assertOwnedBranch(owned);
-  const paths = normalizeExplicitPaths(owned.root, options.paths);
-  const statusBefore = await gitStatus(owned.root);
+  const paths = normalizeExplicitPaths(owned.candidateRoot, options.paths);
+  const statusBefore = await gitStatus(owned.candidateRoot);
   invariant(statusBefore.length > 0, "NO_CHECKPOINT_CHANGES", "Workspace contains no changes to checkpoint");
   const stagedBefore = await run("git", ["diff", "--cached", "--quiet", "--exit-code"], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     allowFailure: true,
   });
   invariant(stagedBefore.exitCode === 0, "PREEXISTING_STAGED_CHANGES", "Refusing to mix preexisting staged changes into a checkpoint");
@@ -486,8 +655,8 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
     "Refusing to checkpoint with unstaged or untracked residue",
     { changedPaths, allowed: paths },
   );
-  await run("git", ["add", "--", ...paths], { cwd: owned.root });
-  const residueAfterStage = parseStatusPaths(await gitStatus(owned.root));
+  await run("git", ["add", "--", ...paths], { cwd: owned.candidateRoot });
+  const residueAfterStage = parseStatusPaths(await gitStatus(owned.candidateRoot));
   invariant(
     residueAfterStage.every((changedPath) => paths.some((path) => pathCovers(path, changedPath))),
     "CHECKPOINT_PATH_ESCAPE",
@@ -495,7 +664,7 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
     { staged: residueAfterStage, allowed: paths },
   );
   const stagedNames = (
-    await run("git", ["diff", "--cached", "--name-only", "-z", "--", ...paths], { cwd: owned.root })
+    await run("git", ["diff", "--cached", "--name-only", "-z", "--", ...paths], { cwd: owned.candidateRoot })
   ).stdout.split("\0").filter(Boolean);
   invariant(stagedNames.length > 0, "NO_CHECKPOINT_CHANGES", "Explicit checkpoint paths contain no changes", { paths });
   try {
@@ -504,7 +673,7 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
       POIESIS_CHECKPOINT: "1",
     };
     const commit = await run("git", ["commit", "-m", options.message], {
-      cwd: owned.root,
+      cwd: owned.candidateRoot,
       allowFailure: true,
       env: commitEnvironment,
     });
@@ -515,14 +684,14 @@ export async function checkpoint(options: CheckpointOptions): Promise<Checkpoint
         stderr: bounded(commit.stderr),
       });
     }
-    const sha = await resolveCommit(owned.root, "HEAD");
-    const postStatus = parseStatusPaths(await gitStatus(owned.root));
+    const sha = await resolveCommit(owned.candidateRoot, "HEAD");
+    const postStatus = parseStatusPaths(await gitStatus(owned.candidateRoot));
     invariant(postStatus.length === 0, "POST_CHECKPOINT_RESIDUE", "Checkpoint created additional unstaged residue", {
       postStatus,
     });
     return { sha, branch, paths: stagedNames, review: options.review };
   } finally {
-    await run("git", ["reset", "--mixed", "HEAD", "--", ...paths], { cwd: owned.root, allowFailure: true });
+    await run("git", ["reset", "--mixed", "HEAD", "--", ...paths], { cwd: owned.candidateRoot, allowFailure: true });
   }
 }
 
@@ -530,11 +699,110 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   validateSha(options.candidateSha, "candidateSha");
   invariant(options.commands.length > 0, "NO_VERIFICATION_COMMANDS", "At least one verification command is required");
   for (const command of options.commands) validateText(command, "verification command");
-  const root = await canonicalGitRoot(options.cwd);
+  // Spec #168 / ticket #169: resolve the shared lifecycle authority BEFORE
+  // any command runs. The manifest / receipt / runtime identity come from
+  // the PRIMARY receipt-authenticated installation, so a stale or
+  // candidate-tracked generated config can never be lifecycle authority.
+  // The commands themselves still execute in the exact candidate workspace.
+  const authority = await resolveVerifyAuthority(options.cwd, options.ownershipId);
+  const outcome = await runVerification(options, options.cwd, options.ownershipId ?? null);
+  // Spec #168 / ticket #171: proof-scope Verify issues the runtime-owned
+  // receipt that Publish later resolves. A failed run still records its real
+  // evidence (outcome `failed`, per-command classification), because a receipt
+  // that could only ever say "verified" would be a constant, not evidence.
+  // The compatibility surface — a repository that never installed Poiesis —
+  // has no installation identity to bind and therefore issues no receipt.
+  let verification: VerificationEvidence | null = null;
+  let receiptFailure: unknown = null;
+  // Spec #168 / ticket #176: a cancelled Verify did not complete the plan, so
+  // it must not mint an authoritative receipt. A receipt is Publish's proof
+  // that the exact candidate was verified; one issued for a plan that was cut
+  // short would say something the run never established. The cancellation is
+  // therefore the reported outcome, and nothing is persisted for it.
+  if (authority !== null && !outcome.cancelled) {
+    try {
+      verification = verificationEvidenceFrom(
+        await createVerificationReceipt({
+          authority,
+          ...outcome.execution,
+        }),
+      );
+    } catch (error) {
+      receiptFailure = error;
+    }
+  }
+  // The verification failure is the operator's actionable error and is never
+  // masked by a secondary receipt-storage failure. When a receipt WAS issued
+  // for the failed run, its reference rides along in the error details so the
+  // operator (and a later Publish attempt) can see the real evidence instead of
+  // a bare exit code.
+  if (outcome.failure !== null) {
+    if (verification !== null && outcome.failure instanceof PoiesisError) {
+      outcome.failure.details.verification = verification;
+    }
+    throw outcome.failure;
+  }
+  if (receiptFailure !== null) throw receiptFailure;
+  return { ...outcome.result, verification };
+}
+
+/**
+ * Spec #168 / ticket #171 — one completed Verify execution: the public result
+ * plus the complete, receipt-bound evidence the issuer records.
+ */
+interface VerificationOutcome {
+  result: VerifyResult;
+  execution: {
+    candidateSha: string;
+    candidateTree: string;
+    plan: string[];
+    timeoutMs: number;
+    outputLimit: number;
+    startedAt: string;
+    endedAt: string;
+    durationMs: number;
+    commands: VerificationCommandEvidenceV1[];
+    cleanAfter: boolean;
+    outcome: "verified" | "failed";
+  };
+  /** The deterministic failure of a completed run, or `null` when it passed. */
+  failure: unknown | null;
+  /**
+   * Spec #168 / ticket #176 — the run ended because the caller cancelled it,
+   * so the plan did not complete and no receipt may be issued for it.
+   */
+  cancelled: boolean;
+}
+
+/**
+ * Spec #168 / ticket #169 — the verification body, split out so
+ * `integrate`'s post-integration verification can run the SAME commands
+ * against its temporary detached worktree. That worktree is not itself a
+ * Poiesis-owned workspace and therefore cannot resolve an authority of its
+ * own; `integrate` already resolved and authenticated the candidate's
+ * authority before the integration side effects ran. Keeping the bypass
+ * module-private (instead of a public `VerifyOptions` field) means no
+ * external caller can hand `verify` a forged authority and skip the
+ * ownership / receipt / runtime identity boundary.
+ *
+ * Spec #168 / ticket #171: the body returns its full per-command evidence and
+ * the deterministic failure instead of throwing mid-loop, so the caller can
+ * persist a faithful receipt for a run that FAILED. Pre-flight failures
+ * (unresolvable candidate, dirty before) still throw: they never reached a
+ * deterministic execution and no receipt exists for them.
+ */
+async function runVerification(
+  options: VerifyOptions,
+  cwd: string,
+  workspaceOwnershipId: string | null,
+): Promise<VerificationOutcome> {
+  const root = await canonicalGitRoot(cwd);
   const candidateSha = await resolveExpectedCommit(root, options.candidateSha, "candidateSha");
   await assertExactClean(root, candidateSha);
   const outputLimit = normalizeOutputLimit(options.outputLimit);
+  const startedAtMs = Date.now();
   const results: VerifyCommandResult[] = [];
+  const commands: VerificationCommandEvidenceV1[] = [];
   let failed: VerifyCommandResult | null = null;
 
   const timeoutMs = options.timeoutMs ?? DEFAULT_VERIFY_TIMEOUT_MS;
@@ -544,16 +812,42 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
   // check below can run unconditionally.
   let runError: unknown = null;
   for (const command of options.commands) {
+    const commandStartedAtMs = Date.now();
     let result: RunResult;
     try {
-      result = await run("/bin/sh", ["-c", command], {
+      // Spec #168 / ticket #176: the plan runs through the one managed
+      // command-processor + strong-containment seam shared with focused checks,
+      // so a verification command can never drift onto a different interpreter
+      // or run outside the boundary Poiesis claims for arbitrary command text.
+      result = await runManagedShellCommand({
         cwd: root,
+        command,
         allowFailure: true,
         timeoutMs,
+        // Spec #168 / ticket #183: the same evidence limit this Verify applies
+        // to the receipt it is about to write, declared to the runner as well.
+        // A command that ends in a typed rejection has no settled result, so the
+        // runner's error details are the only copy of its output — and an
+        // envelope that bounded below the requested limit would make a larger
+        // requested limit unreachable for exactly the commands that failed.
+        outputLimit,
+        // Spec #168 / ticket #170: verification commands run under a
+        // transient managed process lease, so a verify command that leaks
+        // a background descendant is cleaned before the exact-SHA
+        // clean-after check observes the workspace. The lease names this
+        // operation and, when the caller proved one, the workspace that
+        // owns it; it is in-memory only and never persisted.
+        operationId: "poiesis-verify",
+        ...(workspaceOwnershipId === null ? {} : { workspaceId: workspaceOwnershipId }),
         ...(options.env === undefined ? {} : { env: options.env }),
+        ...(options.signal === undefined ? {} : { signal: options.signal }),
       });
     } catch (error) {
       runError = error;
+      // Spec #168 / ticket #171: the timed-out / unspawnable command is still
+      // recorded, with the classification the runner actually reported, so a
+      // receipt never silently drops the command that ended the run.
+      commands.push(failedCommandEvidence(command, error, commandStartedAtMs, timeoutMs, outputLimit));
       break;
     }
     const evidence = {
@@ -563,6 +857,25 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
       stderr: bounded(result.stderr, outputLimit),
     };
     results.push(evidence);
+    const stdoutTruncated = result.stdoutTruncated || evidence.stdout !== result.stdout;
+    const stderrTruncated = result.stderrTruncated || evidence.stderr !== result.stderr;
+    commands.push({
+      command,
+      status: result.exitCode === 0 ? "passed" : "failed",
+      classification: result.exitCode === 0 ? "passed" : "command-failed",
+      exitCode: result.exitCode,
+      signal: result.signal,
+      startedAt: new Date(commandStartedAtMs).toISOString(),
+      endedAt: new Date(commandStartedAtMs + result.durationMs).toISOString(),
+      durationMs: result.durationMs,
+      timeoutMs,
+      timedOut: result.timedOut,
+      stdout: evidence.stdout,
+      stderr: evidence.stderr,
+      stdoutTruncated,
+      stderrTruncated,
+      outputTruncated: stdoutTruncated || stderrTruncated,
+    });
     if (result.exitCode !== 0) {
       failed = evidence;
       break;
@@ -586,9 +899,35 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
       throw cleanError;
     }
   }
+  const endedAtMs = Date.now();
+  const cleanAfter = dirtyStatus === null;
+  const verified = cleanAfter && runError === null && failed === null;
+  const execution: VerificationOutcome["execution"] = {
+    candidateSha,
+    candidateTree: await resolveTree(root, candidateSha),
+    plan: [...options.commands],
+    timeoutMs,
+    outputLimit,
+    startedAt: new Date(startedAtMs).toISOString(),
+    endedAt: new Date(endedAtMs).toISOString(),
+    durationMs: Math.max(0, endedAtMs - startedAtMs),
+    commands,
+    cleanAfter,
+    outcome: verified ? "verified" : "failed",
+  };
 
+  let failure: unknown | null = null;
+  // Spec #168 / ticket #176: a Verify is cancelled when it did not complete AND
+  // the caller declared cancellation. Both facts are needed: the runner's own
+  // `COMMAND_CANCELLED` proves it for a plain cancellation, but a cleanup
+  // failure outranks that rejection and would otherwise hide a cancelled,
+  // incomplete run behind a receipt it must never get.
+  const callerCancelled = options.signal?.aborted === true;
+  const runCancelled =
+    runError instanceof PoiesisError && runError.code === "COMMAND_CANCELLED" && runError.exitCode === 130;
+  const cancelled = !verified && (callerCancelled || runCancelled);
   if (dirtyStatus !== null) {
-    throw new PoiesisError(
+    failure = new PoiesisError(
       "DIRTY_CANDIDATE",
       "Verify invocation left the exact candidate workspace dirty",
       {
@@ -598,17 +937,71 @@ export async function verify(options: VerifyOptions): Promise<VerifyResult> {
         status: dirtyStatus.map(statusEntryForEvidence),
       },
     );
-  }
-
-  if (runError !== null) throw runError;
-  if (failed !== null) {
-    throw new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
+  } else if (runError !== null) {
+    failure = runError;
+  } else if (failed !== null) {
+    failure = new PoiesisError("VERIFICATION_FAILED", "A configured verification command failed", {
       candidateSha,
       failed,
       commands: results,
     });
   }
-  return { candidateSha, cleanBefore: true, cleanAfter: true, commands: results };
+  return {
+    result: { candidateSha, cleanBefore: true, cleanAfter: true, commands: results, verification: null },
+    execution,
+    failure,
+    cancelled,
+  };
+}
+
+/**
+ * Spec #168 / ticket #171 — the per-command record for a command whose runner
+ * never produced a settled `RunResult`. The typed `COMMAND_TIMEOUT` /
+ * `COMMAND_CANCELLED` errors carry the executor's own duration and truncation
+ * fidelity, so a timed-out command is recorded as a timeout rather than being
+ * dropped from the receipt.
+ *
+ * Spec #168 / ticket #183 — the runner's envelope bound and this record's own
+ * `outputLimit` are BOTH facts about truncation, and a command that never
+ * settled has no `RunResult` to compare against. So the record ORs the runner's
+ * reported flag with the fact that its own bound is what shortened the text: a
+ * receipt that held 500 bytes of 7,000 and claimed complete output is exactly
+ * the false evidence Publish later reads.
+ */
+function failedCommandEvidence(
+  command: string,
+  error: unknown,
+  startedAtMs: number,
+  timeoutMs: number,
+  outputLimit: number,
+): VerificationCommandEvidenceV1 {
+  const details = error instanceof PoiesisError ? error.details : {};
+  const timedOut = error instanceof PoiesisError && error.code === "COMMAND_TIMEOUT";
+  // A timeout is its own classification; every other rejection means the runner
+  // never produced a settled result for this command.
+  const classification: VerificationCommandClassification = timedOut ? "timeout" : "spawn-error";
+  const durationMs = typeof details.durationMs === "number" ? details.durationMs : Math.max(0, Date.now() - startedAtMs);
+  const stdoutBound = boundedOutput(typeof details.stdout === "string" ? details.stdout : "", outputLimit);
+  const stderrBound = boundedOutput(typeof details.stderr === "string" ? details.stderr : "", outputLimit);
+  const stdoutTruncated = details.stdoutTruncated === true || stdoutBound.clipped;
+  const stderrTruncated = details.stderrTruncated === true || stderrBound.clipped;
+  return {
+    command,
+    status: "failed",
+    classification,
+    exitCode: typeof details.exitCode === "number" ? details.exitCode : null,
+    signal: typeof details.signal === "string" ? details.signal : null,
+    startedAt: new Date(startedAtMs).toISOString(),
+    endedAt: new Date(startedAtMs + durationMs).toISOString(),
+    durationMs,
+    timeoutMs,
+    timedOut,
+    stdout: stdoutBound.text,
+    stderr: stderrBound.text,
+    stdoutTruncated,
+    stderrTruncated,
+    outputTruncated: stdoutTruncated || stderrTruncated,
+  };
 }
 
 export async function publish(options: PublishOptions): Promise<PublishResult> {
@@ -616,7 +1009,7 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
   validateText(options.title, "title");
   validateText(options.body, "body");
   validateSha(options.candidateSha, "candidateSha");
-  // Spec #139 / ticket #140: publishing coordinates belong to the Git
+// Spec #139 / ticket #140: publishing coordinates belong to the Git
   // remote, never to tracker identity. A tracker-only identity that
   // reaches this seam (from untyped input) is refused before any push,
   // change request, or evidence construction rather than being routed
@@ -628,17 +1021,19 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     "Publishing provider is derived from the configured Git remote, not from tracker identity",
     { provider: options.provider },
   );
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Validates the running package equals the durable
-  // `manifest.poiesisVersion` before any push / change-request side
-  // effect. The receipt-authenticated manifest lives under the primary
-  // checkout that owns this workspace.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+  // Spec #168 / ticket #169: the shared lifecycle authority. Validates the
+  // immutable ownership marker, then the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity, before any push or
+  // change-request side effect. It subsumes the Spec #104 / ticket #106
+  // pre-mutation runtime identity guard, which it runs first as the
+  // fail-closed diagnostic, so that guard is not repeated here.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   // Spec #139 / ticket #143: the central lifecycle-policy guard. Explicitly
   // deferred delivery is a healthy local state, so it stops here — before
   // the push, before the remote revalidation, before any change request, and
-  // before a single field of Publish evidence exists.
+  // before a single field of Publish evidence exists. It reads the installed
+  // config owned by the marker's repository root, which the shared authority
+  // has already proven to be an installation.
   await assertDeliveryPolicyAllows(owned.marker.repositoryRoot, "poiesis publish");
   const branch = await assertOwnedBranch(owned);
   invariant(options.remote === owned.marker.remote, "WORKSPACE_REMOTE_MISMATCH", "Publish remote does not match workspace ownership", {
@@ -651,24 +1046,36 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
     "Publish target does not match workspace ownership",
     { expected: owned.marker.integrationBranch, actual: options.integrationBranch },
   );
-  await validateRemote(owned.root, options.remote);
-  await validateBranchName(owned.root, options.integrationBranch);
-  const candidateSha = await resolveExpectedCommit(owned.root, options.candidateSha, "candidateSha");
-  await assertExactClean(owned.root, candidateSha);
-  const candidateTree = await resolveTree(owned.root, candidateSha);
+  await validateRemote(owned.candidateRoot, options.remote);
+  await validateBranchName(owned.candidateRoot, options.integrationBranch);
+  const candidateSha = await resolveExpectedCommit(owned.candidateRoot, options.candidateSha, "candidateSha");
+  await assertExactClean(owned.candidateRoot, candidateSha);
+  const candidateTree = await resolveTree(owned.candidateRoot, candidateSha);
   invariant(candidateTree === options.candidateTree, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
     expected: candidateTree,
     provided: options.candidateTree,
   });
   validateProofEvidence(options.proof, candidateSha, candidateTree);
+  // Spec #168 / ticket #171: resolve the runtime-owned verification receipt.
+  // `proof.verified` is a claim; the stored receipt is the evidence. Publish
+  // reads the receipt the caller named and revalidates EVERY binding against
+  // live authority, the live verification plan of the PRIMARY installation,
+  // and the live candidate BEFORE any push happens.
+  const receipt = await resolveVerificationReceipt({
+    authority: owned,
+    reference: options.proof.verification,
+    candidateSha,
+    candidateTree,
+    plan: await resolveLiveVerificationPlan(owned.primaryRoot),
+  });
 
   const remoteRef = `refs/heads/${branch}`;
-  const expectedRemote = await lsRemoteHead(owned.root, options.remote, branch);
+  const expectedRemote = await lsRemoteHead(owned.candidateRoot, options.remote, branch);
   if (expectedRemote !== null) {
     const localIsAncestor = await run(
       "git",
       ["merge-base", "--is-ancestor", expectedRemote, candidateSha],
-      { cwd: owned.root, allowFailure: true },
+      { cwd: owned.candidateRoot, allowFailure: true },
     );
     if (localIsAncestor.exitCode !== 0) {
       throw new PoiesisError(
@@ -678,13 +1085,13 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       );
     }
   }
-  await run("git", ["push", "--porcelain", options.remote, `${candidateSha}:${remoteRef}`], { cwd: owned.root });
-  const publishedSha = await lsRemoteHead(owned.root, options.remote, branch);
+  await run("git", ["push", "--porcelain", options.remote, `${candidateSha}:${remoteRef}`], { cwd: owned.candidateRoot });
+  const publishedSha = await lsRemoteHead(owned.candidateRoot, options.remote, branch);
   invariant(publishedSha === candidateSha, "PUBLISHED_SHA_MISMATCH", "Remote branch does not identify the exact candidate", {
     expected: candidateSha,
     actual: publishedSha,
   });
-  await assertExactClean(owned.root, candidateSha);
+  await assertExactClean(owned.candidateRoot, candidateSha);
 
   let providerCompletion: ProviderCompletion;
   if (options.provider === "fixture") {
@@ -694,16 +1101,16 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       action: expectedRemote === null ? "pushed" : "updated",
     };
   } else if (options.provider === "github") {
-    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+    providerCompletion = await publishGitHub(options, branch, candidateSha, remoteRef, owned.candidateRoot, expectedRemote === null);
   } else if (options.provider === "gitlab") {
-    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.root, expectedRemote === null);
+    providerCompletion = await publishGitLab(options, branch, candidateSha, remoteRef, owned.candidateRoot, expectedRemote === null);
   } else {
     providerCompletion = await publishCommand(
       options,
       branch,
       candidateSha,
       remoteRef,
-      owned.root,
+      owned.candidateRoot,
       expectedRemote === null,
     );
   }
@@ -729,6 +1136,10 @@ export async function publish(options: PublishOptions): Promise<PublishResult> {
       id: providerCompletion.requestId,
       url: requestUrl,
     },
+    // The receipt identity is re-derived from the STORED document Publish just
+    // resolved, so the evidence a caller forwards to Preview names exactly
+    // what this process proved.
+    verification: verificationEvidenceFrom(receipt),
   };
   validatePublishEvidence(evidence, candidateSha, candidateTree, branch, remoteRef);
 
@@ -758,12 +1169,13 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateSha(options.candidateSha, "candidateSha");
   validateText(options.message, "message");
   validateText(options.authorAcceptance, "authorAcceptance");
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // Validates the running package equals the durable
-  // `manifest.poiesisVersion` before any
-  // commit-tree / fetch-base / push integration side effect.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+// Spec #168 / ticket #169: the shared lifecycle authority resolves the
+  // immutable ownership marker plus the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity before any commit-tree /
+  // fetch-base / push integration side effect. It subsumes the Spec #104 /
+  // ticket #106 pre-mutation runtime identity guard, which it runs first as
+  // the fail-closed diagnostic, so that guard is not repeated here.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of the
   // fetch-base / commit-tree / push integration side effects and before any
   // Integration evidence is built.
@@ -775,12 +1187,12 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     "WORKSPACE_INTEGRATION_BRANCH_MISMATCH",
     "Integration branch does not match workspace ownership",
   );
-  await validateRemote(owned.root, options.remote);
-  await validateBranchName(owned.root, options.integrationBranch);
-  const expectedBaseSha = await resolveExpectedCommit(owned.root, options.expectedBaseSha, "expectedBaseSha");
-  const candidateSha = await resolveExpectedCommit(owned.root, options.candidateSha, "candidateSha");
-  await assertExactClean(owned.root, candidateSha);
-  const candidateTree = await resolveTree(owned.root, candidateSha);
+  await validateRemote(owned.candidateRoot, options.remote);
+  await validateBranchName(owned.candidateRoot, options.integrationBranch);
+  const expectedBaseSha = await resolveExpectedCommit(owned.candidateRoot, options.expectedBaseSha, "expectedBaseSha");
+  const candidateSha = await resolveExpectedCommit(owned.candidateRoot, options.candidateSha, "candidateSha");
+  await assertExactClean(owned.candidateRoot, candidateSha);
+  const candidateTree = await resolveTree(owned.candidateRoot, candidateSha);
   invariant(candidateTree === options.candidateTree, "CANDIDATE_TREE_MISMATCH", "Provided candidate tree does not match repository", {
     expected: candidateTree,
     provided: options.candidateTree,
@@ -788,13 +1200,13 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   validateProofEvidence(options.proof, candidateSha, candidateTree);
   validateStagingEvidence(options.staging, candidateSha, candidateTree);
 
-  const fetchedBase = await fetchIntegrationBase(owned.root, options.remote, options.integrationBranch);
+  const fetchedBase = await fetchIntegrationBase(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(fetchedBase === expectedBaseSha, "STALE_INTEGRATION_BASE", "Remote integration base changed", {
     expected: expectedBaseSha,
     actual: fetchedBase,
   });
   const basedOnExpected = await run("git", ["merge-base", "--is-ancestor", expectedBaseSha, candidateSha], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     allowFailure: true,
   });
   invariant(
@@ -804,34 +1216,34 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
     { expectedBaseSha, candidateSha },
   );
 
-  const publishedCandidate = await lsRemoteHead(owned.root, options.remote, owned.marker.branch);
+  const publishedCandidate = await lsRemoteHead(owned.candidateRoot, options.remote, owned.marker.branch);
   invariant(
     publishedCandidate === candidateSha,
     "CANDIDATE_NOT_PUBLISHED",
     "Integration requires the exact proven candidate on the published change branch",
     { expected: candidateSha, actual: publishedCandidate },
   );
-  const baseTree = await resolveTree(owned.root, expectedBaseSha);
+  const baseTree = await resolveTree(owned.candidateRoot, expectedBaseSha);
   invariant(candidateTree !== baseTree, "EMPTY_INTEGRATION", "Candidate tree is identical to the integration base");
   const commitEnvironment = identityEnvironment(options.author);
   const commit = await run("git", ["commit-tree", candidateTree, "-p", expectedBaseSha], {
-    cwd: owned.root,
+    cwd: owned.candidateRoot,
     input: `${options.message}\n`,
     ...(commitEnvironment === undefined ? {} : { env: commitEnvironment }),
   });
   const integratedSha = commit.stdout;
   validateSha(integratedSha, "integratedSha");
-  const integratedTree = await resolveTree(owned.root, integratedSha);
+  const integratedTree = await resolveTree(owned.candidateRoot, integratedSha);
   invariant(integratedTree === candidateTree, "INTEGRATED_TREE_MISMATCH", "Squash integration tree differs from candidate", {
     candidateTree,
     integratedTree,
   });
 
-  await assertExactClean(owned.root, candidateSha);
+  await assertExactClean(owned.candidateRoot, candidateSha);
   let postIntegrationVerification: VerifyResult | null = null;
   if (options.postIntegrationCommands !== undefined && options.postIntegrationCommands.length > 0) {
     postIntegrationVerification = await verifyIntegratedCommit(
-      owned.root,
+      owned,
       integratedSha,
       options.postIntegrationCommands,
       options.outputLimit,
@@ -840,21 +1252,21 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
   }
 
   const remoteRef = `refs/heads/${options.integrationBranch}`;
-  const remoteIntegrationHead = await lsRemoteHead(owned.root, options.remote, options.integrationBranch);
+  const remoteIntegrationHead = await lsRemoteHead(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(
     remoteIntegrationHead === expectedBaseSha,
     "INTEGRATION_BASE_DIVERGED",
     "Refusing to integrate: remote integration branch moved off the expected base",
     { expected: expectedBaseSha, actual: remoteIntegrationHead },
   );
-  await run("git", ["push", "--porcelain", options.remote, `${integratedSha}:${remoteRef}`], { cwd: owned.root });
-  const remoteHead = await lsRemoteHead(owned.root, options.remote, options.integrationBranch);
+  await run("git", ["push", "--porcelain", options.remote, `${integratedSha}:${remoteRef}`], { cwd: owned.candidateRoot });
+  const remoteHead = await lsRemoteHead(owned.candidateRoot, options.remote, options.integrationBranch);
   invariant(remoteHead === integratedSha, "INTEGRATION_SHA_MISMATCH", "Remote integration branch has an unexpected revision", {
     expected: integratedSha,
     actual: remoteHead,
   });
-  invariant((await resolveTree(owned.root, integratedSha)) === candidateTree, "INTEGRATED_TREE_MISMATCH", "Integrated content changed unexpectedly");
-  await assertExactClean(owned.root, candidateSha);
+  invariant((await resolveTree(owned.candidateRoot, integratedSha)) === candidateTree, "INTEGRATED_TREE_MISMATCH", "Integrated content changed unexpectedly");
+  await assertExactClean(owned.candidateRoot, candidateSha);
 
   const integration: IntegrationEvidence = {
     candidateSha,
@@ -878,12 +1290,14 @@ export async function integrate(options: IntegrateOptions): Promise<IntegrateRes
 }
 
 export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promise<WorkspaceCleanupResult> {
-  const owned = await resolveOwnedWorkspace(options.cwd, options.ownershipId);
-  // Spec #104 / ticket #106: pre-mutation runtime identity guard.
-  // `workspace cleanup` is the owned-cleanup surface; the running
-  // package must equal the durable `manifest.poiesisVersion` before
-  // any branch / marker / worktree teardown runs.
-  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(owned.marker.repositoryRoot);
+// Spec #168 / ticket #169: the shared lifecycle authority resolves the
+  // immutable ownership marker plus the PRIMARY receipt-authenticated
+  // manifest / receipt / runtime identity before any branch / marker /
+  // worktree teardown runs. It subsumes the Spec #104 / ticket #106
+  // pre-mutation runtime identity guard for the owned-cleanup surface, which
+  // it runs first as the fail-closed diagnostic, so that guard is not
+  // repeated here.
+  const owned = await resolveOwnedCandidateAuthority(options.cwd, options.ownershipId);
   // Spec #139 / ticket #143: the central lifecycle-policy guard. Cleanup
   // proves a delivered tree and then deletes the remote change branch and the
   // owned worktree, so a deferred install — which can never have delivered
@@ -896,15 +1310,15 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     "Refusing to clean an integration branch workspace",
   );
   const branch = await assertOwnedBranch(owned);
-  const headSha = await resolveCommit(owned.root, "HEAD");
+  const headSha = await resolveCommit(owned.candidateRoot, "HEAD");
   if (options.expectedHeadSha !== undefined) {
-    const expected = await resolveExpectedCommit(owned.root, options.expectedHeadSha, "expectedHeadSha");
+    const expected = await resolveExpectedCommit(owned.candidateRoot, options.expectedHeadSha, "expectedHeadSha");
     invariant(headSha === expected, "WORKSPACE_HEAD_MISMATCH", "Workspace HEAD changed before cleanup", {
       expected,
       actual: headSha,
     });
   }
-  const status = await gitStatus(owned.root);
+  const status = await gitStatus(owned.candidateRoot);
   invariant(status.length === 0, "DIRTY_WORKSPACE_CLEANUP_FORBIDDEN", "Refusing to clean a dirty or untracked workspace", {
     status: status.map(statusEntryForEvidence),
   });
@@ -912,17 +1326,17 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
   let delivery: WorkspaceCleanupResult["delivery"] | null = null;
   if (options.deliveredSha !== undefined) {
     validateSha(options.deliveredSha, "deliveredSha");
-    const deliveredSha = await resolveExpectedCommit(owned.root, options.deliveredSha, "deliveredSha");
+    const deliveredSha = await resolveExpectedCommit(owned.candidateRoot, options.deliveredSha, "deliveredSha");
     const fetchedIntegration = await fetchIntegrationBase(
-      owned.root,
+      owned.candidateRoot,
       owned.marker.remote,
       owned.marker.integrationBranch,
     );
     const deliveredIsRemote = await run("git", ["merge-base", "--is-ancestor", deliveredSha, fetchedIntegration], {
-      cwd: owned.root,
+      cwd: owned.candidateRoot,
       allowFailure: true,
     });
-    const sameTree = (await resolveTree(owned.root, deliveredSha)) === (await resolveTree(owned.root, headSha));
+    const sameTree = (await resolveTree(owned.candidateRoot, deliveredSha)) === (await resolveTree(owned.candidateRoot, headSha));
     if (deliveredIsRemote.exitCode === 0 && sameTree) delivery = "integrated-tree";
   }
   invariant(
@@ -932,15 +1346,15 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     { branch, headSha },
   );
 
-  const publishedHead = await lsRemoteHead(owned.root, owned.marker.remote, branch);
+  const publishedHead = await lsRemoteHead(owned.candidateRoot, owned.marker.remote, branch);
   if (publishedHead !== null) {
     invariant(publishedHead === headSha, "REMOTE_BRANCH_CHANGED", "Published change branch changed before cleanup", {
       expected: headSha,
       actual: publishedHead,
     });
     const remoteRef = `refs/heads/${branch}`;
-    await run("git", ["push", "--porcelain", owned.marker.remote, `:${remoteRef}`], { cwd: owned.root });
-    const verifyGone = await lsRemoteHead(owned.root, owned.marker.remote, branch);
+    await run("git", ["push", "--porcelain", owned.marker.remote, `:${remoteRef}`], { cwd: owned.candidateRoot });
+    const verifyGone = await lsRemoteHead(owned.candidateRoot, owned.marker.remote, branch);
     invariant(
       verifyGone === null,
       "REMOTE_BRANCH_NOT_DELETED",
@@ -949,9 +1363,9 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     );
   }
 
-  await run("git", ["worktree", "remove", owned.root], { cwd: owned.marker.repositoryRoot });
+  await run("git", ["worktree", "remove", owned.candidateRoot], { cwd: owned.primaryRoot });
   const deleteRef = await run("git", ["update-ref", "-d", `refs/heads/${branch}`, headSha], {
-    cwd: owned.marker.repositoryRoot,
+    cwd: owned.primaryRoot,
     allowFailure: true,
   });
   invariant(deleteRef.exitCode === 0, "BRANCH_DELETE_FAILED", "Workspace was removed but its branch changed concurrently", {
@@ -961,7 +1375,7 @@ export async function workspaceCleanup(options: WorkspaceCleanupOptions): Promis
     markerPath: owned.markerPath,
   });
   await rm(owned.markerPath);
-  return { path: owned.root, branch, headSha, markerPath: owned.markerPath, delivery };
+  return { path: owned.candidateRoot, branch, headSha, markerPath: owned.markerPath, delivery };
 }
 
 async function publishGitHub(
@@ -1350,24 +1764,35 @@ function parsePublishCommandOutput(stdout: string): {
 }
 
 async function verifyIntegratedCommit(
-  repositoryRoot: string,
+  owned: OwnedCandidateAuthority,
   integratedSha: string,
   commands: string[],
   outputLimit: number | undefined,
   env: NodeJS.ProcessEnv | undefined,
 ): Promise<VerifyResult> {
+  const repositoryRoot = owned.primaryRoot;
   const path = join(tmpdir(), `poiesis-integrate-${randomUUID()}`);
   invariant(!(await pathExists(path)), "TEMPORARY_WORKTREE_COLLISION", "Temporary integration worktree path exists", {
     path,
   });
   await run("git", ["worktree", "add", "--detach", path, integratedSha], { cwd: repositoryRoot });
-  let result: VerifyResult | null = null;
+  let outcome: VerificationOutcome | null = null;
   let failure: unknown;
   try {
+    // Spec #168 / ticket #169: the temporary detached worktree is not a
+    // Poiesis-owned workspace, so it cannot resolve an authority of its
+    // own. `integrate` already resolved and authenticated the candidate's
+    // authority before the integration side effects ran; the commands
+    // still execute in the temporary worktree.
+    //
+    // Spec #168 / ticket #171: post-integration verification is NOT
+    // proof scope — it proves the integrated revision inside a throwaway
+    // worktree, not the candidate — so it issues no verification receipt.
     const verifyOptions: VerifyOptions = { cwd: path, candidateSha: integratedSha, commands };
     if (outputLimit !== undefined) verifyOptions.outputLimit = outputLimit;
     if (env !== undefined) verifyOptions.env = env;
-    result = await verify(verifyOptions);
+    outcome = await runVerification(verifyOptions, path, owned.marker.ownershipId);
+    failure = outcome.failure;
   } catch (error) {
     failure = error;
   }
@@ -1381,9 +1806,9 @@ async function verifyIntegratedCommit(
     );
   }
   await run("git", ["worktree", "remove", path], { cwd: repositoryRoot });
-  if (failure !== undefined) throw failure;
-  invariant(result !== null, "POST_INTEGRATION_VERIFY_FAILED", "Post-integration verification returned no result");
-  return result;
+  if (failure !== undefined && failure !== null) throw failure;
+  invariant(outcome !== null, "POST_INTEGRATION_VERIFY_FAILED", "Post-integration verification returned no result");
+  return outcome.result;
 }
 
 async function canonicalGitRoot(cwd: string): Promise<string> {
@@ -1393,6 +1818,18 @@ async function canonicalGitRoot(cwd: string): Promise<string> {
 async function gitCommonDir(cwd: string): Promise<string> {
   const result = await run("git", ["rev-parse", "--git-common-dir"], { cwd });
   return realpath(isAbsolute(result.stdout) ? result.stdout : resolve(cwd, result.stdout));
+}
+
+/**
+ * The canonical per-worktree Git directory. For the primary checkout this is
+ * the shared common directory; for every linked worktree it is a private
+ * `<commonDir>/worktrees/<name>`. Spec #168 / ticket #169 uses the
+ * distinction to tell a Poiesis-owned candidate apart from foreign linked
+ * work that must not inherit the primary installation's authority.
+ */
+async function gitDir(cwd: string): Promise<string> {
+  const result = await run("git", ["rev-parse", "--absolute-git-dir"], { cwd });
+  return realpath(result.stdout);
 }
 
 async function fetchIntegrationBase(root: string, remote: string, integrationBranch: string): Promise<string> {
@@ -1475,6 +1912,60 @@ async function assertExactClean(cwd: string, expectedSha: string): Promise<{ sha
   return { sha };
 }
 
+/**
+ * Spec #168 / ticket #172 — the READ-ONLY workspace state fingerprint.
+ *
+ * A focused check records the state it ran against so an unchanged failure
+ * is recognizable as unchanged. That reading deliberately reuses this
+ * module's own `gitStatus` / `parseStatusPaths` porcelain semantics and its
+ * own `normalizeOutputLimit` bound, rather than opening a second, subtly
+ * different definition of "clean": the focused fingerprint and the exact
+ * clean-candidate proof check must never disagree about the same tree.
+ *
+ * Read-only and unprivileged by construction: it resolves nothing, mutates
+ * nothing, and asserts nothing. An unreadable HEAD or tree is reported as
+ * `null` (state that cannot be proven) instead of throwing, because a
+ * fingerprint is evidence, not a gate.
+ */
+export async function readWorktreeState(cwd: string, outputLimit?: number): Promise<WorktreeStateFingerprint> {
+  const limit = normalizeOutputLimit(outputLimit);
+  const root = await canonicalGitRoot(cwd);
+  const headResult = await run("git", ["rev-parse", "--verify", "HEAD^{commit}"], {
+    cwd: root,
+    allowFailure: true,
+  });
+  const head = headResult.exitCode === 0 && SHA_PATTERN.test(headResult.stdout) ? headResult.stdout : null;
+  // Spec #168 / ticket #179: the capture's own completeness is read alongside
+  // its records, and the records themselves are whole ones only. A fingerprint
+  // is evidence, not a gate, so an incomplete read is REPORTED rather than
+  // thrown — it simply must never be reportable as a complete one.
+  const capture = await captureGitStatus(root);
+  const entries = capture.entries;
+  const paths = parseStatusPaths(entries);
+  const tree = head === null ? null : await resolveTree(root, head).catch(() => null);
+
+  // Sorted and de-duplicated so the digest list — and therefore the state
+  // fingerprint derived from it — is a deterministic function of the tree,
+  // never of Git's status ordering or of a rename's dual paths.
+  const digestPaths = [...new Set(paths)].sort().slice(0, MAX_PATH_DIGESTS);
+  const pathDigests: WorktreePathDigest[] = [];
+  for (const path of digestPaths) {
+    pathDigests.push({ path, blob: await readPathContentDigest(root, path) });
+  }
+
+  return {
+    root,
+    head,
+    tree,
+    dirty: entries.length > 0,
+    changedFiles: paths.slice(0, limit),
+    changedFilesTruncated: paths.length > limit,
+    statusCaptureTruncated: capture.truncated,
+    pathDigests,
+    pathDigestsTruncated: paths.length > digestPaths.length,
+  };
+}
+
 async function currentBranch(cwd: string): Promise<string | null> {
   const result = await run("git", ["symbolic-ref", "--quiet", "--short", "HEAD"], {
     cwd,
@@ -1483,10 +1974,10 @@ async function currentBranch(cwd: string): Promise<string | null> {
   return result.exitCode === 0 ? result.stdout : null;
 }
 
-async function assertOwnedBranch(owned: OwnedWorkspace): Promise<string> {
-  const branch = await currentBranch(owned.root);
+async function assertOwnedBranch(owned: OwnedCandidateAuthority): Promise<string> {
+  const branch = await currentBranch(owned.candidateRoot);
   invariant(branch !== null, "DETACHED_OWNED_WORKSPACE", "Owned workspace is unexpectedly detached", {
-    path: owned.root,
+    path: owned.candidateRoot,
   });
   invariant(branch === owned.marker.branch, "OWNED_BRANCH_MISMATCH", "Owned workspace branch differs from its immutable marker", {
     expected: owned.marker.branch,
@@ -1497,36 +1988,166 @@ async function assertOwnedBranch(owned: OwnedWorkspace): Promise<string> {
     "INTEGRATION_BRANCH_FORBIDDEN",
     "Poiesis-owned change workspace cannot use the integration branch",
   );
-  const worktree = (await listWorktrees(owned.root)).find((entry) => entry.path === owned.root);
+  const worktree = (await listWorktrees(owned.candidateRoot)).find((entry) => entry.path === owned.candidateRoot);
   invariant(worktree !== undefined, "WORKTREE_NOT_REGISTERED", "Owned workspace is not registered with Git");
   invariant(worktree.branch === branch, "WORKTREE_BRANCH_MISMATCH", "Registered worktree branch differs from ownership marker");
   return branch;
 }
 
-async function resolveOwnedWorkspace(cwd: string, ownershipId?: string): Promise<OwnedWorkspace> {
-  const root = await canonicalGitRoot(cwd);
-  const commonDir = await gitCommonDir(root);
-  const matches = (await readMarkers(commonDir)).filter(({ marker }) => marker.workspacePath === root);
-  invariant(matches.length === 1, "WORKSPACE_OWNERSHIP_UNKNOWN", "Cannot prove Poiesis owns this workspace", {
-    path: root,
-    matches: matches.length,
-  });
-  const owned = matches[0];
-  invariant(owned !== undefined, "WORKSPACE_OWNERSHIP_UNKNOWN", "Cannot resolve workspace ownership");
-  invariant(owned.marker.repositoryRoot !== root, "PRIMARY_CHECKOUT_OWNERSHIP_INVALID", "Ownership marker points at the primary checkout");
+/**
+ * Spec #168 / ticket #169 — the SINGLE shared lifecycle authority seam.
+ *
+ * Resolves, for any project-bound lifecycle operation, the canonical
+ * candidate workspace together with the PRIMARY receipt-authenticated
+ * installation that owns it: the immutable ownership marker, the primary
+ * repository root, the primary ownership receipt, the receipt-authenticated
+ * primary manifest, and the runtime identity those two bind together.
+ *
+ * Everything fails closed with a typed diagnostic:
+ *   - no single marker owns this workspace, or more than one does
+ *     (`WORKSPACE_OWNERSHIP_UNKNOWN`);
+ *   - an ownership id was claimed but does not match the marker
+ *     (`WORKSPACE_OWNERSHIP_ID_MISMATCH`);
+ *   - the marker names the primary checkout (`PRIMARY_CHECKOUT_OWNERSHIP_INVALID`)
+ *     or a different Git repository (`WORKSPACE_REPOSITORY_MISMATCH`);
+ *   - a linked worktree that Poiesis does not own (`WORKSPACE_OWNERSHIP_UNKNOWN`);
+ *   - the primary receipt is missing or does not match the primary manifest
+ *     (`OWNERSHIP_RECEIPT_MISSING` / `OWNERSHIP_RECEIPT_MISMATCH`);
+ *   - the executing runtime does not equal the primary manifest's recorded
+ *     version (`RUNTIME_VERSION_MISMATCH`).
+ *
+ * The primary checkout is the one compatibility surface: it owns no
+ * Poiesis workspace marker, so `marker` / `markerPath` are `null` and the
+ * primary is its own authority.
+ */
+export async function resolveLifecycleAuthority(
+  cwd: string,
+  ownershipId?: string,
+): Promise<LifecycleAuthority> {
+  const candidateRoot = await canonicalGitRoot(cwd);
+  const commonDir = await gitCommonDir(candidateRoot);
+  const matches = (await readMarkers(commonDir)).filter(({ marker }) => marker.workspacePath === candidateRoot);
   invariant(
-    (await gitCommonDir(owned.marker.repositoryRoot)) === commonDir,
-    "WORKSPACE_REPOSITORY_MISMATCH",
-    "Ownership marker belongs to a different Git repository",
+    matches.length <= 1,
+    "WORKSPACE_OWNERSHIP_UNKNOWN",
+    "Cannot prove Poiesis owns this workspace",
+    { path: candidateRoot, matches: matches.length },
   );
-  if (ownershipId !== undefined) {
+
+  let markerPath: string | null = null;
+  let marker: OwnershipMarker | null = null;
+  let primaryRoot = candidateRoot;
+  if (matches.length === 1) {
+    const owned = matches[0]!;
     invariant(
-      owned.marker.ownershipId === ownershipId,
-      "WORKSPACE_OWNERSHIP_ID_MISMATCH",
-      "Workspace ownership identity does not match",
+      owned.marker.repositoryRoot !== candidateRoot,
+      "PRIMARY_CHECKOUT_OWNERSHIP_INVALID",
+      "Ownership marker points at the primary checkout",
+    );
+    invariant(
+      (await gitCommonDir(owned.marker.repositoryRoot)) === commonDir,
+      "WORKSPACE_REPOSITORY_MISMATCH",
+      "Ownership marker belongs to a different Git repository",
+    );
+    primaryRoot = await canonicalExistingPath(owned.marker.repositoryRoot);
+    const primaryGitDir = await gitDir(primaryRoot);
+    invariant(
+      primaryGitDir === commonDir,
+      "WORKSPACE_REPOSITORY_MISMATCH",
+      "Ownership marker no longer names this repository's primary checkout",
+      { expected: commonDir, actual: primaryGitDir },
+    );
+    if (ownershipId !== undefined) {
+      invariant(
+        owned.marker.ownershipId === ownershipId,
+        "WORKSPACE_OWNERSHIP_ID_MISMATCH",
+        "Workspace ownership identity does not match",
+      );
+    }
+    markerPath = owned.markerPath;
+    marker = owned.marker;
+  } else {
+    // No marker owns this workspace. A claimed ownership identity can
+    // never be satisfied, and a linked worktree Poiesis does not own is
+    // foreign work that must never inherit the primary's authority.
+    invariant(
+      ownershipId === undefined,
+      "WORKSPACE_OWNERSHIP_UNKNOWN",
+      "Cannot prove Poiesis owns this workspace",
+      { path: candidateRoot, matches: 0 },
+    );
+    invariant(
+      (await gitDir(candidateRoot)) === commonDir,
+      "WORKSPACE_OWNERSHIP_UNKNOWN",
+      "Cannot prove Poiesis owns this workspace",
+      { path: candidateRoot, matches: 0, reason: "foreign-worktree" },
     );
   }
-  return { root, commonDir, markerPath: owned.markerPath, marker: owned.marker };
+
+  // Runtime identity first: the absent-manifest branch of the shared guard
+  // is the fail-closed diagnostic for an uninstalled primary and must stay
+  // the surfaced code.
+  await (await import("./maintenance.js")).assertRuntimeVersionMatchesProject(primaryRoot);
+  const manifest = await loadManifest(primaryRoot);
+  const receipt = await assertOwnershipReceipt(primaryRoot, manifest);
+  return {
+    candidateRoot,
+    commonDir,
+    markerPath,
+    marker,
+    primaryRoot,
+    receipt,
+    manifest,
+    runtime: manifest.poiesisVersion,
+  };
+}
+
+/**
+ * Spec #168 / ticket #169 — the owned-candidate form of the shared
+ * authority. `checkpoint` / `publish` / `integrate` / `workspace cleanup`
+ * mutate a Poiesis-prepared workspace and therefore additionally require a
+ * proven ownership marker.
+ */
+async function resolveOwnedCandidateAuthority(
+  cwd: string,
+  ownershipId?: string,
+): Promise<OwnedCandidateAuthority> {
+  const authority = await resolveLifecycleAuthority(cwd, ownershipId);
+  invariant(
+    authority.marker !== null && authority.markerPath !== null,
+    "WORKSPACE_OWNERSHIP_UNKNOWN",
+    "Cannot prove Poiesis owns this workspace",
+    { path: authority.candidateRoot, matches: 0 },
+  );
+  return {
+    ...authority,
+    markerPath: authority.markerPath,
+    marker: authority.marker,
+  };
+}
+
+/**
+ * Spec #168 / ticket #169 — `verify`'s authority resolution.
+ *
+ * `verify` is not a project-bound mutation, so a repository that never
+ * installed Poiesis stays a valid, non-project-bound verification surface.
+ * As soon as Poiesis IS involved — an owned candidate workspace, an
+ * installed primary checkout, a claimed ownership id, or foreign linked
+ * work — the strict shared resolver runs and fails closed on wrong
+ * ownership, missing receipts, foreign workspaces, and mismatched runtime
+ * identity.
+ */
+async function resolveVerifyAuthority(cwd: string, ownershipId?: string): Promise<LifecycleAuthority | null> {
+  const candidateRoot = await canonicalGitRoot(cwd);
+  const commonDir = await gitCommonDir(candidateRoot);
+  const owned = (await readMarkers(commonDir)).some(({ marker }) => marker.workspacePath === candidateRoot);
+  const installed = await exists(poiesisPath(candidateRoot, "manifest.json"));
+  const nonProjectBound =
+    ownershipId === undefined &&
+    !owned &&
+    !installed &&
+    (await gitDir(candidateRoot)) === commonDir;
+  return nonProjectBound ? null : resolveLifecycleAuthority(candidateRoot, ownershipId);
 }
 
 async function createMarker(commonDir: string, marker: OwnershipMarker): Promise<string> {
@@ -1662,16 +2283,66 @@ function flagValue(fields: string[], flag: string): string | null {
   return field === flag ? "" : field.slice(flag.length + 1);
 }
 
-async function gitStatus(cwd: string): Promise<string[]> {
+/**
+ * Spec #168 / ticket #179 — one status capture, and whether it was read WHOLE.
+ *
+ * The process runner bounds every capture it takes, so once a worktree's
+ * porcelain status exceeds that bound the reader sees only its prefix, and the
+ * bound can stop part-way through a record. That makes two different facts that
+ * must never be conflated:
+ *
+ *   - the CAPTURE was cut short (`truncated`) — there is workspace state
+ *     nobody read, so the observation cannot be reported as a complete one;
+ *   - a complete capture whose path list was then bounded for evidence, which
+ *     is `readWorktreeState`'s `changedFilesTruncated` / `pathDigestsTruncated`
+ *     and says nothing about how much of the worktree was read.
+ *
+ * `entries` therefore holds COMPLETE records only (see `captureGitStatus` for
+ * how the final unterminated record is told apart from a cut one). A record the
+ * bound cut through is discarded instead of parsed, because half a porcelain
+ * record is not a change: its path is a prefix of a real path that does not
+ * exist on disk, and reporting it would put a content digest on a file the
+ * worktree does not contain.
+ */
+export interface GitStatusCapture {
+  entries: string[];
+  truncated: boolean;
+}
+
+async function captureGitStatus(cwd: string): Promise<GitStatusCapture> {
   const result = await run("git", ["status", "--porcelain=v1", "-z", "--untracked-files=all"], { cwd });
-  if (!result.stdout) return [];
-  const parts = result.stdout.split("\0").filter(Boolean);
+  if (!result.stdout) return { entries: [], truncated: result.stdoutTruncated };
+  // `-z` porcelain terminates every record with NUL EXCEPT the last one, so the
+  // trailing segment is that final whole record when the capture was read to
+  // the end of the stream, and a record the capture stopped inside when the
+  // runner reported output remaining. Only the second is incomplete, and it is
+  // discarded rather than parsed: half a porcelain record is not a change.
+  const records = result.stdout.split("\0");
+  const trailing = records.pop() ?? "";
+  const truncated = result.stdoutTruncated;
+  const whole = records.filter((record) => record.length > 0);
+  if (!truncated && trailing.length > 0) whole.push(trailing);
+  return { entries: parseStatusRecords(whole, truncated), truncated };
+}
+
+/**
+ * Pair up the whole records of a `-z` porcelain capture.
+ *
+ * A rename or copy is TWO NUL-terminated fields — the destination then the
+ * source — and the bound can stop between them. An incomplete capture is the
+ * only thing that explains a missing source field, so there the half-read
+ * record is dropped rather than reported as a change whose source was
+ * reconstructed from the bytes that happened to arrive. A COMPLETE capture
+ * missing the field is Git's own invalid output and still fails closed.
+ */
+function parseStatusRecords(records: string[], truncated: boolean): string[] {
   const entries: string[] = [];
-  for (let index = 0; index < parts.length; index += 1) {
-    const entry = parts[index];
+  for (let index = 0; index < records.length; index += 1) {
+    const entry = records[index];
     if (entry === undefined) continue;
     if (entry[0] === "R" || entry[0] === "C" || entry[1] === "R" || entry[1] === "C") {
-      const source = parts[index + 1];
+      const source = records[index + 1];
+      if (source === undefined && truncated) break;
       invariant(source !== undefined, "INVALID_GIT_OUTPUT", "Git omitted a rename/copy source path");
       entries.push(`${entry}\0${source}`);
       index += 1;
@@ -1680,6 +2351,27 @@ async function gitStatus(cwd: string): Promise<string[]> {
     }
   }
   return entries;
+}
+
+/**
+ * The status read every clean/dirty authority shares: `inspect`, `checkpoint`,
+ * the exact-candidate clean assertions, workspace cleanup, and the temporary
+ * post-integration worktree.
+ *
+ * Spec #168 / ticket #179 — this is deliberately the WHOLE-RECORDS half of
+ * {@link captureGitStatus} and it deliberately keeps its `string[]` signature,
+ * because those callers ask "is anything changed?" and a single whole record
+ * already proves "yes"; a capture bounded at 256KiB can never hold fewer than
+ * one whole record, so a bounded read can never report a dirty tree as clean.
+ * What it can no longer do is turn the bound's last fragment into a claim: the
+ * fragment is a path prefix that does not exist on disk, and matching it as
+ * checkpoint residue or reporting it as a changed file would be a statement
+ * about the worktree that the worktree contradicts. Callers that must know
+ * whether the workspace was read WHOLE — the state fingerprint — read the
+ * detailed capture instead.
+ */
+async function gitStatus(cwd: string): Promise<string[]> {
+  return (await captureGitStatus(cwd)).entries;
 }
 
 function parseStatusPaths(entries: string[]): string[] {

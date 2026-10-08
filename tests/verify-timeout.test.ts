@@ -1,9 +1,10 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { verify } from "../src/git.js";
-import { createTestRepository, type TestRepository } from "./helpers.js";
+import * as processModule from "../src/process.js";
+import { createTestRepository, describeManagedExecution, type TestRepository } from "./helpers.js";
 
 const repositories: TestRepository[] = [];
 const fixtures: string[] = [];
@@ -136,7 +137,7 @@ async function waitForPid(path: string, timeoutMs = 2_000): Promise<number> {
   throw new Error(`descendant did not publish a valid PID at ${path}`);
 }
 
-describe("deterministic Verify timeout", () => {
+describeManagedExecution("deterministic Verify timeout", () => {
   it(
     "runs a Verify command longer than the generic process default within the verify bound",
     { timeout: 90000 },
@@ -194,7 +195,33 @@ describe("deterministic Verify timeout", () => {
   );
 });
 
-describe("Verify exact-SHA clean-after reporting", () => {
+describeManagedExecution("Verify managed execution lease identity", () => {
+  it("names the verify operation on the transient managed process lease", { timeout: 30000 }, async () => {
+    const repository = await createTestRepository();
+    repositories.push(repository);
+    const recorder = vi.spyOn(processModule, "run");
+    try {
+      await verify({
+        cwd: repository.root,
+        candidateSha: repository.baseSha,
+        commands: [`printf "%s" ok`],
+      });
+      const verification = recorder.mock.calls.find(
+        ([command, args]) => command === "/bin/sh" && Array.isArray(args) && args[0] === "-c",
+      );
+      // Spec #168 / ticket #170: the verification command runs under a
+      // managed lease that names the operation. A caller-supplied workspace
+      // identity is added on top of it when one was proven; on a
+      // non-project-bound primary checkout there is none to add.
+      expect(verification?.[2]).toMatchObject({ operationId: "poiesis-verify" });
+      expect(verification?.[2]?.workspaceId).toBeUndefined();
+    } finally {
+      recorder.mockRestore();
+    }
+  });
+});
+
+describeManagedExecution("Verify exact-SHA clean-after reporting", () => {
   it.skipIf(process.platform === "win32")(
     "fails closed with DIRTY_CANDIDATE when a timed-out verify command mutates tracked state",
     { timeout: 30000 },

@@ -192,7 +192,22 @@ describe("the implementation the documents describe is the implementation that r
   it("spawns /bin/sh -c for a verification command", () => {
     // Ties the words to the seam. Whitespace-tolerant on purpose: the contract
     // is the argv shape, not the formatting of the line that spells it.
-    expect(readRepoFile("src/git.ts")).toMatch(/run\(\s*"\/bin\/sh",\s*\["-c",\s*command\],/);
+    //
+    // Spec #168 / ticket #186 moved that argv out of `git.ts` and behind the
+    // shared command-processor seam, because verification is only one of the
+    // surfaces that runs arbitrary command text (`poiesis check` and
+    // post-integration verification reach the same one), and on Windows the
+    // processor is a validated `ComSpec` rather than a POSIX shell. The contract
+    // is unchanged — the same `/bin/sh` with `["-c", <command>]` — so this pin
+    // follows the seam to where it now lives and additionally asserts the
+    // delegation, which is what stops a verification command from drifting onto
+    // a different interpreter. `command-processor.test.ts` pins the same argv
+    // behaviourally on the processor itself.
+    expect(readRepoFile("src/git.ts")).toMatch(/runManagedShellCommand\(\{/);
+    const processor = readRepoFile("src/command-processor.ts");
+    expect(processor).toMatch(/POSIX_COMMAND_PROCESSOR\s*=\s*"\/bin\/sh"/);
+    expect(processor).toMatch(/command:\s*POSIX_COMMAND_PROCESSOR,\s*args:\s*\["-c",\s*command\]/);
+    expect(readRepoFile("src/managed-shell.ts")).toMatch(/run\(\s*processor\.command,\s*\[\.\.\.processor\.args\],/);
   });
 
   it("keeps the requirement documented rather than declared as a package restriction", () => {

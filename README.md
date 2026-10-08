@@ -94,6 +94,14 @@ pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update
 
 Same-version reconciliation and intentional human upgrade are distinct: the former stays pinned to `manifest.poiesisVersion`, the latter uses the fresh-latest `@latest` form. The OpenCode config projection only ever admits the exact-version route; the fresh-latest form is reserved for the human/operator shell.
 
+A release may add one narrow permission without bumping the runtime version, which leaves an installed project recording the current `poiesisVersion` with an earlier projection. The receipt-gated `update` migrates that exact projection forward — see [COMPATIBILITY.md](./COMPATIBILITY.md#same-release-projection-migration-pre-focused-check). Any drift from both the current and the recognized predecessor projections still fails closed with `MANIFEST_AUTHORITY_INVALID`, and the projection `update` installs never grants a broad, `@latest`, or unversioned launcher route.
+
+An ordinary release bump needs no migration entry at all. A project installed by the previously published release carries that release's authentic projection, and the strict manifest-version check is keyed off the manifest's own `poiesisVersion`, so the receipt-gated `update` crosses straight onto the new release and re-keys the exact-version launcher — see [COMPATIBILITY.md](./COMPATIBILITY.md#release-to-release-crossing). The previous release is deliberately kept out of the accepted predecessor set, and a manifest that drifts from its own release projection still fails closed with `MANIFEST_AUTHORITY_INVALID` on every path.
+
+An OpenCode session that was already running when `update` finished keeps the permission projection it loaded at start, so a Worker in that session still has the pre-migration surface and its `check` route stays denied. Restart OpenCode (or open a new session) after `update`; Poiesis does not restart it for you and never widens a permission to cover a stale session — the correct fix is always re-running against the migrated projection.
+
+Workspace mutations are serialized by one fail-fast lock next to the ownership receipt. If a Poiesis session dies without releasing it, the next mutation fails with `POIESIS_MUTATION_LOCKED` and a diagnostic that names the holder pid, whether it is still running, and the one correct recovery. Poiesis never reclaims the lock automatically: removing a live holder's lock would let two mutations run at once.
+
 Installations created by public `poiesis-cli@1.0.0` have no trusted receipt. Ordinary `update` therefore refuses them. An operator may establish that first trust only with an explicit one-time bootstrap after the known 1.0.0 contract is fully validated. This is operator authority, not cryptographic proof that the checkout-controlled 1.0.0 manifest was originally authored by Poiesis:
 
 ```bash
@@ -138,6 +146,146 @@ config projection admits, and the projected agent permissions still deny
 every version-qualified and `@latest` `dlx` variant. The script is
 inert after `uninstall` — it reports that the project is not installed,
 which is also how you reinstall.
+
+### Command execution, containment, and cancellation
+
+Poiesis uses two distinct process-execution contracts, and it does not blur
+them.
+
+**Fixed-argv commands** (`git`, `gh`, `uv`, `opencode`, delivery executables)
+run under a managed process GROUP: each child is spawned `detached`, gets a
+transient in-memory identity lease, and is settled through that lease alone.
+That is isolation, not containment — and it is honest here precisely because
+nothing in a Poiesis-chosen argv can `setsid` its way out of the group.
+
+Cleaning that group has one precondition, and it is not a formality. A process
+group may be signalled only while the leased leader that gave the group its id
+can still be re-confirmed by exact **process-start identity** and exact process
+group — the Linux model, read from the kernel's per-PID process table. Group
+liveness is an absence fact, never an ownership one: a group that still exists
+after its leader is gone names a PID that any later process may be handed, and
+Poiesis will not signal on the strength of a number it cannot attribute.
+
+| Situation | What Poiesis does |
+| --- | --- |
+| Linux, live leader still provable | group `SIGTERM`, bounded wait, re-confirm, group `SIGKILL`, bounded wait; success is confirmed only when the group no longer exists |
+| Linux, leader gone or terminal while the group is still observable | sends **no signal at all**, waits a bounded natural-settlement window for the group to empty itself (a finished leader's descendants may not be reaped yet), and settles when it does. A group still there when the wait closes rejects `PROCESS_CLEANUP_UNRESOLVED` with `details.reason: GROUP_AUTHORITY_LOST` |
+| Linux, leader unreadable / reused / foreign while the group remains | sends **no further signal** and rejects `PROCESS_CLEANUP_UNRESOLVED` with `details.reason: GROUP_AUTHORITY_LOST`, `details.phase`, `details.leaderState`, `details.pid`, `details.processGroupId`, `details.membersEnumerated: false` |
+| Linux, group survives both phases under a provable leader | rejects `PROCESS_CLEANUP_UNRESOLVED` with `details.reason: GROUP_STILL_PRESENT` |
+| non-Linux POSIX (macOS, the BSDs), live leader, no readable process-start identity | sends **no signal at all** and rejects `PROCESS_CLEANUP_REFUSED` with `details.reason: UNSUPPORTED_IDENTITY` plus the actionable `details.pid` and `details.processGroupId`. Poiesis never pretends a termination it could not perform, and it never falls back to the weaker "the child leads the group it was spawned into" argument, because that group id IS that child's PID and the PID becomes reusable the moment the leader exits |
+| already-empty group | settled; nothing to signal and nothing to prove |
+| Windows | unchanged: no POSIX groups, so the tree is reached with `taskkill /PID <pid> /T` only while the child has not exited, then `child.kill`, each phase bounded by the child's own `exit` |
+| Linux, run contained in a cgroup v2 leaf | unchanged, and authoritative: `cgroup.kill` plus a `populated 0` reading from `cgroup.events` empties the leaf, and once that is confirmed no group-local settlement runs at all |
+
+These envelopes are not contained-path-only. `PROCESS_CLEANUP_REFUSED` and
+`PROCESS_CLEANUP_UNRESOLVED` describe a managed process group on any platform,
+and both outrank success, failure, timeout, and cancellation, because they mean
+a process Poiesis spawned may still be running.
+
+Poiesis never enumerates the group to work out what is inside it. There is no
+`/proc` walk, no member snapshot, no per-PID signal, and therefore no survivor
+list to report: cleanup addresses the group or it does nothing.
+
+**Command TEXT** can do exactly that. Three surfaces run it: `poiesis verify`'s
+plan, `poiesis check`'s explicit commands, and the configured
+`postIntegrationCommands` that `poiesis integrate` runs against the integrated
+revision. All three go through one shared command-processor seam and are placed
+in a kernel boundary before any of their text runs:
+
+| | |
+| --- | --- |
+| Processor (POSIX) | `/bin/sh` with `["-c", <the exact command>]` |
+| Processor (Windows) | a validated absolute `ComSpec` naming `cmd.exe`, with `["/d", "/s", "/c", <the exact command>]` |
+| Startup protocol (Linux) | a Poiesis-owned prologue that reports its kernel identity, waits, admits ITSELF into the provisioned cgroup v2 leaf, confirms that membership against the same identity, waits again, and only then runs the caller's argv |
+| Containment (Linux) | that delegated cgroup v2 leaf, provisioned BEFORE the spawn, settled with `cgroup.kill` and confirmed by `cgroup.events` |
+| Containment (Windows) | requires a no-breakaway Job Object from a native launcher, which this runtime does not ship |
+| Containment (macOS / other POSIX) | no portable primitive exists |
+
+What Poiesis **does** claim:
+
+- the leaf exists before the process is created;
+- the managed child is a Poiesis-owned prologue, not the command, and it is spawned
+  with **no caller text in its argv at all**. The startup is two phases:
+  1. the prologue reports its own kernel PID, process-group id, and
+     process-start identity and waits; Poiesis checks that report against the PID
+     `spawn` returned *and* against a fresh kernel read of that PID, establishes a
+     live validated lease, and only then sends the admission token;
+  2. the prologue admits *itself* into the leaf, confirms that membership is bound
+     to the SAME identity it reported, reports that, and waits for a **distinct**
+     execution token. Poiesis binds that report to the identity it leased, and only
+     then releases the caller's argv and arms stdin, the command timeout, and
+     cancellation;
+- so **no caller command text can execute before the admission is confirmed**, and
+  the ordering is structural rather than a race: the text does not exist in the
+  child's argv until the parent has the authority to release it;
+- the boundary path and both gate tokens travel out of band in the environment,
+  never in the argv, and are scrubbed before the processor is `exec`'d;
+- the caller's command is passed through verbatim: byte-identical as the released
+  argv, never interpolated into the prologue;
+- the parent refuses the run if either report is missing, malformed, or disagrees
+  with the kernel — there is no "it probably made it" branch, for a live child or a
+  finished one;
+- every process the command creates after admission inherits the leaf, because
+  cgroup membership survives `fork`, `setsid(2)`, and reparenting;
+- settlement fails closed unless the kernel itself reports the leaf empty.
+
+Cleanup follows the phase the startup actually reached, because each phase earns a
+different authority. Before a lease exists nothing may be signalled: Poiesis
+REVOKES its own control channel — which is what a pre-`exec` prologue exits on —
+settles the leaf, and requires the child's own linked exit; without that proof it
+reports `PROCESS_CLEANUP_UNRESOLVED` with `details.reason:
+STARTUP_EXIT_UNCONFIRMED`. After a lease exists but before the admission is
+confirmed, the group and the leaf are settled independently, because an empty leaf
+cannot prove anything about a leader that never entered it. After a confirmed
+admission the cgroup is the authority and no group-local settlement runs at all.
+`src/process-tree.ts` remains the only place that signals a POSIX process group, and
+the contained startup path sends no raw PID signal of its own.
+
+What Poiesis **does not** claim: that it detects an escape. It never polls for
+one, never matches on a process name, port, user, or age, and never scans the
+system.
+
+On a host with no strong boundary — Windows, macOS, or Linux without a
+delegated cgroup v2 subtree exposing `cgroup.kill` — `verify`, `check`, and
+`postIntegrationCommands` all refuse before spawning anything, with
+`PROCESS_CONTAINMENT_UNAVAILABLE` naming the capability that is missing and the
+remediation: run the operation on a Linux host with a delegated cgroup v2
+subtree. Nothing runs and nothing is reported as verified. On Windows the
+missing primitive is a no-breakaway Job Object, which needs a native launcher
+this runtime does not ship; on macOS and the other POSIX platforms no portable
+strong primitive exists at all.
+
+The library `run()` seam with a fixed argv remains available on such a host for
+work that needs no arbitrary command text, and it is a different trade rather
+than an equivalent cleanup: on Windows its tree cleanup is `taskkill`-based as
+described above, while on macOS and the BSDs a command that is still running at
+a timeout or a cancellation gets a typed fail-closed refusal
+(`PROCESS_CLEANUP_REFUSED` / `UNSUPPORTED_IDENTITY`) instead of a termination.
+Choose it when a caller can act on that refusal; do not read it as the Linux
+behaviour.
+
+The command processor is validated on the same terms, before any process
+exists. `verify` and `check` refuse with `COMMAND_PROCESSOR_UNAVAILABLE`
+carrying `details.reason` (`PROCESSOR_NOT_EXECUTABLE`, or the `ComSpec` reasons
+`COMSPEC_MISSING`, `COMSPEC_NOT_ABSOLUTE`, `COMSPEC_NOT_COMMAND_PROCESSOR`,
+`COMSPEC_UNAVAILABLE`), `details.platform`, the rejected `details.processor`,
+`details.detail`, and a `details.remediation`. `check` passes that refusal
+through with its own code and those fields intact and the bounded
+`details.check` evidence attached — and without the "escalate to `poiesis
+verify`" line a failing check carries, because Verify resolves command text
+through the same processor and would refuse in exactly the same way.
+
+`SIGINT` / `SIGTERM` cancel the two operations that actually consume a signal —
+`poiesis verify` and `poiesis check`. One AbortController per invocation,
+temporary handlers removed in `finally`, the first signal aborts once. Every
+other subcommand keeps the platform default signal behaviour untouched. The
+managed commands then settle: `verify` reports `COMMAND_CANCELLED` (exit code
+130) and issues no verification receipt, and `check` reports `COMMAND_CANCELLED`
+with the complete bounded result attached under `details.check`. A cleanup
+failure always outranks the cancellation — "Poiesis could not confirm it stopped
+what it started" is the fact you have to act on. A library caller that supplies
+its own `AbortSignal` keeps it, and Poiesis installs no process-wide handlers on
+its behalf.
 
 ### Updating the managed config
 
@@ -349,7 +497,9 @@ The delivery adapter is a deterministic command. The command must:
 
 Preview returns a candidate-bound receipt. Staging consumes that Preview receipt and returns a new Staging receipt; callers do not predeclare Staging success. Integration consumes the Staging receipt directly and returns its complete Integration evidence. Production accepts only a Staging-target receipt, preventing a Preview identity from being relabeled as Staging.
 
-Publish produces canonical candidate-bound evidence after a successful operation — every required Publish-evidence field (`candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef`, `publishedHeadSha`, `provider`, `action`, `changeRequest`) with the runtime-enforced equalities (`remoteRef = refs/heads/<branch>`, `publishedHeadSha = candidateSha`). Preview MUST receive the same `--proof`, the same dynamic `--candidate-tree`, and that exact successful Publish evidence unchanged as `--publish`; missing or mismatched proof, tree, or Publish evidence fails closed before any Preview identity is claimed.
+Verify runs the installation's live verification plan against the exact clean candidate and returns runtime-owned evidence: a `verification` block (`receiptId`, `receiptDigest`, `runtime`, `candidateSha`, `candidateTree`, `verificationPlanDigest`) referring to an immutable receipt Poiesis wrote under the repository's shared Git directory. Publish requires that reference, resolves the stored receipt itself, and revalidates it against the live installation identity, workspace ownership, live verification plan, and live candidate before anything is pushed; an asserted `verified: true` is never evidence on its own. A missing, fabricated, stale, or off-plan receipt fails closed and names the one migration that resolves it: run `poiesis verify` again for that exact candidate.
+
+Publish produces canonical candidate-bound evidence after a successful operation — every required Publish-evidence field (`candidateSha`, `candidateTree`, `verified: true`, `branch`, `remoteRef`, `publishedHeadSha`, `provider`, `action`, `changeRequest`, `verification`) with the runtime-enforced equalities (`remoteRef = refs/heads/<branch>`, `publishedHeadSha = candidateSha`). Preview MUST receive the same `--proof`, the same dynamic `--candidate-tree`, and that exact successful Publish evidence unchanged as `--publish`, including the resolved receipt identity. Preview does not take either document on trust: it resolves the receipt they name out of runtime storage and revalidates it against the live installation identity, workspace ownership, live verification plan, and live candidate — the caller's `runtime` and `verificationPlanDigest` must equal the stored receipt's — requires the proof and the Publish evidence to identify the SAME receipt, and revalidates the remote change-branch head. Missing or mismatched proof, tree, receipt reference, or Publish evidence fails closed before any Preview identity is claimed.
 
 Production authorization is a structured JSON envelope binding explicit Author approval and identity to the candidate SHA/tree, Staging artifact identity, and integration SHA. Before invoking Production, Poiesis fetches the configured remote integration branch and requires that exact integration SHA to be its head with content equal to the accepted candidate tree. The orchestration layer remains responsible for asking the Author; the runtime prevents stale or cross-candidate authorization replay.
 
@@ -369,6 +519,7 @@ model set               deterministic single-class set (reasoning|execution <pro
 workspace prepare       create an isolated owned branch/worktree (default omits --path and lives under <root>/.poiesis/workspaces/<derived-id>)
 checkpoint              commit an accepted reviewed ticket
 verify                  run checks against an exact clean SHA
+check                   run explicit non-authoritative focused checks in an owned candidate workspace
 publish                 push and create/update a PR/MR after Proof
 preview                 create Preview for the exact proven candidate
 promote                 promote an immutable identity to Staging or Production
@@ -391,6 +542,12 @@ A non-TTY `poiesis model` invocation fails closed with `NON_TTY_MODEL`; the dete
 `workspace prepare` is invoked as `poiesis workspace prepare --branch <name> --spec <id>`. Omit `--path`; the CLI then selects a deterministic, traversal-safe workspace under `<root>/.poiesis/workspaces/<derived-id>`. The default-path workspace area is gitignored so it never appears as foreign work in the primary checkout.
 
 Do not pass any external path such as `/tmp/...` or any location outside the project root — external worktrees fall outside the harness-readable project root and trigger external-directory permission denials. The explicit absolute `--path` form is reserved for exceptional use only — when the Author explicitly supplied an exceptional path or compatibility recovery requires the exact pre-existing path.
+
+An owned candidate workspace is where the work happens, never where lifecycle authority lives. `verify`, `checkpoint`, `publish`, `preview`, `promote`, `integrate`, and `workspace cleanup` resolve the manifest, the ownership receipt, and the runtime identity through the primary receipt-authenticated installation that owns the workspace, so a candidate's own generated `.poiesis/config.jsonc` — stale the moment the workspace is prepared, and possibly committed into the candidate tree — is never lifecycle authority. Verification commands still execute against the exact candidate workspace. Wrong ownership, a missing primary receipt, a foreign workspace Poiesis does not own, and a runtime identity that does not match the primary manifest all fail closed with a typed error before anything runs.
+
+`poiesis check` is the focused-check surface for ticket work. It runs EXPLICIT commands in a Poiesis-owned (possibly dirty) candidate workspace, refuses any workspace Poiesis cannot prove it owns, never retries, and returns bounded per-command evidence plus a deterministic action fingerprint over the command, the workspace state fingerprint, and a deterministic failure classification. It creates no verification receipt and no other proof: whole-change authority stays with `poiesis verify`. The ticket Worker reaches exactly this one subcommand through the exact-version route; no other Poiesis lifecycle route is granted to it.
+
+`poiesis integrate` runs post-integration verification only when the project configures `verification.postIntegrationCommands`. The configured `verification.commands` plan is never substituted for it: that plan already ran once, in the owned candidate, before Publish. With no `postIntegrationCommands`, integration runs nothing after the push and proves exact identity in Git instead — the integrated commit's tree equals the accepted candidate's tree byte-for-byte, and the published integration ref is exactly that commit.
 
 ## Use with a coding agent
 
@@ -459,6 +616,7 @@ Use this prompt when the human/operator wants a single agent to stand up the who
 - History rewriting is refused: `publish` only accepts non-forcing fast-forward updates of the Poiesis-owned remote change branch.
 - Production promotion requires separate candidate-bound Author authorization plus the operation-produced Staging receipt and the verified canonical Integration evidence.
 - Fixture tracker and delivery adapters exist only for disposable integration tests and bootstrap dogfood; they are not supported production infrastructure.
+- Command cleanup never claims more than it proved: an unresolved or refused cleanup rejects with a typed error ahead of success, failure, timeout, and cancellation, and a command that Poiesis cannot contain is refused before it is created.
 
 ## Development
 

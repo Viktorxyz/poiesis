@@ -41,9 +41,9 @@
  * a new `preimageSkillDirectory` hook).
  */
 import { exists } from "../src/fs.js";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   init,
@@ -65,6 +65,7 @@ import {
 import {
   ArtifactJournal,
   hashDirectoryTree,
+  type ArtifactJournalEntry,
 } from "../src/mutation-transaction.js";
 import { installDefaultSkills, loadDefaultSkills, type DefaultSkill } from "../src/skills.js";
 import { asLegacyProjection } from "./legacy-bootstrap-fixture.js";
@@ -286,6 +287,144 @@ describe("ticket #46 — default-skill transactional rollback (direct journal)",
       // cannot fail the surrounding committed transaction.
       await journal.commit();
       expect(await exists(backupPath)).toBe(false);
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * Spec #168 / ticket #178 — a cross-device rollback cannot lose the preimage.
+ *
+ * The journal keeps its preimage backup under `os.tmpdir()`, which is
+ * routinely a different device from the workspace it protects. Moving that
+ * backup back onto the destination with `rename(2)` therefore fails `EXDEV`
+ * whenever the two really are on different devices — and the restore used to
+ * remove the destination FIRST, so the failure arrived after the only
+ * transaction-owned copy of the tree was gone, and the backup was then cleaned
+ * up as if the restoration had succeeded. Both copies of the preimage were
+ * destroyed by a rollback that merely reported itself incomplete.
+ *
+ * These assertions inject the device failure deterministically (a test host
+ * whose `os.tmpdir()` shares the workspace's filesystem would never produce
+ * one) and pin the two properties that redesign has to hold: the move onto the
+ * destination is fed a candidate staged on the DESTINATION's own filesystem,
+ * and a restoration that fails leaves an intact, named copy of the preimage
+ * instead of deleting it.
+ */
+describe("directory rollback survives a cross-device restore (Spec #168 / ticket #178)", () => {
+  /** The exact errno `rename(2)` raises across two filesystems. */
+  const crossDevice = (): NodeJS.ErrnoException =>
+    Object.assign(new Error("EXDEV: cross-device link not permitted"), { code: "EXDEV" });
+
+  /** A journal whose real leaves are managed, transaction-written, and distinct. */
+  async function capturedThenWrittenDestination(
+    staging: string,
+    journal: ArtifactJournal,
+  ): Promise<{ entry: ArtifactJournalEntry; destination: string }> {
+    const destination = join(staging, "skill");
+    await mkdir(destination, { recursive: true });
+    await writeFile(join(destination, "SKILL.md"), "owned preimage\n");
+    const entry = await journal.captureDirectory(destination);
+    // The transaction replaces the tree it captured.
+    await rm(destination, { recursive: true, force: true });
+    await mkdir(destination, { recursive: true });
+    await writeFile(join(destination, "SKILL.md"), "installed content\n");
+    await journal.recordDirectoryWrite(entry, await hashDirectoryTree(destination));
+    return { entry, destination };
+  }
+
+  it("restores the preimage through a candidate staged on the destination's own filesystem", async () => {
+    const staging = await mkdtemp(join(tmpdir(), "poiesis-t178-stage-"));
+    try {
+      const moved: { from: string; to: string }[] = [];
+      const journal = new ArtifactJournal(4, {
+        moveRestorationCandidate: async (from, to) => {
+          moved.push({ from, to });
+          await rename(from, to);
+        },
+      });
+      const { entry, destination } = await capturedThenWrittenDestination(staging, journal);
+
+      const diagnostics = await journal.rollback();
+
+      expect(diagnostics).toEqual([]);
+      expect(await readFile(join(destination, "SKILL.md"), "utf8")).toBe("owned preimage\n");
+      // The move is fed the staged candidate — a sibling of the destination, so
+      // the SAME filesystem — and never the temp-rooted backup, whose device is
+      // the whole reason the move could fail before.
+      expect(moved).toHaveLength(1);
+      expect(moved[0]?.to).toBe(destination);
+      expect(moved[0]?.from).not.toBe(entry.preimageBackup);
+      expect(dirname(moved[0]!.from)).toBe(dirname(destination));
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the preimage recoverable and names it when the restore move fails with EXDEV", async () => {
+    const staging = await mkdtemp(join(tmpdir(), "poiesis-t178-exdev-"));
+    try {
+      const journal = new ArtifactJournal(4, {
+        moveRestorationCandidate: async () => {
+          throw crossDevice();
+        },
+      });
+      const { entry, destination } = await capturedThenWrittenDestination(staging, journal);
+      const backup = entry.preimageBackup!;
+
+      const diagnostics = await journal.rollback();
+
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toMatchObject({ path: destination, reason: "restore-failed" });
+      expect(diagnostics[0]?.error).toContain("EXDEV");
+      // The reported location really does hold the preimage: a rollback that
+      // cannot restore must not also destroy the only copy of it.
+      const recoveredAt = diagnostics[0]!.preimageRecoveredAt!;
+      expect(recoveredAt).not.toBe(backup);
+      expect(await readFile(join(recoveredAt, "SKILL.md"), "utf8")).toBe("owned preimage\n");
+      // And the backup is still there as well: a failed restore costs the
+      // operator nothing, and two intact copies are strictly safer than one.
+      expect(await readFile(join(backup, "SKILL.md"), "utf8")).toBe("owned preimage\n");
+      // Nothing half-restored is left claiming to be the preimage.
+      expect(await exists(destination)).toBe(false);
+    } finally {
+      await rm(staging, { recursive: true, force: true });
+    }
+  });
+
+  it("removes nothing when the restoration candidate cannot be staged", async () => {
+    const staging = await mkdtemp(join(tmpdir(), "poiesis-t178-stage-fail-"));
+    try {
+      let moves = 0;
+      const journal = new ArtifactJournal(4, {
+        moveRestorationCandidate: async (from, to) => {
+          moves += 1;
+          await rename(from, to);
+        },
+      });
+      const { entry, destination } = await capturedThenWrittenDestination(staging, journal);
+      // The staged copy cannot be made: the candidate is created in the
+      // destination's own parent, so this is the failure a parent that cannot
+      // hold it produces, and it happens BEFORE anything is removed.
+      await rm(entry.preimageBackup!, { recursive: true, force: true });
+
+      const diagnostics = await journal.rollback();
+
+      expect(diagnostics).toHaveLength(1);
+      expect(diagnostics[0]).toMatchObject({
+        path: destination,
+        reason: "restore-failed",
+        preimageRecoveredAt: entry.preimageBackup,
+      });
+      expect(diagnostics[0]?.error).toContain("could not be staged");
+      // The ordering guarantee: the transaction-written destination is still
+      // there, because nothing was removed until a candidate existed to take
+      // its place, and no move was ever attempted.
+      expect(moves).toBe(0);
+      expect(await readFile(join(destination, "SKILL.md"), "utf8")).toBe("installed content\n");
+      // No half-staged candidate is left behind in the destination's parent.
+      expect((await readdir(staging)).sort()).toEqual(["skill"]);
     } finally {
       await rm(staging, { recursive: true, force: true });
     }

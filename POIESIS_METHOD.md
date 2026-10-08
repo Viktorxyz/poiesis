@@ -170,10 +170,22 @@ Material product or architecture expansion discovered during Realize returns to 
 
 Realize owns no new machinery: no new mode, no new stage, no new counter, no new budget, no new cache, no new telemetry, no new durable state, no new database, no new agent. Discipline lives on the existing Realize path.
 
+### Focused ticket checks
+
+Realize proves each ticket with its relevant focused checks, not with the configured full verification plan. That plan is reserved for one Proof run against the exact candidate, inside Prove.
+
+Worker runs focused checks through the one non-authoritative route it owns: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
+
+The same command, state fingerprint, and failure classification does not justify another attempt. A repeat is honest only with a relevant mutation since the last attempt, a concrete new hypothesis, or escalation to Poiesis for reassessment; the reason is stated, never assumed.
+
+A `likely-load-induced-timeout` or `timeout-unknown` classification is not a verdict about the change and not a pass. It calls for bounded reassessment: one justified re-check under a different explicit bound, or escalation to Poiesis. Never repeat it blindly, and never report success the evidence does not support.
+
+Worker owns focused checks for the ticket it implements. Reviewer owns independent review of the same work. Focused checks never substitute for Review, and Review never substitutes for focused checks. No second check or review engine is added: this is discipline over the surfaces already present.
+
 For each ticket:
 
 1. Dispatch a fresh Worker.
-2. Worker implements and runs relevant local checks.
+2. Worker implements and runs relevant focused checks.
 3. Dispatch a fresh independent ticket Reviewer.
 4. If Review identifies a concrete localized issue, the same Worker may make one targeted correction.
 5. Run relevant checks again.
@@ -188,6 +200,21 @@ Checkpoint commits are internal recovery boundaries, not canonical project histo
 A closed accepted ticket is not reopened later. New later findings become new correction/remediation tickets.
 
 Never retry the same action without new evidence, a material state change, or a higher escalation level.
+
+### Correction and delta review
+
+Poiesis dispatches every grouped blocker from the current Review in one message, never one finding at a time, and the Worker answers the whole group exhaustively in one correction. Drip-feeding is not economy: it turns one correction into repeated cycles against the same candidate.
+
+The correction is one delta review, scoped to:
+- the original grouped blockers;
+- the exact diff of the correction;
+- the affected callers and direct regressions of the changed surface.
+
+The delta review judges that scope. It does not re-open the candidate wholesale and it does not widen into unrelated areas.
+
+One correction plus one delta review is the default. Further candidate-caused work starts only after a bounded Poiesis reassessment, and only for what that reassessment authorizes.
+
+A closed area reopens only on new concrete evidence: a new reachable defect, never a re-reading of an area already closed without new evidence.
 
 ## 9. Replan
 
@@ -214,9 +241,12 @@ After all current implementation tickets are accepted, identify the exact clean 
 
 Run whole-change Proof in this order:
 
-1. deterministic Verify;
-2. fresh reasoning Spec Review;
-3. fresh reasoning Standards Review.
+1. non-authoritative combined semantic preflight;
+2. deterministic Verify;
+3. fresh reasoning Spec Review;
+4. fresh reasoning Standards Review.
+
+The configured full verification plan runs once, here, against the exact candidate. It is not an intermediate Realize check: each ticket is proved by its own relevant focused checks, whose evidence is local and non-authoritative, and whole-change authoritative verification belongs to this step alone. Running the configured plan again for the same unchanged candidate is a repeat and needs new evidence, a material state change, or a higher escalation level, exactly like any other repeated action.
 
 The exact candidate identity that flows from Prove into Publish and Preview is one canonical proof object. It must carry:
 
@@ -229,6 +259,30 @@ The exact candidate identity that flows from Prove into Publish and Preview is o
 Every required field must be present for the same clean candidate. Publish and Preview both consume that exact proof and refuse to operate without it.
 
 Reviewers may use **Repository Intelligence** as bounded discovery evidence (callers, impact radius, cross-module dependencies), but the exact candidate source remains authoritative. Repository Intelligence is not part of Proof identity; graph hashes and cache state must never appear in `candidateSha`, `candidateTree`, `verified`, `specReview`, `standardsReview`, or any Publish / Preview / Integration evidence field.
+
+### Preflight
+
+Before deterministic Verify, Poiesis runs one combined semantic preflight over the exact candidate: a single bounded reading pass that triages the candidate against the current Spec, the current standards, and the Proof identity contract.
+
+Preflight is descriptive and non-authoritative. It produces no verification receipt, no Proof field, and no lifecycle evidence; it never runs the configured full verification plan; and it never substitutes for Verify or for the two final reviews. The configured full verification plan still runs once, here. The two fresh, separate, identity-bound Spec and Standards Reviews still run after Verify and are never merged into preflight or into each other.
+
+Preflight is a descriptive step on the existing Prove path. It adds no new lifecycle phase and no new state machine, and it never gates Realize.
+
+A preflight finding blocks only when all four criteria hold:
+- it is concrete and reachable in the exact candidate;
+- it is an explicit violation of the current Spec or of a consequential standard;
+- it materially affects correctness, security, reliability, or the Proof identity;
+- it is caused by the candidate, or it is a proven remaining authorized obligation of the current Spec.
+
+A pre-existing unrelated hardening opportunity, an optional preference, and a hypothetical risk are Concerns or future Specs, never blockers.
+
+### Realization ledger
+
+Poiesis records exactly one disposition per finding: `accepted`, `rejected`, `non-blocking`, or `resolved`. A pre-existing unrelated hardening opportunity, an optional preference, and a hypothetical risk are recorded as `non-blocking` or `rejected`, never as `accepted` blockers.
+
+The dispositions form the frozen realization ledger. The ledger lives only in parent tracker comments and in dispatch context; it is never a repository file, a database entry, a cache entry, or a runtime field. A later snapshot supersedes an earlier one, and the ledger frozen for the Proof in flight is the ledger each final review receives.
+
+Material architecture expansion, platform-capability expansion, and product-policy expansion found in preflight returns to Authorize before implementation, exactly like Realize-time expansion.
 
 ### Verify
 
@@ -253,7 +307,7 @@ After a mutation:
 
 ## 11. Publish
 
-Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
+Publish only after Verify, Spec Review, and Standards Review pass for the same clean candidate. Pass the canonical identity-bound proof (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }`) as `--proof` to `poiesis publish`, along with the exact `--candidate-tree` resolved by the post-Verify capture (the same dynamic tree that Publish and Preview consume). The runtime produces, after a successful Publish, canonical candidate-bound Publish evidence that any caller of Preview MUST forward unchanged. The canonical Publish evidence is a single JSON object carrying every required field below, with the equality invariants the runtime enforces; Publish fails closed if the runtime cannot produce it. Only after Publish succeeds:
 
 - push the Poiesis change branch;
 - create or update one PR/MR targeting the canonical integration branch;
@@ -273,6 +327,7 @@ Canonical Publish evidence fields (runtime-required, equality invariants shown a
 - `action` — one of `"created" | "updated" | "pushed"`.
 - `changeRequest.id` — string-or-null (provider change-request id, if any).
 - `changeRequest.url` — string-or-null (provider change-request URL, if any).
+- `verification` — the runtime-owned verification receipt reference Publish itself resolved for this exact candidate: `receiptId`, `receiptDigest`, `runtime`, `candidateSha`, `candidateTree`, `verificationPlanDigest`. An asserted `verified: true` is a claim; this reference is the evidence, and Preview requires it in the forwarded evidence.
 
 A rejected Publish is fail-closed: Poiesis must not claim that a Preview exists or ask for Author validation until the deterministic `poiesis publish` operation succeeds and returns a concrete published candidate identity, and must not publish a fabricated or assumed Publish evidence value.
 
@@ -318,7 +373,7 @@ The rule composes with the rest of the transaction rather than bypassing it. A m
 
 Preview only after Publish succeeds. Pass, to `poiesis preview`:
 
-- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`);
+- the same canonical identity-bound proof as `--proof` (`candidateSha`, `candidateTree`, `verified: true`, `specReview { verdict: PASS, reviewerIdentity }`, `standardsReview { verdict: PASS, reviewerIdentity }`, `verification { receiptId, receiptDigest, runtime, candidateSha, candidateTree, verificationPlanDigest }`);
 - the same exact dynamic `--candidate-tree` that Publish just produced;
 - the exact successful canonical candidate-bound Publish evidence as `--publish` (the precise object returned by `poiesis publish`, carrying every field listed in §11 above).
 
@@ -399,7 +454,11 @@ Internal ticket checkpoints must not become permanent canonical history.
 After integration:
 - capture the exact integration revision;
 - verify that the integrated content matches the accepted candidate;
-- run the required deterministic post-integration verification.
+- run the deterministic post-integration verification the project configured in `verification.postIntegrationCommands`.
+
+Post-integration verification is opt-in and is NOT the whole-change Proof plan. The Proof plan already ran once, in the owned candidate, before Publish; integration never re-runs it.
+
+When the project configures no `postIntegrationCommands`, integration runs nothing after the push and instead proves exact identity in Git: the integrated commit's tree must equal the accepted candidate's tree byte-for-byte, and the published integration ref must be exactly that commit.
 
 ## 17. Production authorization
 
@@ -437,7 +496,7 @@ Then:
 - close implementation/tracker work;
 - close the top-level Spec;
 - safely clean the Poiesis-owned workspace/branch;
-- clean internal child sessions best-effort;
+- clean every internal child session whose identity is known at this deterministic termination;
 - preserve Git, tracker, PR/MR, and release history.
 
 ## Operating rules
@@ -451,7 +510,7 @@ Then:
 - Use deterministic tools for exact repeated mechanics.
 - Do not create a second workflow/state engine.
 - Durable project truth must be recoverable from ordinary project infrastructure.
-- Session cleanup is hygiene, not a correctness dependency.
+- Session cleanup is hygiene, not a correctness dependency. When a child session identity is known at a deterministic handoff or termination, perform the bounded known-session cleanup at that boundary instead of deferring it; it still never blocks, fails, or gates the lifecycle.
 - Do not repeat work without new evidence or a meaningful change in approach.
 - Prefer focused Repository Intelligence queries over broad mechanical rediscovery when the index can answer the question economically.
 - Repository Intelligence is a rebuildable, non-canonical local state, not durable project truth; an unavailable or stale cache falls back to ordinary source exploration without blocking the Method. The fallback is not a new lifecycle phase and does not create new durable state.
