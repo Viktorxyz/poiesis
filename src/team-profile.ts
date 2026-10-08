@@ -47,7 +47,16 @@ import { isDeepStrictEqual } from "node:util";
 import { lstat, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { parseJsonc, validateConfig, type PoiesisConfig, type ResolvedPoiesisConfig } from "./config.js";
+import {
+  DEFERRED_DELIVERY_MODE,
+  deliveryExtensionKeys,
+  isDeferredDelivery,
+  parseJsonc,
+  trackerExtensionKeys,
+  validateConfig,
+  type PoiesisConfig,
+  type ResolvedPoiesisConfig,
+} from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { readUtf8 } from "./fs.js";
 import { hashContent, hashFile } from "./hash.js";
@@ -128,18 +137,64 @@ export function teamProfileConfig(config: ResolvedPoiesisConfig): PoiesisConfig 
       remote: config.repository.remote,
       integrationBranch: config.repository.integrationBranch,
     },
-    tracker: { provider: config.tracker.provider, project: config.tracker.project },
-    delivery: {
-      preview: config.delivery.preview,
-      staging: config.delivery.staging,
-      production: config.delivery.production,
-    },
+    tracker: profileTracker(config.tracker),
+    delivery: profileDelivery(config.delivery),
     verification: {
       commands: [...config.verification.commands],
       ...(config.verification.postIntegrationCommands === undefined
         ? {}
         : { postIntegrationCommands: [...config.verification.postIntegrationCommands] }),
     },
+  };
+}
+
+/**
+ * Spec #139 / ticket #144 — the tracker a team shares is the block that
+ * provider needs, not a forge block with a missing coordinate.
+ *
+ * `local` has no repository coordinate at all and `linear` carries a team,
+ * so the projection follows the same shape `init` writes: extension keys
+ * first, the coordinates this provider owns last. Spreading the resolved
+ * block instead would publish `project: undefined` for `local` and drop the
+ * Linear team, and a fresh clone would then hydrate a profile it cannot
+ * satisfy.
+ */
+function profileTracker(tracker: ResolvedPoiesisConfig["tracker"]): PoiesisConfig["tracker"] {
+  const extensions = trackerExtensionKeys(tracker);
+  if (tracker.provider === "local") return { ...extensions, provider: "local" };
+  if (tracker.provider === "linear") {
+    return {
+      ...extensions,
+      provider: "linear",
+      team: tracker.team,
+      ...(tracker.project === undefined ? {} : { project: tracker.project }),
+    };
+  }
+  return { ...extensions, provider: tracker.provider, project: tracker.project };
+}
+
+/**
+ * Spec #139 / ticket #140 — a deferred install shares `{ mode: "deferred" }`
+ * verbatim. Recording three command targets the installation never had would
+ * publish a delivery policy nobody chose, and the profile is committed, so the
+ * error would outlive the machine that made it.
+ *
+ * Spec #139 / ticket #153/#154 — the outer `delivery` extension keys are
+ * carried the same way `profileTracker` carries the tracker ones: from the
+ * shared `deliveryExtensionKeys` partition, extensions FIRST and the fields
+ * Poiesis owns LAST, so an extension can never supply, replace, nor complete a
+ * marker or a target. Dropping them here would delete a key the Author's own
+ * config carries on the next managed rewrite of the committed profile — the
+ * one place a silent deletion outlives the machine that made it.
+ */
+function profileDelivery(delivery: ResolvedPoiesisConfig["delivery"]): PoiesisConfig["delivery"] {
+  const extensions = deliveryExtensionKeys(delivery);
+  if (isDeferredDelivery(delivery)) return { ...extensions, mode: DEFERRED_DELIVERY_MODE };
+  return {
+    ...extensions,
+    preview: delivery.preview,
+    staging: delivery.staging,
+    production: delivery.production,
   };
 }
 

@@ -33,6 +33,7 @@
  * pretend it succeeded.
  */
 import { join } from "node:path";
+import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 import { PoiesisError } from "./errors.js";
 import { exists, readUtf8 } from "./fs.js";
 import { hashContent } from "./hash.js";
@@ -448,6 +449,17 @@ export function managedIgnoreBlockLines(context: ManagedIgnoreContext): string[]
     // uninstall that reads the policy must be able to see which Poiesis-owned
     // local-state roots exist without re-deriving them from the block body.
     ".poiesis/cache/",
+    // Spec #139 / ticket #162: the generated delivery targets record their
+    // artifact under `.poiesis/runtime/delivery/`, which is derived local
+    // state, so a delivery run must never appear as untracked work. The
+    // receipt-bearing update / bootstrap transactions reconcile exactly this
+    // one rule too, so stating it here makes that reconcile a genuine no-op
+    // instead of a block rewrite. It names the OWNED subtree, never the
+    // `.poiesis/runtime/` container: ignoring the container would hide state
+    // Poiesis does not own and could not restore. `src/delivery-runtime.ts`
+    // stays the single owner of the path, so the rule, the generated script,
+    // and `uninstall` cannot disagree about what is owned.
+    DELIVERY_RUNTIME_IGNORE_RULE,
     ...teamProfilePolicyLines(context.mode),
     "# Generated OpenCode agent projections. Ordinary `opencode` discovers them on disk,",
     "# which is exactly why a Poiesis installation keeps them untracked.",

@@ -30,7 +30,7 @@ import {
   readOwnershipReceipt,
 } from "../src/receipt.js";
 import { hashContent } from "../src/hash.js";
-import { parseJsonc, serializeConfig, type PoiesisConfig } from "../src/config.js";
+import { parseJsonc, requireConfiguredDelivery, serializeConfig, type PoiesisConfig } from "../src/config.js";
 import type { DoctorReport } from "../src/maintenance.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
@@ -150,7 +150,13 @@ describe("setModel (ticket #56)", () => {
     expect(afterConfig.models.execution).toBe(beforeConfig.models.execution);
     // Unrelated config is preserved.
     expect(afterConfig.tracker?.provider).toBe(beforeConfig.tracker?.provider);
-    expect(afterConfig.delivery?.preview.adapter).toBe(beforeConfig.delivery?.preview.adapter);
+    // Ticket #140: `delivery` is a discriminated union (three complete
+    // targets, or an explicit deferred state). This install configures all
+    // three, so narrow through the shared fail-closed helper to compare the
+    // preserved adapter.
+    expect(requireConfiguredDelivery(afterConfig.delivery!, "model set test").preview.adapter).toBe(
+      requireConfiguredDelivery(beforeConfig.delivery!, "model set test").preview.adapter,
+    );
     expect(afterConfig.verification?.commands).toEqual(beforeConfig.verification?.commands);
 
     // The OpenCode projection reflects the new reasoning model.

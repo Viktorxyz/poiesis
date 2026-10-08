@@ -1,17 +1,44 @@
+/**
+ * Spec #139 / ticket #188 — `createFixtureDeliveryAdapter` is a PACKAGE-PUBLIC
+ * factory, so the adapter it returns carries the delivery authority guard: these
+ * tests drive `preview` / `promote` on the adapter a consumer gets, and that
+ * adapter is only permitted to run in an installation Poiesis actually owns.
+ * The repository is therefore installed (manifest + configured `delivery`) with
+ * `skipSkills` / `allowFixtureAdapters` so the delivery-evidence contract under
+ * test stays fast. The refusal half of the same contract — a deferred install
+ * refused through this very factory, before any remote revalidation, subprocess,
+ * filesystem artifact, or evidence — is pinned in
+ * `tests/deferred-delivery-lifecycle.test.ts`.
+ */
 import { access, rm, writeFile } from "node:fs/promises";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createFixtureDeliveryAdapter, createFixtureTrackerAdapter } from "../src/adapters.js";
 import { resolveTree } from "../src/git.js";
+import { init } from "../src/maintenance.js";
 import { run } from "../src/process.js";
-import { createTestRepository, proofShell, publishEvidence, type TestRepository } from "./helpers.js";
+import { createTestRepository, proofShell, publishEvidence, testConfig, type TestRepository } from "./helpers.js";
+import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
+
+async function installedTestRepository(repositories: TestRepository[]): Promise<TestRepository> {
+  const repository = await createTestRepository();
+  repositories.push(repository);
+  await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
+  return repository;
+}
 
 describe("tracker and delivery adapters", () => {
   const repositories: TestRepository[] = [];
-  afterEach(async () => Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true }))));
+  let env: FakeOpenCodeEnvironment | undefined;
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+  afterEach(async () => {
+    env?.restore();
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
 
   it("preserves Spec relationships and Replan history", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const tracker = createFixtureTrackerAdapter(repository.fixtures, repository.root);
     const spec = await tracker.createSpec({ title: "Intent", body: "Canonical decisions" });
     const first = await tracker.createTicket({
@@ -37,8 +64,7 @@ describe("tracker and delivery adapters", () => {
   });
 
   it("requires content-equal Proof for Preview and explicit Production authorization", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);
@@ -136,8 +162,7 @@ describe("tracker and delivery adapters", () => {
   });
 
   it("verifies the canonical integration commit tree before Production", async () => {
-    const repository = await createTestRepository();
-    repositories.push(repository);
+    const repository = await installedTestRepository(repositories);
     const adapter = createFixtureDeliveryAdapter({ adapter: "fixture", path: repository.fixtures }, repository.root);
     const sha = repository.baseSha;
     const tree = await resolveTree(repository.root, sha);

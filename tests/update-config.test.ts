@@ -421,7 +421,16 @@ describe("update --config", () => {
     const configPath = join(repository.parent, "bad-tracker.jsonc");
     await writeFile(configPath, serializeConfig(invalidTracker));
 
-    await expect(updateFromConfig(repository.root, configPath)).rejects.toMatchObject({ code: "INVALID_CONFIG" });
+    // Ticket #140: an unknown tracker provider now fails with the
+    // dedicated, actionable `INVALID_TRACKER_CONFIG` code (listing the
+    // supported providers) instead of an opaque `INVALID_CONFIG`
+    // discriminator-union issue. The fail-closed contract is unchanged: the
+    // transaction rejects before the first write, and no owned byte, receipt
+    // generation, or manifest record moves.
+    await expect(updateFromConfig(repository.root, configPath)).rejects.toMatchObject({
+      code: "INVALID_TRACKER_CONFIG",
+      details: { provider: "not-a-real-provider", supported: ["github", "gitlab", "linear", "local", "fixture"] },
+    });
 
     expect(await readFile(join(repository.root, CONFIG_ROOT))).toEqual(beforeConfig);
     expect(await readFile(join(repository.root, "opencode.jsonc"))).toEqual(beforeOpenCode);

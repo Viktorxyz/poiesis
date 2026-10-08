@@ -23,11 +23,13 @@ Poiesis is not a workflow database, not an OpenCode plugin, and does not own you
 
 - Node.js `>=22.20.0`
 - Git
+- **A POSIX host with `/bin/sh` at that exact path.** `poiesis verify` and the post-integration verification `poiesis integrate` runs execute every configured verification command as `/bin/sh -c <command>`, with the working directory set to the canonical Git root of the exact candidate being proven. A host with no `/bin/sh` — Windows, or a container image without a POSIX shell — cannot run verification, so this is a stated requirement rather than a `package.json` `os` restriction, and there is no PowerShell, `cmd.exe`, or `sh`-on-`PATH` fallback.
 - OpenCode `1.18.29`, `1.18.30`, or `1.18.31` (see [COMPATIBILITY.md](./COMPATIBILITY.md) for the verified adapter-v1 contract)
 - **Repository Intelligence standard requirement (Poiesis v1.2):** `uv` (https://docs.astral.sh/uv/) on PATH. `uv` is the exact-version runtime that launches the pinned default engine behind the deterministic `poiesis repository` surface; it is invoked via `uvx --python 3.12 --from graphifyy==<pin> graphify ...`. A missing `uv` makes `poiesis init` and `poiesis update` fail closed before any canonical mutation with the typed `REPOSITORY_INTELLIGENCE_REQUIREMENT_MISSING` error; `poiesis doctor` reports the same condition as a hard `fail`. Poiesis does not install `uv`, does not vendor Python, does not offer a fallback flag, and does not ask the Author a question about it.
 - For GitHub projects: GitHub CLI (`gh`) authenticated for the target repository
 - For GitLab projects: GitLab CLI (`glab`) authenticated for the target project
-- A configured Preview, Staging, and Production delivery target (see [Preview and Staging](#preview-and-staging))
+- For Linear projects: exactly one of `LINEAR_API_KEY` or `LINEAR_OAUTH_TOKEN` in the environment — never in the config (see [Trackers](#trackers))
+- A configured Preview, Staging, and Production delivery target, or an explicit deferred state (see [Configured and deferred delivery](#configured-and-deferred-delivery))
 
 ## Install
 
@@ -56,7 +58,7 @@ projection explicitly denies every version-qualified `pnpm dlx
 poiesis-cli@*` variant (including the bare `@latest`) so only the
 exact-version route survives.
 
-`poiesis init` with no flags runs the interactive TTY flow. It discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
+`poiesis init` with no flags runs the interactive TTY flow. It discovers the Git remote, integration branch, package verification scripts, OpenCode model inventory, and `scripts/poiesis-{preview,staging,production}` hints; prints every detection on stderr; prompts only the remaining Author-owned choices (models via the shared selector, the tracker and its coordinates, whether delivery is configured now or deferred, ambiguous remote, real delivery command argv with `{sha}`); probes tracker auth (`gh` / `glab`, or a Linear credential in the environment); and then calls the existing ownership install transaction. After success, restart OpenCode to load the new agent projections — Poiesis does not restart OpenCode on the Author's behalf. A non-TTY invocation without `--config` fails closed with `NON_TTY_INIT`.
 
 `init` resolves the project's Git remote and integration branch automatically, validates the configured models against the local OpenCode model inventory, verifies the configured tracker, and verifies the configured delivery adapters. It installs the canonical method/role files, the OpenCode agent projections, the 11 curated Poiesis skills, and runs `doctor`.
 
@@ -342,6 +344,8 @@ before any side effect.
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
 ```
 
+That includes Poiesis-owned derived state: the Repository Intelligence cache under `.poiesis/cache/repository-intelligence/`, and the generated delivery runtime under `.poiesis/runtime/delivery/`. Ownership of each is exact — Poiesis owns the `repository-intelligence/` entry under `.poiesis/cache/`, and the `delivery/` entry under `.poiesis/runtime/` — and every other sibling in those containers is yours. `uninstall` removes only the owned entry, `rmdir`s the container only when it is empty, and reports anything it preserved. A symlinked container, a symlinked owned entry, or a symlink anywhere inside one is never traversed or deleted: the removal is refused, reported as `preserved`, and the rest of the uninstall proceeds.
+
 ## What `init` produces
 
 `init` cannot run from nothing because every project makes a real choice that only the Author owns. The interactive flow discovers everything it can and asks only for the Author-owned decisions. The successful install writes a resolved `.poiesis/config.jsonc` shaped like:
@@ -358,14 +362,126 @@ pnpm dlx poiesis-cli@<manifest.poiesisVersion> uninstall
     "project": "<owner/repository>"
   },
   "delivery": {
-    "preview": { "adapter": "command", "command": ["scripts/poiesis-preview.mjs", "{sha}"] },
-    "staging": { "adapter": "command", "command": ["scripts/poiesis-staging.mjs", "{sha}"] },
-    "production": { "adapter": "command", "command": ["scripts/poiesis-production.mjs", "{sha}"] }
+    "preview": { "adapter": "command", "command": ["node", "scripts/poiesis-preview.mjs", "{sha}", "{target}"] },
+    "staging": { "adapter": "command", "command": ["node", "scripts/poiesis-staging.mjs", "{sha}", "{target}"] },
+    "production": { "adapter": "command", "command": ["node", "scripts/poiesis-production.mjs", "{sha}", "{target}"] }
   }
 }
 ```
 
-The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init). `repository.remote` and `repository.integrationBranch` are auto-discovered from the Git repository; `verification.commands` are auto-derived from the project's package manager and test scripts.
+The same shape is the accepted input to `init --config` (for non-interactive / scripted use) and `update --config` (for managed configuration changes after init), with one difference: an `update --config` document must also state its `delivery` decision, because it configures an installation that already recorded one. `repository.remote` and `repository.integrationBranch` are auto-discovered from the Git repository; `verification.commands` are auto-derived from the project's package manager and test scripts.
+
+`tracker` and `delivery` are independent blocks, and each has more than one valid shape:
+
+```jsonc
+  // github: a forge repository, operated through `gh`.
+  "tracker": { "provider": "github", "project": "<owner/repository>" },
+  // gitlab: a forge project, operated through `glab`.
+  "tracker": { "provider": "gitlab", "project": "<group/subgroup/project>" },
+  // linear: a Linear team, optionally inside a Linear project. The credential
+  // is environment-only and is never stored in this file.
+  "tracker": { "provider": "linear", "team": "<team key or name>" },
+  // local: the clone itself. No coordinate at all.
+  "tracker": { "provider": "local" },
+
+  // Explicitly deferred delivery. No delivery script is generated for it.
+  "delivery": { "mode": "deferred" }
+```
+
+## Trackers
+
+The tracker choice and the delivery choice are independent. Where your Spec and tickets live says nothing about whether a candidate can be published, previewed, and released today.
+
+| `"provider"` | Where the Spec and tickets live | What you need |
+|---|---|---|
+| `github` | the forge repository, at `project` (`<owner>/<repository>`) | `gh` authenticated for that repository |
+| `gitlab` | the forge project, at `project` (`group/subgroup/project`) | `glab` authenticated for that project |
+| `linear` | a Linear team at `team` (key or name), optionally inside a `project` | exactly one credential in the **environment** |
+| `local` | the clone itself, under `poiesis-tracker-v1` beneath the Git common directory | nothing |
+
+`fixture` is test-only: it requires `--allow-fixtures` at `init`, writes outside the repository root, and is never offered as a choice.
+
+### `linear`
+
+Linear is reached over its GraphQL API. Its coordinates are a required `team` and an optional `project`: `team` is a key or a name, and Poiesis never picks a team for you. Poiesis reads the credential from the environment only, and expects exactly one of:
+
+- `LINEAR_API_KEY` — a personal API key, sent as the raw `Authorization` value;
+- `LINEAR_OAUTH_TOKEN` — an OAuth access token, sent as `Authorization: Bearer <token>`.
+
+Setting both fails closed with `LINEAR_AUTH_AMBIGUOUS`; setting neither fails closed with `LINEAR_AUTH_MISSING`. The credential is never written to `.poiesis/config.jsonc`, never placed in a tracker item, never logged, and never echoed into an error message. If `init` reports a missing credential, export it in your shell and re-run `init` — do not put it in the config file.
+
+### `local`
+
+`local` persists Spec and ticket state in the clone itself under `poiesis-tracker-v1` beneath the Git common directory, outside every working tree, and makes no network call. It needs no CLI and no credential, and it is a first-class product tracker, not a test fixture.
+
+That means it also needs no forge account, no forge issue tracker, and no network to run a full Specify → Tickets → Realize → Prove cycle. Items carry monotonic `LOCAL-<n>` identities. The store lives beside your objects rather than inside your checkout, so it survives `uninstall` and reinstall, is shared by every linked worktree of the clone, and never shows up in `git status`. Its files are `0600` inside a `0700` directory and are validated strictly: a corrupted, foreign, symlinked, or world-readable store fails closed instead of being repaired or overwritten.
+
+Note that `local` is a **tracker** choice, not a delivery choice. It does not stop Poiesis from publishing, and deferring delivery does not stop the Local tracker from persisting Specs and tickets.
+
+## Configured and deferred delivery
+
+`"delivery"` is either complete or explicitly deferred. There is no partial state, and mixing a mode with individual targets fails closed.
+
+**Configured** delivery is the three command targets above. On the interactive path it is an explicit choice, never a silent default: `init` asks `Configure delivery now? (configured|deferred)` once, offers no bracketed default, and fails closed with `INVALID_DELIVERY_MODE` on any other answer. When an `init` config carries no `delivery` block at all — a non-interactive `init --config` file, for example — Poiesis resolves the three generated command targets instead, because an adapter that actually runs is a better answer than a placeholder. Either way `init` writes a real `scripts/poiesis-{preview,staging,production}.mjs` for any target the project does not already have, and never overwrites a script you wrote yourself. `poiesis update --config` reads that omission differently; see [Configured and deferred delivery](#configured-and-deferred-delivery).
+
+A generated target records what it produced at `.poiesis/runtime/delivery/<target>/<sha>/delivery.json`, in the workspace it ran in. That path is Poiesis-owned derived state, and the ownership is exact: `init`, `update`, and `update --bootstrap-legacy-ownership` each reconcile the single ignore rule `.poiesis/runtime/delivery/` — never the whole `.poiesis/runtime/` container — transactionally, and a failed transaction restores your `.gitignore` byte-for-byte. The runtime is never a manifest file and never a tracked path, so running a target leaves `git status` exactly as it was, in the primary checkout and in a linked workspace alike; `workspace cleanup` is never blocked by delivery residue. `uninstall` removes the owned `delivery/` subtree and the `.poiesis/runtime/` parent when nothing else is there, and leaves any other sibling under `.poiesis/runtime/` byte-for-byte. Write your own artifact path anywhere you like by editing the generated script — Poiesis stops touching it at your first edit.
+
+**Deferred** delivery is an explicit, healthy state:
+
+```jsonc
+"delivery": { "mode": "deferred" }
+```
+
+The lifecycle runs normally up to and including whole-change Proof for the exact candidate — Prepare, Realize, accepted Review, Checkpoint, Verify — and `doctor` reports the deferred state as a nonblocking warning with `report.ok === true`. `init` generates no delivery scripts, because there is nothing to run.
+
+At Proof the lifecycle hard-stops. `poiesis publish`, `poiesis preview`, `poiesis promote --target staging`, `poiesis promote --target production`, `poiesis integrate`, and `poiesis workspace cleanup` each fail closed with a typed `DELIVERY_DEFERRED` error naming the blocked operation and its remediation — before any push, fetch, remote revalidation, delivery subprocess, integration commit, remote branch deletion, or worktree removal. Nothing claims that Publish, Preview, integration, or completion happened, and you are never asked to validate a realization that was never delivered.
+
+The exact code is the same wherever you run it from. `poiesis publish`, `poiesis preview`, `poiesis promote`, and `poiesis integrate` each run one shared preflight before they read your config: your installed Poiesis version is checked first, then the deferred state above. So a deferred install reports `DELIVERY_DEFERRED` for those operations, and a project with no `.poiesis/config.jsonc` reports `CONFIG_NOT_INSTALLED` for them too, whether you invoke them in the primary checkout or in a Poiesis workspace.
+
+`poiesis workspace cleanup` is the sixth operation, and it decides in the opposite order, because it has to know what it would delete before it can know anything about delivery. Workspace ownership comes first for cleanup: `poiesis workspace cleanup` proves it owns the workspace before it reads any installation, so a cleanup invoked outside a workspace Poiesis can prove it owns is refused with `WORKSPACE_OWNERSHIP_UNKNOWN` and never reaches the installed-state decision. `poiesis workspace cleanup` invoked outside a workspace Poiesis can prove it owns never reports a delivery code at all: on a fully installed deferred project it reports `WORKSPACE_OWNERSHIP_UNKNOWN` rather than `DELIVERY_DEFERRED`. The primary checkout and a linked worktree Poiesis never prepared are both outside an owned workspace, so both report that code, and a directory that is not inside a Git repository at all is refused even earlier, with `NOT_GIT_REPOSITORY`. Inside an owned workspace the precedence is unchanged and strictly ordered: `RUNTIME_VERSION_MISMATCH` when the installed version does not match, then `CONFIG_NOT_INSTALLED` naming the PRIMARY checkout's `.poiesis/config.jsonc` when that installed config is missing, then `DELIVERY_DEFERRED` when it states the deferred mode. Every one of those refusals is decided before the first lifecycle side effect: before any side-effecting subprocess, before any remote branch deletion, before any worktree removal, before any local ref deletion, and before any change to the immutable workspace ownership marker. The read-only `git rev-parse` calls that find the repository and read its ownership markers finish before the refusal is raised — what is guaranteed is that nothing that changes anything has run. A refused cleanup leaves the remote, the branch, the worktree, and the marker exactly as they were.
+
+`poiesis publish` on a CONFIGURED install whose remote is not a recognized forge refuses with `PUBLISH_PROVIDER_UNRESOLVED` instead (see [Publishing coordinates and forks](#publishing-coordinates-and-forks)). Every one of these is fail-closed, and none of them pushes anything.
+
+Those operations require a real installation, too. Once Poiesis has confirmed the project's installed version — and, for `poiesis workspace cleanup`, once it has proved the workspace is one it owns — a project with no `.poiesis/config.jsonc` is an incomplete install, not an exemption, so the operation fails closed with a typed `CONFIG_NOT_INSTALLED` error naming the missing managed path and the managed fix — before your own delivery arguments are turned into an adapter, and before the first side effect. The path it names is always the PRIMARY checkout's, never the workspace you happened to invoke it from. Restore the config with `poiesis init` or `poiesis update --config`; Poiesis never guesses a delivery state it did not install. Unknown extension keys in the `delivery` block — on the three configured targets, on the deferred mode, or inside a target adapter — are preserved as-is, so a newer Poiesis can read a config written by an older one without losing your fields.
+
+Configuring delivery later is the ordinary managed-configuration workflow, never a hand edit of `.poiesis/config.jsonc`: `poiesis update --config`. Supply the proposed complete config as the argument, replacing the `delivery` block with the three command targets and leaving the `tracker` block untouched:
+
+```bash
+pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update --config ./poiesis-config.jsonc
+```
+
+That transaction is atomic — config, OpenCode projection, manifest, receipt — and `doctor` gates the result. Tracker and delivery stay independent through the change.
+
+An omitted `delivery` block is a fresh-install default, never an update default: `poiesis init --config` resolves it to the three generated command targets, and `poiesis update --config` refuses it. `poiesis update --config` refuses a proposed config that omits `delivery` with `INVALID_DELIVERY_CONFIG` and details `{ field: "delivery", operation: "update --config" }`, before any default resolution, probe, journal, or write, so an installation's recorded delivery decision is never replaced by a default its Author did not choose. The rule is contextual, not a schema change: `delivery` stays optional in the config, so an `init --config` file that omits it still installs, and the three valid shapes — three targets, `{ "mode": "deferred" }`, or three targets plus a partial typo — still fail closed exactly as before. A stated `"delivery": null` is a malformed document rather than an omission, and keeps the schema's own `INVALID_CONFIG` verdict. `poiesis update --config` never generates a delivery script, so configuring delivery later through it requires the Author's own three commands. Point each target's `command` at the script or binary you already have, and keep the installed block honest about what it runs.
+
+The same document also has to answer for `model set`. `poiesis model set reasoning|execution <provider/model>` proposes the installed config with one model field changed, so the resolved `delivery` block is carried through unchanged — a deferred install stays deferred, and a configured install keeps its three targets — and it is that same explicit block, not a re-resolved default, that the transaction writes back.
+
+## Publishing coordinates and forks
+
+Publishing coordinates are a property of the configured Git remote, never of the tracker. Poiesis uses the remote when it is a recognized `github.com` or `gitlab.com` host; otherwise the only coordinates it may use are the test-only `fixture` tracker's; otherwise there are none. A `github` or `gitlab` tracker never supplies them either — tracker identity is not a second source of truth for where a change request is opened — and a `linear` or `local` tracker never appears as the `provider` of Publish evidence, so a project whose Specs live in Linear or in the clone still publishes to the repository its remote points at.
+
+A remote URL may carry a credential (`https://user:token@github.com/owner/repo.git`). Poiesis reads such a URL as the recognized remote it is, and strips the userinfo before the URL reaches a coordinate, a `doctor` report, an error detail, a CLI JSON envelope, a log line, or published evidence.
+
+When nothing resolves, `poiesis publish` fails closed with `PUBLISH_PROVIDER_UNRESOLVED` before any push, fetch, remote revalidation, change request, or evidence. That is what a project with a filesystem or self-hosted remote gets; Poiesis does not invent a repository to publish into.
+
+A fork is a different repository, not a shortcut to its upstream. A remote pointing at a fork is a recognized host, so Poiesis publishes to the fork that remote names and opens the change request against that fork's own configured integration branch. Nothing in a clone records the fork/upstream relationship, so Poiesis cannot publish back to the upstream it was forked from and does not pretend to: if the change request that comes back is owned by a different repository than the coordinates it resolved, Publish fails closed.
+
+### Onboarding a project with no publishing path (Veritium)
+
+Veritium-style projects — an application that already ships through its own AWS pipeline, with its own release and rollback process, and no GitHub or GitLab issue tracker to mirror — are a first-class onboarding, not a compromise. Onboard with the Local tracker and deferred delivery:
+
+```jsonc
+{
+  "schema": 1,
+  "models": { "reasoning": "<provider/model>", "execution": "<provider/model>" },
+  "tracker": { "provider": "local" },
+  "delivery": { "mode": "deferred" }
+}
+```
+
+What adopting Poiesis that way costs the project: nothing it already runs. Adopting a deferred install requires no change to any existing project workflow: nothing is pushed, no pull or merge request is opened, and nothing is deployed to any environment. The AWS workflow, its roles, its pipelines, its environments, and its rollback process are untouched — Poiesis does not adopt, replace, reorder, or reconfigure them, and onboarding Poiesis is not itself a deployment step. Your Specs and tickets live in the clone; your work is proven, reviewed, and checkpointed; and the lifecycle stops at Proof instead of pretending to ship.
+
+When the project later grows a Preview, a forge, or a tracker, that is a separate, deliberate change: `poiesis update --config` with a new `delivery` block, or a new `tracker` block, in either order and independently of the other.
 
 ## Preview and Staging
 
@@ -449,7 +565,7 @@ After init (Poiesis is installed locally):
   2. Inspect: `poiesis inspect` for bounded project and Git facts.
   3. Change a model slot: `poiesis model` (TTY), or the deterministic `poiesis model set reasoning|execution <provider/model>` for scripted use.
 
-If a step needs authentication that Poiesis cannot perform on its own (e.g. signing in to `gh`, `glab`, or a delivery target), copy-paste the exact auth command Poiesis prints, run it, and re-run the Poiesis step — do not invent a different auth path.
+If a step needs authentication that Poiesis cannot perform on its own (e.g. signing in to `gh`, `glab`, or a delivery target, or exporting a `LINEAR_API_KEY` / `LINEAR_OAUTH_TOKEN` credential), copy-paste the exact auth command Poiesis prints, run it, and re-run the Poiesis step — do not invent a different auth path.
 
 Ask the human only for decisions that materially affect their product (intent, acceptance, consequential constraints). Do not ask about adapter version numbers, capability shapes, manifest paths, or other Poiesis internals — those are Poiesis's responsibility. If a command fails closed with a structured error, surface the error verbatim; do not silently retry or substitute.
 ```
@@ -469,7 +585,7 @@ Steps (run in order, stop on first fail-closed error and report it verbatim):
 
   2. Run the fresh-latest interactive bootstrap if Poiesis is not yet installed in this repo:
        pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init
-     On a TTY this is interactive; follow every printed prompt, choose the Author-owned model slots via the live OpenCode inventory, supply the real preview/staging/production argv with `{sha}`, and only stop when `init` reports success. If `.poiesis/manifest.json` already exists, instead run the same-version reconciliation:
+     On a TTY this is interactive; follow every printed prompt, choose the Author-owned model slots via the live OpenCode inventory, choose the tracker (github / gitlab / linear / local) and configure delivery now or defer it, supply the real preview/staging/production argv with `{sha}` when delivery is configured, and only stop when `init` reports success. If `.poiesis/manifest.json` already exists, instead run the same-version reconciliation:
        pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
      If the operator explicitly wants the freshest published runtime, use the fresh-latest form:
        pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest update

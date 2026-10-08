@@ -25,7 +25,7 @@
  *   5. Worker/Reviewer ownership is preserved and no second check or review
  *      engine is introduced.
  *
- * The contract spans POIESIS_METHOD.md (§8 Realize and §10 Prove), 
+ * The contract spans POIESIS_METHOD.md (§8 Realize and §10 Prove),
  * POIESIS_ROLE_POIESIS.md, and POIESIS_ROLE_WORKER.md, plus the projections
  * `init` and `update` write. The OpenCode wrappers stay thin projections, and
  * the Reviewer role is asserted to be UNCHANGED in ownership.

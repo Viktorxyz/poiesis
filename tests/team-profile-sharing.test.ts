@@ -850,6 +850,157 @@ describe("Spec #190 / ticket #192 - a fresh clone hydrates from the shared profi
   }, 180_000);
 });
 
+/**
+ * Spec #139 / ticket #153/#154 carried into the Team/shared profile.
+ *
+ * An outer `delivery` extension key is a key the Author's own config carries
+ * and Poiesis has no opinion about, so it survives every managed rewrite —
+ * including the one that publishes the COMMITTED profile. The projection
+ * dropped it, and the committed profile is the one artifact whose damage
+ * outlives the machine that made it: the next teammate's hydration would
+ * rewrite the team's shared policy with the key deleted, and nothing on the
+ * Author's machine would show the loss.
+ */
+describe("Spec #190 / ticket #192 - a delivery extension key survives the shared profile", () => {
+  const repositories: TestRepository[] = [];
+
+  const repository = async (): Promise<TestRepository> => {
+    const created = await createTestRepository();
+    repositories.push(created);
+    return created;
+  };
+
+  afterAll(async () => {
+    await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
+  });
+
+  /** A portable, non-secret, non-machine extension key of the kind #152 admits. */
+  const DELIVERY_EXTENSION = { experimental: { note: "kept", retries: 2 } };
+
+  /** The suite's delivery block with the extension key merged in. */
+  function extendedDelivery(): Record<string, unknown> {
+    const base = teamConfig().delivery as Record<string, unknown>;
+    return { ...base, ...DELIVERY_EXTENSION };
+  }
+
+  async function installAuthorTeam(repository: TestRepository): Promise<void> {
+    const configPath = await writeConfig(repository, { delivery: extendedDelivery() });
+    const result = await poiesis(repository.root, "init", "--config", configPath, "--allow-fixtures");
+    expect(result.exitCode, result.stderr).toBe(0);
+    await commitAll(repository, "team: share the Poiesis profile with a delivery extension");
+  }
+
+  it("keeps a delivery extension key in the committed profile and hydrates it on a fresh clone", async () => {
+    const author = await repository();
+    await installAuthorTeam(author);
+
+    // The committed profile states the extension AND the three targets the
+    // projection owns. A projection that spread the resolved block would have
+    // kept the extension only by accident; one that rebuilt from targets alone
+    // would have deleted it here.
+    const profile = parseJsonc<{ delivery: Record<string, unknown> }>(
+      await readFile(join(author.root, TEAM_PROFILE_CONFIG_PATH), "utf8"),
+      TEAM_PROFILE_CONFIG_PATH,
+    );
+    expect(profile.delivery.experimental).toEqual(DELIVERY_EXTENSION.experimental);
+    for (const target of ["preview", "staging", "production"]) {
+      expect(profile.delivery[target], `${target} must stay a project-relative command target`).toBeDefined();
+    }
+
+    // A fresh clone hydrates from that profile alone and STILL carries the key
+    // in the installed config it writes for itself.
+    const clone = await freshClone(author);
+    const hydration = await poiesis(
+      clone.root,
+      "init",
+      "--config",
+      join(clone.root, TEAM_PROFILE_CONFIG_PATH),
+      "--allow-fixtures",
+    );
+    expect(hydration.exitCode, hydration.stderr).toBe(0);
+
+    const installed = parseJsonc<{ delivery: Record<string, unknown> }>(
+      await readFile(join(clone.root, ".poiesis", "config.jsonc"), "utf8"),
+      ".poiesis/config.jsonc",
+    );
+    expect(installed.delivery.experimental).toEqual(DELIVERY_EXTENSION.experimental);
+    expect(installed.delivery.preview).toBeDefined();
+  }, 180_000);
+
+  it("adopts a committed profile that carries a delivery extension, writing none of it", async () => {
+    // The profile is hand-editable JSONC that a team commits, so the key under
+    // test is one a TEAMMATE committed, not one this machine happened to
+    // write: a projection that could not represent it would either refuse the
+    // hydration as a contradiction or silently reserialize the shared policy
+    // without it.
+    const author = await repository();
+    const configPath = await writeConfig(author);
+    const installed = await poiesis(author.root, "init", "--config", configPath, "--allow-fixtures");
+    expect(installed.exitCode, installed.stderr).toBe(0);
+
+    const profilePath = join(author.root, TEAM_PROFILE_CONFIG_PATH);
+    const committed = parseJsonc<Record<string, unknown>>(
+      await readFile(profilePath, "utf8"),
+      TEAM_PROFILE_CONFIG_PATH,
+    );
+    committed.delivery = { ...(committed.delivery as Record<string, unknown>), ...DELIVERY_EXTENSION };
+    await writeFile(profilePath, `${JSON.stringify(committed, null, 2)}\n`);
+    await commitAll(author, "team: share the Poiesis profile with a delivery extension");
+
+    const clone = await freshClone(author);
+    const profileBefore = await readFile(join(clone.root, TEAM_PROFILE_CONFIG_PATH), "utf8");
+    expect(parseJsonc<{ delivery: Record<string, unknown> }>(profileBefore, TEAM_PROFILE_CONFIG_PATH).delivery.experimental)
+      .toEqual(DELIVERY_EXTENSION.experimental);
+
+    const hydration = await poiesis(
+      clone.root,
+      "init",
+      "--config",
+      join(clone.root, TEAM_PROFILE_CONFIG_PATH),
+      "--allow-fixtures",
+    );
+    expect(hydration.exitCode, hydration.stderr).toBe(0);
+
+    // ADOPTED, byte-for-byte: hydration did not reserialize the team's shared
+    // policy, and it did not refuse a policy it could not rebuild either.
+    expect(await readFile(join(clone.root, TEAM_PROFILE_CONFIG_PATH), "utf8")).toBe(profileBefore);
+    // ...and adopting it staged nothing, so the extension was not rewritten
+    // into a different profile either.
+    expect(await stageablePaths(clone.root)).toEqual([]);
+    // Hydration really happened, so the adoption is not vacuous, and the key
+    // reached the config this clone wrote for itself.
+    expect(await exists(join(clone.root, ".poiesis", "manifest.json"))).toBe(true);
+    const installedConfig = parseJsonc<{ delivery: Record<string, unknown> }>(
+      await readFile(join(clone.root, ".poiesis", "config.jsonc"), "utf8"),
+      ".poiesis/config.jsonc",
+    );
+    expect(installedConfig.delivery.experimental).toEqual(DELIVERY_EXTENSION.experimental);
+  }, 180_000);
+
+  it("carries a delivery extension key beside a deferred team install's marker", async () => {
+    // Spec #139 / ticket #140: a deferred install shares `{ mode: "deferred" }`
+    // and no invented targets. The marker is a field Poiesis OWNS, so it is
+    // written last and the extension rides with it rather than replacing it.
+    const author = await repository();
+    const configPath = await writeConfig(author, {
+      delivery: { mode: "deferred", ...DELIVERY_EXTENSION },
+    });
+    const result = await poiesis(author.root, "init", "--config", configPath, "--allow-fixtures");
+    expect(result.exitCode, result.stderr).toBe(0);
+
+    const profile = parseJsonc<{ delivery: Record<string, unknown> }>(
+      await readFile(join(author.root, TEAM_PROFILE_CONFIG_PATH), "utf8"),
+      TEAM_PROFILE_CONFIG_PATH,
+    );
+    expect(profile.delivery.mode).toBe("deferred");
+    expect(profile.delivery.experimental).toEqual(DELIVERY_EXTENSION.experimental);
+    // A deferred install generated no target, so none may be invented here.
+    for (const target of ["preview", "staging", "production"]) {
+      expect(profile.delivery[target], `${target} must not be invented for a deferred install`).toBeUndefined();
+    }
+  }, 180_000);
+});
+
 describe("Spec #190 / ticket #192 - the sharing classification matrix", () => {
   /**
    * The regression matrix. Every artifact class Poiesis can produce is named

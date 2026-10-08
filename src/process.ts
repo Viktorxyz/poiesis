@@ -1,6 +1,8 @@
 import { Buffer } from "node:buffer";
 import { spawn, type ChildProcess } from "node:child_process";
 import { PoiesisError, asPoiesisError } from "./errors.js";
+import { completeUtf8PrefixLength } from "./utf8-prefix.js";
+import { sanitizeSubprocessOutput } from "./url-userinfo.js";
 import {
   ADMISSION_ARGV0,
   ADMISSION_CONFIRM_MS,
@@ -547,8 +549,8 @@ export async function run(command: string, args: string[], options: RunOptions):
       command,
       args,
       exitCode,
-      stdout: stripTrailingWhitespace(captureText(stdout)),
-      stderr: stripTrailingWhitespace(captureText(stderr)),
+      stdout: sanitizedStream(stdout),
+      stderr: sanitizedStream(stderr),
       stdoutTruncated: stdout.truncated,
       stderrTruncated: stderr.truncated,
       timedOut,
@@ -1231,40 +1233,6 @@ function captureText(capture: Capture): string {
   return Buffer.concat(capture.chunks, capture.bytes).toString("utf8");
 }
 
-function completeUtf8PrefixLength(buffer: Buffer): number {
-  let offset = 0;
-  while (offset < buffer.length) {
-    const lead = buffer[offset]!;
-    if (lead <= 0x7f) {
-      offset += 1;
-      continue;
-    }
-
-    let width: number;
-    if (lead >= 0xc2 && lead <= 0xdf) width = 2;
-    else if (lead >= 0xe0 && lead <= 0xef) width = 3;
-    else if (lead >= 0xf0 && lead <= 0xf4) width = 4;
-    else return offset;
-    if (offset + width > buffer.length) return offset;
-
-    const second = buffer[offset + 1]!;
-    if (!isUtf8Continuation(second)) return offset;
-    if (lead === 0xe0 && second < 0xa0) return offset;
-    if (lead === 0xed && second > 0x9f) return offset;
-    if (lead === 0xf0 && second < 0x90) return offset;
-    if (lead === 0xf4 && second > 0x8f) return offset;
-    for (let index = 2; index < width; index += 1) {
-      if (!isUtf8Continuation(buffer[offset + index]!)) return offset;
-    }
-    offset += width;
-  }
-  return offset;
-}
-
-function isUtf8Continuation(byte: number): boolean {
-  return byte >= 0x80 && byte <= 0xbf;
-}
-
 function isExpectedStdinClosure(error: Error): boolean {
   const code = (error as NodeJS.ErrnoException).code;
   return (
@@ -1694,6 +1662,32 @@ function commandIoError(
 
 function stripTrailingWhitespace(value: string): string {
   return value.replace(/[\s\u0000]+$/, "");
+}
+
+/**
+ * Spec #139 / ticket #149 — the redaction seam for a captured stream.
+ *
+ * This runner is the ONE place subprocess output is captured, so the URL
+ * userinfo redaction is applied here rather than at each of the many
+ * call sites that report a command's output. Every settlement path reads
+ * `buildResult()` — the resolved result (including `allowFailure`), the
+ * `COMMAND_TIMEOUT` details, and the `COMMAND_FAILED` details — so a
+ * credential a child printed (`fatal: unable to access
+ * 'https://user:<token>@host/…'`) cannot reach any of them.
+ *
+ * Sanitizing happens AFTER the capture and BEFORE `bounded()` bounds the
+ * text for an error detail, so a later cut can only ever shorten a
+ * credential-free URL, never expose a credential that is still present.
+ *
+ * `truncated` is the capture's own flag: when the byte cap or an
+ * incomplete trailing code point cut the stream, the text's end is not a
+ * real boundary, and the sanitizer withholds a trailing authority it
+ * cannot prove is credential-free.
+ */
+function sanitizedStream(capture: Capture): string {
+  return sanitizeSubprocessOutput(stripTrailingWhitespace(captureText(capture)), {
+    truncated: capture.truncated,
+  });
 }
 
 function normalizeTimeout(value: number | undefined): number {

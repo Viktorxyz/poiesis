@@ -341,6 +341,47 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect((await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8"))).toContain("openai/gpt-5.6-sol");
   }, 30_000);
 
+  /**
+   * Ticket #160 — the persisted config is the whole point of the discovery
+   * overlay. A draft that states only `postIntegrationCommands` and a
+   * repository whose `package.json` supplies the pre-integration scripts must
+   * end up on disk with BOTH halves, not with the discovered commands having
+   * replaced the block.
+   */
+  it("persists discovered verification commands AND the draft's postIntegrationCommands (ticket #160)", async () => {
+    const repo = await createTestRepository();
+    repositories.push(repo);
+    await writeDeliveryScripts(repo.root);
+    await writeFile(
+      join(repo.root, "package.json"),
+      [
+        "{",
+        '  "name": "fixture",',
+        '  "version": "0.0.0",',
+        '  "scripts": {',
+        '    "test": "true",',
+        '    "lint": "echo lint"',
+        "  }",
+        "}",
+        "",
+      ].join("\n"),
+    );
+    const io = scriptedInitIO({ isTTY: true });
+    const draft: PoiesisConfig = {
+      ...baseDraft(),
+      verification: { postIntegrationCommands: ["pnpm release:notes"] },
+    };
+
+    const manifest = await runInteractiveInit({ root: repo.root, io, draft });
+    expect(manifest).toBeDefined();
+
+    const installed = JSON.parse(await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8")) as {
+      verification: { commands: string[]; postIntegrationCommands?: string[] };
+    };
+    expect(installed.verification.commands).toEqual(["true", "echo lint"]);
+    expect(installed.verification.postIntegrationCommands).toEqual(["pnpm release:notes"]);
+  }, 30_000);
+
   it("prompts the Author via the shared model selector when both model classes are unresolved", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
@@ -597,62 +638,72 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(message).toContain("glab auth login");
   });
 
-  it("discovers tracker provider+project from a github.com remote WITHOUT a draft and never prompts for provider", async () => {
+  it("offers the github.com inference as a visible default and still asks the Author to choose the tracker", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await writeDeliveryScripts(repo.root);
-    // Point origin at a github.com URL so the composer resolves
+    // Point origin at a github.com URL so the composer can infer
     // provider+project from the remote.
     await run("git", ["remote", "set-url", "origin", "https://github.com/poiesis-test/flagless-interactive.git"], { cwd: repo.root });
-    // No draft at all — flagless invocation. We still need to script the
+    // No draft at all: a flagless invocation. We still need to script the
     // model selector answers because the composer leaves the models
     // unresolved when no draft is provided.
     const io = scriptedInitIO({
       isTTY: true,
       inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
       modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
-      promptAnswers: { "verification command": "test -f README.md" },
+      promptAnswers: {
+        "verification command": "test -f README.md",
+        "tracker provider": "",
+        "configure delivery": "deferred",
+      },
     });
-    // The remote is not actually reachable; `init()` will eventually fail
-    // when `verifyGitRepository` runs `git ls-remote` against the github
-    // URL. The interesting behavior for this ticket is the prompt log
-    // BEFORE init() runs: the composer MUST NOT have asked the Author for
-    // the tracker provider or the tracker project. We catch any failure
-    // and assert on the prompt log.
+    // The remote is not actually reachable, so `init()` fails when
+    // `verifyGitRepository` runs `git ls-remote` against the github URL. The
+    // behavior this ticket owns is the prompt log BEFORE init() runs.
     let caught: unknown;
     try {
       await runInteractiveInit({ root: repo.root, io });
     } catch (error) {
       caught = error;
     }
-    // The composer must NOT have prompted the Author for the provider,
-    // because the github.com URL is enough to infer it uniquely.
+    // Spec #139 / ticket #144: the Author is always asked which tracker to
+    // use, because a provider inferred from the Git remote is a DEFAULT, not
+    // a decision. The default is visible, so an empty Enter accepts it.
     const providerPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker provider"));
-    expect(providerPrompt, "no tracker provider prompt is expected when the remote host is github.com").toBeUndefined();
+    expect(providerPrompt, "the tracker provider is always the Author's choice").toBeDefined();
+    expect(providerPrompt?.prompt).toContain("[github]");
+    for (const provider of ["github", "gitlab", "linear", "local"]) {
+      expect(providerPrompt?.prompt).toContain(provider);
+    }
 
-    // The Author's prompt log must not contain "Tracker project" either —
-    // the composer must copy the discovered project into the config rather
-    // than starting from `tracker: { provider: "github" }` with no project.
+    // The Author's prompt log must not contain "Tracker project" either:
+    // the composer copies the discovered project into the config rather than
+    // starting from `tracker: { provider: "github" }` with no project.
     const projectPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker project"));
     expect(projectPrompt, "no tracker project prompt is expected when the project is discovered from the github.com URL").toBeUndefined();
 
     // The flow reached `init()`, which then failed on the unreachable
-    // github URL — that is the expected, documented verification path.
+    // github URL: the expected, documented verification path.
     expect(caught).toBeDefined();
     expect((caught as { code?: string }).code).toBe("GIT_REMOTE_UNAVAILABLE");
   });
 
-  it("discovers tracker provider=gitlab from a gitlab.com remote WITHOUT a draft and never prompts for provider", async () => {
+  it("offers the gitlab.com inference as a visible default and still asks the Author to choose the tracker", async () => {
     const repo = await createTestRepository();
     repositories.push(repo);
     await writeDeliveryScripts(repo.root);
     await run("git", ["remote", "set-url", "origin", "https://gitlab.com/poiesis-test/flagless-gitlab-interactive.git"], { cwd: repo.root });
-    // No draft at all — flagless invocation.
+    // No draft at all: a flagless invocation.
     const io = scriptedInitIO({
       isTTY: true,
       inventory: ["openai/gpt-5.6-sol", "minimax/MiniMax-M3"],
       modelAnswers: { reasoning: "openai/gpt-5.6-sol", execution: "minimax/MiniMax-M3" },
-      promptAnswers: { "verification command": "test -f README.md" },
+      promptAnswers: {
+        "verification command": "test -f README.md",
+        "tracker provider": "",
+        "configure delivery": "deferred",
+      },
     });
     let caught: unknown;
     try {
@@ -660,16 +711,16 @@ describe("runInteractiveInit (ticket #58)", () => {
     } catch (error) {
       caught = error;
     }
-    // The composer must NOT have prompted the Author for the provider.
     const providerPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker provider"));
-    expect(providerPrompt, "no tracker provider prompt is expected when the remote host is gitlab.com").toBeUndefined();
+    expect(providerPrompt, "the tracker provider is always the Author's choice").toBeDefined();
+    expect(providerPrompt?.prompt).toContain("[gitlab]");
 
-    // The composer must NOT have prompted the Author for the project either.
+    // The composer must NOT have prompted for the project either.
     const projectPrompt = io.prompts.find((p) => p.prompt.toLowerCase().includes("tracker project"));
     expect(projectPrompt, "no tracker project prompt is expected when the project is discovered from the gitlab.com URL").toBeUndefined();
 
     // The flow reached `init()`, which then failed on the unreachable
-    // gitlab URL — that is the expected, documented verification path.
+    // gitlab URL: the expected, documented verification path.
     expect(caught).toBeDefined();
     expect((caught as { code?: string }).code).toBe("GIT_REMOTE_UNAVAILABLE");
   });
@@ -692,6 +743,7 @@ describe("runInteractiveInit (ticket #58)", () => {
         "verification command": "test -f README.md",
         "tracker provider": "github",
         "tracker project": "example/project",
+        "configure delivery": "deferred",
       },
     });
     const manifest = await runInteractiveInit({ root: repo.root, io });
@@ -702,11 +754,15 @@ describe("runInteractiveInit (ticket #58)", () => {
     expect(providerPrompt, "tracker provider prompt is expected when the remote host is unknown").toBeDefined();
 
     // The prompt must NOT advertise a silent default — unknown hosts must
-    // require an explicit github|gitlab answer. Empty Enter MUST fail closed.
-    // The previous shape was "Tracker provider [github]" (a default in
-    // `[...]`); that bracket-default must NOT be present anymore.
+    // require an explicit answer, and every supported provider is named.
+    // Empty Enter MUST still fail closed. The previous shape was
+    // "Tracker provider [github]" (a default in `[...]`); that bracket-default
+    // must NOT be present for an unrecognized host.
     expect(providerPrompt?.prompt).not.toMatch(/\[github\]/);
     expect(providerPrompt?.prompt).not.toMatch(/\[gitlab\]/);
+    for (const provider of ["github", "gitlab", "linear", "local"]) {
+      expect(providerPrompt?.prompt).toContain(provider);
+    }
 
     // The Author's answer must be carried into the final config.
     const installedConfigRaw = await readFile(join(repo.root, ".poiesis", "config.jsonc"), "utf8");

@@ -23,11 +23,42 @@
     "integrationBranch": "main"
   },
 
+  // The tracker choice and the delivery choice are independent. Pick exactly
+  // one `provider`; the shape below is the shape that provider needs.
+  //
+  //   "github" | "gitlab" — a forge repository through `gh` / `glab`.
+  //       Required: "project" ("<owner>/<repository>", or a nested
+  //       "group/subgroup/project" path for GitLab).
+  //
+  //   "linear" — a Linear team through the GraphQL API. Required: "team"
+  //       (key or name). Optional: "project". Poiesis reads the credential
+  //       from the environment only — set exactly one of LINEAR_API_KEY
+  //       (sent as the raw credential) or LINEAR_OAUTH_TOKEN (sent as a
+  //       Bearer token). It is never stored in this file; do not put one here.
+  //
+  //   "local" — clone-local, with no network call, no CLI, and no credential.
+  //       Spec and ticket state lives in `poiesis-tracker-v1` beneath the Git
+  //       common directory, outside every working tree. No coordinate at all.
+  //
+  //   "fixture" — test-only. Requires `--allow-fixtures` at `init` and writes
+  //       outside the repository root. Never an Author choice.
   "tracker": {
-    "provider": "<supported-tracker-adapter>",
-    "project": "<provider-specific-project-reference>"
+    "provider": "<github|gitlab|linear|local|fixture>",
+    "project": "<provider-specific-project-reference>",
+    "team": "<linear-team-key-or-name>"
   },
 
+  // Either the complete configured form below, or the deferred alternative:
+  //
+  //   "delivery": { "mode": "deferred" }
+  //
+  // Deferred is an explicit, healthy state: the lifecycle works normally up to
+  // and including exact-candidate Proof and then hard-stops. `init` generates
+  // no delivery scripts for it, and Publish, Preview, Staging and Production
+  // promotion, Integrate, and workspace cleanup fail closed with
+  // DELIVERY_DEFERRED before any push, fetch, or delivery subprocess.
+  // Configure delivery later with `poiesis update --config`; never hand-edit
+  // this file.
   "delivery": {
     "preview": {
       "adapter": "command",
@@ -47,7 +78,7 @@
   // POIESIS_DELIVERY_IDENTITY. They must return exact sha, candidateTree,
   // target, verified: true, and an artifactIdentity matching id/url/artifact.
   //
-  // "commands" is the whole-change Proof plan. It runs ONCE, in the owned
+// "commands" is the whole-change Proof plan. It runs ONCE, in the owned
   // candidate, before Publish, and `integrate` never re-runs it.
   //
   // "postIntegrationCommands" is optional and is the ONLY thing `integrate`
@@ -55,6 +86,13 @@
   // absent, integration runs nothing and proves exact identity in Git
   // instead (integrated tree === candidate tree, published ref === the
   // integrated commit).
+  //
+  // Every string in this `verification` block is one POSIX-sh command line,
+  // not an argument vector: Poiesis executes it as `/bin/sh -c` with the
+  // working directory set to the canonical Git root of the exact candidate. So
+  // the strings configured here and the package-script strings `init`
+  // discovers from package.json must both be POSIX-sh compatible; the same
+  // rule covers `postIntegrationCommands` if you add that block.
   "verification": {
     "commands": ["<authoritative-project-check-command>"]
     // "postIntegrationCommands": ["<deterministic-post-integration-check>"]

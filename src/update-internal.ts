@@ -41,8 +41,8 @@
  * manifest ownership; the actual write still uses `applyOpenCodeConfig`
  * (which carries its own `expectedContent` pre-write guard and the
  * `onWritten` callback that binds `transactionWrittenIdentity`). The
- * transactional `.gitignore` rule keeps its own hash-gated atomic update
- * + rollback helper because it is not a Poiesis-owned artifact under
+ * transactional `.gitignore` rules keep their own hash-gated atomic update
+ * + rollback helper because the file is not a Poiesis-owned artifact under
  * the journal's contract.
  */
 import { exists, atomicWrite } from "./fs.js";
@@ -76,6 +76,7 @@ import { installDefaultSkills } from "./skills.js";
 import { refreshIgnoreBlockRecord } from "./install-mode.js";
 import { POIESIS_GENERATED_AGENT_PATHS, templateMappings } from "./templates.js";
 import { assertTeamOverridesUnchanged, readTeamOverrides, type TeamOverride } from "./team-profile.js";
+import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
 import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
@@ -111,6 +112,29 @@ function assertUpdateDoctorGate(report: DoctorReport, skipSkills: boolean): void
 }
 
 const POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN = ".poiesis/workspaces/";
+
+/**
+ * The transactional ignore patterns, in reconciliation order.
+ *
+ * Spec #139 / ticket #162: the generated delivery runtime is derived local
+ * state too. A delivery run must never leave the Author's project dirty, so
+ * the receipt-authenticated `update` and the explicit 1.0.0 `bootstrap`
+ * reconcile the SAME rules `init` writes: the default-path workspace area and
+ * the owned `.poiesis/runtime/delivery/` subtree, never the whole
+ * `.poiesis/runtime/` container.
+ *
+ * Spec #190 / ticket #191: the rules are written ONLY through the shared
+ * `ensureGitignore`, so an installation that states them inside its managed
+ * block keeps that block byte-identical (its hash is uninstall's ownership
+ * identity) and an installation with no block keeps the legacy appended shape.
+ * Idempotence is therefore pattern-based, not header-based: a rule already
+ * present anywhere in the file is skipped, so an update that changed nothing
+ * writes nothing and the snapshot / written-hash rollback stays a no-op.
+ */
+const POIESIS_TRANSACTIONAL_IGNORE_PATTERNS: readonly string[] = [
+  POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN,
+  DELIVERY_RUNTIME_IGNORE_RULE,
+];
 
 /**
  * Captured state for the transactional `.gitignore` rule so the
@@ -179,9 +203,9 @@ export interface UpdateBootstrapTransactionHooks {
   preOpenCodeApply?: () => void | Promise<void>;
   /** Called immediately AFTER the new OpenCode projection has been written. */
   postOpenCodeApply?: () => void | Promise<void>;
-  /** Called immediately before the default-path `.gitignore` rule is appended. */
+  /** Called immediately before the transactional `.gitignore` rules are appended. */
   preDefaultPathGitignoreEnsure?: () => void | Promise<void>;
-  /** Called immediately AFTER the default-path `.gitignore` rule has been appended. */
+  /** Called immediately AFTER the transactional `.gitignore` rules have been appended. */
   postDefaultPathGitignoreEnsure?: () => void | Promise<void>;
   /** Called immediately before atomic-writing the new `.poiesis/manifest.json`. */
   preManifestWrite?: () => void | Promise<void>;
@@ -196,12 +220,21 @@ export interface UpdateBootstrapTransactionHooks {
 /**
  * Spec #190 / ticket #191 — the transactional `.gitignore` reconcile.
  *
- * Only the ONE pattern is requested, and no mode is claimed: a Spec #190
- * installation already states this rule inside its managed block, so the
- * shared `ensureGitignore` resolves to a no-op and the block Poiesis
- * owns is never rewritten. A pre-Spec #190 installation with no block
- * keeps the legacy appended-rule shape, which is exactly the state its
- * existing snapshot + written-hash rollback was built against.
+ * Every transactional pattern is reconciled in ONE write, so the
+ * snapshot / written-hash rollback above reverses all of them atomically.
+ * No mode is claimed: a Spec #190 installation already states these rules
+ * inside its managed block, so the shared `ensureGitignore` resolves to a
+ * no-op and the block Poiesis owns is never rewritten. A pre-Spec #190
+ * installation with no block keeps the legacy appended-rules shape, which
+ * is exactly the state its existing snapshot + written-hash rollback was
+ * built against.
+ *
+ * Drift is checked only when a write is actually needed, and a foreign
+ * replacement of `.gitignore` between the snapshot and this call fails
+ * closed with `POIESIS_GITIGNORE_CHANGED` before any byte is written. The
+ * function name keeps its original seam name because the hooks it is
+ * driven through (`preDefaultPathGitignoreEnsure` /
+ * `postDefaultPathGitignoreEnsure`) and their test seam are unchanged.
  */
 async function ensureDefaultPathGitignore(
   root: string,
@@ -212,14 +245,14 @@ async function ensureDefaultPathGitignore(
   if (await exists(path)) {
     content = (await readFile(path)).toString("utf8");
   }
-  if (content.split(/\r?\n/).includes(POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN)) {
-    return { writtenHash: undefined };
-  }
+  const stated = content.split(/\r?\n/).map((line) => line.trim());
+  const missing = POIESIS_TRANSACTIONAL_IGNORE_PATTERNS.filter((pattern) => !stated.includes(pattern));
+  if (missing.length === 0) return { writtenHash: undefined };
   if (expected !== null && Buffer.compare(Buffer.from(content, "utf8"), expected) !== 0) {
     throw new PoiesisError("POIESIS_GITIGNORE_CHANGED", "Gitignore changed before default-path ensure");
   }
   const { ensureGitignore } = await import("./templates.js");
-  const written = await ensureGitignore(root, [POIESIS_DEFAULT_PATH_GITIGNORE_PATTERN], expected);
+  const written = await ensureGitignore(root, missing, expected);
   if (written === undefined) return { writtenHash: undefined };
   return { writtenHash: hashContent(written) };
 }
