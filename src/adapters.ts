@@ -2,9 +2,31 @@ import { createHash } from "node:crypto";
 import { mkdir, open } from "node:fs/promises";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { pathToFileURL } from "node:url";
-import type { PoiesisConfig } from "./config.js";
+import type { DeliveryTargetConfig, PoiesisConfig } from "./config.js";
+import { trackerProjectOf } from "./config.js";
+// Spec #139 / ticket #141: the Poiesis metadata envelope, the body round
+// trip, and the tracker item / comment shapes are ONE implementation shared
+// by every adapter. A second copy of the envelope would let an item created
+// through one provider become unreadable through another.
+import {
+  assertKind,
+  decorateBody,
+  isRecord,
+  metadataFromItem,
+  requiredText,
+  trackerItem,
+  type TrackerComment,
+  type TrackerItem,
+  type TrackerItemKind,
+  type TrackerItemState,
+  type TrackerMetadata,
+} from "./tracker-item.js";
+export type { TrackerComment, TrackerItem, TrackerItemKind, TrackerItemState };
 import { PoiesisError, invariant } from "./errors.js";
 import { atomicWrite, exists, readUtf8 } from "./fs.js";
+import { assertDeliveryPolicyAllows, type DeferredBlockedOperation } from "./lifecycle-policy.js";
+import { createLinearTrackerAdapter, type LinearTrackerConfig } from "./linear-tracker.js";
+import { createLocalTrackerAdapter as buildLocalTrackerAdapter } from "./local-tracker.js";
 import { run } from "./process.js";
 import {
   validateIntegrationEvidence,
@@ -31,37 +53,25 @@ import type { VerificationReceiptAuthority } from "./verification-receipt.js";
  */
 type PreviewVerificationAuthority = VerificationReceiptAuthority & { primaryRoot: string };
 
-export type TrackerProvider = "github" | "gitlab" | "fixture";
-export type TrackerItemKind = "spec" | "ticket";
-export type TrackerItemState = "open" | "closed" | "superseded";
+/**
+ * Spec #139 / ticket #140: tracker identity is independent from Git
+ * hosting. `linear` and `local` are configurable providers whose
+ * coordinates come from the Poiesis config, not from the Git remote.
+ */
+export type TrackerProvider = "github" | "gitlab" | "linear" | "local" | "fixture";
 
 const SHA_PATTERN = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
-export interface TrackerConfig {
-  provider: TrackerProvider;
-  project: string;
-}
-
-export interface TrackerItem {
-  id: string;
-  kind: TrackerItemKind;
-  title: string;
-  body: string;
-  state: TrackerItemState;
-  url: string;
-  parentSpecId?: string;
-  dependencyText?: string;
-  supersededBy?: string[];
-  supersededReason?: string;
-}
-
-export interface TrackerComment {
-  id: string;
-  itemId: string;
-  body: string;
-  url?: string;
-}
-
+/**
+ * The provider-specific tracker coordinates. Only the Git hosts and the
+ * test-only fixture carry a repository coordinate; `local` has none at
+ * all and `linear` carries a team (and optionally a project) instead.
+ */
+export type TrackerConfig =
+  | { provider: "github" | "gitlab"; project: string }
+  | { provider: "linear"; team: string; project?: string }
+  | { provider: "local" }
+  | { provider: "fixture"; project: string };
 export interface CreateSpecInput {
   title: string;
   body: string;
@@ -101,103 +111,6 @@ export interface TrackerAdapter {
   commentTicket(id: string, body: string): Promise<TrackerComment>;
   closeTicket(id: string): Promise<TrackerItem>;
   supersedeTicket(id: string, input: SupersedeInput): Promise<TrackerItem>;
-}
-
-interface TrackerMetadata {
-  kind: TrackerItemKind;
-  parentSpecId?: string;
-  dependencyText?: string;
-  supersededReason?: string;
-  supersededBy?: string[];
-}
-
-const METADATA_START = "<!-- poiesis:tracker\n";
-const METADATA_END = "\npoiesis:tracker -->\n\n";
-
-function requiredText(value: string, name: string): string {
-  invariant(value.trim().length > 0, "INVALID_ADAPTER_INPUT", `${name} must not be empty`, { name });
-  return value;
-}
-
-function decorateBody(body: string, metadata: TrackerMetadata): string {
-  return `${METADATA_START}${JSON.stringify(metadata)}${METADATA_END}${relationshipText(metadata)}${body}`;
-}
-
-function parseBody(value: string): { body: string; metadata: TrackerMetadata } {
-  if (!value.startsWith(METADATA_START)) {
-    throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item is not managed by Poiesis");
-  }
-  const end = value.indexOf(METADATA_END, METADATA_START.length);
-  if (end < 0) throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item metadata is incomplete");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(value.slice(METADATA_START.length, end));
-  } catch (error) {
-    throw new PoiesisError("INVALID_TRACKER_ITEM", "Tracker item metadata is invalid JSON", {
-      cause: error instanceof Error ? error.message : String(error),
-    });
-  }
-  invariant(isRecord(parsed), "INVALID_TRACKER_ITEM", "Tracker item metadata must be an object");
-  invariant(parsed.kind === "spec" || parsed.kind === "ticket", "INVALID_TRACKER_ITEM", "Unknown tracker item kind");
-  const metadata: TrackerMetadata = { kind: parsed.kind };
-  if (typeof parsed.parentSpecId === "string") metadata.parentSpecId = parsed.parentSpecId;
-  if (typeof parsed.dependencyText === "string") metadata.dependencyText = parsed.dependencyText;
-  if (typeof parsed.supersededReason === "string") metadata.supersededReason = parsed.supersededReason;
-  if (Array.isArray(parsed.supersededBy) && parsed.supersededBy.every((entry) => typeof entry === "string")) {
-    metadata.supersededBy = parsed.supersededBy;
-  }
-  const remainder = value.slice(end + METADATA_END.length);
-  const relationships = relationshipText(metadata);
-  invariant(remainder.startsWith(relationships), "INVALID_TRACKER_ITEM", "Tracker relationship text is incomplete");
-  return { body: remainder.slice(relationships.length), metadata };
-}
-
-function relationshipText(metadata: TrackerMetadata): string {
-  const lines = [`**Poiesis ${metadata.kind === "spec" ? "Spec" : "Ticket"}**`];
-  if (metadata.parentSpecId !== undefined) lines.push(`Parent Spec: ${metadata.parentSpecId}`);
-  if (metadata.dependencyText !== undefined) lines.push(`Dependencies:\n${metadata.dependencyText}`);
-  if (metadata.supersededReason !== undefined) lines.push(`Superseded: ${metadata.supersededReason}`);
-  if (metadata.supersededBy !== undefined && metadata.supersededBy.length > 0) {
-    lines.push(`Replaced by: ${metadata.supersededBy.join(", ")}`);
-  }
-  return `${lines.join("\n\n")}\n\n---\n\n`;
-}
-
-function trackerItem(
-  raw: { id: string; title: string; body: string; state: string; url: string },
-): TrackerItem {
-  const parsed = parseBody(raw.body);
-  const supersessionReason = parsed.metadata.supersededReason?.trim();
-  const superseded = supersessionReason !== undefined && supersessionReason.length > 0;
-  const normalizedState = raw.state.trim().toLowerCase();
-  const openStates = new Set(["open", "opened", "reopened"]);
-  return {
-    id: raw.id,
-    kind: parsed.metadata.kind,
-    title: raw.title,
-    body: parsed.body,
-    state: superseded ? "superseded" : openStates.has(normalizedState) ? "open" : "closed",
-    url: raw.url,
-    ...(parsed.metadata.parentSpecId === undefined ? {} : { parentSpecId: parsed.metadata.parentSpecId }),
-    ...(parsed.metadata.dependencyText === undefined ? {} : { dependencyText: parsed.metadata.dependencyText }),
-    ...(parsed.metadata.supersededBy === undefined ? {} : { supersededBy: [...parsed.metadata.supersededBy] }),
-    ...(supersessionReason === undefined || supersessionReason.length === 0
-      ? {}
-      : { supersededReason: supersessionReason }),
-  };
-}
-
-function assertKind(item: TrackerItem, kind: TrackerItemKind): TrackerItem {
-  invariant(item.kind === kind, "TRACKER_ITEM_KIND_MISMATCH", `Tracker item ${item.id} is not a ${kind}`, {
-    id: item.id,
-    expected: kind,
-    actual: item.kind,
-  });
-  return item;
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function jsonObject(stdout: string, command: string): Record<string, unknown> {
@@ -314,16 +227,6 @@ abstract class CliTrackerAdapter implements TrackerAdapter {
     await this.updateIssue(current.id, current.title, decorateBody(current.body, metadata));
     return this.closeIssue(current.id);
   }
-}
-
-function metadataFromItem(item: TrackerItem): TrackerMetadata {
-  return {
-    kind: item.kind,
-    ...(item.parentSpecId === undefined ? {} : { parentSpecId: item.parentSpecId }),
-    ...(item.dependencyText === undefined ? {} : { dependencyText: item.dependencyText }),
-    ...(item.supersededReason === undefined ? {} : { supersededReason: item.supersededReason }),
-    ...(item.supersededBy === undefined ? {} : { supersededBy: [...item.supersededBy] }),
-  };
 }
 
 class GitHubTrackerAdapter extends CliTrackerAdapter {
@@ -681,16 +584,55 @@ export function createTrackerAdapter(
   config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>,
   root = process.cwd(),
 ): TrackerAdapter {
-  const project = config.project ?? "";
-  requiredText(project, "tracker project");
   switch (config.provider) {
     case "github":
-      return new GitHubTrackerAdapter(project, root);
+      return new GitHubTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
     case "gitlab":
-      return new GitLabTrackerAdapter(project, root);
+      return new GitLabTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
     case "fixture":
-      return new FixtureTrackerAdapter(project, root);
+      return new FixtureTrackerAdapter(requiredText(configProject(config), "tracker project"), root);
+    // Spec #139 / ticket #142: `local` is a first-class provider with a
+    // complete adapter and its own durable store under the Git common
+    // directory. It is NOT routed through a Git host CLI and NOT served by
+    // the test-only fixture.
+    case "local":
+      return buildLocalTrackerAdapter(root);
+    // Spec #139 / ticket #141: Linear is a first-class provider. It speaks
+    // the official GraphQL endpoint directly with a credential read only from
+    // the environment, and it is never routed through a Git host CLI.
+    case "linear":
+      return createLinearTrackerAdapter(linearConfigOf(config));
   }
+}
+
+/**
+ * Read the repository coordinate from any tracker config shape. Used only
+ * by the providers that actually carry one; `linear` and `local` never
+ * reach it because they fail closed above.
+ */
+function configProject(config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>): string {
+  return trackerProjectOf(config) ?? "";
+}
+
+/**
+ * The `linear` branch's non-secret coordinates. An empty team is refused
+ * rather than defaulted: filing a Spec in a team the Author never named
+ * would put their work somewhere they are not looking.
+ */
+function linearConfigOf(config: TrackerConfig | NonNullable<PoiesisConfig["tracker"]>): LinearTrackerConfig {
+  const team = (config as { team?: unknown }).team;
+  if (typeof team !== "string" || team.trim().length === 0) {
+    throw new PoiesisError(
+      "INVALID_TRACKER_CONFIG",
+      "A linear tracker requires a non-empty tracker.team; Poiesis will not choose a Linear team for you",
+      { provider: "linear", field: "tracker.team" },
+    );
+  }
+  const project = trackerProjectOf(config);
+  return {
+    team: team.trim(),
+    ...(project === undefined || project.trim().length === 0 ? {} : { project: project.trim() }),
+  };
 }
 
 export function createGitHubTrackerAdapter(project: string, cwd = process.cwd()): TrackerAdapter {
@@ -703,6 +645,16 @@ export function createGitLabTrackerAdapter(project: string, cwd = process.cwd())
 
 export function createFixtureTrackerAdapter(projectPath: string, root = process.cwd()): TrackerAdapter {
   return new FixtureTrackerAdapter(requiredText(projectPath, "tracker project path"), root);
+}
+
+/**
+ * Spec #139 / ticket #142. The `local` adapter's store layout, lock envelope,
+ * and validation contract live in `src/local-tracker.ts` and stay module-
+ * internal; only the factory is public, so callers get a complete
+ * `TrackerAdapter` without the store shape freezing into the package root.
+ */
+export function createLocalTrackerAdapter(cwd: string = process.cwd()): TrackerAdapter {
+  return buildLocalTrackerAdapter(cwd);
 }
 
 export type DeliveryTarget = "preview" | "staging" | "production";
@@ -783,7 +735,14 @@ export interface FixtureDeliveryConfig {
 }
 
 export type DeliveryAdapterConfig = CommandDeliveryConfig | FixtureDeliveryConfig;
-export type ConfiguredDeliveryTarget = NonNullable<PoiesisConfig["delivery"]>[DeliveryTarget];
+/**
+ * Ticket #140: a configured delivery target is always a complete adapter
+ * object. The deferred state lives at the `delivery` block level and is
+ * resolved away (or refused) by `requireConfiguredDelivery` before an
+ * adapter is ever constructed, so no adapter can be built from a deferred
+ * or partial shape.
+ */
+export type ConfiguredDeliveryTarget = DeliveryTargetConfig;
 
 class CommandDeliveryAdapter implements DeliveryAdapter {
   readonly kind = "command" as const;
@@ -1218,9 +1177,17 @@ function isAlreadyExists(error: unknown): boolean {
   return isRecord(error) && error.code === "EEXIST";
 }
 
-export function createDeliveryAdapter(
+/**
+ * Spec #139 / ticket #188 — the UNCHECKED construction seam. Module-internal on
+ * purpose: a `DeliveryAdapter` built here runs the delivery subprocess, writes
+ * the delivery artifact, and produces delivery evidence with no policy check at
+ * all, so it must never be reachable from the package public surface. Only the
+ * guarded factories below and the already-guarded `previewDelivery` /
+ * `promoteDelivery` wrappers construct through it.
+ */
+function constructDeliveryAdapter(
   config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
-  root = process.cwd(),
+  root: string,
 ): DeliveryAdapter {
   switch (config.adapter) {
     case "command":
@@ -1234,12 +1201,145 @@ export function createDeliveryAdapter(
   }
 }
 
-export function createCommandDeliveryAdapter(config: CommandDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+function constructCommandDeliveryAdapter(config: CommandDeliveryConfig, root: string): DeliveryAdapter {
   return new CommandDeliveryAdapter(config, root);
 }
 
-export function createFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+function constructFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root: string): DeliveryAdapter {
   return new FixtureDeliveryAdapter(config, root);
+}
+
+/**
+ * Spec #139 / ticket #188 — every PUBLIC construction path is policy-aware.
+ *
+ * The factories below are re-exported by `src/index.ts`, so before this ticket
+ * a library consumer could call one and then drive `preview` / `promote`
+ * directly: the deferred lifecycle was bypassable through the public API,
+ * because only the `previewDelivery` / `promoteDelivery` wrappers consulted
+ * `assertDeliveryAuthority`. A deferred installation therefore could still run
+ * a delivery subprocess, revalidate a remote, write a fixture delivery
+ * artifact, and mint a delivery identity through a returned adapter object.
+ *
+ * The guard now belongs to the adapter the public factory hands back, so the
+ * deferred lifecycle cannot be bypassed by construction at all. It runs BEFORE
+ * the delegated call, in the established order — runtime identity first, then
+ * the single central lifecycle-policy guard — and therefore before remote
+ * revalidation, before any delivery subprocess, before any filesystem artifact,
+ * and before any evidence. Construction itself stays side-effect-free and
+ * unguarded: `verifyDeliveryConfiguration` classifies a configured target by
+ * `kind` from an installation that may itself be deferred or not yet installed,
+ * so the policy is judged by the mutation, which is where the work happens.
+ *
+ * `previewDelivery` / `promoteDelivery` keep their own explicit guard and then
+ * construct through the unchecked seam, so a guarded wrapper still guards
+ * exactly once.
+ *
+ * Ticket #189 — the delegate and the authority root are ECMAScript
+ * runtime-PRIVATE (`#adapter`, `#root`), NOT TypeScript `private`. A
+ * TypeScript `private` is erased at emit and leaves an ordinary own
+ * enumerable property behind, so the object every public factory hands back
+ * exposed its unchecked delegate: `wrapper.adapter.preview(...)` revalidated
+ * the remote, ran the delivery subprocess, wrote the artifact, and minted the
+ * delivery identity with no runtime identity check and no deferred policy
+ * whatsoever. A `#private` is a real language-level slot with no property key,
+ * no descriptor, and no symbol, so the delegate is unreachable from JavaScript
+ * by any means short of the wrapper's own guarded methods.
+ *
+ * `kind` stays a plain public readonly field: it is part of the published
+ * `DeliveryAdapter` interface (and is what `verifyDeliveryConfiguration`
+ * classifies on), it is a discriminant string, and it yields neither the
+ * delegate nor any way around the guard.
+ */
+class PolicyEnforcingDeliveryAdapter implements DeliveryAdapter {
+  readonly kind: "command" | "fixture";
+  readonly #adapter: DeliveryAdapter;
+  readonly #root: string;
+
+  constructor(adapter: DeliveryAdapter, root: string) {
+    this.#adapter = adapter;
+    this.#root = root;
+    this.kind = adapter.kind;
+  }
+
+  async preview(input: PreviewDeliveryInput): Promise<PreviewDeliveryResult> {
+    await assertDeliveryAuthority(this.#root, "poiesis preview");
+    return this.#adapter.preview(input);
+  }
+
+  promote(input: StagingPromotionInput): Promise<StagingDeliveryResult>;
+  promote(input: ProductionPromotionInput): Promise<ProductionDeliveryResult>;
+  async promote(input: PromoteDeliveryInput): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
+    await assertDeliveryAuthority(this.#root, `poiesis promote --target ${input.target}`);
+    return input.target === "staging" ? this.#adapter.promote(input) : this.#adapter.promote(input);
+  }
+}
+
+/**
+ * Ticket #188 — the package-public factory. It returns a POLICY-AWARE adapter:
+ * the guard runs before the delegated `preview` / `promote`, so the deferred
+ * lifecycle cannot be bypassed through the public delivery-adapter API.
+ */
+export function createDeliveryAdapter(
+  config: DeliveryAdapterConfig | ConfiguredDeliveryTarget,
+  root = process.cwd(),
+): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructDeliveryAdapter(config, root), root);
+}
+
+/**
+ * Ticket #188 — the package-public command factory. It is guarded exactly as
+ * `createDeliveryAdapter` is; only the unchecked construction it delegates to
+ * is module-internal.
+ */
+export function createCommandDeliveryAdapter(config: CommandDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructCommandDeliveryAdapter(config, root), root);
+}
+
+/**
+ * Ticket #188 — the package-public fixture factory, guarded exactly as
+ * `createDeliveryAdapter` is. A deferred installation refuses before the
+ * fixture writes any delivery record.
+ */
+export function createFixtureDeliveryAdapter(config: FixtureDeliveryConfig, root = process.cwd()): DeliveryAdapter {
+  return new PolicyEnforcingDeliveryAdapter(constructFixtureDeliveryAdapter(config, root), root);
+}
+
+/**
+ * Spec #139 / ticket #157 — the installation AUTHORITY of a delivery mutation
+ * is the PRIMARY checkout's installation, derived here, structurally, and
+ * never handed in by a caller.
+ *
+ * Poiesis installs into the primary checkout of a clone, so a linked worktree
+ * of that clone carries none of the managed Poiesis state. Running the guards
+ * against the root a caller passed therefore made a legitimate Preview or
+ * promotion launched from a linked worktree read the worktree's absence of an
+ * install and refuse — and the `poiesis` CLI, which resolves the installation
+ * root in its own preflight, disagreed with the library seam about the very
+ * same operation.
+ *
+ * So the authority is derived from Git's own two-path report instead: equal
+ * paths are a primary checkout that owns its own installation, differing paths
+ * are a linked worktree whose common directory is the primary's `.git`, and
+ * anything Git cannot answer leaves the invocation root standing rather than a
+ * guess. It is derived structurally and NEVER probed for a config file, because
+ * a project whose installed config is missing is exactly the case the
+ * installed-state guard has to diagnose — a resolver that went looking for one
+ * could not be the thing that decides whether it is there.
+ *
+ * The derivation is a pure function of the report, and the report is read with
+ * the platform's own path semantics, so a Windows linked worktree resolves its
+ * primary the same way a POSIX one does.
+ *
+ * The order is unchanged: runtime identity first, then the single central
+ * policy guard that decides the installed state and the delivery block. The
+ * dynamic import keeps the top-level module graph acyclic (`adapters.ts` and
+ * `maintenance.ts` must not import each other at module-load time).
+ */
+async function assertDeliveryAuthority(root: string, operation: DeferredBlockedOperation | string): Promise<void> {
+  const maintenance = await import("./maintenance.js");
+  const authorityRoot = await maintenance.resolveInstallationRoot(root);
+  await maintenance.assertRuntimeVersionMatchesProject(authorityRoot);
+  await assertDeliveryPolicyAllows(authorityRoot, operation);
 }
 
 export async function previewDelivery(
@@ -1247,12 +1347,29 @@ export async function previewDelivery(
   input: PreviewDeliveryInput,
   root = process.cwd(),
 ): Promise<PreviewDeliveryResult> {
-  // Spec #168 / ticket #169: resolve the shared lifecycle authority.
-  // Preview is not an upgrade channel, and the authoritative manifest /
-  // receipt / runtime identity come from the PRIMARY receipt-authenticated
-  // installation — never from a prepared candidate workspace's own
-  // generated config. Delivery therefore runs against
-  // `authority.primaryRoot`. Dynamic imports keep the top-level module
+// Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Preview is not an upgrade channel; the running package must equal
+  // the durable `manifest.poiesisVersion` before the adapter creates
+  // a Preview identity.
+  // Spec #139 / ticket #143: the central lifecycle-policy guard. The guard
+  // runs before the adapter is constructed, so a deferred install produces no
+  // remote revalidation, no delivery subprocess, no delivery artifact, and no
+  // Preview identity.
+  // Spec #139 / ticket #157: all three read the PRIMARY installation, while
+  // the adapter below still resolves the candidate and runs the delivery
+  // command in the linked worktree the caller named.
+  // Ticket #188: the guard above is the ONLY one on this path, so the wrapper
+  // constructs through the module-internal unchecked seam; the public factories
+  // are the ones that must carry the guard themselves.
+  await assertDeliveryAuthority(root, "poiesis preview");
+  // Spec #168 / ticket #169: resolve the shared lifecycle authority FROM the
+  // root the caller named, so an owned candidate workspace is resolved as the
+  // candidate (marker, receipt, and runtime identity all bind to it) instead of
+  // a primary with no ownership marker. The authoritative manifest / receipt /
+  // runtime identity come from the PRIMARY receipt-authenticated installation —
+  // never from a prepared candidate workspace's own generated config, which is
+  // why `authenticateForwardedVerification` reads receipts and the live plan
+  // through `authority.primaryRoot`. Dynamic imports keep the top-level module
   // graph acyclic (`adapters.ts` and `git.ts` reference each other only
   // through type positions and deferred imports).
   const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
@@ -1269,7 +1386,13 @@ export async function previewDelivery(
   validateProofEvidence(input.proof, input.sha, input.candidateTree);
   validatePreviewPublishEvidence(input.publish, input.sha, input.candidateTree);
   await authenticateForwardedVerification(authority, input);
-  return createDeliveryAdapter(config, authority.primaryRoot).preview(input);
+  // The adapter is built for the root the CALLER named — the linked worktree
+  // that holds the candidate and the evidence being delivered (Spec #139 /
+  // ticket #157) — while every authority, receipt, and policy decision above
+  // was resolved from the primary installation that governs it (Spec #168).
+  // Constructing through the unchecked seam is what keeps this wrapper guarded
+  // exactly once (Spec #139 / ticket #188).
+  return constructDeliveryAdapter(config, root).preview(input);
 }
 
 /**
@@ -1335,10 +1458,24 @@ export async function promoteDelivery(
   input: PromoteDeliveryInput,
   root = process.cwd(),
 ): Promise<StagingDeliveryResult | ProductionDeliveryResult> {
+// Spec #104 / ticket #106: pre-mutation runtime identity guard.
+  // Promote is the extension of preview into staging / production; the
+  // guard mirrors `previewDelivery` so the surfaced error code is
+  // uniform across delivery mutations.
+  // Spec #139 / ticket #143: the central lifecycle-policy guard, ahead of
+  // adapter construction and of the canonical-integration revalidation and
+  // release subprocess that follow.
+  // Spec #139 / ticket #157: both guards read the PRIMARY installation of the
+  // clone, so a configured linked worktree promotes against the install that
+  // governs it, and the adapter below still promotes in that worktree.
+  await assertDeliveryAuthority(root, `poiesis promote --target ${input.target}`);
   // Spec #168 / ticket #169: the guard mirrors `previewDelivery` so the
   // surfaced error code is uniform across delivery mutations, and the
-  // authority is the same PRIMARY receipt-authenticated installation.
-  const authority = await (await import("./git.js")).resolveLifecycleAuthority(root);
-  const adapter = createDeliveryAdapter(config, authority.primaryRoot);
+  // authority is the same PRIMARY receipt-authenticated installation — resolved
+  // from the root the caller named so an owned candidate workspace keeps its
+  // ownership binding, while `assertDeliveryAuthority` above already judged the
+  // delivery policy from the primary that governs it.
+  await (await import("./git.js")).resolveLifecycleAuthority(root);
+  const adapter = constructDeliveryAdapter(config, root);
   return input.target === "staging" ? adapter.promote(input) : adapter.promote(input);
 }

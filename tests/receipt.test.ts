@@ -42,7 +42,14 @@ describe("ownership receipts", () => {
     const removed = await uninstall(repository.root);
     expect(removed.complete).toBe(true);
     expect(removed.manifestRemoved).toBe(true);
-    expect(await exists(join(repository.root, ".poiesis", "roles", "worker.md"))).toBe(true);
+    // Spec #190 / ticket #191: a PRIVATE installation owns its canon, so
+    // uninstall removes it. `durable` ("the project tracks this on
+    // purpose") is a team-mode classification, and a private install
+    // records none — leaving the role file behind would mean uninstall
+    // never actually reversed the installation.
+    expect(await exists(join(repository.root, ".poiesis", "roles", "worker.md"))).toBe(false);
+    // And the visible ignore policy goes with it.
+    expect(await exists(join(repository.root, ".gitignore"))).toBe(false);
     expect(await exists(await ownershipReceiptLocation(repository.root))).toBe(false);
   }, 60_000);
 

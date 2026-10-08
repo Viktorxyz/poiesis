@@ -114,6 +114,10 @@ export function testConfig(
   const withDelivery = options.withDelivery ?? true;
   return {
     schema: 1,
+    // Spec #190 / ticket #191: `init` requires an explicit installation
+    // mode. The suite installs private mode, which is the mode the
+    // behaviour under test actually asserts.
+    mode: "private",
     models: {
       reasoning: "openai/gpt-5.6-sol",
       execution: "minimax/MiniMax-M3",

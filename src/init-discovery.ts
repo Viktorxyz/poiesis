@@ -32,13 +32,12 @@
  */
 import { lstat, readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
-import type { PoiesisConfig, ResolvedPoiesisConfig } from "./config.js";
-import {
-  parseTrackerFromUrl,
-  autoResolveConfigDefaults,
-} from "./maintenance.js";
+import type { DeliveryTargetConfig, PoiesisConfig, ResolvedPoiesisConfig, TrackerProviderId } from "./config.js";
+import { deliveryExtensionKeys, isDeferredDelivery, requireConfiguredDelivery, trackerProjectOf } from "./config.js";
+import { parseTrackerFromUrl, autoResolveConfigDefaults } from "./maintenance.js";
 import { exists } from "./fs.js";
 import { PoiesisError } from "./errors.js";
+import { sanitizeGitRemoteUrl } from "./git-remote-url.js";
 import { run as runChildProcess } from "./process.js";
 
 export type RemoteSource = "explicit" | "git-origin" | "git-singleton" | "ambiguous" | "none";
@@ -75,13 +74,14 @@ export interface VerificationDetection {
 }
 
 export interface TrackerDetection {
-  provider?: "github" | "gitlab" | "fixture";
+  provider?: TrackerProviderId;
   project?: string;
+  team?: string;
   source: TrackerSource;
 }
 
 export interface DeliveryDetectionTarget {
-  config: ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]];
+  config: DeliveryTargetConfig;
   source: DeliverySource;
 }
 
@@ -165,14 +165,29 @@ export async function composeInitDiscovery(
   if (verificationDetection.source === "none") {
     unresolved.push("verification.commands");
   }
-  if (trackerDetection.source === "missing" || trackerDetection.project === undefined) {
+  // Spec #139 / ticket #140: a `local` tracker has no repository
+  // coordinate to resolve, so it never blocks the composer. A `linear`
+  // tracker needs a team; its repository-equivalent project is optional.
+  if (
+    detectionTrackerNeedsProject(trackerDetection) &&
+    (trackerDetection.source === "missing" || trackerDetection.project === undefined)
+  ) {
     unresolved.push("tracker.project");
   }
-  if (
-    draft?.tracker?.provider === undefined &&
-    trackerDetection.provider === undefined
-  ) {
+  // Spec #139 / ticket #144: the tracker choice belongs to the Author, so a
+  // provider the composer INFERRED from the Git remote is a suggested
+  // default, never a recorded decision. `tracker.provider` is therefore
+  // unresolved for every draft that does not state one — including a
+  // github.com / gitlab.com remote, which previously removed the question
+  // entirely and silently coupled tracker identity to Git hosting. The
+  // inference stays available on `detections.tracker` as the default the
+  // TTY offers; a draft that states the provider keeps it, so every
+  // existing noninteractive config stays a recorded explicit choice.
+  if (draft?.tracker?.provider === undefined) {
     unresolved.push("tracker.provider");
+  }
+  if (draft?.tracker?.provider === "linear" && trackerDetection.team === undefined) {
+    unresolved.push("tracker.team");
   }
   if (draft?.models.reasoning === undefined || draft.models.reasoning.trim().length === 0) {
     unresolved.push("models.reasoning");
@@ -184,30 +199,80 @@ export async function composeInitDiscovery(
   // working `scripts/poiesis-<target>.mjs` when the target is absent, so the
   // composer resolves to the generated script instead of surfacing an
   // unresolved field. The Author can still replace the script afterwards.
-  for (const target of DELIVERY_TARGETS) {
-    if (deliveryDetection[target] !== null) continue;
-    if (await exists(join(root, deliveryScriptPath(target)))) continue;
-    unresolved.push(`delivery.${target}`);
+  // Spec #139 / ticket #140: an explicitly deferred draft is complete as
+  // stated, so no target question is raised for it.
+  //
+  // Spec #139 / ticket #144: the two honest delivery states are so different
+  // from one another (three working targets versus an intentional pause) that
+  // picking one silently would record a readiness decision the Author never
+  // made. A draft that states no delivery block at all therefore raises
+  // `delivery.mode` exactly once, before any per-target question. The
+  // per-target questions are raised independently of it, so a draft that
+  // still has to be configured can ask for the three commands AFTER the
+  // Author answers `configured` — and is skipped entirely when the answer is
+  // `deferred`. A draft that states EITHER state already answers the mode
+  // question, so a `--config` install and an existing configuration are never
+  // asked twice.
+  if (!statesDeliveryMode(draft)) {
+    unresolved.push("delivery.mode");
+  }
+  if (!isDeferredDelivery(draft?.delivery)) {
+    for (const target of DELIVERY_TARGETS) {
+      if (deliveryDetection[target] !== null) continue;
+      if (await exists(join(root, deliveryScriptPath(target)))) continue;
+      unresolved.push(`delivery.${target}`);
+    }
   }
 
   if (unresolved.length === 0) {
     try {
       const resolved = await autoResolveConfigDefaults(root, draft as PoiesisConfig);
-      if (resolved.config.verification.commands.length > 0 && trackerDetection.project !== undefined) {
+      if (resolved.config.verification.commands.length > 0 && trackerResolved(trackerDetection)) {
         // Replace any delivery target that still carries a `<...>` placeholder
         // (e.g. the canonical config template) with the composer's prefilled
         // command adapter. The composer reuses `autoResolveConfigDefaults` for
         // every field it cannot reasonably recompute, but it owns the delivery
         // argv because the delivery script-hint rule is internal-only.
+        // Spec #139 / ticket #140: a deferred draft keeps its deferred state
+        // instead of being completed with discovered command targets.
+        // Spec #139 / ticket #154: the overlay is the LAST seam to rewrite
+        // `delivery`, so it must carry the block's extension keys too — the
+        // schema accepted them (#152) and `resolveDelivery` preserved them
+        // (#153), and this rebuild used to delete what both had kept. The keys
+        // come from the shared `deliveryExtensionKeys` partition and the three
+        // known targets are written LAST, so the managed targets stay
+        // authoritative and an extension still cannot introduce or complete
+        // one.
         const finalConfig: ResolvedPoiesisConfig = {
           ...resolved.config,
-          delivery: {
-            preview: replaceTemplateDelivery(resolved.config.delivery.preview, deliveryDetection.preview),
-            staging: replaceTemplateDelivery(resolved.config.delivery.staging, deliveryDetection.staging),
-            production: replaceTemplateDelivery(resolved.config.delivery.production, deliveryDetection.production),
-          },
+          delivery: isDeferredDelivery(resolved.config.delivery)
+            ? resolved.config.delivery
+            : {
+                ...deliveryExtensionKeys(resolved.config.delivery),
+                preview: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").preview,
+                  deliveryDetection.preview,
+                ),
+                staging: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").staging,
+                  deliveryDetection.staging,
+                ),
+                production: replaceTemplateDelivery(
+                  requireConfiguredDelivery(resolved.config.delivery, "init discovery").production,
+                  deliveryDetection.production,
+                ),
+              },
+          // Spec #139 / ticket #160: the composer owns
+          // `verification.commands` and nothing else. The managed block is
+          // OVERLAID, not rebuilt: `autoResolveConfigDefaults` already
+          // resolved the whole block, including a draft's own
+          // `postIntegrationCommands`, and this rebuild used to delete it
+          // whenever the package scripts supplied the commands. A draft that
+          // states only `postIntegrationCommands` is a complete statement
+          // about the post-integration half, so the discovered scripts
+          // complete that block instead of replacing it.
           verification: verificationDetection.source === "package-scripts"
-            ? { commands: [...verificationDetection.commands] }
+            ? { ...resolved.config.verification, commands: [...verificationDetection.commands] }
             : resolved.config.verification,
         };
         if (containsTemplatePlaceholder(finalConfig)) {
@@ -342,12 +407,57 @@ async function detectVerification(root: string, draft: PoiesisConfig | undefined
   return { commands: [], source: "none" };
 }
 
+/**
+ * Spec #139 / ticket #144 — does the draft already state a delivery state?
+ *
+ * A `{ mode: "deferred" }` block and a three-target block are both complete,
+ * explicit answers, so neither is asked again. An OMITTED block is not an
+ * answer: it is the legacy shape, and only a noninteractive `--config`
+ * install may rely on it. The interactive TTY must ask, because that is the
+ * only place an Author can be asked.
+ */
+function statesDeliveryMode(draft: PoiesisConfig | undefined): boolean {
+  return draft?.delivery !== undefined;
+}
+
+/**
+ * Spec #139 / ticket #140: a `local` tracker is complete without a
+ * repository coordinate, and a `linear` tracker is complete with a team.
+ * Only the Git hosts and the test-only fixture need a project.
+ */
+function detectionTrackerNeedsProject(detection: TrackerDetection): boolean {
+  return detection.provider !== "local" && detection.provider !== "linear";
+}
+
+function trackerResolved(detection: TrackerDetection): boolean {
+  if (detection.provider === "local") return true;
+  if (detection.provider === "linear") return detection.team !== undefined;
+  return detection.project !== undefined;
+}
+
 async function detectTracker(
   draft: PoiesisConfig | undefined,
   remoteUrl: string | undefined,
 ): Promise<TrackerDetection> {
   const provider = draft?.tracker?.provider;
-  const explicitProject = draft?.tracker?.project;
+  const explicitProject = draft?.tracker === undefined ? undefined : trackerProjectOf(draft.tracker);
+  const explicitTeam =
+    draft?.tracker?.provider === "linear" &&
+    typeof (draft.tracker as { team?: unknown }).team === "string"
+      ? (draft.tracker as { team: string }).team
+      : undefined;
+  // Spec #139: an explicitly chosen non-forge tracker (`linear` / `local`)
+  // is never second-guessed against the Git remote. Tracker selection and
+  // Git hosting are independent choices.
+  if (provider === "local") return { provider, source: "explicit" };
+  if (provider === "linear") {
+    return {
+      provider,
+      ...(explicitTeam === undefined ? {} : { team: explicitTeam }),
+      ...(explicitProject === undefined ? {} : { project: explicitProject }),
+      source: "explicit",
+    };
+  }
   if (provider !== undefined && explicitProject !== undefined && explicitProject.trim().length > 0) {
     return { provider, project: explicitProject, source: "explicit" };
   }
@@ -411,8 +521,12 @@ async function detectDelivery(draft: PoiesisConfig | undefined, root: string): P
   }
 
   const detection: DeliveryDetection = { preview: null, staging: null, production: null };
+  // Spec #139 / ticket #140: an explicitly deferred draft states its own
+  // complete answer. There is no per-target detection to perform and no
+  // script hint may complete it.
+  if (isDeferredDelivery(draft?.delivery)) return detection;
   for (const target of DELIVERY_TARGETS) {
-    const explicitConfig = draft?.delivery?.[target];
+    const explicitConfig = draft?.delivery === undefined ? undefined : draft.delivery[target];
     if (explicitConfig !== undefined && !containsTemplatePlaceholder(explicitConfig)) {
       // Explicit non-template delivery wins over script hints.
       const source: DeliverySource = explicitConfig.adapter === "fixture"
@@ -451,9 +565,9 @@ function containsTemplatePlaceholder(value: unknown): boolean {
 }
 
 function replaceTemplateDelivery(
-  original: ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]],
+  original: DeliveryTargetConfig,
   detected: DeliveryDetectionTarget | null,
-): ResolvedPoiesisConfig["delivery"][keyof ResolvedPoiesisConfig["delivery"]] {
+): DeliveryTargetConfig {
   if (detected === null) return original;
   if (!containsTemplatePlaceholder(original)) return original;
   return detected.config;
@@ -524,7 +638,10 @@ async function readRemoteUrls(root: string, remoteNames: string[]): Promise<Map<
         { cwd: root, allowFailure: true },
       );
       const first = result.stdout.split("\n").map((line) => line.trim()).find((line) => line.length > 0);
-      if (first !== undefined) map.set(name, first);
+      // Spec #139 / ticket #146: the detected URL is rendered in the init
+      // summary the Author reads, so it is sanitized at the one seam rather
+      // than at each render site.
+      if (first !== undefined) map.set(name, sanitizeGitRemoteUrl(first));
     } catch {
       // skip — leave absent
     }

@@ -69,7 +69,6 @@ import { init, update } from "../src/maintenance.js";
 import { packageVersion } from "../src/maintenance.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { readOwnershipReceipt } from "../src/receipt.js";
-import { POIESIS_SCRIPT_COMMAND, POIESIS_SCRIPT_NAME } from "../src/package-script.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
@@ -234,23 +233,16 @@ describe("Poiesis 1.4.2 release / update contract", () => {
     expect(await packageVersion()).toBe(RELEASE_VERSION);
   });
 
-  it("the pnpm poiesis script value is the literal cache-bypassing @latest route, not version-interpolated", async () => {
-    // Spec #133: the Author is never asked to type a version, and the
-    // script is never allowed to resolve a stale `dlx` cache entry. The
-    // script value is a release-independent constant, so a version bump
-    // must not touch it. Poiesis CLI's OWN package.json is not a
-    // Poiesis-managed project (it is the tool, not an install of it), so
-    // it correctly carries no `poiesis` script; assert that so nobody
-    // "fixes" it by adding a self-referential route to the CLI itself.
+  it("Poiesis installs no project script into package.json", async () => {
+    // Spec #190 / ticket #191: invoking Poiesis must not require a project
+    // manifest mutation, so the installed surface carries no `poiesis`
+    // script at all. Asserted here on the CLI's OWN package.json (the tool
+    // is not an install of itself) so nobody re-introduces a
+    // self-referential route, and end-to-end on a real installed project in
+    // `tests/private-install-git-isolation.test.ts`.
     const pkg = await readPackageJson();
-    expect(POIESIS_SCRIPT_COMMAND).toBe("pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest");
-    expect(POIESIS_SCRIPT_NAME).toBe("poiesis");
-    expect(POIESIS_SCRIPT_COMMAND).toContain("--config.dlx-cache-max-age=0");
-    expect(POIESIS_SCRIPT_COMMAND).toContain("@latest");
-    expect(POIESIS_SCRIPT_COMMAND).not.toContain(pkg.version);
-    expect(POIESIS_SCRIPT_COMMAND).not.toContain(RELEASE_VERSION);
-    expect(POIESIS_SCRIPT_COMMAND).not.toMatch(/@\d+\.\d+\.\d+/);
-    expect(pkg.scripts?.[POIESIS_SCRIPT_NAME]).toBeUndefined();
+    expect(pkg.scripts?.["poiesis"]).toBeUndefined();
+    expect(pkg.scripts?.["pnpm:poiesis"]).toBeUndefined();
   });
 
   it("package.json::files enumerates every required canonical doc / role / runtime output", async () => {

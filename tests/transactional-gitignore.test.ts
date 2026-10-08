@@ -26,17 +26,33 @@ import { hashContent } from "../src/hash.js";
  * post-write probe that trips the seam.
  */
 
+/**
+ * Strip every rule the transactional `.gitignore` seam is responsible for, so
+ * the transaction under test MUST install them.
+ *
+ * Spec #139 / ticket #162 added the generated-delivery-runtime rule to the
+ * same transactional write as the default-path workspace rule: one
+ * snapshot, one write, one written-hash gate, one byte-exact rollback. Both
+ * rules are therefore stripped together, and the assertions below prove
+ * NEITHER survives a failed transaction — a partial reversal would show up as
+ * a `.gitignore` that no longer equals the preimage.
+ */
 async function stripNewPathFromGitignore(root: string): Promise<Buffer> {
   const gitignorePath = join(root, ".gitignore");
   const before = await readFile(gitignorePath, "utf8");
   const stripped = before
     .split(/\r?\n/)
     .filter((line) => line.trim() !== ".poiesis/workspaces/")
+    .filter((line) => line.trim() !== ".poiesis/runtime/delivery/")
     .filter((line) => !line.includes("default-path workspace area"))
+    .filter((line) => !line.includes("generated delivery runtime state"))
     .join("\n");
   await writeFile(gitignorePath, stripped);
   return readFile(gitignorePath);
 }
+
+/** Every rule the transactional `.gitignore` seam reconciles. */
+const TRANSACTIONAL_IGNORE_RULES = [".poiesis/workspaces/", ".poiesis/runtime/delivery/"] as const;
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -202,9 +218,13 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
     await rebindReceipt(repository);
 
     const gitignorePath = join(repository.root, ".gitignore");
-    // Strip the new ticket rule so the transaction MUST install it.
+    // Strip the new ticket rules so the transaction MUST install them, and
+    // prove the preimage really is rule-free — otherwise every later
+    // "restored byte-for-byte" assertion would pass vacuously.
     const preimage = await stripNewPathFromGitignore(repository.root);
-    expect(preimage.toString("utf8")).not.toContain(".poiesis/workspaces/");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(preimage.toString("utf8")).not.toContain(rule);
+    }
 
     const manifestBytesBefore = await readFile(join(repository.root, ".poiesis", "manifest.json"));
     const configBytesBefore = await readFile(join(repository.root, ".poiesis", "config.jsonc"));
@@ -233,11 +253,16 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
     ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
 
     // Gitignore preimage is restored byte-for-byte: exact trailing
-    // newline, exact presence/absence of the `.poiesis/workspaces/`
-    // rule. This proves the catch-block rollback executes against the
-    // current file (the post-write content hash matched).
+    // newline, exact presence/absence of every rule this transaction owns.
+    // This proves the catch-block rollback executes against the current file
+    // (the post-write content hash matched). Ticket #162: the delivery
+    // runtime rule shares that single write, so a partial reversal would
+    // leave the bytes different from the preimage.
     expect(await readFile(gitignorePath)).toEqual(preimage);
-    expect((await readFile(gitignorePath, "utf8")).includes(".poiesis/workspaces/")).toBe(false);
+    const afterFailure = await readFile(gitignorePath, "utf8");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(afterFailure.includes(rule)).toBe(false);
+    }
 
     // Every other transaction-state surface is also restored.
     expect(await readFile(join(repository.root, ".poiesis", "manifest.json"))).toEqual(manifestBytesBefore);
@@ -248,13 +273,16 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
     expect(receiptAfter.manifestDigest).toBe(receiptBefore.manifestDigest);
 
     // A subsequent receipt-authenticated update WITHOUT the failing fake
-    // succeeds transactionally and installs the new rule. This proves
-    // the receipt-authenticated happy path still installs the rule after
-    // the failure was rolled back.
+    // succeeds transactionally and installs every rule. This proves the
+    // receipt-authenticated happy path still installs them after the
+    // failure was rolled back.
     env?.restore();
     env = await installFakeOpenCode();
     await update(repository.root, {});
-    expect((await readFile(gitignorePath, "utf8")).includes(".poiesis/workspaces/")).toBe(true);
+    const afterSuccess = await readFile(gitignorePath, "utf8");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(afterSuccess.includes(rule)).toBe(true);
+    }
   }, 60_000);
 
   it("fresh init restores exact .gitignore preimage (including absence) on post-write doctor failure", async () => {
@@ -300,13 +328,16 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
     expect(await pathExists(join(repository.root, "opencode.jsonc"))).toBe(false);
 
     // A subsequent init WITHOUT the failing fake succeeds transactionally
-    // and creates the durable `.gitignore` with the new rule. This proves
+    // and creates the durable `.gitignore` with every rule. This proves
     // the rollback did not leave residual state that would block re-init.
     env?.restore();
     env = await installFakeOpenCode();
     await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
     expect(await pathExists(gitignorePath)).toBe(true);
-    expect((await readFile(gitignorePath, "utf8")).includes(".poiesis/workspaces/")).toBe(true);
+    const afterInit = await readFile(gitignorePath, "utf8");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(afterInit.includes(rule)).toBe(true);
+    }
   }, 60_000);
 
   it("explicit 1.0.0 bootstrap restores exact .gitignore preimage on post-write doctor failure (shared helper with update)", async () => {
@@ -392,19 +423,26 @@ describe("transactional .gitignore rollback on post-write doctor failure", () =>
       update(repository.root, { bootstrapLegacyOwnership: true }),
     ).rejects.toMatchObject({ code: "UPDATE_DOCTOR_FAILED" });
 
-    // Shared helper: bootstrap restores the exact gitignore bytes too.
+    // Shared helper: bootstrap restores the exact gitignore bytes too, for
+    // every rule the seam owns.
     expect(await readFile(gitignorePath)).toEqual(preimage);
-    expect((await readFile(gitignorePath, "utf8")).includes(".poiesis/workspaces/")).toBe(false);
+    const afterBootstrapFailure = await readFile(gitignorePath, "utf8");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(afterBootstrapFailure.includes(rule)).toBe(false);
+    }
 
     // Bootstrap also rolled back the receipt + manifest it would have
     // written. The project is left at the legacy 1.0.0 state with no
     // ownership receipt so the receipt-authenticated path still fails.
     expect(await ownershipReceiptExists(repository.root)).toBe(false);
 
-    // A clean bootstrap re-runs successfully and installs the rule.
+    // A clean bootstrap re-runs successfully and installs every rule.
     env?.restore();
     env = await installFakeOpenCode();
     await update(repository.root, { skipSkills: true, bootstrapLegacyOwnership: true });
-    expect((await readFile(gitignorePath, "utf8")).includes(".poiesis/workspaces/")).toBe(true);
+    const afterBootstrapSuccess = await readFile(gitignorePath, "utf8");
+    for (const rule of TRANSACTIONAL_IGNORE_RULES) {
+      expect(afterBootstrapSuccess.includes(rule)).toBe(true);
+    }
   }, 60_000);
 });
