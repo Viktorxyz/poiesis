@@ -379,7 +379,12 @@ export async function packageVersion(): Promise<string> {
  *     Poiesis (no project-bound mutation; `verify` still guards every
  *     owned-candidate and installed-primary invocation through the shared
  *     lifecycle authority),
- *   - `tracker <kind> get` (read-only dispatch; guarded mutations only).
+ *   - `tracker <kind> get` (read-only dispatch; guarded mutations only),
+ *   - `latest` (Spec #203 / ticket #204 — the read-only update-availability
+ *     report). It answers from the DURABLE `manifest.poiesisVersion`, so the
+ *     running package version is not one of its inputs: refusing to answer
+ *     across a mismatch would hide the notice from exactly the Author whose
+ *     runtime is stale enough to need it. It mutates nothing.
  *
  * The manifest-less branch fails CLOSED with `RUNTIME_VERSION_MISMATCH`
  * and details `{ project: null, runtime }` so a guarded mutation cannot

@@ -18,6 +18,7 @@ import {
   type LifecycleAuthority,
 } from "./git.js";
 import { inspectProject } from "./inspect.js";
+import type { LatestOptions } from "./latest.js";
 import {
   createTrackerAdapter,
   previewDelivery,
@@ -47,6 +48,7 @@ Usage:
   poiesis init                                          # default: interactive TTY discovery; asks Private/local vs Team/shared first, then the rest of the guided configuration
   poiesis init --config <file> [--allow-fixtures]       # non-interactive: the config MUST state "mode": "private" | "team"
   poiesis doctor
+  poiesis latest                                            # Spec #203 / ticket #204 — READ-ONLY. Compares the installed \`manifest.poiesisVersion\` against the npm \`latest\` of \`poiesis-cli\` and returns \`installed\`, \`latest\`, \`newerAvailable\`, \`lookup\` (\`ok\` | \`unavailable\`), and — only when a newer published version exists — one copy-paste \`updateCommand\`. ONE registry request, ~3s, no retry, no project identity, nothing written; the network path fails open and only a project that is not installed fails closed. It NEVER updates Poiesis and NEVER restarts OpenCode.
   poiesis update [--bootstrap-legacy-ownership]
   poiesis update --config <file>
   poiesis migrate install-mode --to private|team   # Spec #190 / ticket #194 — the EXPLICIT migration of a released installation that records no sharing mode onto private/local or team/shared. Not reachable through \`update --config\`, which keeps refusing an explicit mode against a mode-less manifest, and never a side effect of any other command. It appends the ONE visible Poiesis-managed ignore block, records it in the manifest, writes the same mode into the local config, and for \`team\` publishes only the accepted declarative project profile. Artifacts such a release used to TRACK are removed from the Git INDEX only — the worktree bytes stay, every staged removal is reported in the result, and Poiesis never commits and never pushes.
@@ -96,6 +98,8 @@ async function main(argv: string[], signal?: AbortSignal): Promise<void> {
       return commandInit(rest);
     case "doctor":
       return commandDoctor(rest);
+    case "latest":
+      return commandLatest(rest);
     case "update":
       return commandUpdate(rest);
     case "uninstall":
@@ -311,6 +315,37 @@ async function commandDoctor(args: string[]): Promise<void> {
   const report = await doctor(root);
   writeSuccess("doctor", report);
   if (!report.ok) process.exitCode = 1;
+}
+
+/**
+ * Spec #203 / ticket #204 — the read-only update-availability report.
+ *
+ * A thin shell on purpose, exactly like `commandInspect`: resolve where the
+ * installation is, hand that root to the deep module, emit the canonical
+ * envelope. The comparison, the single registry lookup, the numeric ordering,
+ * the fail-open policy, and the shape of the one copy-paste command all live
+ * in `src/latest.ts`, so this surface has no second decision to get wrong.
+ *
+ * `doctor` and `inspect` are untouched: this operation adds a read, it does
+ * not change what either of them reports.
+ *
+ * The optional second parameter is the lookup seam tests inject so no test
+ * reaches npm; production always takes the module's own single-request
+ * lookup. It is a dispatcher parameter, never a flag, so an operator cannot
+ * substitute an answer source from the command line.
+ *
+ * Exported as a library seam (same pattern as `commandVerify` / `commandCheck`)
+ * so the envelope and the injected lookup are exercised directly; it is
+ * intentionally NOT re-exported by `src/index.ts`.
+ */
+export async function commandLatest(
+  args: string[],
+  lookupOptions: LatestOptions = {},
+): Promise<void> {
+  const values = options(args, { cwd: { type: "string" } });
+  const root = await resolveGitRoot(cwdOf(values));
+  const { latestReport } = await import("./latest.js");
+  writeSuccess("latest", await latestReport(root, lookupOptions));
 }
 
 export async function commandUpdate(args: string[]): Promise<void> {
