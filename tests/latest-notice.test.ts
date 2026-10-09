@@ -9,11 +9,13 @@
  *   - `updateCommand` is the one copy-paste form
  *     `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@<latest> update`,
  *     pinned to the exact published version and never to `@latest`;
- *   - the compare is NUMERIC X.Y.Z, so `1.10.0` is newer than `1.9.0` and a
- *     non-numeric published version (`1.6.0-beta.1`) is not compared at all;
- *   - the network path FAILS OPEN: a failed, rejected, or empty lookup still
- *     reports the installed version with `lookup: "unavailable"`, no
- *     `newerAvailable`, and no `updateCommand`;
+ *   - the compare is NUMERIC X.Y.Z, so `1.10.0` is newer than `1.9.0`, and a
+ *     version that is not a plain numeric `X.Y.Z` on EITHER side is not a
+ *     version this report can act on at all;
+ *   - the network path FAILS OPEN: a failed, rejected, or empty lookup — and
+ *     equally a non-`X.Y.Z` version on either side — still reports the
+ *     installed version with `latest: null`, `lookup: "unavailable"`, no
+ *     `newerAvailable`, and no `updateCommand`, under `ok: true`;
  *   - the ONE fail-closed case is a project that is not installed, and it is
  *     decided BEFORE any lookup is attempted;
  *   - nothing is mutated — the operation is a pure read;
@@ -150,26 +152,36 @@ describe("poiesis latest — the update-availability report (Spec #203 / ticket 
     expect(report.newerAvailable).toBe(true);
   });
 
-  it("does not compare a non-numeric published version into a notice", async () => {
+  it("fails open on a non-numeric published version: no version reported, no notice", async () => {
     await installedVersion("1.5.0");
     const report = await latestReport(repository.root, { lookup: async () => "1.6.0-beta.1" });
+    // A version the rule refuses to order is not a version this report can act
+    // on, so the envelope is indistinguishable from an unreachable registry:
+    // `latest: null`, `lookup: "unavailable"`, no notice. Echoing the raw
+    // string under `lookup: "ok"` would claim a comparison that never ran.
     expect(report).toEqual({
       installed: "1.5.0",
-      latest: "1.6.0-beta.1",
+      latest: null,
       newerAvailable: false,
-      lookup: "ok",
+      lookup: "unavailable",
     });
+    expect("updateCommand" in report).toBe(false);
   });
 
-  it("does not compare a non-numeric installed version into a notice", async () => {
+  it("fails open on a non-numeric installed version, still reporting the raw installed string", async () => {
     await installedVersion("1.6.0-rc.1");
     const report = await latestReport(repository.root, { lookup: async () => "1.5.0" });
+    // `installed` is the durable manifest value verbatim — it is a fact about
+    // this project, not a comparison result — so the unorderable string is
+    // reported; the published side is dropped because it could not be ordered
+    // against anything.
     expect(report).toEqual({
       installed: "1.6.0-rc.1",
-      latest: "1.5.0",
+      latest: null,
       newerAvailable: false,
-      lookup: "ok",
+      lookup: "unavailable",
     });
+    expect("updateCommand" in report).toBe(false);
   });
 
   it("fails open when the registry lookup rejects", async () => {
@@ -271,6 +283,20 @@ describe("poiesis latest — CLI surface (Spec #203 / ticket #204)", () => {
       ok: true,
       operation: "latest",
       result: { installed: "1.5.0", latest: "1.5.0", newerAvailable: false, lookup: "ok" },
+    });
+  });
+
+  it("succeeds with the fail-open envelope when the published version is not comparable", async () => {
+    await installedVersion("1.5.0");
+    const stdout = await captureStdout(() =>
+      commandLatest(["--cwd", repository.root], { lookup: async () => "1.6.0-beta.1" }),
+    );
+    // Fail-open means `ok: true`, never an error envelope: an uncomparable
+    // version is a quiet report, not a broken one.
+    expect(JSON.parse(stdout)).toEqual({
+      ok: true,
+      operation: "latest",
+      result: { installed: "1.5.0", latest: null, newerAvailable: false, lookup: "unavailable" },
     });
   });
 

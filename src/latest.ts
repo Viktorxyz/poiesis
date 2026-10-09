@@ -22,12 +22,15 @@ import { poiesisPath } from "./paths.js";
  *      input at all, which is why this operation is exempt from the runtime
  *      identity boundary: an Author whose runtime is stale is precisely the
  *      Author who must be able to hear that a newer release exists.
- *   3. It fails OPEN on the network and closed on everything else. A missing
- *      registry answer means "no notice", never "block the Author's session":
- *      the comparison is advisory, so an unreachable registry may only ever
- *      make the report quieter. The single fail-closed case is a project that
- *      is not installed, where there is no installed version to report and a
- *      silent success would be a fabricated answer.
+ *   3. It fails OPEN on the network and on an unorderable version, and
+ *      closed on everything else. A missing registry answer — or a version on
+ *      either side that is not a plain numeric `X.Y.Z` — means "no notice",
+ *      never "block the Author's session": the comparison is advisory, so a
+ *      registry that is unreachable and a version this rule will not order are
+ *      the same situation to the Author, and either may only make the report
+ *      quieter. The single fail-closed case is a project that is not installed,
+ *      where there is no installed version to report and a silent success
+ *      would be a fabricated answer.
  */
 
 /**
@@ -59,7 +62,7 @@ export const NPM_LATEST_LOOKUP_TIMEOUT_MS = 3_000;
  */
 export const UPDATE_COMMAND_TEMPLATE = "pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@{latest} update";
 
-/** Whether the registry answered with a usable published version. */
+/** Whether the registry answered with a comparable `X.Y.Z` version. */
 export type LatestLookupStatus = "ok" | "unavailable";
 
 /**
@@ -75,13 +78,20 @@ export type LatestVersionLookup = () => Promise<string | null>;
 export interface LatestReport {
   /** The durable installed version: `manifest.poiesisVersion`. */
   installed: string;
-  /** The published version, or `null` when the registry could not answer. */
+  /**
+   * The published version, or `null` when the registry could not answer or
+   * answered with something this report cannot order.
+   */
   latest: string | null;
   /** True only when a newer version is published. */
   newerAvailable: boolean;
   /** Present exactly when `newerAvailable` is true. */
   updateCommand?: string;
-  /** Whether the registry answered. */
+  /**
+   * Whether the registry answered with a version this report could compare.
+   * `unavailable` is the whole fail-open class: no answer, and equally no
+   * comparable answer.
+   */
   lookup: LatestLookupStatus;
 }
 
@@ -94,10 +104,11 @@ export interface LatestOptions {
  * The one copy-paste command for a published version.
  *
  * The value interpolated here is always one that already passed the strict
- * numeric `X.Y.Z` check, because that check gates `updateCommand`: a
- * published version carrying anything else produces no command at all. So the
- * string the Author pastes is built from digits and dots and can carry no
- * shell metacharacter from a registry response.
+ * numeric `X.Y.Z` check, because that check gates the whole reported-version
+ * envelope, `updateCommand` included: a published version carrying anything
+ * else produces no command at all. So the string the Author pastes is built
+ * from digits and dots and can carry no shell metacharacter from a registry
+ * response.
  */
 export function updateCommandFor(latest: string): string {
   return UPDATE_COMMAND_TEMPLATE.replace("{latest}", () => latest);
@@ -167,7 +178,17 @@ export async function latestReport(root: string, options: LatestOptions = {}): P
   const ordering = compareNumericVersions(installed, latest);
   // `compareNumericVersions` is ordered `installed` against `latest`, so a
   // NEGATIVE ordering is the one that means the Author is behind.
-  const newerAvailable = ordering !== null && ordering < 0;
+  //
+  // A `null` ordering means one side is not a plain numeric `X.Y.Z`, and that
+  // is classified exactly like an unreachable registry: there is no comparable
+  // published version, so the report carries no version to act on. Reporting
+  // the raw string under `lookup: "ok"` would advertise a comparison that this
+  // rule deliberately refused to make, and would hand the Author a version it
+  // cannot order — the precise failure the numeric rule exists to prevent.
+  if (ordering === null) {
+    return { installed, latest: null, newerAvailable: false, lookup: "unavailable" };
+  }
+  const newerAvailable = ordering < 0;
   return {
     installed,
     latest,
