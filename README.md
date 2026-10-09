@@ -118,11 +118,14 @@ After `init`, the everyday human surface is the exact-version route:
 
 ```bash
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
+pnpm dlx poiesis-cli@<manifest.poiesisVersion> latest
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> model set reasoning openai/gpt-5.6-sol
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
 `<manifest.poiesisVersion>` is the `poiesisVersion` recorded in `.poiesis/manifest.json`: the single durable runtime identity. That exact-version route is the one the projected agent permissions admit, and every version-qualified and `@latest` `dlx` variant is denied, so the runtime identity an agent runs under is never ambiguous. When you deliberately want the current published release instead of the recorded one, use the fresh-latest `update` form documented above; that is the intentional human upgrade, and it is a different command from the same-version reconciliation above.
+
+`poiesis latest` is the read-only way to ask whether any of that matters yet. It compares the durable `manifest.poiesisVersion` against the published `poiesis-cli` release and returns `installed`, `latest`, `newerAvailable`, and `lookup` (`ok` or `unavailable`), plus — only when a newer published version actually exists — one copy-paste `updateCommand` pinned to that exact version. It changes nothing: it is one registry request, never a retry, and it fails open on the network, so an unreachable registry can only make the report quieter, never break your session. It never updates Poiesis for you and never restarts OpenCode; running the update stays your decision.
 
 `init` itself installs no launcher on `PATH` either. `poiesis uninstall` removes what it installed, and reinstalling is `init` again.
 
@@ -558,6 +561,7 @@ doctor                  inspect health without mutation
 update                  update only proven-owned files and skills
 uninstall               remove only proven-owned state
 inspect                 return bounded project and Git facts
+latest                  report whether a newer Poiesis release is published (read-only; never updates)
 capability install      install one selected, revision-pinned skill
 model                   interactive: pick exactly one slot (reasoning or execution) from the live OpenCode inventory
 model set               deterministic single-class set (reasoning|execution <provider/model>)

@@ -68,7 +68,7 @@ beforeAll(async () => {
   const repoRoot = join(import.meta.dirname, "..");
   // Use a dedicated out-dir under the repo so this suite never shares build
   // output with anything else: the canonical `dist/` belongs to `pnpm build`
-  // and to `tests/release-contract-v1.5.0.test.ts` (Spec #168 / ticket #181 —
+  // and to `tests/release-contract-v1.6.0.test.ts` (Spec #168 / ticket #181 —
   // `tests/cli-bin.test.ts` used to own it too, and now builds into its own
   // isolated package root instead). The CLI's real behaviour is independent of
   // where the bundled file lives; what we need here is the rendered HELP text

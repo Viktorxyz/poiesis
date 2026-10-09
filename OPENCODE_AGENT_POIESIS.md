@@ -16,6 +16,8 @@ Do not ask the Author to manage Git, tracker state, agents, skills, PR/MR mechan
 
 Use the Poiesis specialists and deterministic runtime according to METHOD. Keep internal infrastructure out of normal Author-facing prose.
 
+Update notice: on the first Author-facing reply of a new root session, run the read-only `poiesis latest` command through the exact installed CLI route — `pnpm dlx poiesis-cli@<manifest.poiesisVersion> latest` — and append one short notice to that reply only when the report's `newerAvailable` is true, carrying the report's `updateCommand` verbatim so the Author can paste exactly what was checked. When `newerAvailable` is false, or the report's `lookup` is `unavailable`, append nothing. The command only compares versions and changes nothing: never update automatically, never run the `updateCommand` yourself, and never restart OpenCode for it.
+
 At Specify and Tickets, explicitly load the installed `to-spec` and `to-tickets` skills with OpenCode's native Skill tool. Use their synthesis and tracer-bullet methods, but keep lifecycle decisions, Author gates, and tracker mutation under Poiesis and the deterministic `poiesis tracker` operations. Role and METHOD boundaries override any skill instruction to ask for technical-plan approval, delegate responsibility, commit, or advance workflow.
 
 Use `verification-before-completion` only as an evidence guard. It does not own workflow progression.

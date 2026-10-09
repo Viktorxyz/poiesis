@@ -14,9 +14,10 @@
  * project whose manifest records `poiesisVersion: "1.1.1"` while the
  * runtime package presents as `1.0.3` — and proves every guarded
  * mutation entry point fails closed WITHOUT mutating any owned byte.
- * The companion exempt reads (`doctor`, `inspect`, `init`) keep working
- * and the explicit `update` boundary still migrates the Lucca-class
- * manifest forward.
+ * The companion exempt reads (`doctor`, `inspect`, `init`, and — since
+ * Spec #203 / ticket #204 — the read-only `latest` update-availability
+ * report) keep working and the explicit `update` boundary still
+ * migrates the Lucca-class manifest forward.
  *
  * Implementation note: the "runtime 1.0.3" portion of the fixture is
  * projected via the bounded internal seam
@@ -689,5 +690,83 @@ describe("runtime identity boundary — tracker dispatcher (ticket #110)", () =>
     } finally {
       capture.restore();
     }
+  }, 60_000);
+});
+
+/**
+ * Spec #203 / ticket #204 — `poiesis latest` is exempt from the runtime
+ * identity boundary.
+ *
+ * The operation answers exactly one Author-facing question: is a newer
+ * Poiesis published? Its `installed` half is the DURABLE
+ * `manifest.poiesisVersion`, so the running package version is not an input
+ * at all — and refusing to answer across a mismatch would hide the notice
+ * from exactly the Author whose runtime is stale enough to need it. It stays
+ * read-only, so it gains nothing the guarded mutations have.
+ */
+describe("runtime identity boundary — `poiesis latest` exemption (ticket #204)", () => {
+  const latestRepositories: TestRepository[] = [];
+  let env: FakeOpenCodeEnvironment | undefined;
+
+  beforeEach(async () => {
+    env = await installFakeOpenCode();
+  });
+
+  afterEach(async () => {
+    setRuntimePackageVersionOverrideForTest(null);
+    env?.restore();
+    await Promise.all(
+      latestRepositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })),
+    );
+  });
+
+  function captureLatestStdout(): { chunks: string[]; restore: () => void } {
+    const chunks: string[] = [];
+    const original = process.stdout.write.bind(process.stdout);
+    process.stdout.write = ((chunk: string | Uint8Array): boolean => {
+      chunks.push(typeof chunk === "string" ? chunk : chunk.toString());
+      return true;
+    }) as typeof process.stdout.write;
+    return { chunks, restore: () => { process.stdout.write = original; } };
+  }
+
+  it("stays usable across a runtime/manifest mismatch and reports the durable installed version", async () => {
+    const repository = await createTestRepository();
+    latestRepositories.push(repository);
+    await init(repository.root, testConfig(repository), {
+      skipSkills: true,
+      allowFixtureAdapters: true,
+    });
+    const manifest = await loadManifest(repository.root);
+    // Lucca-class mismatch: the running package presents as an unrelated
+    // version while the manifest keeps its own.
+    setRuntimePackageVersionOverrideForTest("9.9.9-different");
+    const { commandLatest } = await import("../src/cli.js");
+    const capture = captureLatestStdout();
+    try {
+      await expect(
+        commandLatest(["--cwd", repository.root], { lookup: async () => "9.9.9" }),
+      ).resolves.toBeUndefined();
+    } finally {
+      capture.restore();
+    }
+    const envelope = JSON.parse(capture.chunks.join("")) as {
+      ok: boolean;
+      operation: string;
+      result: { installed: string; newerAvailable: boolean; lookup: string; updateCommand?: string };
+    };
+    expect(envelope.ok).toBe(true);
+    expect(envelope.operation).toBe("latest");
+    // The report answers from the DURABLE manifest, so it still says what is
+    // installed and what is published even while the running package presents
+    // as something else entirely. An implementation that read the running
+    // package version instead would report `installed: "9.9.9-different"` and
+    // could never compare it at all.
+    expect(envelope.result.installed).toBe(manifest.poiesisVersion);
+    expect(envelope.result.newerAvailable).toBe(true);
+    expect(envelope.result.updateCommand).toBe(
+      `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@9.9.9 update`,
+    );
+    expect(envelope.result.lookup).toBe("ok");
   }, 60_000);
 });

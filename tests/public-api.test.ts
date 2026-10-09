@@ -437,6 +437,23 @@ const forbiddenFunctions = [
   "DELIVERY_RUNTIME_RELATIVE",
   "DELIVERY_RUNTIME_IGNORE_RULE",
   "removeValidatedDeliveryRuntime",
+  // Spec #203 / ticket #204: the update-availability report stays CLI- and
+  // runtime-internal. Promoting it would freeze the advisory network policy
+  // (one registry GET, ~3s, one attempt, fail-open, no project identity), the
+  // numeric X.Y.Z ordering, the fail-closed missing-install refusal, and the
+  // copy-paste `updateCommand` shape into a public API — and a public
+  // `latestReport` would hand a library caller a network call Poiesis runs on
+  // the Author's critical path with no route to bound it. It is reached only
+  // through `poiesis latest`; the runtime test surface in
+  // `tests/latest-notice.test.ts` reaches it through the source module
+  // directly.
+  "latestReport",
+  "compareNumericVersions",
+  "updateCommandFor",
+  "lookupPublishedLatestVersion",
+  "NPM_LATEST_LOOKUP_URL",
+  "NPM_LATEST_LOOKUP_TIMEOUT_MS",
+  "UPDATE_COMMAND_TEMPLATE",
 ] as const;
 
 const forbiddenTypes = [
@@ -595,6 +612,13 @@ const forbiddenTypes = [
   // the module; the body stream is a reader and a cancel, not a capability.
   "LinearBodyCapture",
   "LinearResponseBodyStream",
+  // Spec #203 / ticket #204: the report envelope and the injected lookup seam
+  // stay internal with the module that owns the decision, so neither the
+  // advisory network contract nor the lookup shape can be widened from outside.
+  "LatestReport",
+  "LatestOptions",
+  "LatestLookupStatus",
+  "LatestVersionLookup",
   // Tickets #149 / #167: the complete-UTF-8-prefix rule is shared by the
   // subprocess capture and the Linear capture and has one implementation in
   // `src/utf8-prefix.ts`. It is a decoding rule, not a public helper.

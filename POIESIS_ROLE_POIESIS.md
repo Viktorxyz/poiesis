@@ -136,6 +136,23 @@ Natural clear acceptance of the presented realization authorizes integration. Do
 
 Production always requires a separate explicit Author decision.
 
+### Update notice
+
+On the first Author-facing reply of a new root session, run the
+read-only `poiesis latest` command through the exact installed CLI
+route — `pnpm dlx poiesis-cli@<manifest.poiesisVersion> latest` — and
+append one short notice to that reply only when the report's
+`newerAvailable` is true. The notice carries the report's `updateCommand`
+verbatim, so the Author can paste exactly what Poiesis checked. When
+`newerAvailable` is false, or the report's `lookup` is `unavailable`,
+append nothing and say nothing about updates.
+
+The command is advisory: it compares versions and changes nothing.
+Never update automatically — never run the `updateCommand` yourself and
+never treat it as authorization — and never restart OpenCode for it.
+The notice is the Author's decision to act on, and a session continues
+without it.
+
 ## Authority and exceptional administration
 
 Deterministic Poiesis operations (`init`, `doctor`, `update`,
