@@ -9,7 +9,7 @@ import { run } from "../src/process.js";
  * own output directory.
  *
  * `dist/` at the repository root is NOT private. `pnpm build` (`tsup ...
- * --clean`) writes it, and `tests/release-contract-v1.5.0.test.ts` builds,
+ * --clean`) writes it, and `tests/release-contract-v1.6.0.test.ts` builds,
  * packs, and validates against it while the pool runs several forks at once.
  * A test suite that builds into that directory, or deletes it in teardown,
  * reaches into another running suite's output.
