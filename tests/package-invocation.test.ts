@@ -1,15 +1,17 @@
 /**
  * Spec #207 / ticket #210 — pinned local package invocation with ownership-safe
  * package.json + lockfile lifecycle.
+ * Spec #219 / ticket #220 — root-aligned pnpm workspace eligibility + scope.
  *
- * Pure / in-memory / injected-executor tests only. No mock agent sessions and
- * no new consumer projects that run a real package manager install.
+ * Pure / in-memory / injected-executor tests plus one bounded real-pnpm
+ * workspace fixture. No mock agent sessions.
  */
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
 import { parseJsonc, type PoiesisConfig } from "../src/config.js";
 import { PoiesisError } from "../src/errors.js";
 import { hashContent } from "../src/hash.js";
 import {
+  LOCAL_CLI_BIN_RELATIVE,
   LOCAL_CLI_PACKAGE_JSON_RELATIVE,
   ORDINARY_SCRIPT_VALUE,
   PACKAGE_JSON_RELATIVE,
@@ -20,22 +22,29 @@ import {
   SELFHOST_SCRIPT_VALUE,
   applyPackageContributionPlan,
   applyPackageContributionWithJournal,
+  assertLocalCliExecutableAtRoot,
   assertPackageContributionCaptureIdentity,
   assertPackageContributionMatches,
   assertPackageContributionRuntimeReady,
+  assertResolvedLocalCliExecutable,
   assertResolvedLocalCliVersion,
   assertSelfhostDistReady,
   buildPackageContributionRecord,
   classifyPackageProject,
+  createNativePackageManagerExecutor,
   desiredScriptValue,
+  detectOuterPnpmWorkspace,
   gateUpdateConfigEarlyNoopPackage,
+  isExternalLockfileDir,
   nativePackageManagerArgv,
   packageContributionMode,
   packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
+  parsePnpmSharedLockSettings,
   planPackageContribution,
   planPackageContributionForVersionCross,
   planPackageContributionRemoval,
+  readPackageFsSnapshot,
   resolvePackageManagerOwnership,
   writeManifestWithNoopPackageContributionGate,
   writeManifestWithPackageContributionGate,
@@ -49,7 +58,8 @@ import {
   desiredOpenCodePatches,
 } from "../src/opencode.js";
 import type { ArtifactJournalEntry } from "../src/mutation-transaction.js";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile as writeFileUtf8 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 function parsePkg(content: string): {
@@ -74,6 +84,8 @@ function testConfig(): PoiesisConfig {
 function snap(args: {
   packageJson?: string | null;
   lockfiles?: Partial<Record<"pnpm-lock.yaml" | "package-lock.json" | "yarn.lock" | "bun.lock" | "bun.lockb" | "pnpm-workspace.yaml", string | null>>;
+  npmrc?: string | null;
+  outerPnpmWorkspace?: boolean;
 }): PackageFsSnapshot {
   return {
     packageJson: args.packageJson === undefined ? null : args.packageJson,
@@ -85,6 +97,8 @@ function snap(args: {
       "bun.lockb": args.lockfiles?.["bun.lockb"] ?? null,
       "pnpm-workspace.yaml": args.lockfiles?.["pnpm-workspace.yaml"] ?? null,
     },
+    ...(args.npmrc === undefined ? {} : { npmrc: args.npmrc }),
+    ...(args.outerPnpmWorkspace === undefined ? {} : { outerPnpmWorkspace: args.outerPnpmWorkspace }),
   };
 }
 
@@ -128,6 +142,7 @@ describe("package manager ownership resolution (ticket #210)", () => {
       kind: "supported",
       manager: "pnpm",
       lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "single-package" },
     });
   });
 
@@ -139,6 +154,7 @@ describe("package manager ownership resolution (ticket #210)", () => {
       kind: "supported",
       manager: "npm",
       lockfile: "package-lock.json",
+      executionScope: { kind: "single-package" },
     });
   });
 
@@ -174,16 +190,7 @@ describe("package manager ownership resolution (ticket #210)", () => {
     if (resolved.kind === "unsupported") expect(resolved.code).toBe("PACKAGE_MANAGER_UNSUPPORTED");
   });
 
-  it("fails closed on pnpm workspace and package.json workspaces", () => {
-    const pnpmWs = resolvePackageManagerOwnership(
-      snap({
-        packageJson: ORDINARY_PKG,
-        lockfiles: { "pnpm-lock.yaml": "x", "pnpm-workspace.yaml": "packages:\n  - apps/*\n" },
-      }),
-    );
-    expect(pnpmWs.kind).toBe("unsupported");
-    if (pnpmWs.kind === "unsupported") expect(pnpmWs.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
-
+  it("fails closed on package.json npm workspaces", () => {
     const npmWs = resolvePackageManagerOwnership(
       snap({
         packageJson: ['{', '  "name": "demo",', '  "workspaces": ["packages/*"]', "}", ""].join("\n"),
@@ -192,6 +199,345 @@ describe("package manager ownership resolution (ticket #210)", () => {
     );
     expect(npmWs.kind).toBe("unsupported");
     if (npmWs.kind === "unsupported") expect(npmWs.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+  });
+});
+
+describe("pnpm workspace-root eligibility (Spec #219 / ticket #220)", () => {
+  const PNPM_WS = "packages:\n  - 'packages/*'\n";
+  const PNPM_LOCK = "lockfileVersion: '9.0'\n";
+
+  it("accepts root-aligned pnpm workspace with sole root pnpm-lock.yaml", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+    );
+    expect(resolved).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    });
+  });
+
+  it("fails closed on npm workspaces even when pnpm-workspace.yaml is also present", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ['{', '  "name": "demo",', '  "workspaces": ["packages/*"]', "}", ""].join("\n"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.packageWorkspaces).toBe(true);
+    }
+  });
+
+  it("fails closed when shared-workspace-lockfile is disabled via .npmrc", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+        npmrc: "shared-workspace-lockfile=false\n",
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.sharedWorkspaceLockfile).toBe(false);
+    }
+  });
+
+  it("fails closed when package.json disables pnpm.sharedWorkspaceLockfile", () => {
+    const pkg = [
+      "{",
+      '  "name": "demo",',
+      '  "pnpm": { "sharedWorkspaceLockfile": false }',
+      "}",
+      "",
+    ].join("\n");
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: pkg,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+  });
+
+  it("fails closed when lockfile-dir redirects outside the root", () => {
+    expect(isExternalLockfileDir("../locks")).toBe(true);
+    expect(isExternalLockfileDir(".")).toBe(false);
+    expect(parsePnpmSharedLockSettings("lockfile-dir=../other\n").lockfileDir).toBe("../other");
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+        npmrc: "lockfile-dir=../external-locks\n",
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.lockfileDir).toBe("../external-locks");
+    }
+  });
+
+  it("fails closed when local workspace + outer parent workspace (non-root effective scope)", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+        outerPnpmWorkspace: true,
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.outerPnpmWorkspace).toBe(true);
+      expect(resolved.details.pnpmWorkspace).toBe(true);
+    }
+  });
+
+  it("fails closed on outer parent workspace even without a local pnpm-workspace.yaml (nested single-package layout)", () => {
+    // Nested project under an outer monorepo: sole root lock present, no local
+    // workspace file — must not resolve as single-package ownership.
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK },
+        outerPnpmWorkspace: true,
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.outerPnpmWorkspace).toBe(true);
+      expect(resolved.details.pnpmWorkspace).toBe(false);
+    }
+  });
+
+  it("ordinary single-package without outer flag remains supported", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK },
+      }),
+    );
+    expect(resolved).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "single-package" },
+    });
+  });
+
+  it("detectOuterPnpmWorkspace / readPackageFsSnapshot see parent workspace and refuse nested ownership", async () => {
+    const outer = await mkdtemp(join(tmpdir(), "poiesis-outer-ws-220-"));
+    try {
+      const nested = join(outer, "apps", "nested");
+      await mkdir(nested, { recursive: true });
+      await writeFileUtf8(join(outer, "pnpm-workspace.yaml"), "packages:\n  - 'apps/*'\n", "utf8");
+      await writeFileUtf8(join(nested, "package.json"), ORDINARY_PKG, "utf8");
+      await writeFileUtf8(join(nested, "pnpm-lock.yaml"), PNPM_LOCK, "utf8");
+      // No local pnpm-workspace.yaml under nested.
+
+      const readText = async (absolutePath: string): Promise<string | null> => {
+        try {
+          return await readFile(absolutePath, "utf8");
+        } catch {
+          return null;
+        }
+      };
+
+      expect(await detectOuterPnpmWorkspace(nested, { readText })).toBe(true);
+      expect(await detectOuterPnpmWorkspace(outer, { readText })).toBe(false);
+
+      const snapshot = await readPackageFsSnapshot(nested, { readText });
+      expect(snapshot.outerPnpmWorkspace).toBe(true);
+      expect(snapshot.lockfiles["pnpm-workspace.yaml"]).toBeNull();
+      const resolved = resolvePackageManagerOwnership(snapshot);
+      expect(resolved.kind).toBe("unsupported");
+      if (resolved.kind === "unsupported") {
+        expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+        expect(resolved.details.outerPnpmWorkspace).toBe(true);
+        expect(resolved.details.pnpmWorkspace).toBe(false);
+      }
+    } finally {
+      await rm(outer, { recursive: true, force: true });
+    }
+  });
+
+  it("fails closed on ambiguous locks inside a pnpm workspace", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: {
+          "pnpm-lock.yaml": PNPM_LOCK,
+          "package-lock.json": "{}",
+          "pnpm-workspace.yaml": PNPM_WS,
+        },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") expect(resolved.code).toBe("PACKAGE_MANAGER_AMBIGUOUS");
+  });
+
+  it("fails closed when pnpm-workspace.yaml exists without a root pnpm-lock.yaml", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-workspace.yaml": PNPM_WS },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") expect(resolved.code).toBe("PACKAGE_MANAGER_UNSUPPORTED");
+  });
+
+  it("planning carries explicit workspace-root execution scope without durable schema fields", () => {
+    const plan = planPackageContribution({
+      snapshot: snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+    // Durable record stays root-relative — no workspace field on the ownership schema.
+    expect(plan.record).toEqual({
+      owned: true,
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      packageJson: "package.json",
+      scriptName: "poiesis",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    expect(Object.keys(plan.record).sort()).toEqual(
+      [
+        "owned",
+        "manager",
+        "lockfile",
+        "projectKind",
+        "packageJson",
+        "scriptName",
+        "scriptValue",
+        "devDependencyVersion",
+      ].sort(),
+    );
+    const next = parsePkg(plan.nextPackageJson);
+    expect(next.scripts?.poiesis).toBe("poiesis");
+    expect(next.devDependencies?.["poiesis-cli"]).toBe("1.6.0");
+  });
+
+  it("native argv uses explicit -w for pnpm workspace-root add and remove", () => {
+    const scope = { kind: "pnpm-workspace-root" as const };
+    expect(
+      nativePackageManagerArgv("pnpm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" }, scope),
+    ).toEqual(["add", "-w", "-D", "-E", "poiesis-cli@1.6.0", "--ignore-scripts"]);
+    expect(nativePackageManagerArgv("pnpm", { op: "remove-dev", name: "poiesis-cli" }, scope)).toEqual([
+      "remove",
+      "-w",
+      "poiesis-cli",
+      "--ignore-scripts",
+    ]);
+    // Single-package default remains unchanged.
+    expect(nativePackageManagerArgv("pnpm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" })).toEqual([
+      "add",
+      "-D",
+      "-E",
+      "poiesis-cli@1.6.0",
+      "--ignore-scripts",
+    ]);
+  });
+
+  it("apply passes workspace-root scope to the executor and only writes root package.json + lock", async () => {
+    const childManifest = ['{', '  "name": "@demo/app",', '  "version": "0.0.1"', "}", ""].join("\n");
+    const writes: Array<{ path: string; content: string }> = [];
+    const executorCalls: unknown[] = [];
+    const plan = planPackageContribution({
+      snapshot: snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    await applyPackageContributionPlan({
+      plan,
+      preimage: { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK },
+      executor: {
+        async apply(request) {
+          executorCalls.push(request);
+          return { packageJson: request.packageJson, lockfile: "lock-after\n" };
+        },
+      },
+      writeFile: async (path, content) => {
+        writes.push({ path, content });
+      },
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+    });
+    expect(executorCalls).toHaveLength(1);
+    expect(executorCalls[0]).toMatchObject({
+      manager: "pnpm",
+      executionScope: { kind: "pnpm-workspace-root" },
+      ignoreScripts: true,
+    });
+    expect(writes.map((w) => w.path)).toEqual([PACKAGE_JSON_RELATIVE, "pnpm-lock.yaml"]);
+    // Child manifests are never in the write set.
+    expect(writes.some((w) => w.path.includes("packages/"))).toBe(false);
+    expect(childManifest).toContain("@demo/app");
+  });
+
+  it("assertResolvedLocalCliExecutable fails closed when the root bin is missing", () => {
+    expect(() =>
+      assertResolvedLocalCliExecutable({ expectedVersion: "1.6.0", present: false }),
+    ).toThrow(PoiesisError);
+    try {
+      assertResolvedLocalCliExecutable({ expectedVersion: "1.6.0", present: false });
+    } catch (error) {
+      expect((error as PoiesisError).code).toBe("PACKAGE_LOCAL_BIN_UNRESOLVED");
+      expect((error as PoiesisError).details.path).toBe(LOCAL_CLI_BIN_RELATIVE);
+    }
+    expect(() =>
+      assertResolvedLocalCliExecutable({
+        expectedVersion: "1.6.0",
+        present: true,
+        versionProbe: { ok: true, stdout: "1.6.0\n" },
+      }),
+    ).not.toThrow();
+  });
+
+  it("runtime ready invokes executable assert when wired", async () => {
+    let executableChecked = false;
+    await assertPackageContributionRuntimeReady({
+      record: buildPackageContributionRecord({
+        manager: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        projectKind: "ordinary",
+        scriptValue: "poiesis",
+        devDependencyVersion: "1.6.0",
+      }),
+      poiesisVersion: "1.6.0",
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+      assertLocalCliExecutable: async () => {
+        executableChecked = true;
+        assertResolvedLocalCliExecutable({
+          expectedVersion: "1.6.0",
+          present: true,
+          versionProbe: { ok: true, stdout: "1.6.0\n" },
+        });
+      },
+    });
+    expect(executableChecked).toBe(true);
   });
 });
 
@@ -2731,4 +3077,133 @@ describe("update-config version-cross package planning seam (ticket #210 correct
       }),
     ).toThrow(PoiesisError);
   });
+});
+
+describe("real pnpm workspace-root install (Spec #219 / ticket #220)", () => {
+  const ownedRoots: string[] = [];
+  afterAll(async () => {
+    for (const root of ownedRoots) {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    "installs exact root contribution under isolated linker without touching child manifests",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "poiesis-pnpm-ws-220-"));
+      ownedRoots.push(root);
+      const childDir = join(root, "packages", "app");
+      await mkdir(childDir, { recursive: true });
+
+      const rootPkg = [
+        "{",
+        '  "name": "ws-root-demo",',
+        '  "private": true,',
+        '  "version": "0.0.0"',
+        "}",
+        "",
+      ].join("\n");
+      const childPkg = [
+        "{",
+        '  "name": "@ws/app",',
+        '  "version": "0.0.1",',
+        '  "private": true',
+        "}",
+        "",
+      ].join("\n");
+      const workspaceYaml = "packages:\n  - 'packages/*'\n";
+      // Default isolated linker; do not enable hoisting.
+      const npmrc = "node-linker=isolated\n";
+
+      await writeFileUtf8(join(root, "package.json"), rootPkg, "utf8");
+      await writeFileUtf8(join(root, "pnpm-workspace.yaml"), workspaceYaml, "utf8");
+      await writeFileUtf8(join(root, ".npmrc"), npmrc, "utf8");
+      await writeFileUtf8(join(childDir, "package.json"), childPkg, "utf8");
+
+      // Seed a real root lockfile via pnpm so eligibility sees sole pnpm-lock.yaml.
+      const { run } = await import("../src/process.js");
+      await run("pnpm", ["install", "--ignore-scripts"], { cwd: root });
+      const lockBefore = await readFile(join(root, "pnpm-lock.yaml"), "utf8");
+      expect(lockBefore.length).toBeGreaterThan(0);
+
+      const childBefore = await readFile(join(childDir, "package.json"), "utf8");
+      const targetVersion = "1.7.0";
+      const plan = planPackageContribution({
+        snapshot: snap({
+          packageJson: rootPkg,
+          lockfiles: {
+            "pnpm-lock.yaml": lockBefore,
+            "pnpm-workspace.yaml": workspaceYaml,
+          },
+          npmrc,
+        }),
+        poiesisVersion: targetVersion,
+        mode: "ensure",
+      });
+      expect(plan.kind).toBe("apply");
+      if (plan.kind !== "apply") throw new Error("expected apply");
+      expect(plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+      expect(
+        nativePackageManagerArgv("pnpm", plan.lockfileOperation!, plan.executionScope),
+      ).toEqual(["add", "-w", "-D", "-E", `poiesis-cli@${targetVersion}`, "--ignore-scripts"]);
+
+      const executor = createNativePackageManagerExecutor(root);
+      const result = await applyPackageContributionPlan({
+        plan,
+        preimage: { packageJson: rootPkg, lockfile: lockBefore },
+        executor,
+        writeFile: async (relative, content) => {
+          // Only root package.json + root lock — never child paths.
+          expect(relative === PACKAGE_JSON_RELATIVE || relative === "pnpm-lock.yaml").toBe(true);
+          await writeFileUtf8(join(root, relative), content, "utf8");
+        },
+        readResolvedLocalPackageJson: async () => {
+          try {
+            return await readFile(join(root, LOCAL_CLI_PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        assertLocalCliExecutable: () =>
+          assertLocalCliExecutableAtRoot({
+            root,
+            expectedVersion: targetVersion,
+            run,
+          }),
+      });
+
+      expect(result.record.devDependencyVersion).toBe(targetVersion);
+      expect(result.record.scriptValue).toBe("poiesis");
+      // Durable schema still has no workspace field.
+      expect("executionScope" in result.record).toBe(false);
+
+      const rootAfter = parsePkg(await readFile(join(root, PACKAGE_JSON_RELATIVE), "utf8"));
+      expect(rootAfter.scripts?.poiesis).toBe("poiesis");
+      expect(rootAfter.devDependencies?.["poiesis-cli"]).toBe(targetVersion);
+
+      const childAfter = await readFile(join(childDir, "package.json"), "utf8");
+      expect(childAfter).toBe(childBefore);
+      expect(childAfter).toBe(childPkg);
+
+      // Isolated linker: package identity + usable root bin.
+      const installedPkg = JSON.parse(await readFile(join(root, LOCAL_CLI_PACKAGE_JSON_RELATIVE), "utf8")) as {
+        version: string;
+      };
+      expect(installedPkg.version).toBe(targetVersion);
+      await assertLocalCliExecutableAtRoot({ root, expectedVersion: targetVersion, run });
+
+      // Root invocation: package script value is `poiesis`, resolved via PATH to
+      // the root-local .bin shim under the isolated linker (same as `pnpm run`).
+      const scriptRun = await run("pnpm", ["exec", "poiesis", "--version"], {
+        cwd: root,
+        allowFailure: true,
+      });
+      expect(
+        scriptRun.exitCode,
+        `pnpm exec poiesis --version failed: stdout=${scriptRun.stdout} stderr=${scriptRun.stderr}`,
+      ).toBe(0);
+      expect(scriptRun.stdout.trim().split(/\r?\n/)[0]?.trim()).toBe(targetVersion);
+    },
+    120_000,
+  );
 });

@@ -1,5 +1,6 @@
 /**
  * Spec #207 / ticket #210 — pinned local package invocation (Author replan).
+ * Spec #219 / ticket #220 — root-aligned pnpm workspace eligibility.
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -10,6 +11,16 @@
  * --version`) — never by running arbitrary package scripts. Projects without
  * `package.json` keep exact `pnpm dlx poiesis-cli@<version>` and never receive
  * fabricated package metadata.
+ *
+ * Spec #219: a root-aligned pnpm workspace (root `package.json` + root
+ * `pnpm-workspace.yaml` + sole root `pnpm-lock.yaml`, effective workspace root
+ * equal to the installation root, shared lockfile contract intact) is eligible.
+ * Poiesis owns only the root contribution; child manifests are never mutated.
+ * Native pnpm ops use explicit `--workspace-root` (`-w`) semantics. npm
+ * package.json workspaces, outer/non-root effective scope, disabled or
+ * redirected shared lock settings, and ambiguous/missing locks stay fail-closed.
+ * Workspace execution scope is plan/runtime context only — the durable
+ * `packageContribution` schema stays root-relative and unchanged.
  *
  * Ownership is contribution-scoped (script + optional exact dep + lockfile
  * fields Poiesis wrote), not whole-file package.json ownership. Native pm runs
@@ -44,12 +55,26 @@ export const ORDINARY_SCRIPT_VALUE = "poiesis";
 export const SELFHOST_SCRIPT_VALUE = "node dist/cli.js";
 /** Resolved ordinary install identity under the primary root. */
 export const LOCAL_CLI_PACKAGE_JSON_RELATIVE = "node_modules/poiesis-cli/package.json";
+/**
+ * Root-local executable shim under a normal isolated pnpm (or npm) linker.
+ * Spec #219 / ticket #220 — readiness requires this path to be usable; there is
+ * no dlx / global / member-package fallback.
+ */
+export const LOCAL_CLI_BIN_RELATIVE = "node_modules/.bin/poiesis";
 /** Selfhost built entry; probed with `node dist/cli.js --version`. */
 export const SELFHOST_DIST_CLI_RELATIVE = "dist/cli.js";
 
 export type SupportedPackageManager = "npm" | "pnpm";
 export type PackageLockfileName = "package-lock.json" | "pnpm-lock.yaml";
 export type PackageProjectKind = "ordinary" | "selfhost";
+/**
+ * Spec #219 / ticket #220 — where native package-manager ops must run.
+ * Carried on plans and executor requests only; never written into the durable
+ * `packageContribution` record schema.
+ */
+export type PackageExecutionScope =
+  | { kind: "single-package" }
+  | { kind: "pnpm-workspace-root" };
 export type { PackageContributionRecord };
 
 /**
@@ -97,6 +122,61 @@ export function assertResolvedLocalCliVersion(args: {
     throw new PoiesisError(
       "PACKAGE_LOCAL_BIN_VERSION_MISMATCH",
       "Resolved local poiesis-cli version does not equal the installed target",
+      { path, expectedVersion: args.expectedVersion, actualVersion: actual },
+    );
+  }
+}
+
+/**
+ * Spec #219 / ticket #220 — ordinary readiness also requires a usable
+ * root-local executable under the normal isolated linker layout
+ * (`node_modules/.bin/poiesis`). Missing bin or version-probe mismatch fails
+ * closed; there is no dlx/global/member fallback.
+ */
+export function assertResolvedLocalCliExecutable(args: {
+  expectedVersion: string;
+  /** Whether `node_modules/.bin/poiesis` exists (file or symlink). */
+  present: boolean;
+  /**
+   * Optional `poiesis --version` (or equivalent) probe of that bin. When
+   * omitted, presence alone is accepted (pure unit tests). Production paths
+   * should probe.
+   */
+  versionProbe?: { ok: true; stdout: string } | { ok: false; detail?: string };
+  path?: string;
+}): void {
+  const path = args.path ?? LOCAL_CLI_BIN_RELATIVE;
+  if (!args.present) {
+    throw new PoiesisError(
+      "PACKAGE_LOCAL_BIN_UNRESOLVED",
+      "poiesis-cli root-local executable was not resolved under node_modules/.bin after the native package-manager install",
+      { path, expectedVersion: args.expectedVersion },
+    );
+  }
+  if (args.versionProbe === undefined) return;
+  if (!args.versionProbe.ok) {
+    throw new PoiesisError(
+      "PACKAGE_LOCAL_BIN_UNRESOLVED",
+      "poiesis-cli root-local executable could not be probed",
+      {
+        path,
+        expectedVersion: args.expectedVersion,
+        detail: args.versionProbe.detail,
+      },
+    );
+  }
+  const actual = args.versionProbe.stdout.trim().split(/\r?\n/)[0]?.trim() ?? "";
+  if (actual.length === 0) {
+    throw new PoiesisError(
+      "PACKAGE_LOCAL_BIN_UNRESOLVED",
+      "poiesis-cli root-local executable produced no version output",
+      { path, expectedVersion: args.expectedVersion },
+    );
+  }
+  if (actual !== args.expectedVersion) {
+    throw new PoiesisError(
+      "PACKAGE_LOCAL_BIN_VERSION_MISMATCH",
+      "Resolved local poiesis-cli executable version does not equal the installed target",
       { path, expectedVersion: args.expectedVersion, actualVersion: actual },
     );
   }
@@ -197,11 +277,30 @@ export type PackageFsSnapshot = {
     "bun.lockb": string | null;
     "pnpm-workspace.yaml": string | null;
   };
+  /**
+   * Spec #219 / ticket #220 — optional root `.npmrc` text used to refuse
+   * disabled or redirected shared-workspace lock contracts. `null`/omitted =
+   * absent file (defaults apply).
+   */
+  npmrc?: string | null;
+  /**
+   * Spec #219 / ticket #220 — when true, a parent of the installation root
+   * owns a `pnpm-workspace.yaml`, so the effective pnpm workspace root is not
+   * the Poiesis installation root. Production load walks parents; pure tests
+   * inject the flag.
+   */
+  outerPnpmWorkspace?: boolean;
 };
 
 export type PackageManagerResolution =
   | { kind: "absent" }
-  | { kind: "supported"; manager: SupportedPackageManager; lockfile: PackageLockfileName }
+  | {
+      kind: "supported";
+      manager: SupportedPackageManager;
+      lockfile: PackageLockfileName;
+      /** Spec #219 — plan/executor scope only; never durable ownership schema. */
+      executionScope: PackageExecutionScope;
+    }
   | {
       kind: "unsupported";
       code: "PACKAGE_MANAGER_AMBIGUOUS" | "PACKAGE_MANAGER_UNSUPPORTED" | "PACKAGE_WORKSPACE_UNSUPPORTED";
@@ -218,15 +317,20 @@ export type LockfileOperation =
  * Exact native package-manager argv for a lock/dep operation.
  * Add-dev always pins exact (`-E` / `--save-exact` equivalent).
  * Lifecycle scripts are always disabled (`--ignore-scripts`).
+ * Spec #219 / ticket #220 — pnpm workspace-root scope adds explicit `-w`
+ * (`--workspace-root`) so a member package is never selected accidentally.
  */
 export function nativePackageManagerArgv(
   manager: SupportedPackageManager,
   operation: Exclude<LockfileOperation, null>,
+  executionScope: PackageExecutionScope = { kind: "single-package" },
 ): readonly string[] {
   if (manager === "pnpm") {
+    const workspaceRoot =
+      executionScope.kind === "pnpm-workspace-root" ? (["-w"] as const) : ([] as const);
     return operation.op === "add-dev"
-      ? ["add", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
-      : ["remove", operation.name, "--ignore-scripts"];
+      ? ["add", ...workspaceRoot, "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
+      : ["remove", ...workspaceRoot, operation.name, "--ignore-scripts"];
   }
   return operation.op === "add-dev"
     ? ["install", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
@@ -253,6 +357,11 @@ export type PackageContributionPlan =
       nextPackageJson?: undefined;
       preserved?: undefined;
       /**
+       * Spec #219 / ticket #220 — validated execution scope for native ops.
+       * Plan/runtime context only; not part of durable package ownership schema.
+       */
+      executionScope: PackageExecutionScope;
+      /**
        * `sha256` of the package.json bytes this noop was observed against when
        * package.json was present at plan time. Required for every contribution
        * noop that retains/advances `packageContribution` — bind via
@@ -268,6 +377,11 @@ export type PackageContributionPlan =
       packageJsonChanged: boolean;
       lockfileOperation: LockfileOperation;
       nextPackageJson: string;
+      /**
+       * Spec #219 / ticket #220 — validated execution scope for native ops.
+       * Plan/runtime context only; not part of durable package ownership schema.
+       */
+      executionScope: PackageExecutionScope;
       /**
        * `sha256` of the **original** package.json snapshot bytes this plan was
        * computed from — never `nextPackageJson`. Callers that await work between
@@ -450,6 +564,8 @@ export type PackageManagerExecutor = {
     packageJson: string;
     lockfile: string;
     ignoreScripts: true;
+    /** Spec #219 — explicit workspace-root vs single-package native semantics. */
+    executionScope: PackageExecutionScope;
   }): Promise<{ packageJson: string; lockfile: string }>;
 };
 
@@ -509,6 +625,77 @@ function hasWorkspacesField(document: JsonObject): boolean {
   return false;
 }
 
+/**
+ * Spec #219 / ticket #220 — parse root `.npmrc` for shared-workspace lock
+ * contract settings. Unknown keys are ignored. Fail-closed values surface as
+ * structured flags for {@link resolvePackageManagerOwnership}.
+ */
+export function parsePnpmSharedLockSettings(npmrc: string | null | undefined): {
+  sharedWorkspaceLockfile: boolean | undefined;
+  /** Raw lockfile-dir value when set; undefined when absent. */
+  lockfileDir: string | undefined;
+} {
+  if (npmrc === null || npmrc === undefined || npmrc.length === 0) {
+    return { sharedWorkspaceLockfile: undefined, lockfileDir: undefined };
+  }
+  let sharedWorkspaceLockfile: boolean | undefined;
+  let lockfileDir: string | undefined;
+  for (const rawLine of npmrc.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || line.startsWith("#") || line.startsWith(";")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim().toLowerCase();
+    const value = line.slice(eq + 1).trim();
+    if (key === "shared-workspace-lockfile") {
+      if (value === "false" || value === "0") sharedWorkspaceLockfile = false;
+      else if (value === "true" || value === "1") sharedWorkspaceLockfile = true;
+    } else if (key === "lockfile-dir") {
+      lockfileDir = value.length === 0 ? undefined : value;
+    }
+  }
+  return { sharedWorkspaceLockfile, lockfileDir };
+}
+
+/**
+ * Spec #219 / ticket #220 — package.json `pnpm.sharedWorkspaceLockfile` when set.
+ */
+export function readPackageJsonPnpmSharedLockfile(document: JsonObject): boolean | undefined {
+  if (!Object.hasOwn(document, "pnpm")) return undefined;
+  const pnpm = document.pnpm;
+  if (typeof pnpm !== "object" || pnpm === null || Array.isArray(pnpm)) return undefined;
+  if (!Object.hasOwn(pnpm as JsonObject, "sharedWorkspaceLockfile")) return undefined;
+  const value = (pnpm as JsonObject).sharedWorkspaceLockfile;
+  if (value === false) return false;
+  if (value === true) return true;
+  return undefined;
+}
+
+/**
+ * True when lockfile-dir redirects the lock outside the authoritative root.
+ * Only `.` / `./` (and empty) are accepted as root-local; any other value
+ * fails closed — Poiesis does not rewrite pnpm configuration to gain eligibility.
+ */
+export function isExternalLockfileDir(lockfileDir: string | undefined): boolean {
+  if (lockfileDir === undefined) return false;
+  const normalized = lockfileDir.trim().replace(/\\/g, "/");
+  if (normalized.length === 0) return false;
+  if (normalized === "." || normalized === "./") return false;
+  return true;
+}
+
+function unsupportedWorkspace(
+  message: string,
+  details: Record<string, unknown>,
+): Extract<PackageManagerResolution, { kind: "unsupported" }> {
+  return {
+    kind: "unsupported",
+    code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+    message,
+    details,
+  };
+}
+
 export function resolvePackageManagerOwnership(snapshot: PackageFsSnapshot): PackageManagerResolution {
   if (snapshot.packageJson === null) return { kind: "absent" };
 
@@ -522,23 +709,105 @@ export function resolvePackageManagerOwnership(snapshot: PackageFsSnapshot): Pac
     });
   }
 
-  if (present(snapshot.lockfiles["pnpm-workspace.yaml"]) || hasWorkspacesField(document)) {
-    return {
-      kind: "unsupported",
-      code: "PACKAGE_WORKSPACE_UNSUPPORTED",
-      message:
-        "Poiesis cannot safely own package/lock contributions in a workspace; use a single-package project with one native lockfile",
-      details: {
-        pnpmWorkspace: present(snapshot.lockfiles["pnpm-workspace.yaml"]),
-        packageWorkspaces: hasWorkspacesField(document),
-      },
-    };
-  }
-
+  const npmWorkspaces = hasWorkspacesField(document);
+  const pnpmWorkspaceFile = present(snapshot.lockfiles["pnpm-workspace.yaml"]);
   const pnpm = present(snapshot.lockfiles["pnpm-lock.yaml"]);
   const npm = present(snapshot.lockfiles["package-lock.json"]);
   const yarn = present(snapshot.lockfiles["yarn.lock"]);
   const bun = present(snapshot.lockfiles["bun.lock"]) || present(snapshot.lockfiles["bun.lockb"]);
+
+  // Spec #219 / ticket #220 correction — outer/non-root effective workspace scope
+  // fails closed for every non-absent package.json path, whether or not a local
+  // pnpm-workspace.yaml exists. A nested project under an outer pnpm workspace
+  // must never resolve as single-package ownership.
+  if (snapshot.outerPnpmWorkspace === true) {
+    return unsupportedWorkspace(
+      "Poiesis installation root is inside an outer pnpm workspace; the effective workspace root must equal the authoritative installation root",
+      {
+        outerPnpmWorkspace: true,
+        pnpmWorkspace: pnpmWorkspaceFile,
+        packageWorkspaces: npmWorkspaces,
+      },
+    );
+  }
+
+  // npm package.json workspaces remain unsupported in Spec #219.
+  if (npmWorkspaces) {
+    return unsupportedWorkspace(
+      "Poiesis cannot safely own package/lock contributions in an npm workspaces project; use a single-package project or an eligible root-aligned pnpm workspace",
+      {
+        pnpmWorkspace: pnpmWorkspaceFile,
+        packageWorkspaces: true,
+      },
+    );
+  }
+
+  if (pnpmWorkspaceFile) {
+    const npmrcSettings = parsePnpmSharedLockSettings(snapshot.npmrc);
+    const pkgShared = readPackageJsonPnpmSharedLockfile(document);
+    const sharedWorkspaceLockfile =
+      npmrcSettings.sharedWorkspaceLockfile !== undefined
+        ? npmrcSettings.sharedWorkspaceLockfile
+        : pkgShared;
+
+    if (sharedWorkspaceLockfile === false) {
+      return unsupportedWorkspace(
+        "pnpm shared-workspace-lockfile is disabled; Poiesis requires the shared root lockfile contract for workspace ownership",
+        {
+          sharedWorkspaceLockfile: false,
+          pnpmWorkspace: true,
+        },
+      );
+    }
+
+    if (isExternalLockfileDir(npmrcSettings.lockfileDir)) {
+      return unsupportedWorkspace(
+        "pnpm lockfile-dir redirects the lockfile away from the authoritative installation root; Poiesis refuses external lock ownership",
+        {
+          lockfileDir: npmrcSettings.lockfileDir,
+          pnpmWorkspace: true,
+        },
+      );
+    }
+
+    if (yarn || bun) {
+      return {
+        kind: "unsupported",
+        code: "PACKAGE_MANAGER_UNSUPPORTED",
+        message: "Only npm and pnpm lock ownership are supported for local Poiesis package invocation",
+        details: { yarn, bun, supported: ["npm", "pnpm"], pnpmWorkspace: true },
+      };
+    }
+
+    if (pnpm && npm) {
+      return {
+        kind: "unsupported",
+        code: "PACKAGE_MANAGER_AMBIGUOUS",
+        message: "Both pnpm-lock.yaml and package-lock.json are present; refuse to choose a package manager",
+        details: { lockfiles: ["pnpm-lock.yaml", "package-lock.json"], pnpmWorkspace: true },
+      };
+    }
+
+    if (!pnpm) {
+      return {
+        kind: "unsupported",
+        code: "PACKAGE_MANAGER_UNSUPPORTED",
+        message:
+          "Root pnpm-workspace.yaml is present without a root pnpm-lock.yaml; refuse to invent lock ownership for a workspace",
+        details: {
+          pnpmWorkspace: true,
+          supportedLockfiles: ["pnpm-lock.yaml"],
+        },
+      };
+    }
+
+    return {
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    };
+  }
 
   if (pnpm && npm) {
     return {
@@ -562,8 +831,22 @@ export function resolvePackageManagerOwnership(snapshot: PackageFsSnapshot): Pac
     };
   }
 
-  if (pnpm) return { kind: "supported", manager: "pnpm", lockfile: "pnpm-lock.yaml" };
-  if (npm) return { kind: "supported", manager: "npm", lockfile: "package-lock.json" };
+  if (pnpm) {
+    return {
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "single-package" },
+    };
+  }
+  if (npm) {
+    return {
+      kind: "supported",
+      manager: "npm",
+      lockfile: "package-lock.json",
+      executionScope: { kind: "single-package" },
+    };
+  }
 
   return {
     kind: "unsupported",
@@ -1048,6 +1331,7 @@ export function planPackageContribution(args: {
     scriptValue,
     ...(desiredDepVersion === undefined ? {} : { devDependencyVersion: desiredDepVersion }),
   });
+  const executionScope = resolution.executionScope;
 
   if (!packageJsonChanged && lockfileOperation === null) {
     return {
@@ -1055,6 +1339,7 @@ export function planPackageContribution(args: {
       record,
       packageJsonChanged: false,
       lockfileOperation: null,
+      executionScope,
       expectedPackageJsonPreimageHash,
     };
   }
@@ -1068,6 +1353,7 @@ export function planPackageContribution(args: {
     packageJsonChanged,
     lockfileOperation,
     nextPackageJson: next,
+    executionScope,
     expectedPackageJsonPreimageHash,
   };
 }
@@ -1076,12 +1362,26 @@ export function planPackageContributionRemoval(args: {
   snapshot: PackageFsSnapshot;
   record: PackageContributionRecord;
 }): PackageContributionPlan {
+  // Removal with no package.json: nothing to bind; scope defaults to single-package
+  // (no native op will run from an empty tree). Durable record is unchanged.
   if (args.snapshot.packageJson === null) {
-    return { kind: "noop", record: args.record, packageJsonChanged: false, lockfileOperation: null };
+    return {
+      kind: "noop",
+      record: args.record,
+      packageJsonChanged: false,
+      lockfileOperation: null,
+      executionScope: { kind: "single-package" },
+    };
   }
   const resolution = resolvePackageManagerOwnership(args.snapshot);
   if (resolution.kind === "absent") {
-    return { kind: "noop", record: args.record, packageJsonChanged: false, lockfileOperation: null };
+    return {
+      kind: "noop",
+      record: args.record,
+      packageJsonChanged: false,
+      lockfileOperation: null,
+      executionScope: { kind: "single-package" },
+    };
   }
   // Removal still requires the same manager/lock ownership that installed the contribution.
   if (resolution.kind === "unsupported") {
@@ -1097,6 +1397,7 @@ export function planPackageContributionRemoval(args: {
       },
     );
   }
+  const executionScope = resolution.executionScope;
 
   const content = args.snapshot.packageJson;
   const expectedPackageJsonPreimageHash = hashContent(content);
@@ -1163,6 +1464,7 @@ export function planPackageContributionRemoval(args: {
         record: args.record,
         packageJsonChanged: false,
         lockfileOperation: null,
+        executionScope,
         expectedPackageJsonPreimageHash,
       };
     }
@@ -1172,6 +1474,7 @@ export function planPackageContributionRemoval(args: {
       packageJsonChanged: false,
       lockfileOperation: null,
       nextPackageJson: content,
+      executionScope,
       expectedPackageJsonPreimageHash,
       preserved,
     };
@@ -1183,6 +1486,7 @@ export function planPackageContributionRemoval(args: {
     packageJsonChanged,
     lockfileOperation,
     nextPackageJson: next,
+    executionScope,
     expectedPackageJsonPreimageHash,
     ...(preserved.length === 0 ? {} : { preserved }),
   };
@@ -1259,6 +1563,12 @@ export async function applyPackageContributionPlan(args: {
   onWritten?: (path: string, content: string) => void;
   /** After ordinary add-dev: installed `node_modules/poiesis-cli/package.json` text, or null. */
   readResolvedLocalPackageJson?: () => Promise<string | null>;
+  /**
+   * Spec #219 / ticket #220 — after ordinary install, prove root-local
+   * `node_modules/.bin/poiesis` is usable (isolated linker). Production wires
+   * this; pure unit tests may omit when only package.json version is under test.
+   */
+  assertLocalCliExecutable?: () => Promise<void>;
   /** Before selfhost script write: injected dist probe (tests) or production probe. */
   probeSelfhostDist?: () => Promise<
     { ok: false; code: "missing" | "spawn-failed"; detail?: string } | { ok: true; stdout: string }
@@ -1308,6 +1618,7 @@ export async function applyPackageContributionPlan(args: {
 
   if (args.plan.lockfileOperation !== null) {
     let result: { packageJson: string; lockfile: string };
+    const executionScope = args.plan.executionScope;
     try {
       result = await args.executor.apply({
         manager: args.plan.record.manager,
@@ -1315,6 +1626,7 @@ export async function applyPackageContributionPlan(args: {
         packageJson,
         lockfile,
         ignoreScripts: true,
+        executionScope,
       });
     } catch (error) {
       const cause = error instanceof PoiesisError ? error : undefined;
@@ -1324,7 +1636,10 @@ export async function applyPackageContributionPlan(args: {
         {
           manager: args.plan.record.manager,
           operation: args.plan.lockfileOperation,
-          argv: [...nativePackageManagerArgv(args.plan.record.manager, args.plan.lockfileOperation)],
+          executionScope,
+          argv: [
+            ...nativePackageManagerArgv(args.plan.record.manager, args.plan.lockfileOperation, executionScope),
+          ],
           ownedArtifactsMayRollback: true,
           nativeSideEffectsNotClaimedRolledBack: true,
           cause: cause?.code ?? (error instanceof Error ? error.message : String(error)),
@@ -1346,7 +1661,10 @@ export async function applyPackageContributionPlan(args: {
         {
           manager: args.plan.record.manager,
           operation: args.plan.lockfileOperation,
-          argv: [...nativePackageManagerArgv(args.plan.record.manager, args.plan.lockfileOperation)],
+          executionScope,
+          argv: [
+            ...nativePackageManagerArgv(args.plan.record.manager, args.plan.lockfileOperation, executionScope),
+          ],
           ownedArtifactsMayRollback: true,
           nativeSideEffectsNotClaimedRolledBack: true,
           postPmMismatch: true,
@@ -1360,8 +1678,9 @@ export async function applyPackageContributionPlan(args: {
   }
 
   // Ordinary contribution: every successful apply that retains a local
-  // devDependency MUST prove the resolved primary-root bin version. No reader
-  // and no skip — missing/wrong version fails closed.
+  // devDependency MUST prove the resolved primary-root package version. No
+  // reader and no skip — missing/wrong version fails closed. Spec #219 also
+  // proves the root-local executable when the production probe is wired.
   if (args.plan.record.devDependencyVersion !== undefined) {
     if (args.readResolvedLocalPackageJson === undefined) {
       throw new PoiesisError(
@@ -1374,6 +1693,9 @@ export async function applyPackageContributionPlan(args: {
       expectedVersion: args.plan.record.devDependencyVersion,
       installedPackageJson: await args.readResolvedLocalPackageJson(),
     });
+    if (args.assertLocalCliExecutable !== undefined) {
+      await args.assertLocalCliExecutable();
+    }
   }
 
   assertPackageContributionMatches(packageJson, args.plan.record);
@@ -1386,9 +1708,43 @@ export async function applyPackageContributionPlan(args: {
   };
 }
 /**
+ * Walk parent directories of `root` looking for an outer `pnpm-workspace.yaml`.
+ * The installation root itself is not counted — only a parent that would make
+ * the effective pnpm workspace root differ from the Poiesis root.
+ */
+export async function detectOuterPnpmWorkspace(
+  root: string,
+  io: {
+    readText: (absolutePath: string) => Promise<string | null>;
+  },
+): Promise<boolean> {
+  const { dirname, join, parse, resolve } = await import("node:path");
+  let current = resolve(root);
+  const { root: fsRoot } = parse(current);
+  for (;;) {
+    const parent = dirname(current);
+    if (parent === current || parent === fsRoot) {
+      // Check fsRoot itself as a possible outer workspace root when root is nested.
+      if (parent === fsRoot && resolve(root) !== fsRoot) {
+        const atFsRoot = await io.readText(join(fsRoot, "pnpm-workspace.yaml"));
+        if (present(atFsRoot)) return true;
+      }
+      return false;
+    }
+    const workspace = await io.readText(join(parent, "pnpm-workspace.yaml"));
+    if (present(workspace)) return true;
+    current = parent;
+  }
+}
+
+/**
  * Read a filesystem snapshot for package ownership decisions. Callers that
  * already hold primary-root resolution should pass that root — never a
  * linked worktree path for ownership writes.
+ *
+ * Spec #219 / ticket #220 — also loads root `.npmrc` and detects an outer
+ * pnpm workspace so eligibility stays centralized in
+ * {@link resolvePackageManagerOwnership}.
  */
 export async function readPackageFsSnapshot(
   root: string,
@@ -1398,6 +1754,7 @@ export async function readPackageFsSnapshot(
 ): Promise<PackageFsSnapshot> {
   const { join } = await import("node:path");
   const read = async (relative: string): Promise<string | null> => io.readText(join(root, relative));
+  const outerPnpmWorkspace = await detectOuterPnpmWorkspace(root, io);
   return {
     packageJson: await read(PACKAGE_JSON_RELATIVE),
     lockfiles: {
@@ -1408,6 +1765,8 @@ export async function readPackageFsSnapshot(
       "bun.lockb": await read("bun.lockb"),
       "pnpm-workspace.yaml": await read("pnpm-workspace.yaml"),
     },
+    npmrc: await read(".npmrc"),
+    outerPnpmWorkspace,
   };
 }
 
@@ -1465,8 +1824,12 @@ export function createNativePackageManagerExecutor(root: string): PackageManager
       const { run } = await import("./process.js");
       const { readFile } = await import("node:fs/promises");
       const { join } = await import("node:path");
-      const args = [...nativePackageManagerArgv(request.manager, request.operation)];
+      const args = [
+        ...nativePackageManagerArgv(request.manager, request.operation, request.executionScope),
+      ];
       try {
+        // Spec #219 — always run with the authoritative installation root as cwd.
+        // Workspace-root scope is also encoded in argv (`-w`) for pnpm.
         await run(request.manager, args, { cwd: root });
       } catch (error) {
         throw new PoiesisError(
@@ -1475,7 +1838,9 @@ export function createNativePackageManagerExecutor(root: string): PackageManager
           {
             manager: request.manager,
             operation: request.operation,
+            executionScope: request.executionScope,
             argv: args,
+            cwd: root,
             cause: error instanceof Error ? error.message : String(error),
           },
         );
@@ -1530,6 +1895,8 @@ export async function applyPackageContributionWithJournal(args: {
   poiesisVersion: string;
   /** Test injection for resolved local package.json after ordinary install. */
   readResolvedLocalPackageJson?: () => Promise<string | null>;
+  /** Test injection for root-local executable readiness after ordinary install. */
+  assertLocalCliExecutable?: () => Promise<void>;
   /** Test injection for selfhost dist probe. */
   probeSelfhostDist?: () => Promise<
     { ok: false; code: "missing" | "spawn-failed"; detail?: string } | { ok: true; stdout: string }
@@ -1597,9 +1964,25 @@ export async function applyPackageContributionWithJournal(args: {
       args.probeSelfhostDist ?? (() => probeSelfhostDistVersion(args.root, run));
   }
   // Ordinary: always wire a primary-root reader — required on every success path.
+  // Spec #219 — production (no injected readers) also proves the root-local
+  // executable under the isolated linker. Pure unit tests that inject only the
+  // package.json reader keep version-only checks unless they wire the executable
+  // assert explicitly.
   if (args.plan.record.devDependencyVersion !== undefined) {
+    const expectedVersion = args.plan.record.devDependencyVersion;
+    const productionPath = args.readResolvedLocalPackageJson === undefined;
     planArgs.readResolvedLocalPackageJson =
       args.readResolvedLocalPackageJson ?? (() => readResolvedLocalCliPackageJson(args.root));
+    if (args.assertLocalCliExecutable !== undefined) {
+      planArgs.assertLocalCliExecutable = args.assertLocalCliExecutable;
+    } else if (productionPath) {
+      planArgs.assertLocalCliExecutable = () =>
+        assertLocalCliExecutableAtRoot({
+          root: args.root,
+          expectedVersion,
+          run,
+        });
+    }
   }
   const result = await applyPackageContributionPlan(planArgs);
 
@@ -1628,12 +2011,21 @@ export async function readResolvedLocalCliPackageJson(root: string): Promise<str
  * Ordinary with `devDependencyVersion`: resolved primary-root
  * `node_modules/poiesis-cli/package.json` MUST exist and equal the target —
  * a reader is required; missing/wrong fails closed (no silent skip).
- * Selfhost: `node dist/cli.js --version` equals target.
+ * Spec #219 / ticket #220 — when `assertLocalCliExecutable` is provided (production
+ * and real-pnpm paths), the root-local `node_modules/.bin/poiesis` must also be
+ * usable under the normal isolated linker. Selfhost: `node dist/cli.js --version`
+ * equals target.
  */
 export async function assertPackageContributionRuntimeReady(args: {
   record: PackageContributionRecord;
   poiesisVersion: string;
   readResolvedLocalPackageJson?: () => Promise<string | null>;
+  /**
+   * Ordinary: prove root-local executable readiness (presence and optional
+   * version probe). Production always wires this; pure version-only unit tests
+   * may omit it.
+   */
+  assertLocalCliExecutable?: () => Promise<void>;
   probeSelfhostDist?: () => Promise<
     { ok: false; code: "missing" | "spawn-failed"; detail?: string } | { ok: true; stdout: string }
   >;
@@ -1663,6 +2055,68 @@ export async function assertPackageContributionRuntimeReady(args: {
     assertResolvedLocalCliVersion({
       expectedVersion: args.record.devDependencyVersion,
       installedPackageJson: await args.readResolvedLocalPackageJson(),
+    });
+    if (args.assertLocalCliExecutable !== undefined) {
+      await args.assertLocalCliExecutable();
+    }
+  }
+}
+
+/**
+ * Production ordinary executable readiness under the primary installation root:
+ * `node_modules/.bin/poiesis` must exist and `--version` must equal the target.
+ */
+export async function assertLocalCliExecutableAtRoot(args: {
+  root: string;
+  expectedVersion: string;
+  run: (command: string, argv: string[], options: { cwd: string; allowFailure: true }) => Promise<{
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+  }>;
+}): Promise<void> {
+  const { join } = await import("node:path");
+  const { exists } = await import("./fs.js");
+  const binPath = join(args.root, LOCAL_CLI_BIN_RELATIVE);
+  const presentBin = await exists(binPath);
+  if (!presentBin) {
+    assertResolvedLocalCliExecutable({
+      expectedVersion: args.expectedVersion,
+      present: false,
+    });
+    return;
+  }
+  try {
+    // Real npm/pnpm installers place a shell shim at node_modules/.bin/poiesis
+    // (not a JS file). Execute that path directly; `node <shim>` fails.
+    const result = await args.run(binPath, ["--version"], {
+      cwd: args.root,
+      allowFailure: true,
+    });
+    if (result.exitCode !== 0) {
+      assertResolvedLocalCliExecutable({
+        expectedVersion: args.expectedVersion,
+        present: true,
+        versionProbe: {
+          ok: false,
+          detail: result.stderr.trim() || `exit ${result.exitCode}`,
+        },
+      });
+      return;
+    }
+    assertResolvedLocalCliExecutable({
+      expectedVersion: args.expectedVersion,
+      present: true,
+      versionProbe: { ok: true, stdout: result.stdout },
+    });
+  } catch (error) {
+    assertResolvedLocalCliExecutable({
+      expectedVersion: args.expectedVersion,
+      present: true,
+      versionProbe: {
+        ok: false,
+        detail: error instanceof Error ? error.message : String(error),
+      },
     });
   }
 }

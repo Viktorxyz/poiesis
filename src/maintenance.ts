@@ -86,6 +86,7 @@ import {
 import {
   applyPackageContributionWithJournal,
   assertPackageContributionCaptureIdentity,
+  assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
   packagePlanRetainsContribution,
   planPackageContributionAtRoot,
@@ -1821,6 +1822,12 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
           record: packagePlan.record,
           poiesisVersion: installingPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: packagePlan.record.devDependencyVersion ?? installingPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         });
       }
@@ -3735,6 +3742,8 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
               packageJson: removal.nextPackageJson,
               lockfile: preimageLockfile,
               ignoreScripts: true,
+              // Spec #219 — removal reuses the plan's validated execution scope.
+              executionScope: removal.executionScope,
             });
           } catch (error) {
             throw new PoiesisError(
@@ -3743,6 +3752,7 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
               {
                 manager: removal.record.manager,
                 operation: removal.lockfileOperation,
+                executionScope: removal.executionScope,
                 ownedArtifactsMayRollback: true,
                 nativeSideEffectsNotClaimedRolledBack: true,
                 cause: error instanceof Error ? error.message : String(error),
