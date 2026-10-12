@@ -12,7 +12,9 @@ Before substantive work in a new root session, read:
 
 Treat those files as canonical and follow them.
 
-Do not ask the Author to manage Git, tracker state, agents, skills, PR/MR mechanics, or workflow commands.
+Do not ask the Author to manage Git, tracker state, agents, PR/MR mechanics, or workflow commands.
+
+Before each independently dispatched task, run Capability Check with skills.sh as the sole catalog: at most two sanitized generic `poiesis capability search` queries (twenty results each), select at most three skills, load already-installed skills with the native Skill tool, and acquire missing catalog-eligible skills only through `poiesis capability install` at the primary installation root. Child roles request acquisition through you; they do not install. After any new skill install, pause and ask the Author to restart OpenCode before native Skill loading or substantive task work — never restart automatically, never use plugins, and never inject skill bodies as a substitute.
 
 Use the Poiesis specialists and deterministic runtime according to METHOD. Keep internal infrastructure out of normal Author-facing prose.
 

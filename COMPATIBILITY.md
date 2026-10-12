@@ -55,6 +55,15 @@ The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not
 
 A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.6.0 is the current release and the migration boundary for that install.
 
+### Same-release projection migration (1.6.0 static skills → native skill wildcard)
+
+Spec #207 / ticket #208 replaces fixed per-skill OpenCode `permission.skill` allow maps with a native `skill: { "*": "allow" }` wildcard so catalog-acquired local skills load without enumerating names, while bash/task/lifecycle authority stay unchanged. A project installed by the earlier `1.6.0` image therefore records `poiesisVersion = "1.6.0"` with the authentic static skill maps.
+
+- **Admitted:** the exact **static-skill** projection for `poiesisVersion = "1.6.0"` — and only through the receipt-gated `poiesis update`.
+- **Not admitted:** drift from that exact set, and any other version labelled as this predecessor.
+- **Not admitted elsewhere:** `doctor`, `uninstall`, `capability install`, and `poiesis update --config` remain current-projection-only.
+- **No lifecycle widening:** only `permission.skill` maps change; bash/task surfaces are untouched.
+
 A project installed by the earlier `1.4.0` image therefore records `poiesisVersion = "1.4.0"` with a `configPatches` set that no longer equals the `1.4.0` focused-check projection. The compatible migration is:
 
 - **Admitted:** the exact **pre-focused-check** projection for `poiesisVersion = "1.4.0"` — that published predecessor version and no other — and only through the receipt-gated `poiesis update`. For the version it is keyed on, the predecessor differs from that version's own projection in exactly one field: `agent.poiesis-worker.permission.bash` omits the single focused-check allow key, derived through the same builder the current projection uses.
@@ -136,12 +145,13 @@ After `npm publish` of `poiesis-cli@1.6.0` succeeds:
 
 Poiesis uses the upstream `skills@1.5.24` CLI and project-local `.agents/skills/` installs.
 
-- `mattpocock/skills` is pinned to `3cca18b368ae95cdbdebbff572ccafa662551015`.
+- `mattpocock/skills` is pinned to `3cca18b368ae95cdbdebbff572ccafa662551015` for the original nine defaults; `writing-for-agents` uses reviewed pin `49dd158d1076134a641b33efb035946536778336`.
 - `obra/superpowers` is pinned to `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`.
+- `vercel-labs/skills` (`find-skills`) is pinned to `13e4063a1cf913f5606d57d42ab83a86f5001e04`. Canonical installs stay project-local and override any upstream `-g` guidance.
 
 The installer passes exact skill names as separate `--skill name ...` arguments; it never uses the defective `--skill=name` form and never installs the full Superpowers plugin.
 
-### Curated defaults (11)
+### Curated defaults (13)
 
 ```text
 grilling                       (mattpocock/skills)
@@ -155,6 +165,8 @@ code-review                    (mattpocock/skills)
 diagnosing-bugs                (mattpocock/skills)
 test-driven-development        (obra/superpowers)
 verification-before-completion (obra/superpowers)
+writing-for-agents             (mattpocock/skills @ 49dd158d1076134a641b33efb035946536778336)
+find-skills                    (vercel-labs/skills @ 13e4063a1cf913f5606d57d42ab83a86f5001e04)
 ```
 
 Caveman / Cavecrew are deferred dogfood experiments and not installed by v1.

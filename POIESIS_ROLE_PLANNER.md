@@ -35,6 +35,7 @@ Do not pre-write ordinary implementation code, exact helper names, or step-by-st
 
 You may use:
 - harness-native `explore` for repository facts;
+- already-installed native skills that apply to the planning task; request missing catalog skills through Poiesis (do not install);
 - `poiesis-research` for current external facts;
 - **Repository Intelligence** for bounded cross-file architecture, dependency, ownership, and impact questions. The deterministic surface is `poiesis repository query --question <text>`, `poiesis repository path --from <node> --to <node>`, `poiesis repository explain --node <node>`;
 - Bash under a bounded allowlist where it is useful for the planning task (deterministic Poiesis operations retain lifecycle authority; raw shell gains no lifecycle evidence or authority).

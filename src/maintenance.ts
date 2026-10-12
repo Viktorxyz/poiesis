@@ -2934,6 +2934,13 @@ export async function installAuthorizedCapability(
   root: string,
   input: CapabilityInstallInput,
 ): Promise<ManagedSkill> {
+  // Spec #207 / ticket #208 — catalog provenance gate. Bundled defaults
+  // and skills.sh hits are admitted; arbitrary owner/repo sources are
+  // refused. The internal `runCapabilityInstallTransaction` seam stays
+  // ungated so pure transactional fixtures can inject preimages without
+  // contacting the catalog.
+  const { resolveCapabilityCatalogProvenance } = await import("./skills.js");
+  await resolveCapabilityCatalogProvenance(input);
   return runCapabilityInstallTransaction(root, input);
 }
 

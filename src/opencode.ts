@@ -388,9 +388,48 @@ export function workerFocusedCheckAllowKey(poiesisVersion: string): string {
   return `${primaryExactRoute(poiesisVersion)} check *`;
 }
 
+/**
+ * Spec #207 / ticket #208 — native Skill permission for local discovered
+ * skills. A single wildcard under `skill` admits every project-local skill
+ * OpenCode discovers under `.agents/skills/` without enumerating fixed
+ * names. Bash, task, and every other permission surface stay unchanged: this
+ * does not grant lifecycle authority, capability install, or broader shell.
+ */
+export function nativeSkillPermissions(): Record<string, string> {
+  return { "*": "allow" };
+}
+
+/**
+ * Spec #207 / ticket #208 — the authentic published `1.6.0` static skill
+ * allow maps. Ticket #208 replaced those fixed maps with
+ * {@link nativeSkillPermissions} while `package.json` still records
+ * `1.6.0`, so a project installed by the earlier image carries these
+ * exact maps under `poiesisVersion = "1.6.0"`. The predecessor projection
+ * in `src/authority.ts` restores them byte-for-byte for receipt-gated
+ * migration and never widens bash/task.
+ */
+export const OPENCODE_V160_STATIC_SKILL_PERMISSIONS: Readonly<
+  Record<string, Readonly<Record<string, string>>>
+> = {
+  poiesis: {
+    grilling: "allow",
+    "grill-with-docs": "allow",
+    "domain-modeling": "allow",
+    "to-spec": "allow",
+    "to-tickets": "allow",
+    "verification-before-completion": "allow",
+  },
+  "poiesis-planner": { "codebase-design": "allow" },
+  "poiesis-worker": { "test-driven-development": "allow", "diagnosing-bugs": "allow" },
+  "poiesis-research": { research: "allow" },
+  "poiesis-reviewer": { "code-review": "allow" },
+  "poiesis-final-reviewer": { "code-review": "allow" },
+};
+
 function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {
   const reasoning = config.models.reasoning;
   const execution = config.models.execution;
+  const skill = nativeSkillPermissions();
   return {
     explore: { model: execution },
     poiesis: {
@@ -404,14 +443,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         list: "allow",
         question: "allow",
         todowrite: "allow",
-        skill: {
-          grilling: "allow",
-          "grill-with-docs": "allow",
-          "domain-modeling": "allow",
-          "to-spec": "allow",
-          "to-tickets": "allow",
-          "verification-before-completion": "allow",
-        },
+        skill,
         task: {
           explore: "allow",
           "poiesis-planner": "allow",
@@ -433,7 +465,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "codebase-design": "allow" },
+        skill,
         task: { explore: "allow", "poiesis-research": "allow" },
         // Spec #120 / ticket #123 — Planner reaches Repository
         // Intelligence through the deterministic Poiesis CLI only.
@@ -456,7 +488,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         grep: "allow",
         list: "allow",
         edit: "allow",
-        skill: { "test-driven-development": "allow", "diagnosing-bugs": "allow" },
+        skill,
         task: { explore: "allow" },
         bash: {
           "*": "allow",
@@ -506,7 +538,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         read: "allow",
         webfetch: "allow",
         websearch: "allow",
-        skill: { research: "allow" },
+        skill,
         // Spec #120 / ticket #123 — Research owns external facts, not
         // repository structure. NO Repository Intelligence bash
         // permission is granted here so a Research subagent cannot
@@ -524,7 +556,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "code-review": "allow" },
+        skill,
         // Spec #120 / ticket #123 — Ticket Reviewer reaches Repository
         // Intelligence through the deterministic Poiesis CLI only;
         // no arbitrary bash is granted.
@@ -541,7 +573,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "code-review": "allow" },
+        skill,
         task: { explore: "allow" },
         // Spec #120 / ticket #123 — Final Reviewer reaches Repository
         // Intelligence through the deterministic Poiesis CLI only;

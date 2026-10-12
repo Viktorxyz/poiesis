@@ -96,6 +96,8 @@ async function seedDefaultSkillDirectoriesAsPreexisting(repository: TestReposito
     "diagnosing-bugs",
     "test-driven-development",
     "verification-before-completion",
+    "writing-for-agents",
+    "find-skills",
   ];
   for (const name of defaultNames) {
     const dir = join(repository.root, ".agents", "skills", name);

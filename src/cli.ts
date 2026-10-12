@@ -55,7 +55,8 @@ Usage:
 poiesis uninstall
   poiesis uninstall --purge-history [--yes]                 # Spec #190 / ticket #195 — the ONLY operation that destroys Local tracker history. Ordinary \`uninstall\` removes every safely attributable artifact and RETURNS the recorded Local tracker history as user data (reported under \`retained\`, and never a reason the runtime uninstall is incomplete). This flag removes that retained history too, and only after an interactive confirmation naming exactly what is destroyed and what is not, or after the explicit non-interactive confirmation flag \`--yes\` — without a TTY and without \`--yes\` the command refuses before touching anything. The purge removes ONLY a validated, repository-bound Local tracker store (the canonical \`<git-common-dir>/poiesis-tracker-v1\` document) and works against a tracker-only remainder: an installation that is already fully uninstalled needs no manifest for this to run. A symlink, an unknown entry, foreign content, a held store lock, or a store that does not resolve to this repository's canonical path is refused without deleting anything. Git history, remote tracker issues, pull/merge requests, releases, and deployment state are never purge targets.
   poiesis inspect
-  poiesis capability install --source <owner/repo> --name <skill> --revision <sha>
+  poiesis capability search --query <topic> [--limit 20]   # Spec #207 / ticket #208 — bounded skills.sh catalog search (sanitized generic topics only; max 20 results). Distinguishes ok / none-relevant / catalog-unavailable. Never installs.
+  poiesis capability install --source <owner/repo> --name <skill> --revision <sha>   # Project-local pinned install at the primary installation root. Requires bundled-default or skills.sh catalog provenance. Restart OpenCode after a new install; Poiesis does not restart it.
   poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis model set reasoning|execution <provider/model> # deterministic single-class set; goes through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
   poiesis workspace prepare --branch <name> --spec <id> # default: Omit \`--path\`; the CLI selects a deterministic in-project workspace under <root>/.poiesis/workspaces/<derived-id>. Never an external path such as \`/tmp/...\`
@@ -549,22 +550,70 @@ async function commandInspect(args: string[]): Promise<void> {
 }
 
 async function commandCapability(args: string[]): Promise<void> {
-  if (args[0] !== "install") throw new PoiesisError("UNKNOWN_COMMAND", "Expected capability install");
+  const sub = args[0];
+  if (sub === "search") {
+    const values = options(args.slice(1), {
+      query: { type: "string" },
+      limit: { type: "string" },
+    });
+    const { searchSkillsCatalog, SKILLS_DISCOVERY_MAX_RESULTS } = await import("./skills.js");
+    const limitRaw = values.limit;
+    const limit =
+      limitRaw === undefined
+        ? undefined
+        : (() => {
+            const parsed = Number(limitRaw);
+            if (!Number.isInteger(parsed)) {
+              throw new PoiesisError("INVALID_DISCOVERY_LIMIT", "Catalog search limit must be an integer", {
+                limit: limitRaw,
+              });
+            }
+            return parsed;
+          })();
+    const outcome = await searchSkillsCatalog(required(values, "query"), {
+      ...(limit === undefined ? {} : { limit }),
+    });
+    writeSuccess("capability.search", {
+      ...outcome,
+      bounds: {
+        maxResults: SKILLS_DISCOVERY_MAX_RESULTS,
+        maxSearches: 2,
+        maxSelected: 3,
+      },
+    });
+    return;
+  }
+  if (sub !== "install") {
+    throw new PoiesisError("UNKNOWN_COMMAND", "Expected capability search or capability install", {
+      subcommand: sub ?? "",
+      supported: ["search", "install"],
+    });
+  }
   const values = options(args.slice(1), {
     source: { type: "string" },
     name: { type: "string" },
     revision: { type: "string" },
     cwd: { type: "string" },
   });
-  const root = await resolveGitRoot(cwdOf(values));
-  writeSuccess(
-    "capability.install",
-    await installAuthorizedCapability(root, {
-      source: required(values, "source"),
-      name: required(values, "name"),
-      revision: required(values, "revision"),
-    }),
-  );
+  // Spec #207 / ticket #208 — install into the PRIMARY installation root even
+  // when invoked from a linked worktree. `resolveGitRoot` alone would target
+  // the worktree checkout and leave the Author's real install untouched.
+  const repoRoot = await resolveGitRoot(cwdOf(values));
+  const root = await resolveInstallationRoot(repoRoot);
+  const installed = await installAuthorizedCapability(root, {
+    source: required(values, "source"),
+    name: required(values, "name"),
+    revision: required(values, "revision"),
+  });
+  writeSuccess("capability.install", {
+    ...installed,
+    installationRoot: root,
+    restartRequired: installed.preexisting !== true,
+    restartNotice:
+      installed.preexisting === true
+        ? null
+        : "Restart OpenCode before native Skill loading or substantive task work. Poiesis does not restart OpenCode, does not use plugins, and does not inject skill bodies as a substitute.",
+  });
 }
 
 /**

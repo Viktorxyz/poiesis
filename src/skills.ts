@@ -18,11 +18,54 @@ export const SKILLS_CLI_VERSION = "1.5.24";
 export const SKILLS_DIRECTORY = ".agents/skills";
 export const MATT_SKILLS_REVISION = "3cca18b368ae95cdbdebbff572ccafa662551015";
 export const SUPERPOWERS_REVISION = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797";
+/** Reviewed pin for default `writing-for-agents` (mattpocock/skills). */
+export const WRITING_FOR_AGENTS_REVISION = "49dd158d1076134a641b33efb035946536778336";
+/** Reviewed pin for default `find-skills` (vercel-labs/skills). */
+export const FIND_SKILLS_REVISION = "13e4063a1cf913f5606d57d42ab83a86f5001e04";
+export const FIND_SKILLS_SOURCE = "vercel-labs/skills";
+
+/**
+ * Spec #207 / ticket #208 — skills.sh is the sole discovery catalog.
+ * Bounded search uses the unauthenticated public search endpoint only
+ * (`/api/v1` requires OIDC and is never used). Limits are hard product
+ * bounds, not soft guidance.
+ */
+export const SKILLS_SH_SEARCH_URL = "https://skills.sh/api/search";
+export const SKILLS_DISCOVERY_MAX_RESULTS = 20;
+export const SKILLS_DISCOVERY_MAX_SEARCHES = 2;
+export const SKILLS_DISCOVERY_MAX_SELECTED = 3;
+const SKILLS_DISCOVERY_QUERY_MAX_LENGTH = 80;
+const SKILLS_SH_SEARCH_TIMEOUT_MS = 8_000;
 
 export interface DefaultSkill {
   source: string;
   name: string;
   revision: string;
+}
+
+export interface CatalogSkillResult {
+  id: string;
+  source: string;
+  name: string;
+}
+
+export type CatalogSearchOutcome =
+  | { status: "ok"; query: string; results: CatalogSkillResult[] }
+  | { status: "none-relevant"; query: string; results: [] }
+  | { status: "catalog-unavailable"; query: string; reason: string };
+
+export type CatalogProvenance =
+  | { kind: "bundled-default"; source: string; name: string; revision: string }
+  | { kind: "skills.sh-catalog"; source: string; name: string; catalogId: string };
+
+export interface CatalogSearchOptions {
+  fetch?: typeof globalThis.fetch;
+  limit?: number;
+}
+
+export interface CatalogProvenanceOptions {
+  fetch?: typeof globalThis.fetch;
+  defaults?: readonly DefaultSkill[];
 }
 
 export interface SkillMaintenanceOptions {
@@ -111,11 +154,16 @@ export interface CapabilityInstallInput {
 const sourceRevisions: Readonly<Record<string, string>> = {
   "mattpocock/skills": MATT_SKILLS_REVISION,
   "obra/superpowers": SUPERPOWERS_REVISION,
+  [FIND_SKILLS_SOURCE]: FIND_SKILLS_REVISION,
 };
 
 interface SkillsMetadata {
   schema: number;
-  defaults: Array<{ source: string; name: string }>;
+  defaults: Array<{ source: string; name: string; revision?: string }>;
+}
+
+function isExactRevision(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{40}$/.test(value);
 }
 
 function isSkillsMetadata(value: unknown): value is SkillsMetadata {
@@ -131,9 +179,221 @@ function isSkillsMetadata(value: unknown): value is SkillsMetadata {
         typeof skill.source === "string" &&
         skill.source.length > 0 &&
         typeof skill.name === "string" &&
-        /^[a-z0-9][a-z0-9-]*$/.test(skill.name),
+        /^[a-z0-9][a-z0-9-]*$/.test(skill.name) &&
+        (skill.revision === undefined || isExactRevision(skill.revision)),
     )
   );
+}
+
+/**
+ * Spec #207 / ticket #208 — sanitize a discovery query before it reaches
+ * skills.sh. Only generic topic text is admitted: no absolute paths, no
+ * owner/repo coordinates, no credential-shaped tokens, no private repo
+ * identity. The bound is deliberate so the model cannot improvise raw
+ * catalog calls with task-private content.
+ */
+export function sanitizeDiscoveryQuery(raw: string): string {
+  if (typeof raw !== "string") {
+    throw new PoiesisError("INVALID_DISCOVERY_QUERY", "Discovery query must be a string");
+  }
+  const query = raw.trim().replace(/\s+/g, " ");
+  if (query.length === 0) {
+    throw new PoiesisError("INVALID_DISCOVERY_QUERY", "Discovery query must not be empty");
+  }
+  if (query.length > SKILLS_DISCOVERY_QUERY_MAX_LENGTH) {
+    throw new PoiesisError("INVALID_DISCOVERY_QUERY", "Discovery query exceeds the maximum length", {
+      maxLength: SKILLS_DISCOVERY_QUERY_MAX_LENGTH,
+    });
+  }
+  if (/[/\\]/.test(query) || /:/.test(query)) {
+    throw new PoiesisError(
+      "INVALID_DISCOVERY_QUERY",
+      "Discovery query must not contain paths, drives, or private coordinates",
+      { query },
+    );
+  }
+  if (/\b[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\b/.test(query)) {
+    throw new PoiesisError(
+      "INVALID_DISCOVERY_QUERY",
+      "Discovery query must not contain owner/repository coordinates",
+      { query },
+    );
+  }
+  if (/\b(ghp_|gho_|ghu_|ghs_|ghr_|github_pat_|sk-|xox[baprs]-)\S+/i.test(query)) {
+    throw new PoiesisError("INVALID_DISCOVERY_QUERY", "Discovery query must not contain credential-shaped tokens");
+  }
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ._-]*$/.test(query)) {
+    throw new PoiesisError(
+      "INVALID_DISCOVERY_QUERY",
+      "Discovery query may contain only letters, digits, spaces, dots, underscores, and hyphens",
+      { query },
+    );
+  }
+  return query;
+}
+
+function parseCatalogSkill(value: unknown): CatalogSkillResult | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const candidate = value as Record<string, unknown>;
+  const source = typeof candidate.source === "string" ? candidate.source : undefined;
+  const name =
+    typeof candidate.name === "string"
+      ? candidate.name
+      : typeof candidate.skillId === "string"
+        ? candidate.skillId
+        : undefined;
+  const id =
+    typeof candidate.id === "string"
+      ? candidate.id
+      : source !== undefined && name !== undefined
+        ? `${source}/${name}`
+        : undefined;
+  if (source === undefined || name === undefined || id === undefined) return undefined;
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(source)) return undefined;
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(name)) return undefined;
+  return { id, source, name };
+}
+
+/**
+ * Spec #207 / ticket #208 — bounded skills.sh catalog search.
+ *
+ * Distinguishes three outcomes that must never collapse:
+ * - `ok` — at least one validated catalog hit;
+ * - `none-relevant` — catalog answered with zero hits;
+ * - `catalog-unavailable` — network/transport/parse failure (not "none relevant").
+ *
+ * The request carries no project identity: no Authorization, no Referer, no
+ * repository name. Inject `fetch` for pure tests.
+ */
+export async function searchSkillsCatalog(
+  rawQuery: string,
+  options: CatalogSearchOptions = {},
+): Promise<CatalogSearchOutcome> {
+  const query = sanitizeDiscoveryQuery(rawQuery);
+  const limit = options.limit ?? SKILLS_DISCOVERY_MAX_RESULTS;
+  if (!Number.isInteger(limit) || limit < 1 || limit > SKILLS_DISCOVERY_MAX_RESULTS) {
+    throw new PoiesisError("INVALID_DISCOVERY_LIMIT", "Catalog search limit must be an integer from 1 to 20", {
+      limit,
+      max: SKILLS_DISCOVERY_MAX_RESULTS,
+    });
+  }
+  const url = new URL(SKILLS_SH_SEARCH_URL);
+  url.searchParams.set("q", query);
+  url.searchParams.set("limit", String(limit));
+  const fetcher = options.fetch ?? globalThis.fetch;
+  let response: Response;
+  try {
+    response = await fetcher(url, {
+      method: "GET",
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(SKILLS_SH_SEARCH_TIMEOUT_MS),
+    });
+  } catch (error) {
+    return {
+      status: "catalog-unavailable",
+      query,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+  if (!response.ok) {
+    return {
+      status: "catalog-unavailable",
+      query,
+      reason: `skills.sh responded ${response.status}`,
+    };
+  }
+  let body: unknown;
+  try {
+    body = await response.json();
+  } catch (error) {
+    return {
+      status: "catalog-unavailable",
+      query,
+      reason: error instanceof Error ? error.message : "skills.sh response was not JSON",
+    };
+  }
+  if (typeof body !== "object" || body === null || !Array.isArray((body as { skills?: unknown }).skills)) {
+    return { status: "catalog-unavailable", query, reason: "skills.sh response missing a skills array" };
+  }
+  const parsed: CatalogSkillResult[] = [];
+  for (const entry of (body as { skills: unknown[] }).skills) {
+    const skill = parseCatalogSkill(entry);
+    if (skill === undefined) continue;
+    parsed.push(skill);
+    if (parsed.length >= limit) break;
+  }
+  if (parsed.length === 0) {
+    return { status: "none-relevant", query, results: [] };
+  }
+  return { status: "ok", query, results: parsed };
+}
+
+/**
+ * Spec #207 / ticket #208 — catalog provenance gate for capability install.
+ *
+ * Bundled defaults are trustworthy bootstrap origins (exact source + name
+ * from `POIESIS_SKILLS.json`). Every other source must appear on skills.sh
+ * for the requested name. Arbitrary GitHub owner/repo acceptance is refused.
+ */
+export async function resolveCapabilityCatalogProvenance(
+  input: CapabilityInstallInput,
+  options: CatalogProvenanceOptions = {},
+): Promise<CatalogProvenance> {
+  if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.source)) {
+    throw new PoiesisError("INVALID_SKILL_SOURCE", "Capability source must use owner/repository form", {
+      source: input.source,
+    });
+  }
+  if (!isExactRevision(input.revision)) {
+    throw new PoiesisError("UNPINNED_CAPABILITY", "Capability installation requires an exact 40-character revision", {
+      revision: input.revision,
+    });
+  }
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(input.name)) {
+    throw new PoiesisError("INVALID_SKILL_NAME", "Skill name is not a safe exact directory name", { name: input.name });
+  }
+  const defaults = options.defaults ?? (await loadDefaultSkills());
+  const bundled = defaults.find((skill) => skill.source === input.source && skill.name === input.name);
+  if (bundled !== undefined) {
+    return {
+      kind: "bundled-default",
+      source: bundled.source,
+      name: bundled.name,
+      revision: bundled.revision,
+    };
+  }
+  const outcome = await searchSkillsCatalog(
+    input.name,
+    options.fetch === undefined ? {} : { fetch: options.fetch },
+  );
+  if (outcome.status === "catalog-unavailable") {
+    throw new PoiesisError(
+      "CATALOG_UNAVAILABLE",
+      "skills.sh catalog is unavailable; cannot confirm capability provenance",
+      { query: outcome.query, reason: outcome.reason },
+    );
+  }
+  if (outcome.status === "none-relevant") {
+    throw new PoiesisError(
+      "ARBITRARY_CAPABILITY_SOURCE",
+      "Capability is not present in the skills.sh catalog and is not a bundled default",
+      { source: input.source, name: input.name },
+    );
+  }
+  const match = outcome.results.find((skill) => skill.source === input.source && skill.name === input.name);
+  if (match === undefined) {
+    throw new PoiesisError(
+      "ARBITRARY_CAPABILITY_SOURCE",
+      "Capability source/name was not returned by the skills.sh catalog for this skill",
+      { source: input.source, name: input.name },
+    );
+  }
+  return {
+    kind: "skills.sh-catalog",
+    source: match.source,
+    name: match.name,
+    catalogId: match.id,
+  };
 }
 
 export function skillPath(root: string, name: string): string {
@@ -151,9 +411,9 @@ export async function loadDefaultSkills(): Promise<DefaultSkill[]> {
   }
 
   const seen = new Set<string>();
-  return metadata.defaults.map(({ source, name }) => {
-    const revision = sourceRevisions[source];
-    if (revision === undefined) {
+  return metadata.defaults.map(({ source, name, revision: pinnedRevision }) => {
+    const revision = pinnedRevision ?? sourceRevisions[source];
+    if (revision === undefined || !isExactRevision(revision)) {
       throw new PoiesisError("UNPINNED_SKILL_SOURCE", "Default skill source has no pinned revision", {
         source,
         name,

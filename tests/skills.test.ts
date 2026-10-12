@@ -16,7 +16,9 @@ describe("skill integration", () => {
 
   it("contains only the curated defaults and emits safe exact CLI arguments", async () => {
     const defaults = await loadDefaultSkills();
-    expect(defaults).toHaveLength(11);
+    expect(defaults).toHaveLength(13);
+    expect(defaults.map((skill) => skill.name)).toContain("find-skills");
+    expect(defaults.map((skill) => skill.name)).toContain("writing-for-agents");
     expect(defaults.map((skill) => skill.name)).toContain("to-spec");
     expect(defaults.map((skill) => skill.name)).toContain("to-tickets");
     expect(defaults.map((skill) => skill.name)).not.toContain("writing-plans");

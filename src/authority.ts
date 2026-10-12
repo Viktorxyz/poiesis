@@ -9,6 +9,7 @@ import {
   CERTIFIED_OPENCODE_VERSION,
   desiredOpenCodePatches,
   isCertifiedOpenCodeVersion,
+  OPENCODE_V160_STATIC_SKILL_PERMISSIONS,
   workerFocusedCheckAllowKey,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
@@ -580,6 +581,48 @@ export function predecessorProjectionPreFocusedCheck(
 }
 
 /**
+ * Spec #207 / ticket #208 — authentic published `1.6.0` static skill
+ * permission projection.
+ *
+ * Ticket #208 replaced fixed per-skill allow maps with a native
+ * `skill: { "*": "allow" }` wildcard so catalog-acquired skills load
+ * without enumerating names, while bash/task stay unchanged. A project
+ * installed by the earlier `1.6.0` image therefore records
+ * `poiesisVersion = "1.6.0"` with the static maps. Without this
+ * predecessor the receipt-gated `update` fails closed on an authentic
+ * install.
+ *
+ * Differs from the current projection ONLY in each agent's `permission.skill`
+ * map. Bash, task, models, and every other field are taken from the current
+ * builder so the migration never widens lifecycle authority.
+ */
+export function predecessorProjectionV160StaticSkills(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
+    if (patch.path.length !== 2 || patch.path[0] !== "agent") return patch;
+    const agentName = patch.path[1];
+    if (typeof agentName !== "string") return patch;
+    const staticSkills = OPENCODE_V160_STATIC_SKILL_PERMISSIONS[agentName];
+    if (staticSkills === undefined) return patch;
+    const installed = patch.value as Record<string, unknown>;
+    const permission = installed.permission as Record<string, unknown> | undefined;
+    if (permission === undefined) return patch;
+    return {
+      ...patch,
+      value: {
+        ...installed,
+        permission: {
+          ...permission,
+          skill: { ...staticSkills },
+        },
+      },
+    };
+  });
+}
+
+/**
  * Returns true if `manifest.configPatches` exactly matches the given projection:
  * same length, same `(file, path)` keys, and `isDeepStrictEqual` values.
  * Used to verify that a predecessor manifest is byte-for-byte the v1.0.0/1.0.1/1.0.2
@@ -645,11 +688,9 @@ export async function assertManifestAuthorityToleratingPredecessor(
   root: string,
   manifest: Manifest,
   config: PoiesisConfig,
-  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4" | "1.4.0"> = [
-    "1.0.0",
-    "1.0.1",
-    "1.0.2",
-  ],
+  acceptedPredecessorVersions: ReadonlyArray<
+    "1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4" | "1.4.0" | "1.6.0"
+  > = ["1.0.0", "1.0.1", "1.0.2"],
 ): Promise<void> {
   // Spec #104 / ticket #105: the exact-version canonical route
   // `pnpm dlx poiesis-cli@<X>` derives from the manifest's recorded
@@ -711,6 +752,20 @@ export async function assertManifestAuthorityToleratingPredecessor(
   // and is rethrown by the strict check below.
   if (manifest.poiesisVersion === "1.4.0") {
     const predecessor = predecessorProjectionPreFocusedCheck(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, predecessor);
+      return;
+    }
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
+    return;
+  }
+  // Spec #207 / ticket #208 — authentic 1.6.0 static-skill predecessor.
+  // Ticket #208 changed skill permission maps to a native wildcard while
+  // the release label stayed `1.6.0`. Only the exact static-skill set is
+  // admitted; drift fails closed and never falls through to older
+  // predecessors.
+  if (manifest.poiesisVersion === "1.6.0") {
+    const predecessor = predecessorProjectionV160StaticSkills(config, manifest.poiesisVersion);
     if (isExactProjection(manifest, predecessor)) {
       await assertManifestAuthorityImpl(root, manifest, predecessor);
       return;

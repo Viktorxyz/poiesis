@@ -84,7 +84,7 @@ type JsonObject = Record<string, unknown>;
 
 /**
  * Journal artifact limit. 13 template mappings + `.poiesis/config.jsonc`
- * + opencode config + manifest + receipt + 11 default skill directories
+  * + opencode config + manifest + receipt + default skill directories
  * = 28 artifacts in the worst case (ticket #46); 32 leaves comfortable
  * headroom for future Poiesis-managed files.
  */
@@ -435,7 +435,18 @@ async function runLockedUpdateTransaction(
   // accepted surface stays fail-closed: only that exact set is admitted, and
   // the projection the transaction writes grants no broad / `@latest` /
   // unversioned launcher.
-  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"]);
+  // Spec #207 / ticket #208: accept authentic `1.6.0` static-skill
+  // projections so receipt-gated update migrates them onto the native
+  // skill-wildcard surface without widening bash/task authority.
+  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, [
+    "1.0.1",
+    "1.0.2",
+    "1.1.1",
+    "1.1.3",
+    "1.1.4",
+    "1.4.0",
+    "1.6.0",
+  ]);
   await verifyGitRepository(resolvedRoot, config);
   // The transaction's actual capability probes (`models` via
   // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run

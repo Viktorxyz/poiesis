@@ -125,6 +125,8 @@ const DEFAULT_SKILL_NAMES = [
   "diagnosing-bugs",
   "test-driven-development",
   "verification-before-completion",
+  "writing-for-agents",
+  "find-skills",
 ];
 
 function portableConfig(mode: "private" | "team"): PoiesisConfig {

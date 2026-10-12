@@ -24,6 +24,7 @@ You may:
 - run focused tests, typecheck, lint, and builds;
 - use `test-driven-development` for behavior-changing work;
 - use `diagnosing-bugs` when actual debugging is required;
+- load other already-installed native skills when they apply; request missing catalog skills through Poiesis (do not run `capability install` yourself);
 - use harness-native `explore` for bounded repository lookup;
 - use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful.
 

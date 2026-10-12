@@ -269,7 +269,7 @@ describe("OpenCode adapter", () => {
       glob: "allow",
       grep: "allow",
       list: "allow",
-      skill: { "code-review": "allow" },
+      skill: { "*": "allow" },
     });
   });
 

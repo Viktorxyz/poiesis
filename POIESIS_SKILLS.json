@@ -44,6 +44,16 @@
     {
       "source": "obra/superpowers",
       "name": "verification-before-completion"
+    },
+    {
+      "source": "mattpocock/skills",
+      "name": "writing-for-agents",
+      "revision": "49dd158d1076134a641b33efb035946536778336"
+    },
+    {
+      "source": "vercel-labs/skills",
+      "name": "find-skills",
+      "revision": "13e4063a1cf913f5606d57d42ab83a86f5001e04"
     }
   ],
   "notDefault": [

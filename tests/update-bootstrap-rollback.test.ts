@@ -352,6 +352,8 @@ async function seedDefaultSkillDirectoriesAsPreexisting(repository: TestReposito
     "diagnosing-bugs",
     "test-driven-development",
     "verification-before-completion",
+    "writing-for-agents",
+    "find-skills",
   ];
   const { mkdir } = await import("node:fs/promises");
   for (const name of defaultNames) {

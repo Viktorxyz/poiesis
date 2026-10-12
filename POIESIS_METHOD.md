@@ -79,15 +79,24 @@ A `github` or `gitlab` coordinate may be inferred from a recognized `github.com`
 
 ### Capability Check
 
+Before each independently dispatched task (planning, research, implementation, review — not each tool call), prepare skills through the skills.sh catalog.
+
+skills.sh is the sole discovery catalog. Use the deterministic `poiesis capability search --query <topic>` surface (sanitized generic topics only; at most two searches, twenty results each, three selected skills). Do not improvise raw catalog HTTP calls, leak private repository paths/names/credentials into queries, or treat network failure as "none relevant" — catalog-unavailable is distinct from none-relevant.
+
+Primary owns selection and acquisition. Child roles may recommend a capability; they do not install. Prefer an already-installed local skill loaded with OpenCode's native Skill tool. When a missing catalog-eligible skill is selected, install it project-locally with `poiesis capability install --source <owner/repo> --name <skill> --revision <40-hex>` (exact revision, primary installation root, catalog or bundled-default provenance only — never arbitrary GitHub acceptance, never global `-g` install, never overwrite an Author preexisting skill).
+
+If a new skill was just installed, pause before substantive task work and request an Author-controlled OpenCode restart so native Skill loading can see it. Never restart OpenCode automatically, never use plugins, never inject or read a skill body as a substitute for native loading, and never claim loading succeeded without the restart. Resume through existing tracker/task context after the Author restarts.
+
 Always ask whether current capability is sufficient for the specialized work.
 
 If sufficient, continue.
 
 If insufficient:
-- research current high-trust sources;
+- run the bounded skills.sh discovery above;
 - select a maintained relevant capability when useful;
 - otherwise use current official documentation/research;
 - install the selected capability deterministically when required;
+- pause for Author restart when installation changed local skills;
 - then continue.
 
 Do not rely on stale model knowledge when current specialized knowledge materially matters.

@@ -20,12 +20,13 @@ For fast-moving software, verify current versions and dates.
 ## Capability research
 
 When asked to find a capability:
+- prefer skills.sh catalog candidates (Primary runs bounded `poiesis capability search`; you may assess returned hits);
 - identify the best maintained relevant skill or current official documentation;
 - assess whether it actually matches the task;
-- report provenance/currentness;
-- do not install it.
+- report provenance/currentness and exact source coordinates when known;
+- do not install it, do not call capability install, and do not recommend global `-g` installation.
 
-Poiesis selects. Deterministic tooling installs.
+Poiesis selects. Deterministic project-local tooling installs. After install, Author restart is required before native loading.
 
 ## Boundaries
 
