@@ -18,13 +18,13 @@
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
  *
- * Spec #190 / ticket #191 — this transaction no longer touches
- * `package.json` at all. Invoking Poiesis must not require a project
- * manifest mutation, so the `scripts.poiesis` reconcile this file used to
- * perform (and its whole snapshot + written-hash rollback apparatus) is
- * gone. That makes a config no-op a genuine whole-project no-op again:
- * `setModel` reaching an already-current value now returns without any
- * second surface to reconcile, and the journal drives the only writes.
+ * Spec #190 / ticket #191 — this transaction no longer invents a
+ * `scripts.poiesis` reconcile for its own sake. Spec #207 / ticket #210 +
+ * #218 — when a package contribution plan is present, version-cross /
+ * repair `apply` still mutates package.json + lock inside this journal;
+ * a config-byte no-op may early-return only when the plan is absent or a
+ * genuine hashed noop that still passes fresh identity + runtime readiness
+ * before doctor (no package write, no receipt/manifest advancement).
  *
  * Spec #190 / ticket #193 — this transaction is ALSO the explicit
  * `Private <-> Team` transition surface. `mode` is part of the config an
@@ -79,6 +79,7 @@ import {
   applyPackageContributionWithJournal,
   assertPackageContributionCaptureIdentity,
   assertPackageContributionRuntimeReady,
+  gateUpdateConfigEarlyNoopPackage,
   loadPackageFsSnapshot,
   PACKAGE_JSON_RELATIVE,
   packagePlanRetainsContribution,
@@ -216,8 +217,10 @@ export interface UpdateTransactionHooks {
    */
   postManifestWrite?: () => void | Promise<void>;
   /**
-   * Called immediately BEFORE `doctor()` in the no-op branch — after
-   * the byte-hash match short-circuit AND before the extracted
+   * Called immediately BEFORE `doctor()` in the config-byte early no-op
+   * branch — after the byte-hash match, after Spec #207 / ticket #218
+   * `gateUpdateConfigEarlyNoopPackage` allows early-return (absent or
+   * validated hashed noop), AND before the extracted
    * `assertUpdateConfigDoctorGate` helper runs. This seam exists for
    * tests that need to deterministically make the no-op doctor
    * unhealthy (e.g. by toggling a `POIESIS_TEST_OPENCODE_FAIL`
@@ -772,23 +775,46 @@ async function runLockedUpdateConfigTransaction(
   // existing manifest here would leave the installation stating two different
   // sharing modes at once.
   if (poiesisConfigBytesMatch && openCodeBytesMatch && !transitionRequested) {
-    // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
-    // so tests can deterministically fail the gate (e.g. by toggling a
-    // doctor-failure environment variable) and prove the extracted
-    // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
-    // owned byte. Production callers leave the seam unset, so it is a
-    // no-op and doctor runs exactly as before. Note: in this branch, the
-    // `opencode-schema` check happens through `doctor()` → which calls the
-    // same `validateOpenCodeConfig` (debug config), so the no-op path and
-    // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
-    // on schema rejection.
-    await hooks?.preNoopDoctor?.();
-    // Spec #190 / ticket #191: this is now a genuine whole-project no-op.
-    // `package.json` is no longer an artifact Poiesis mutates at all, so a
-    // config no-op has nothing left to reconcile.
-    const report = await doctor(resolvedRoot);
-    assertUpdateConfigDoctorGate(report, manifest);
-    return { manifest, doctor: report };
+    // Spec #207 / ticket #218 — package plan is already computed. Config-byte
+    // equality may early-return only when the plan is absent or a genuine
+    // hashed noop that still passes fresh package.json identity + runtime
+    // readiness. Apply (repair / version-cross / lock) never early-returns;
+    // fall through so the full transaction still reconciles package state.
+    // Failures throw before doctor, package write, or receipt/manifest advance.
+    const earlyPackageGate = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan,
+      readPackageJson: async () => {
+        try {
+          return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+        } catch {
+          return null;
+        }
+      },
+      assertRuntimeReady: (record) =>
+        assertPackageContributionRuntimeReady({
+          record,
+          poiesisVersion: nextPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        }),
+    });
+    if (earlyPackageGate.decision === "allow-early-return") {
+      // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
+      // so tests can deterministically fail the gate (e.g. by toggling a
+      // doctor-failure environment variable) and prove the extracted
+      // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
+      // owned byte. Production callers leave the seam unset, so it is a
+      // no-op and doctor runs exactly as before. Note: in this branch, the
+      // `opencode-schema` check happens through `doctor()` → which calls the
+      // same `validateOpenCodeConfig` (debug config), so the no-op path and
+      // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
+      // on schema rejection. Doctor runs only after the package gates above.
+      await hooks?.preNoopDoctor?.();
+      const report = await doctor(resolvedRoot);
+      assertUpdateConfigDoctorGate(report, manifest);
+      return { manifest, doctor: report };
+    }
+    // earlyPackageGate.decision === "continue-transaction" (apply): fall through.
   }
 
   // 8. Validate the projected (post-write) OpenCode config payload against the

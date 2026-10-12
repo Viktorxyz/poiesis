@@ -28,6 +28,7 @@ import {
   buildPackageContributionRecord,
   classifyPackageProject,
   desiredScriptValue,
+  gateUpdateConfigEarlyNoopPackage,
   nativePackageManagerArgv,
   packageContributionMode,
   packagePlanIsNoopWithPreimage,
@@ -2326,6 +2327,342 @@ describe("package plan-to-capture identity bind (ticket #214 correction A)", () 
     expect(updateInternal).toMatch(/kind:\s*"apply"/);
     expect(maintenance).toMatch(/kind:\s*"apply"/);
     expect(updateConfig).toMatch(/kind:\s*"apply"/);
+  });
+});
+
+describe("update-config early config-noop package gate (ticket #218)", () => {
+  const ownedOrdinary = [
+    "{",
+    '  "name": "demo",',
+    '  "scripts": { "poiesis": "poiesis", "build": "tsc" },',
+    '  "devDependencies": { "poiesis-cli": "1.6.0", "typescript": "^5.0.0" }',
+    "}",
+    "",
+  ].join("\n");
+
+  const ownedSelfhost = [
+    "{",
+    '  "name": "poiesis-cli",',
+    '  "version": "1.6.0",',
+    '  "scripts": { "poiesis": "node dist/cli.js", "build": "tsup" }',
+    "}",
+    "",
+  ].join("\n");
+
+  function ordinaryNoopPlan() {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ownedOrdinary, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("noop");
+    if (plan.kind !== "noop") throw new Error("expected ordinary hashed noop");
+    expect(plan.expectedPackageJsonPreimageHash).toBe(hashContent(ownedOrdinary));
+    return plan;
+  }
+
+  function selfhostNoopPlan() {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ownedSelfhost, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("noop");
+    if (plan.kind !== "noop") throw new Error("expected selfhost hashed noop");
+    return plan;
+  }
+
+  function applyPlan() {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    return plan;
+  }
+
+  it("apply returns continue-transaction without reading package.json or readiness", async () => {
+    const events: string[] = [];
+    const result = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: applyPlan(),
+      readPackageJson: async () => {
+        events.push("read");
+        return ownedOrdinary;
+      },
+      assertRuntimeReady: async () => {
+        events.push("ready");
+      },
+    });
+    expect(result).toEqual({ decision: "continue-transaction" });
+    expect(events).toEqual([]);
+  });
+
+  it("absent allows early-return without package read or readiness", async () => {
+    const events: string[] = [];
+    const result = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: { kind: "absent" },
+      readPackageJson: async () => {
+        events.push("read");
+        return null;
+      },
+      assertRuntimeReady: async () => {
+        events.push("ready");
+      },
+    });
+    expect(result).toEqual({ decision: "allow-early-return" });
+    expect(events).toEqual([]);
+  });
+
+  it("hashed noop with matching fresh read and readiness allows early-return", async () => {
+    const plan = ordinaryNoopPlan();
+    const events: string[] = [];
+    const result = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: plan,
+      readPackageJson: async () => {
+        events.push("read");
+        return ownedOrdinary;
+      },
+      assertRuntimeReady: async (record) => {
+        events.push("ready");
+        expect(record.devDependencyVersion).toBe("1.6.0");
+        expect(record.projectKind).toBe("ordinary");
+      },
+    });
+    expect(result).toEqual({ decision: "allow-early-return" });
+    expect(events).toEqual(["read", "ready"]);
+  });
+
+  it("hashed noop rejects drifted package.json and never calls readiness", async () => {
+    const plan = ordinaryNoopPlan();
+    const events: string[] = [];
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => {
+          events.push("read");
+          return ownedOrdinary.replace('"name": "demo"', '"name": "author-edit"');
+        },
+        assertRuntimeReady: async () => {
+          events.push("ready");
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "ARTIFACT_IDENTITY_DRIFT",
+      details: { path: PACKAGE_JSON_RELATIVE },
+    });
+    expect(events).toEqual(["read"]);
+  });
+
+  it("hashed noop rejects missing package.json and never calls readiness", async () => {
+    const plan = ordinaryNoopPlan();
+    const events: string[] = [];
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => {
+          events.push("read");
+          return null;
+        },
+        assertRuntimeReady: async () => {
+          events.push("ready");
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "ARTIFACT_IDENTITY_DRIFT",
+      details: { path: PACKAGE_JSON_RELATIVE },
+    });
+    expect(events).toEqual(["read"]);
+  });
+
+  it("hashed noop rejects read errors as identity drift and never calls readiness", async () => {
+    const plan = ordinaryNoopPlan();
+    const events: string[] = [];
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => {
+          events.push("read");
+          throw new Error("EIO simulated");
+        },
+        assertRuntimeReady: async () => {
+          events.push("ready");
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "ARTIFACT_IDENTITY_DRIFT",
+      details: { path: PACKAGE_JSON_RELATIVE },
+    });
+    expect(events).toEqual(["read"]);
+  });
+
+  it("hashed noop propagates ordinary readiness failure and is not successful", async () => {
+    const plan = ordinaryNoopPlan();
+    const events: string[] = [];
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => {
+          events.push("read");
+          return ownedOrdinary;
+        },
+        assertRuntimeReady: async (record) => {
+          events.push("ready");
+          await assertPackageContributionRuntimeReady({
+            record,
+            poiesisVersion: "1.6.0",
+            readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.5.0" }),
+          });
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "PACKAGE_LOCAL_BIN_VERSION_MISMATCH",
+      details: { expectedVersion: "1.6.0", actualVersion: "1.5.0" },
+    });
+    expect(events).toEqual(["read", "ready"]);
+  });
+
+  it("hashed noop propagates missing ordinary resolved bin as not successful", async () => {
+    const plan = ordinaryNoopPlan();
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => ownedOrdinary,
+        assertRuntimeReady: async (record) => {
+          await assertPackageContributionRuntimeReady({
+            record,
+            poiesisVersion: "1.6.0",
+            readResolvedLocalPackageJson: async () => null,
+          });
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_LOCAL_BIN_UNRESOLVED" });
+  });
+
+  it("hashed selfhost noop succeeds only after matching dist probe; wrong probe rejects", async () => {
+    const plan = selfhostNoopPlan();
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => ownedSelfhost,
+        assertRuntimeReady: async (record) => {
+          await assertPackageContributionRuntimeReady({
+            record,
+            poiesisVersion: "1.6.0",
+            probeSelfhostDist: async () => ({ ok: true, stdout: "1.6.0\n" }),
+          });
+        },
+      }),
+    ).resolves.toEqual({ decision: "allow-early-return" });
+
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => ownedSelfhost,
+        assertRuntimeReady: async (record) => {
+          await assertPackageContributionRuntimeReady({
+            record,
+            poiesisVersion: "1.6.0",
+            probeSelfhostDist: async () => ({ ok: true, stdout: "1.5.0\n" }),
+          });
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "SELFHOST_DIST_VERSION_MISMATCH",
+    });
+
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => ownedSelfhost,
+        assertRuntimeReady: async (record) => {
+          await assertPackageContributionRuntimeReady({
+            record,
+            poiesisVersion: "1.6.0",
+            probeSelfhostDist: async () => ({ ok: false, code: "missing" }),
+          });
+        },
+      }),
+    ).rejects.toMatchObject({ code: "SELFHOST_DIST_MISSING" });
+  });
+
+  it("version-cross apply (package target not yet next runtime) continues transaction", async () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.5.0",
+    });
+    const current = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis", "build": "tsc" },',
+      '  "devDependencies": { "poiesis-cli": "1.5.0", "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const { plan } = planPackageContributionForVersionCross({
+      snapshot: snap({ packageJson: current, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      nextPoiesisVersion: "1.6.0",
+      prior,
+    });
+    expect(plan.kind).toBe("apply");
+    const events: string[] = [];
+    const result = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: plan,
+      readPackageJson: async () => {
+        events.push("read");
+        return current;
+      },
+      assertRuntimeReady: async () => {
+        events.push("ready");
+      },
+    });
+    expect(result).toEqual({ decision: "continue-transaction" });
+    expect(events).toEqual([]);
+  });
+
+  it("version-cross hashed noop only when package target already matches next runtime", async () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const { plan } = planPackageContributionForVersionCross({
+      snapshot: snap({ packageJson: ownedOrdinary, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      nextPoiesisVersion: "1.6.0",
+      prior,
+    });
+    expect(plan.kind).toBe("noop");
+    const result = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: plan,
+      readPackageJson: async () => ownedOrdinary,
+      assertRuntimeReady: async () => undefined,
+    });
+    expect(result).toEqual({ decision: "allow-early-return" });
+  });
+
+  it("production update-config early branch wires the gate before doctor", async () => {
+    const root = join(import.meta.dirname, "..");
+    const updateConfig = await readFile(join(root, "src/update-config-internal.ts"), "utf8");
+    expect(updateConfig).toContain("gateUpdateConfigEarlyNoopPackage");
+    // Gate runs inside the config-byte no-op branch, before preNoopDoctor/doctor.
+    const noopBranch = updateConfig.slice(
+      updateConfig.indexOf("if (poiesisConfigBytesMatch && openCodeBytesMatch && !transitionRequested)"),
+      updateConfig.indexOf("// 8. Validate the projected"),
+    );
+    expect(noopBranch).toContain("gateUpdateConfigEarlyNoopPackage");
+    expect(noopBranch).toContain('decision === "allow-early-return"');
+    expect(noopBranch).toContain("preNoopDoctor");
+    expect(noopBranch.indexOf("gateUpdateConfigEarlyNoopPackage")).toBeLessThan(
+      noopBranch.indexOf("preNoopDoctor"),
+    );
+    // Apply must not early-return: continue falls through out of the branch.
+    expect(noopBranch).toMatch(/continue-transaction|decision !== "allow-early-return"|decision === "continue-transaction"/);
   });
 });
 

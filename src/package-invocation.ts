@@ -1668,6 +1668,65 @@ export async function assertPackageContributionRuntimeReady(args: {
 }
 
 /**
+ * Spec #207 / ticket #218 — decision for the update-config **config-byte**
+ * early no-op branch once `packagePlan` is already computed.
+ *
+ * - `apply` (repair / version-cross / lock reconciliation) → never early-return;
+ *   continue the full transaction so package work still runs.
+ * - `absent` (and non-retain plans) → allow early-return; no package gates.
+ * - hashed `noop` → allow early-return only after a fresh package.json identity
+ *   bind against the original plan hash and runtime readiness (ordinary local
+ *   resolved exact version, or selfhost dist target). Read missing / drift /
+ *   readiness failure throws; callers must not write package bytes or advance
+ *   receipt/manifest generation.
+ *
+ * Noop is only possible when the package target already matches the candidate
+ * runtime `nextPoiesisVersion` (version-cross planning yields `apply` otherwise).
+ * Reuses {@link assertPackageContributionCaptureIdentity} — does not duplicate
+ * the later full-transaction publication helper.
+ */
+export type UpdateConfigEarlyNoopPackageDecision =
+  | { decision: "continue-transaction" }
+  | { decision: "allow-early-return" };
+
+export async function gateUpdateConfigEarlyNoopPackage(args: {
+  packagePlan: PackageContributionPlan;
+  /** Fresh package.json reader; `null` or throw → identity drift for hashed noop. */
+  readPackageJson: () => Promise<string | null>;
+  /**
+   * Runtime readiness for the hashed-noop record (ordinary resolved local exact
+   * version or selfhost dist). Invoked only after identity bind succeeds.
+   */
+  assertRuntimeReady: (record: PackageContributionRecord) => Promise<void>;
+}): Promise<UpdateConfigEarlyNoopPackageDecision> {
+  if (args.packagePlan.kind === "apply") {
+    return { decision: "continue-transaction" };
+  }
+  if (packagePlanIsNoopWithPreimage(args.packagePlan)) {
+    let content: string | null;
+    try {
+      content = await args.readPackageJson();
+    } catch {
+      content = null;
+    }
+    if (content === null) {
+      throw new PoiesisError(
+        "ARTIFACT_IDENTITY_DRIFT",
+        "package.json changed while preparing the package contribution",
+        { path: PACKAGE_JSON_RELATIVE },
+      );
+    }
+    assertPackageContributionCaptureIdentity(args.packagePlan, {
+      packageJsonContent: content,
+    });
+    await args.assertRuntimeReady(args.packagePlan.record);
+    return { decision: "allow-early-return" };
+  }
+  // absent, or non-retain noop without preimage — nothing to bind or write.
+  return { decision: "allow-early-return" };
+}
+
+/**
  * Spec #207 / ticket #210 — pure planning seam for version-crossing config
  * updates. Given a package FS snapshot, the next runtime version, and any
  * prior owned contribution, returns the plan plus the contribution the
