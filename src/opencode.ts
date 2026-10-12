@@ -218,6 +218,48 @@ export async function assertOpenCodeAdapterContract(
 }
 
 /**
+ * Spec #207 / ticket #212 + #215 — Worker local package-script lifecycle deny
+ * keys. Supported local spellings (`pnpm poiesis`, `pnpm run poiesis`,
+ * `npm run poiesis`, `npm run-script poiesis`) are denied bare and as
+ * `'<spelling> *'` (covering `--` forwarding). `npm run poiesis -- *` is
+ * retained as the compatibility / canonical-npm broad deny. Authentic
+ * historical predecessor images never carried these keys; migration helpers
+ * strip every entry via {@link stripWorkerLocalLifecycleDenies}.
+ *
+ * Ordering in the Worker bash map is broad `*` allow, then launcher denies
+ * including this complete set, then narrow check/repository allows on the
+ * canonical generated route only.
+ */
+export const WORKER_LOCAL_LIFECYCLE_DENY_KEYS = [
+  "pnpm poiesis",
+  "pnpm run poiesis",
+  "npm run poiesis",
+  "npm run-script poiesis",
+  "pnpm poiesis *",
+  "pnpm run poiesis *",
+  "npm run poiesis *",
+  "npm run-script poiesis *",
+  "npm run poiesis -- *",
+] as const;
+
+/** Strip every current Worker local lifecycle deny key from a bash map. */
+export function stripWorkerLocalLifecycleDenies(bash: Record<string, string>): Record<string, string> {
+  const next = { ...bash };
+  for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+    delete next[key];
+  }
+  return next;
+}
+
+function workerLocalLifecycleDenies(): Record<string, string> {
+  const denies: Record<string, string> = {};
+  for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+    denies[key] = "deny";
+  }
+  return denies;
+}
+
+/**
  * Spec #104 / tickets #105 / #110 / #173 / #174, extended by Spec #207 /
  * ticket #210 — the ONE derivation of the canonical Poiesis invocation
  * prefix.
@@ -541,14 +583,15 @@ function permissions(
           // preserved so the exact-version deny still precedes every allow.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
-          // Spec #207 / ticket #212: deny BOTH broad local package-script
-          // prefixes BEFORE the narrow check/repository allows. Without
-          // these, Worker's `*` allow admits full lifecycle through
-          // `pnpm poiesis …` / `npm run poiesis -- …` when a local
-          // contribution projects those prefixes. Primary alone keeps the
-          // owned local lifecycle allow; other tools stay unchanged.
-          "pnpm poiesis *": "deny",
-          "npm run poiesis -- *": "deny",
+          // Spec #207 / ticket #212 + #215: deny every supported local
+          // package-script spelling (bare + remainder, incl -- forwarding
+          // and npm compatibility `npm run poiesis -- *`) BEFORE the narrow
+          // check/repository allows. Without these, Worker's `*` allow
+          // admits full lifecycle through alias routes (`pnpm run poiesis`,
+          // `npm run poiesis`, `npm run-script poiesis`, …). Primary alone
+          // keeps the owned canonical local lifecycle allow; noncanonical
+          // aliases never receive narrow allows.
+          ...workerLocalLifecycleDenies(),
           // Spec #120 / ticket #123: append the four Repository
           // Intelligence subcommand allows AFTER the launcher denies so
           // OpenCode's last-match-wins resolver grants only the

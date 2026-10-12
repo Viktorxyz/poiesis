@@ -213,14 +213,18 @@ describe("inventoryAgents (ticket #209)", () => {
         [`${root}/real-src/util/AGENTS.md`]: "# util\n",
       },
       symlinks: {
-        [`${root}/src`]: `${root}/real-src`,
+        // Alias sorts before the real directory name so it is the first
+        // logical representative of the shared canonical target.
+        [`${root}/alias-src`]: `${root}/real-src`,
       },
     });
 
     const result = await inventoryAgents(root, { fs });
     const byPath = Object.fromEntries(result.folders.map((f) => [f.path, f.agentsMd]));
-    expect(byPath["src"]).toBe("missing");
-    expect(byPath["src/util"]).toBe("present");
+    expect(byPath["alias-src"]).toBe("missing");
+    expect(byPath["alias-src/util"]).toBe("present");
+    // real-src shares the same canonical target — first representative wins.
+    expect(byPath["real-src"]).toBeUndefined();
   });
 
   it("bounds canonical ancestor cycles from internal symlinks (self and back-to-root)", async () => {
@@ -303,6 +307,147 @@ describe("inventoryAgents (ticket #209)", () => {
     expect(byPath[".opencode/agents"]).toBe("missing");
     expect(byPath[".agents/skills"]).toBeUndefined();
     expect(byPath[".agents/skills/writing-for-agents"]).toBeUndefined();
+  });
+
+  it("ticket #215: excludes canonical aliases into node_modules, .poiesis, skills, and nested-repo descendants", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [
+        root,
+        `${root}/src`,
+        `${root}/node_modules`,
+        `${root}/node_modules/pkg`,
+        `${root}/.poiesis`,
+        `${root}/.poiesis/cache`,
+        `${root}/.agents`,
+        `${root}/.agents/skills`,
+        `${root}/.agents/skills/writing-for-agents`,
+        `${root}/vendor-repo`,
+        `${root}/vendor-repo/.git`,
+        `${root}/vendor-repo/deep`,
+        `${root}/vendor-repo/deep/nested`,
+        `${root}/real-src`,
+        `${root}/real-src/util`,
+        `${root}/.hidden-ok`,
+      ],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`${root}/src/index.ts`]: "export {}",
+        [`${root}/node_modules/pkg/index.js`]: "module.exports = {}",
+        [`${root}/.poiesis/manifest.json`]: "{}\n",
+        [`${root}/.agents/skills/writing-for-agents/SKILL.md`]: "# skill\n",
+        // Nested repo: .git as directory marker at vendor-repo, deep descendant
+        [`${root}/vendor-repo/.git/HEAD`]: "ref: refs/heads/main\n",
+        [`${root}/vendor-repo/deep/nested/file.ts`]: "export {}",
+        // Nested repo deep also marked by gitfile
+        [`${root}/vendor-repo/deep/nested/.git`]: "gitdir: /elsewhere/git",
+        [`${root}/real-src/util/AGENTS.md`]: "# util\n",
+        [`${root}/.hidden-ok/AGENTS.md`]: "# hidden\n",
+      },
+      symlinks: {
+        [`${root}/alias-nm`]: `${root}/node_modules/pkg`,
+        [`${root}/alias-poiesis`]: `${root}/.poiesis/cache`,
+        [`${root}/alias-skills`]: `${root}/.agents/skills/writing-for-agents`,
+        [`${root}/alias-nested-deep`]: `${root}/vendor-repo/deep/nested`,
+        // Legitimate internal source alias sorts before real-src so it wins
+        // as the first logical representative of that canonical target.
+        [`${root}/lib-alias`]: `${root}/real-src`,
+      },
+    });
+
+    const result = await inventoryAgents(root, { fs });
+    const paths = result.folders.map((f) => f.path).sort();
+    expect(paths).toContain("");
+    expect(paths).toContain("src");
+    expect(paths).toContain(".hidden-ok");
+    expect(paths).toContain("lib-alias");
+    expect(paths).toContain("lib-alias/util");
+    expect(paths).not.toContain("real-src"); // same canonical as lib-alias; first wins
+    expect(paths).not.toContain("alias-nm");
+    expect(paths).not.toContain("alias-poiesis");
+    expect(paths).not.toContain("alias-skills");
+    expect(paths).not.toContain("alias-nested-deep");
+    expect(paths).not.toContain("vendor-repo");
+    expect(paths).not.toContain("vendor-repo/deep");
+    expect(paths).not.toContain("vendor-repo/deep/nested");
+    expect(paths).not.toContain("node_modules");
+    expect(paths).not.toContain(".poiesis");
+    expect(paths).not.toContain(".agents/skills");
+  });
+
+  it("ticket #215: canonical visited set dedupes aliases; first sorted logical representative wins", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [root, `${root}/real`, `${root}/real/leaf`],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`${root}/real/leaf/AGENTS.md`]: "# leaf\n",
+      },
+      symlinks: {
+        // Sorted order: a-link before z-link; both target the same canonical real/
+        [`${root}/a-link`]: `${root}/real`,
+        [`${root}/z-link`]: `${root}/real`,
+      },
+    });
+
+    const result = await inventoryAgents(root, { fs });
+    const paths = result.folders.map((f) => f.path).sort();
+    // First logical representative under deterministic sort is a-link (not z-link, not both).
+    expect(paths).toContain("a-link");
+    expect(paths).toContain("a-link/leaf");
+    expect(paths).not.toContain("z-link");
+    expect(paths).not.toContain("z-link/leaf");
+    // Direct real/ may also appear if visited before aliases — either real or a-link is fine
+    // as the single representative family; both real and a-link would double-count canonical.
+    const leafRepresentatives = paths.filter((p) => p.endsWith("/leaf") || p === "real/leaf" || p === "a-link/leaf");
+    expect(leafRepresentatives.length).toBe(1);
+  });
+
+  it("ticket #215: inventory AGENTS presence matches resolver regular-file semantics", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [
+        root,
+        `${root}/src`,
+        `${root}/with-dir-agents`,
+        `${root}/with-dir-agents/AGENTS.md`,
+        `${root}/internal-target`,
+        `${root}/with-dangling`,
+        `${root}/with-internal-ok`,
+        `/outside`,
+      ],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`${root}/src/main.ts`]: "export {}",
+        [`${root}/internal-target/regular.md`]: "# regular\n",
+        [`/outside/AGENTS.md`]: "# external\n",
+        [`${root}/with-internal-ok/note.ts`]: "export {}",
+      },
+      symlinks: {
+        [`${root}/src/AGENTS.md`]: `/outside/AGENTS.md`,
+        [`${root}/with-external`]: `/outside`,
+        [`${root}/with-dangling/AGENTS.md`]: `${root}/does-not-exist.md`,
+        [`${root}/with-internal-ok/AGENTS.md`]: `${root}/internal-target/regular.md`,
+      },
+    });
+
+    const result = await inventoryAgents(root, { fs });
+    const byPath = Object.fromEntries(result.folders.map((f) => [f.path, f.agentsMd]));
+    expect(byPath[""]).toBe("present");
+    expect(byPath["src"]).toBe("missing"); // external AGENTS symlink
+    expect(byPath["with-dir-agents"]).toBe("missing"); // AGENTS.md is a directory
+    expect(byPath["with-dangling"]).toBe("missing");
+    expect(byPath["with-internal-ok"]).toBe("present"); // internal symlink → regular file
+    expect(byPath["with-external"]).toBeUndefined(); // external dir symlink excluded
+
+    // Resolver agrees on the same folders.
+    const srcChain = await resolveAgentsChain(root, "src/main.ts", { fs });
+    expect(srcChain.chain.find((e) => e.folder === "src")?.status).toBe("missing");
+    const okChain = await resolveAgentsChain(root, "with-internal-ok/note.ts", { fs });
+    expect(okChain.chain.find((e) => e.folder === "with-internal-ok")?.status).toBe("present");
   });
 });
 

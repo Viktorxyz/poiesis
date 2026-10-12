@@ -40,7 +40,11 @@ import {
 import { parseJsonc } from "../src/config.js";
 import { readUtf8 } from "../src/fs.js";
 import { doctor, init, packageVersion, update } from "../src/maintenance.js";
-import { desiredOpenCodePatches } from "../src/opencode.js";
+import {
+  WORKER_LOCAL_LIFECYCLE_DENY_KEYS,
+  desiredOpenCodePatches,
+  stripWorkerLocalLifecycleDenies,
+} from "../src/opencode.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
 import { installFakeOpenCode, type FakeOpenCodeEnvironment } from "./fake-opencode.js";
@@ -130,11 +134,15 @@ function preFocusedCheckProjection(repository: TestRepository): Array<{ path: st
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
     }
-    // Ticket #212: authentic pre-focused-check Worker bash never carried
-    // these local lifecycle denies; strip them with the check allow.
-    delete bash["pnpm poiesis *"];
-    delete bash["npm run poiesis -- *"];
-    return { path: patch.path, value: { ...installed, permission: { ...installed.permission, bash } } };
+    // Ticket #212 + #215: authentic pre-focused-check Worker bash never
+    // carried local lifecycle denies; strip every current key with the check allow.
+    return {
+      path: patch.path,
+      value: {
+        ...installed,
+        permission: { ...installed.permission, bash: stripWorkerLocalLifecycleDenies(bash) },
+      },
+    };
   });
 }
 
@@ -186,10 +194,9 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     // running runtime's own projection is re-proven below under its own label.
     const version = PREDECESSOR_VERSION;
     const predecessor = predecessorProjectionPreFocusedCheck(testConfig(repository), version);
-    const excludedFromPredecessor = new Set([
+    const excludedFromPredecessor = new Set<string>([
       `pnpm dlx poiesis-cli@${version} check *`,
-      "pnpm poiesis *",
-      "npm run poiesis -- *",
+      ...WORKER_LOCAL_LIFECYCLE_DENY_KEYS,
     ]);
 
     expect(predecessor.map((patch) => patch.path.join("\0"))).toEqual(manifest.configPatches.map((patch) => patch.path.join("\0")));
@@ -207,11 +214,11 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     ).permission.bash;
 
     expect(currentWorker[`pnpm dlx poiesis-cli@${version} check *`]).toBe("allow");
-    expect(currentWorker["pnpm poiesis *"]).toBe("deny");
-    expect(currentWorker["npm run poiesis -- *"]).toBe("deny");
+    for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+      expect(currentWorker[key], key).toBe("deny");
+      expect(predecessorWorker).not.toHaveProperty(key);
+    }
     expect(predecessorWorker).not.toHaveProperty(`pnpm dlx poiesis-cli@${version} check *`);
-    expect(predecessorWorker).not.toHaveProperty("pnpm poiesis *");
-    expect(predecessorWorker).not.toHaveProperty("npm run poiesis -- *");
     expect(Object.keys(predecessorWorker)).toEqual(
       Object.keys(currentWorker).filter((key) => !excludedFromPredecessor.has(key)),
     );
@@ -219,7 +226,7 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
       expect(currentWorker[key], `predecessor key ${key}`).toBe(value);
     }
 
-    // The same three-key delta holds for the running runtime's own version, so
+    // The same delta holds for the running runtime's own version, so
     // the helper stays keyed off its supplied version rather than a literal.
     const current = await packageVersion();
     const currentPredecessorWorker = (
@@ -227,8 +234,9 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
         .value as { permission: { bash: Record<string, string> } }
     ).permission.bash;
     expect(currentPredecessorWorker).not.toHaveProperty(`pnpm dlx poiesis-cli@${current} check *`);
-    expect(currentPredecessorWorker).not.toHaveProperty("pnpm poiesis *");
-    expect(currentPredecessorWorker).not.toHaveProperty("npm run poiesis -- *");
+    for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+      expect(currentPredecessorWorker).not.toHaveProperty(key);
+    }
   }, 60_000);
 
   it("admit-miss: the strict current gate rejects the 1.4.0 pre-focused-check projection", async () => {

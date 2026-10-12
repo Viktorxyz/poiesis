@@ -354,9 +354,16 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "npx poiesis *": "deny",
       "pnpm dlx poiesis-cli *": "deny",
       "pnpm dlx poiesis-cli@*": "deny",
-      // Spec #207 / ticket #212 — both broad local prefixes denied before
-      // narrow check/repository allows.
+      // Spec #207 / ticket #212 + #215 — every supported local alias denied
+      // before narrow check/repository allows.
+      "pnpm poiesis": "deny",
+      "pnpm run poiesis": "deny",
+      "npm run poiesis": "deny",
+      "npm run-script poiesis": "deny",
       "pnpm poiesis *": "deny",
+      "pnpm run poiesis *": "deny",
+      "npm run poiesis *": "deny",
+      "npm run-script poiesis *": "deny",
       "npm run poiesis -- *": "deny",
       // Spec #120 / ticket #123 — the four narrow Repository
       // Intelligence subcommand allows are appended AFTER the

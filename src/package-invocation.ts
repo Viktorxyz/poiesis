@@ -566,15 +566,72 @@ export function buildPackageContributionRecord(args: {
   };
 }
 
-function dependencyVersion(document: JsonObject, name: string): { section: string; version: string } | undefined {
-  for (const section of ["devDependencies", "dependencies", "optionalDependencies", "peerDependencies"] as const) {
+const DEPENDENCY_SECTIONS = [
+  "devDependencies",
+  "dependencies",
+  "optionalDependencies",
+  "peerDependencies",
+] as const;
+
+type DependencySection = (typeof DEPENDENCY_SECTIONS)[number];
+
+export type PackageDependencyDeclaration = {
+  section: DependencySection;
+  /** Declared value — string version or malformed non-string. */
+  version: unknown;
+};
+
+/**
+ * Spec #207 / ticket #215 — every `poiesis-cli` declaration across dependency
+ * sections, including malformed non-string values. Multiple declarations are
+ * all returned (none hidden). Owned path is only exact
+ * `devDependencies.poiesis-cli`.
+ */
+export function collectPoiesisCliDeclarations(document: JsonObject): PackageDependencyDeclaration[] {
+  const found: PackageDependencyDeclaration[] = [];
+  for (const section of DEPENDENCY_SECTIONS) {
     const block = document[section];
     if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
-    if (!Object.hasOwn(block as JsonObject, name)) continue;
-    const version = (block as JsonObject)[name];
-    if (typeof version === "string") return { section, version };
+    if (!Object.hasOwn(block as JsonObject, POIESIS_CLI_PACKAGE_NAME)) continue;
+    found.push({ section, version: (block as JsonObject)[POIESIS_CLI_PACKAGE_NAME] });
   }
+  return found;
+}
+
+function dependencyVersion(document: JsonObject, name: string): { section: string; version: string } | undefined {
+  if (name !== POIESIS_CLI_PACKAGE_NAME) {
+    for (const section of DEPENDENCY_SECTIONS) {
+      const block = document[section];
+      if (typeof block !== "object" || block === null || Array.isArray(block)) continue;
+      if (!Object.hasOwn(block as JsonObject, name)) continue;
+      const version = (block as JsonObject)[name];
+      if (typeof version === "string") return { section, version };
+    }
+    return undefined;
+  }
+  // Owned lookup: only exact string in devDependencies counts as the owned path.
+  const block = document.devDependencies;
+  if (typeof block !== "object" || block === null || Array.isArray(block)) return undefined;
+  if (!Object.hasOwn(block as JsonObject, name)) return undefined;
+  const version = (block as JsonObject)[name];
+  if (typeof version === "string") return { section: "devDependencies", version };
   return undefined;
+}
+
+function foreignNonDevDeclarations(declarations: readonly PackageDependencyDeclaration[]): PackageDependencyDeclaration[] {
+  return declarations.filter((d) => d.section !== "devDependencies");
+}
+
+function throwForeignDependencyConflict(foreign: readonly PackageDependencyDeclaration[], expected?: string): never {
+  throw new PoiesisError(
+    "PACKAGE_DEPENDENCY_CONFLICT",
+    "package.json declares poiesis-cli outside owned devDependencies or with a conflicting value",
+    {
+      path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
+      ...(expected === undefined ? {} : { expected }),
+      foreign: foreign.map((d) => ({ section: d.section, version: d.version })),
+    },
+  );
 }
 
 function detectFormattingOptions(content: string): FormattingOptions {
@@ -753,12 +810,12 @@ function setDevDependency(content: string, version: string): string {
 }
 
 function removeDevDependency(content: string): string {
-  // Prefer removing from the section where it lives.
+  // Owned removal path is only exact devDependencies.poiesis-cli.
   const document = parsePackageObject(content);
   const found = dependencyVersion(document, POIESIS_CLI_PACKAGE_NAME);
-  if (found === undefined) return content;
-  const next = applyJsonPathEdit(content, [found.section, POIESIS_CLI_PACKAGE_NAME], undefined);
-  assertByteMinimalEdit(content, next, [[found.section, POIESIS_CLI_PACKAGE_NAME]]);
+  if (found === undefined || found.section !== "devDependencies") return content;
+  const next = applyJsonPathEdit(content, ["devDependencies", POIESIS_CLI_PACKAGE_NAME], undefined);
+  assertByteMinimalEdit(content, next, [["devDependencies", POIESIS_CLI_PACKAGE_NAME]]);
   return next;
 }
 
@@ -790,21 +847,38 @@ export function planPackageContribution(args: {
   const scriptValue = desiredScriptValue(projectKind);
   const desiredDepVersion = projectKind === "ordinary" ? args.poiesisVersion : undefined;
 
-  // Selfhost must never carry a self-dependency.
-  if (projectKind === "selfhost") {
-    const selfDep = dependencyVersion(document, POIESIS_CLI_PACKAGE_NAME);
-    if (selfDep !== undefined) {
-      throw new PoiesisError(
-        "PACKAGE_SELF_DEPENDENCY",
-        "poiesis-cli must not depend on itself; use scripts.poiesis = node dist/cli.js",
-        { path: [selfDep.section, POIESIS_CLI_PACKAGE_NAME], version: selfDep.version },
-      );
-    }
+  // Spec #207 / ticket #215 — section-aware declarations (all sections + malformed).
+  const allDeclarations = collectPoiesisCliDeclarations(document);
+  const foreignNonDev = foreignNonDevDeclarations(allDeclarations);
+  const devDeclaration = allDeclarations.find((d) => d.section === "devDependencies");
+  const existingDep =
+    devDeclaration !== undefined && typeof devDeclaration.version === "string"
+      ? { section: "devDependencies" as const, version: devDeclaration.version }
+      : undefined;
+
+  // Selfhost must never carry a self-dependency in any section.
+  if (projectKind === "selfhost" && allDeclarations.length > 0) {
+    throw new PoiesisError(
+      "PACKAGE_SELF_DEPENDENCY",
+      "poiesis-cli must not depend on itself; use scripts.poiesis = node dist/cli.js",
+      {
+        foreign: allDeclarations.map((d) => ({ section: d.section, version: d.version })),
+        path: [allDeclarations[0]!.section, POIESIS_CLI_PACKAGE_NAME],
+        version: allDeclarations[0]!.version,
+      },
+    );
+  }
+
+  // Any non-dev declaration is a foreign conflict even at the desired version.
+  if (foreignNonDev.length > 0 && desiredDepVersion !== undefined) {
+    throwForeignDependencyConflict(foreignNonDev, desiredDepVersion);
+  }
+  // Malformed devDependencies value (non-string) is also foreign.
+  if (devDeclaration !== undefined && typeof devDeclaration.version !== "string" && desiredDepVersion !== undefined) {
+    throwForeignDependencyConflict([devDeclaration], desiredDepVersion);
   }
 
   const existingScript = getAtPath(document, ["scripts", POIESIS_SCRIPT_NAME]);
-  const existingDep =
-    projectKind === "ordinary" ? dependencyVersion(document, POIESIS_CLI_PACKAGE_NAME) : undefined;
 
   if (args.mode === "ensure") {
     if (existingScript.exists && existingScript.value !== scriptValue) {
@@ -823,17 +897,21 @@ export function planPackageContribution(args: {
       }
     }
     if (existingDep !== undefined && desiredDepVersion !== undefined && existingDep.version !== desiredDepVersion) {
-      // Only exact version is owned. Ranges/other versions are foreign conflicts on ensure.
+      // Only exact owned dev path version is eligible. Prior permits only same
+      // devDependencies path version cross — never a non-dev section.
       const priorOwned =
-        args.prior?.devDependencyVersion !== undefined && existingDep.version === args.prior.devDependencyVersion;
+        args.prior?.devDependencyVersion !== undefined &&
+        existingDep.section === "devDependencies" &&
+        existingDep.version === args.prior.devDependencyVersion;
       if (!priorOwned) {
         throw new PoiesisError(
           "PACKAGE_DEPENDENCY_CONFLICT",
           "package.json already defines a different poiesis-cli dependency",
           {
-            path: [existingDep.section, POIESIS_CLI_PACKAGE_NAME],
+            path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
             existing: existingDep.version,
             expected: desiredDepVersion,
+            foreign: [{ section: existingDep.section, version: existingDep.version }],
           },
         );
       }
@@ -858,23 +936,27 @@ export function planPackageContribution(args: {
       existingDep !== undefined &&
       desiredDepVersion !== undefined &&
       existingDep.version !== desiredDepVersion &&
-      existingDep.version !== args.prior.devDependencyVersion
+      !(
+        existingDep.section === "devDependencies" &&
+        existingDep.version === args.prior.devDependencyVersion
+      )
     ) {
       throw new PoiesisError(
         "PACKAGE_DEPENDENCY_CONFLICT",
         "package.json poiesis-cli dependency drifted from owned contribution and is not the prior owned value",
         {
-          path: [existingDep.section, POIESIS_CLI_PACKAGE_NAME],
+          path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
           existing: existingDep.version,
           prior: args.prior.devDependencyVersion,
+          foreign: [{ section: existingDep.section, version: existingDep.version }],
         },
       );
     }
   }
 
   // Overwrite is allowed only when the field is absent, already desired, or
-  // authenticated by prior ownership of the current value. Mode `"repair"`
-  // alone never bypasses foreign conflict — no prior ⇒ same refusal as ensure.
+  // authenticated by prior ownership of the current value on the owned dev path.
+  // Mode `"repair"` alone never bypasses foreign conflict — no prior ⇒ same refusal as ensure.
   const mayOverwriteScript =
     !existingScript.exists ||
     existingScript.value === scriptValue ||
@@ -883,7 +965,9 @@ export function planPackageContribution(args: {
     desiredDepVersion === undefined ||
     existingDep === undefined ||
     existingDep.version === desiredDepVersion ||
-    (args.prior !== undefined && existingDep.version === args.prior.devDependencyVersion);
+    (args.prior !== undefined &&
+      existingDep.section === "devDependencies" &&
+      existingDep.version === args.prior.devDependencyVersion);
   if (!mayOverwriteScript) {
     throw new PoiesisError("PACKAGE_SCRIPT_CONFLICT", "package.json already defines a different poiesis script", {
       path: ["scripts", POIESIS_SCRIPT_NAME],
@@ -896,9 +980,10 @@ export function planPackageContribution(args: {
       "PACKAGE_DEPENDENCY_CONFLICT",
       "package.json already defines a different poiesis-cli dependency",
       {
-        path: [existingDep.section, POIESIS_CLI_PACKAGE_NAME],
+        path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
         existing: existingDep.version,
         expected: desiredDepVersion,
+        foreign: [{ section: existingDep.section, version: existingDep.version }],
       },
     );
   }
@@ -914,10 +999,7 @@ export function planPackageContribution(args: {
   let lockfileOperation: LockfileOperation = null;
   if (desiredDepVersion !== undefined) {
     if (existingDep === undefined || existingDep.version !== desiredDepVersion) {
-      // Move onto devDependencies with exact version.
-      if (existingDep !== undefined && existingDep.section !== "devDependencies") {
-        next = removeDevDependency(next);
-      }
+      // Only write exact owned devDependencies — never overwrite/relocate non-dev.
       next = setDevDependency(next, desiredDepVersion);
       packageJsonChanged = true;
       lockfileOperation = { op: "add-dev", name: POIESIS_CLI_PACKAGE_NAME, version: desiredDepVersion };
@@ -1003,15 +1085,36 @@ export function planPackageContributionRemoval(args: {
 
   let lockfileOperation: LockfileOperation = null;
   if (args.record.devDependencyVersion !== undefined) {
-    const existingDep = dependencyVersion(parsePackageObject(next), POIESIS_CLI_PACKAGE_NAME);
-    if (existingDep !== undefined) {
-      if (existingDep.version === args.record.devDependencyVersion) {
+    // Spec #207 / ticket #215 — section-aware removal. Owned path is only
+    // exact devDependencies.poiesis-cli when the value matches the record.
+    // Non-dev declarations always preserve/report. Native uninstall is
+    // name-wide: if any non-dev declaration remains, preserve matching dev
+    // too and schedule no native remove. Script removal stays independent.
+    const declarations = collectPoiesisCliDeclarations(parsePackageObject(next));
+    const nonDev = foreignNonDevDeclarations(declarations);
+    const dev = declarations.find((d) => d.section === "devDependencies");
+    for (const decl of nonDev) {
+      preserved.push({
+        path: [decl.section, POIESIS_CLI_PACKAGE_NAME],
+        reason: "foreign dependency section is outside owned devDependencies",
+      });
+    }
+    if (nonDev.length > 0) {
+      if (dev !== undefined) {
+        preserved.push({
+          path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
+          reason: "preserving owned devDependency because a non-dev declaration remains (native remove is name-wide)",
+        });
+      }
+      // No package.json dep mutation and no native remove while non-dev remains.
+    } else if (dev !== undefined) {
+      if (typeof dev.version === "string" && dev.version === args.record.devDependencyVersion) {
         next = removeDevDependency(next);
         packageJsonChanged = true;
         lockfileOperation = { op: "remove-dev", name: POIESIS_CLI_PACKAGE_NAME };
       } else {
         preserved.push({
-          path: [existingDep.section, POIESIS_CLI_PACKAGE_NAME],
+          path: ["devDependencies", POIESIS_CLI_PACKAGE_NAME],
           reason: "foreign dependency version differs from owned contribution",
         });
       }
@@ -1060,7 +1163,21 @@ export function assertPackageContributionMatches(packageJson: string, record: Pa
       { expected: record.scriptValue, actual: script.value },
     );
   }
+  const declarations = collectPoiesisCliDeclarations(document);
+  const foreign = foreignNonDevDeclarations(declarations);
   if (record.devDependencyVersion !== undefined) {
+    // Ordinary retaining success requires exact owned dev path only; foreign
+    // non-dev sections fail closed even at the desired version.
+    if (foreign.length > 0) {
+      throw new PoiesisError(
+        "PACKAGE_CONTRIBUTION_MISMATCH",
+        "package.json poiesis-cli devDependency does not match the owned contribution",
+        {
+          expected: record.devDependencyVersion,
+          foreign: foreign.map((d) => ({ section: d.section, version: d.version })),
+        },
+      );
+    }
     const dep = dependencyVersion(document, POIESIS_CLI_PACKAGE_NAME);
     if (dep === undefined || dep.version !== record.devDependencyVersion || dep.section !== "devDependencies") {
       throw new PoiesisError(
@@ -1069,15 +1186,15 @@ export function assertPackageContributionMatches(packageJson: string, record: Pa
         { expected: record.devDependencyVersion, actual: dep },
       );
     }
-  } else {
-    const dep = dependencyVersion(document, POIESIS_CLI_PACKAGE_NAME);
-    if (dep !== undefined) {
-      throw new PoiesisError(
-        "PACKAGE_SELF_DEPENDENCY",
-        "selfhost package contribution must not carry a poiesis-cli dependency",
-        { path: [dep.section, POIESIS_CLI_PACKAGE_NAME] },
-      );
-    }
+  } else if (declarations.length > 0) {
+    throw new PoiesisError(
+      "PACKAGE_SELF_DEPENDENCY",
+      "selfhost package contribution must not carry a poiesis-cli dependency",
+      {
+        foreign: declarations.map((d) => ({ section: d.section, version: d.version })),
+        path: [declarations[0]!.section, POIESIS_CLI_PACKAGE_NAME],
+      },
+    );
   }
 }
 

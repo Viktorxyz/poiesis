@@ -199,12 +199,74 @@ function isInsideRoot(rootReal: string, candidateReal: string): boolean {
 }
 
 /**
- * True when `directory` is a nested separate Git repository root
- * (contains `.git` as a directory or gitfile) and is not the project root.
+ * Root-relative POSIX path for a canonical absolute path under `rootReal`.
+ * Returns `null` when the candidate is outside the root.
  */
-async function isNestedGitRepository(fs: AgentsFs, directory: string, projectRoot: string): Promise<boolean> {
-  if (directory === projectRoot) return false;
-  return fs.exists(join(directory, ".git"));
+function canonicalRelativePath(rootReal: string, candidateReal: string): string | null {
+  if (candidateReal === rootReal) return "";
+  if (!isInsideRoot(rootReal, candidateReal)) return null;
+  const rootPrefix = rootReal.endsWith(sep) ? rootReal : `${rootReal}${sep}`;
+  return candidateReal.slice(rootPrefix.length).split(sep).join("/");
+}
+
+/**
+ * True when any canonical ancestor of `directory` (walking up, excluding the
+ * project root) is a nested separate Git repository root — `.git` as a
+ * directory or gitfile. Project-root `.git` is allowed and never marks the
+ * root as nested. Canonicalization failure on an intermediate hop skips that
+ * hop and continues upward.
+ */
+async function hasNestedGitAncestor(
+  fs: AgentsFs,
+  directory: string,
+  rootReal: string,
+): Promise<boolean> {
+  let current = directory;
+  const seen = new Set<string>();
+  while (current !== rootReal) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    if (current === "" || current === sep) break;
+    // Stop before treating the project root as a nested-repo candidate.
+    let parent: string;
+    try {
+      const parentRaw = join(current, "..");
+      parent = await fs.realpath(parentRaw).catch(() => parentRaw);
+    } catch {
+      break;
+    }
+    // Nested-repo marker on `current` itself (not root).
+    if (current !== rootReal) {
+      const gitMarker = join(current, ".git");
+      try {
+        if (await fs.exists(gitMarker)) return true;
+      } catch {
+        // existence probe failure — skip this hop
+      }
+    }
+    if (parent === current) break;
+    // Do not walk above rootReal.
+    if (!isInsideRoot(rootReal, parent) && parent !== rootReal) break;
+    if (parent === rootReal) {
+      // Final check: current is a direct child of root — already checked .git above.
+      break;
+    }
+    current = parent;
+  }
+  return false;
+}
+
+/**
+ * Lexical exclusion plus canonical root-relative exclusion. A path is
+ * ineligible when its reported relative path OR its canonical path under
+ * `rootReal` matches the exclusion table (so a symlink alias into
+ * `node_modules` / `.poiesis` / `.agents/skills` cannot become eligible).
+ * Canonicalization failure skips the canonical check (lexical still applies).
+ */
+function isAgentsExcludedPath(reportRelative: string, canonicalRel: string | null): boolean {
+  if (isAgentsExcludedRelativePath(reportRelative)) return true;
+  if (canonicalRel !== null && isAgentsExcludedRelativePath(canonicalRel)) return true;
+  return false;
 }
 
 /**
@@ -213,19 +275,22 @@ async function isNestedGitRepository(fs: AgentsFs, directory: string, projectRoo
  *
  * Skips Git internals, dependency/vendor trees, generated/build/cache trees,
  * `.poiesis`, the installed skills subtree (`.agents/skills`), and nested
- * separate repositories. Does not blanket-exclude hidden Author containers
- * (`.agents`, `.opencode`, `.github`, …). Does not follow external symlinks.
- * Bounds internal symlink cycles via the canonical ancestor stack so a link
- * back to root/self cannot grow report paths unboundedly. Symlinks to regular
- * files are never treated as eligible directories.
+ * separate repositories (including deep descendants reached via alias). Does
+ * not blanket-exclude hidden Author containers (`.agents`, `.opencode`,
+ * `.github`, …). Does not follow external symlinks. One traversal with a
+ * visited canonical set: cycles and duplicate aliases collapse to the first
+ * deterministic sorted logical representative. AGENTS.md presence shares the
+ * resolver's bounded regular-file semantics (regular file or internal
+ * symlink→regular present; external/dangling/cycle/directory missing).
  */
 export async function inventoryAgents(root: string, options: AgentsOptions = {}): Promise<AgentsInventoryResult> {
   const fs = options.fs ?? defaultFs();
   const absoluteRoot = resolve(root);
   const rootReal = await fs.realpath(absoluteRoot).catch(() => absoluteRoot);
   const folders: AgentsFolderRecord[] = [];
-  // Dedupe by reported relative path so the same coverage path is not emitted twice.
-  const seenReportPaths = new Set<string>();
+  // One traversal: visited canonical realpaths (dedupe + cycles). First
+  // sorted logical representative wins.
+  const visitedCanonical = new Set<string>();
 
   /**
    * @param readDir - absolute directory to readdir (realpath for links)
@@ -237,28 +302,36 @@ export async function inventoryAgents(root: string, options: AgentsOptions = {})
     reportRelative: string,
     ancestorCanonical: ReadonlySet<string>,
   ): Promise<void> {
-    if (isAgentsExcludedRelativePath(reportRelative)) return;
-    if (seenReportPaths.has(reportRelative)) return;
-
     let canonical: string;
     try {
       canonical = await fs.realpath(readDir);
     } catch {
-      canonical = readDir;
+      // Canonicalization failure: skip this node (fail closed on eligibility).
+      return;
     }
 
-    // Cycle: this canonical directory is already an active ancestor.
+    const canonicalRel = canonicalRelativePath(rootReal, canonical);
+    if (canonicalRel === null) return;
+    if (isAgentsExcludedPath(reportRelative, canonicalRel)) return;
+
+    // Cycle / already emitted via another logical path: first representative wins.
     if (ancestorCanonical.has(canonical)) return;
+    if (visitedCanonical.has(canonical)) return;
 
     if (!(await fs.isDirectory(readDir))) return;
 
-    seenReportPaths.add(reportRelative);
+    // Nested separate repository ancestry (from target up, excluding root).
+    if (reportRelative !== "" && (await hasNestedGitAncestor(fs, canonical, rootReal))) return;
 
-    const agentsPath = join(readDir, "AGENTS.md");
-    const agentsPresent = await fs.exists(agentsPath);
+    visitedCanonical.add(canonical);
+
+    // Presence is evaluated on the canonical read directory so internal
+    // directory aliases observe the target tree, with the same regular-file
+    // semantics as the path-scoped resolver.
+    const agentsMd = await agentsMdStatusAtAbsolute(fs, rootReal, join(readDir, "AGENTS.md"));
     folders.push({
       path: reportRelative,
-      agentsMd: agentsPresent ? "present" : "missing",
+      agentsMd,
     });
 
     const nextAncestors = new Set(ancestorCanonical);
@@ -283,6 +356,7 @@ export async function inventoryAgents(root: string, options: AgentsOptions = {})
         try {
           targetReal = await fs.realpath(childAbs);
         } catch {
+          // Dangling / cycle canonicalize failure — skip.
           continue;
         }
         if (!isInsideRoot(rootReal, targetReal)) continue;
@@ -290,13 +364,15 @@ export async function inventoryAgents(root: string, options: AgentsOptions = {})
         if (!(await fs.isDirectory(targetReal))) continue;
         // Ancestor / self cycle on the canonical stack.
         if (nextAncestors.has(targetReal)) continue;
-        if (await isNestedGitRepository(fs, targetReal, absoluteRoot)) continue;
+        if (visitedCanonical.has(targetReal)) continue;
+        const targetRel = canonicalRelativePath(rootReal, targetReal);
+        if (targetRel === null || isAgentsExcludedPath(childReport, targetRel)) continue;
+        if (await hasNestedGitAncestor(fs, targetReal, rootReal)) continue;
         await visit(targetReal, childReport, nextAncestors);
         continue;
       }
 
       if (!entry.isDirectory) continue;
-      if (await isNestedGitRepository(fs, childAbs, absoluteRoot)) continue;
       await visit(childAbs, childReport, nextAncestors);
     }
   }
@@ -321,21 +397,16 @@ function assertInsideProjectRoot(rootReal: string, candidateReal: string, target
 }
 
 /**
- * AGENTS.md presence for a folder under root. External AGENTS file symlinks
- * (and any candidate whose realpath escapes the root) are treated as missing
- * and never surface an external path. Internal symlinks that stay inside root
- * count as present when the link resolves.
+ * Bounded regular-file AGENTS.md presence at an absolute path.
+ * Regular file or internal symlink→regular file → present.
+ * Missing, external, dangling, cycle, or directory → missing.
+ * Never surfaces an external path.
  */
-async function agentsMdStatusInFolder(
+async function agentsMdStatusAtAbsolute(
   fs: AgentsFs,
   rootReal: string,
-  absoluteRoot: string,
-  folderRelative: string,
+  agentsAbs: string,
 ): Promise<"present" | "missing"> {
-  const agentsAbs =
-    folderRelative === ""
-      ? join(absoluteRoot, "AGENTS.md")
-      : join(absoluteRoot, ...folderRelative.split("/"), "AGENTS.md");
   const st = await fs.lstat(agentsAbs);
   if (!st.exists) return "missing";
   let agentsReal: string;
@@ -349,7 +420,7 @@ async function agentsMdStatusInFolder(
     return "missing";
   }
   if (st.isSymbolicLink) {
-    // Resolved inside root: present when the target is a regular file (or still a file path).
+    // Resolved inside root: present when the target is a regular file.
     const targetKind = await fs.lstat(agentsReal);
     if (!targetKind.exists) return "missing";
     if (targetKind.isFile) return "present";
@@ -357,6 +428,25 @@ async function agentsMdStatusInFolder(
     return "missing";
   }
   return st.isFile ? "present" : "missing";
+}
+
+/**
+ * AGENTS.md presence for a folder under root (logical relative path).
+ * Inventory of a canonical read directory should call
+ * {@link agentsMdStatusAtAbsolute} on `join(readDir, "AGENTS.md")` so directory
+ * aliases still observe the target tree's AGENTS.md.
+ */
+async function agentsMdStatusInFolder(
+  fs: AgentsFs,
+  rootReal: string,
+  absoluteRoot: string,
+  folderRelative: string,
+): Promise<"present" | "missing"> {
+  const agentsAbs =
+    folderRelative === ""
+      ? join(absoluteRoot, "AGENTS.md")
+      : join(absoluteRoot, ...folderRelative.split("/"), "AGENTS.md");
+  return agentsMdStatusAtAbsolute(fs, rootReal, agentsAbs);
 }
 
 /**

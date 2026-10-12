@@ -39,7 +39,7 @@ import {
   workspacePrepare,
 } from "../src/git.js";
 import { init, packageVersion, update } from "../src/maintenance.js";
-import { desiredOpenCodePatches } from "../src/opencode.js";
+import { desiredOpenCodePatches, stripWorkerLocalLifecycleDenies } from "../src/opencode.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { parseJsonc } from "../src/config.js";
 import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
@@ -95,11 +95,15 @@ function preFocusedCheck(repository: TestRepository): Array<{ path: string[]; va
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
     }
-    // Ticket #212: authentic pre-focused-check Worker bash never carried
-    // these local lifecycle denies; strip them with the check allow.
-    delete bash["pnpm poiesis *"];
-    delete bash["npm run poiesis -- *"];
-    return { path: patch.path, value: { ...installed, permission: { ...installed.permission, bash } } };
+    // Ticket #212 + #215: authentic pre-focused-check Worker bash never
+    // carried local lifecycle denies; strip every current key with the check allow.
+    return {
+      path: patch.path,
+      value: {
+        ...installed,
+        permission: { ...installed.permission, bash: stripWorkerLocalLifecycleDenies(bash) },
+      },
+    };
   });
 }
 

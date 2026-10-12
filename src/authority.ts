@@ -10,6 +10,7 @@ import {
   desiredOpenCodePatches,
   isCertifiedOpenCodeVersion,
   OPENCODE_V160_STATIC_SKILL_PERMISSIONS,
+  stripWorkerLocalLifecycleDenies,
   workerFocusedCheckAllowKey,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
@@ -525,23 +526,6 @@ export function predecessorProjectionV113V114(
 }
 
 /**
- * Spec #207 / ticket #212 — Worker local package-script lifecycle deny keys
- * added on the current projection. Authentic historical predecessor images
- * never carried them; migration helpers must strip them so inherited
- * manifests stay byte-authentic while `desiredOpenCodePatches` keeps the
- * ordered denies.
- */
-const WORKER_LOCAL_LIFECYCLE_DENY_KEYS = ["pnpm poiesis *", "npm run poiesis -- *"] as const;
-
-function stripWorkerLocalLifecycleDenies(bash: Record<string, string>): Record<string, string> {
-  const next = { ...bash };
-  for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
-    delete next[key];
-  }
-  return next;
-}
-
-/**
  * Spec #168 / ticket #174 — the exact pre-focused-check predecessor
  * projection for the OpenCode adapter.
  *
@@ -561,10 +545,10 @@ function stripWorkerLocalLifecycleDenies(bash: Record<string, string>): Record<s
  * version it differs from that version's own strict projection in:
  *   - `agent.poiesis-worker.permission.bash` omits the single focused-check
  *     allow key;
- *   - Spec #207 / ticket #212: the same Worker bash omits the two local
- *     package-script lifecycle denies (`pnpm poiesis *`,
- *     `npm run poiesis -- *`) that the current projection added after those
- *     historical images shipped.
+ *   - Spec #207 / ticket #212 + #215: the same Worker bash omits every
+ *     local package-script lifecycle deny key the current projection emits
+ *     (`WORKER_LOCAL_LIFECYCLE_DENY_KEYS`) that authentic historical images
+ *     never carried.
  *
  * Everything else — the primary's exact-version canonical route, the ordered
  * launcher denies, the Repository Intelligence additive allows, the Specialist
@@ -614,11 +598,11 @@ export function predecessorProjectionPreFocusedCheck(
  * install.
  *
  * Differs from the current projection in each agent's `permission.skill`
- * map, and — Spec #207 / ticket #212 — in Worker bash by omitting the two
- * local package-script lifecycle denies (`pnpm poiesis *`,
- * `npm run poiesis -- *`) that authentic older `1.6.0` images never carried.
- * Task, models, and every other field are taken from the current builder so
- * the migration never widens lifecycle authority.
+ * map, and — Spec #207 / ticket #212 + #215 — in Worker bash by omitting
+ * every local package-script lifecycle deny key
+ * (`WORKER_LOCAL_LIFECYCLE_DENY_KEYS`) that authentic older `1.6.0` images
+ * never carried. Task, models, and every other field are taken from the
+ * current builder so the migration never widens lifecycle authority.
  */
 export function predecessorProjectionV160StaticSkills(
   config: PoiesisConfig,
@@ -637,9 +621,9 @@ export function predecessorProjectionV160StaticSkills(
       ...permission,
       skill: { ...staticSkills },
     };
-    // Ticket #212: authentic 1.6.0 Worker bash never carried the local
-    // package-script lifecycle denies; strip them so inheritance matches
-    // the older shape while current desired keeps them ordered.
+    // Ticket #212 + #215: authentic 1.6.0 Worker bash never carried the
+    // local package-script lifecycle denies; strip every current key so
+    // inheritance matches the older shape while current desired keeps them.
     if (agentName === "poiesis-worker" && typeof permission.bash === "object" && permission.bash !== null) {
       nextPermission.bash = stripWorkerLocalLifecycleDenies(permission.bash as Record<string, string>);
     }

@@ -114,9 +114,17 @@ describe("OpenCode adapter", () => {
       "npx poiesis *": "deny",
       "pnpm dlx poiesis-cli *": "deny",
       "pnpm dlx poiesis-cli@*": "deny",
-      // Spec #207 / ticket #212: both broad local prefixes denied before
+      // Spec #207 / ticket #212+#215: every supported local alias bare +
+      // remainder (incl -- forwarding / npm compatibility) denied before
       // narrow check/repository allows (last-match-wins).
+      "pnpm poiesis": "deny",
+      "pnpm run poiesis": "deny",
+      "npm run poiesis": "deny",
+      "npm run-script poiesis": "deny",
       "pnpm poiesis *": "deny",
+      "pnpm run poiesis *": "deny",
+      "npm run poiesis *": "deny",
+      "npm run-script poiesis *": "deny",
       "npm run poiesis -- *": "deny",
       "pnpm dlx poiesis-cli@1.1.2 repository status": "allow",
       "pnpm dlx poiesis-cli@1.1.2 repository query *": "allow",

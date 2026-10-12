@@ -41,7 +41,11 @@ import {
   type PackageFsSnapshot,
   type PackageManagerExecutor,
 } from "../src/package-invocation.js";
-import { canonicalInvocationPrefix, desiredOpenCodePatches } from "../src/opencode.js";
+import {
+  WORKER_LOCAL_LIFECYCLE_DENY_KEYS,
+  canonicalInvocationPrefix,
+  desiredOpenCodePatches,
+} from "../src/opencode.js";
 import type { ArtifactJournalEntry } from "../src/mutation-transaction.js";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -832,22 +836,20 @@ describe("local invocation permission route (ticket #210 / #212)", () => {
     expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(workerBash["pnpm poiesis check *"]).toBe("allow");
     expect(workerBash["pnpm poiesis repository status"]).toBe("allow");
-    // Ticket #212: Worker denies both broad local prefixes (ordered before
-    // narrow check/repository allows) so `*` cannot grant full lifecycle.
-    expect(workerBash["pnpm poiesis *"]).toBe("deny");
-    expect(workerBash["npm run poiesis -- *"]).toBe("deny");
+    // Ticket #212 + #215: Worker denies every supported local alias (ordered
+    // before narrow check/repository allows) so `*` cannot grant full lifecycle.
+    for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+      expect(workerBash[key], key).toBe("deny");
+    }
     expect(workerBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     const keys = Object.keys(workerBash);
-    const pnpmLocalDenyIdx = keys.indexOf("pnpm poiesis *");
-    const npmLocalDenyIdx = keys.indexOf("npm run poiesis -- *");
+    const lastLocalDenyIdx = Math.max(...WORKER_LOCAL_LIFECYCLE_DENY_KEYS.map((k) => keys.indexOf(k)));
+    const firstLocalDenyIdx = Math.min(...WORKER_LOCAL_LIFECYCLE_DENY_KEYS.map((k) => keys.indexOf(k)));
     const checkAllowIdx = keys.indexOf("pnpm poiesis check *");
     const repoAllowIdx = keys.indexOf("pnpm poiesis repository status");
-    expect(pnpmLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
-    expect(npmLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
-    expect(checkAllowIdx).toBeGreaterThan(pnpmLocalDenyIdx);
-    expect(checkAllowIdx).toBeGreaterThan(npmLocalDenyIdx);
-    expect(repoAllowIdx).toBeGreaterThan(pnpmLocalDenyIdx);
-    expect(repoAllowIdx).toBeGreaterThan(npmLocalDenyIdx);
+    expect(firstLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
+    expect(checkAllowIdx).toBeGreaterThan(lastLocalDenyIdx);
+    expect(repoAllowIdx).toBeGreaterThan(lastLocalDenyIdx);
   });
 
   it("projects npm run poiesis local invocation allows", () => {
@@ -868,13 +870,13 @@ describe("local invocation permission route (ticket #210 / #212)", () => {
     expect(bash["pnpm dlx poiesis-cli@1.6.0 *"]).toBeUndefined();
     expect(workerBash["npm run poiesis -- check *"]).toBe("allow");
     expect(workerBash["npm run poiesis -- repository status"]).toBe("allow");
-    expect(workerBash["pnpm poiesis *"]).toBe("deny");
-    expect(workerBash["npm run poiesis -- *"]).toBe("deny");
+    for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+      expect(workerBash[key], key).toBe("deny");
+    }
     const keys = Object.keys(workerBash);
-    expect(keys.indexOf("npm run poiesis -- check *")).toBeGreaterThan(keys.indexOf("npm run poiesis -- *"));
-    expect(keys.indexOf("npm run poiesis -- repository status")).toBeGreaterThan(
-      keys.indexOf("npm run poiesis -- *"),
-    );
+    const lastLocalDenyIdx = Math.max(...WORKER_LOCAL_LIFECYCLE_DENY_KEYS.map((k) => keys.indexOf(k)));
+    expect(keys.indexOf("npm run poiesis -- check *")).toBeGreaterThan(lastLocalDenyIdx);
+    expect(keys.indexOf("npm run poiesis -- repository status")).toBeGreaterThan(lastLocalDenyIdx);
   });
 
   it("denies Worker pnpm/npm full lifecycle through last-match evaluation", () => {
@@ -933,6 +935,424 @@ describe("local invocation permission route (ticket #210 / #212)", () => {
     // Primary keeps the owned local lifecycle allow (last-match wins).
     expect(lastMatchBashPermission(pnpmPrimary, "pnpm poiesis workspace create")).toBe("allow");
     expect(lastMatchBashPermission(pnpmPrimary, "pnpm poiesis verify")).toBe("allow");
+  });
+
+  it("ticket #215: denies every supported local alias bare and remainder; narrow allows only canonical route", () => {
+    const pnpmRecord = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const npmRecord = buildPackageContributionRecord({
+      manager: "npm",
+      lockfile: "package-lock.json",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const pnpmWorker = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", pnpmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+    const npmWorker = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", npmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+    const pnpmPrimary = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", pnpmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+
+    // Complete deny key set projected and ordered: broad allow → all denies → narrow allows.
+    for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+      expect(pnpmWorker[key], key).toBe("deny");
+      expect(npmWorker[key], key).toBe("deny");
+    }
+    const keys = Object.keys(pnpmWorker);
+    expect(keys[0]).toBe("*");
+    expect(pnpmWorker["*"]).toBe("allow");
+    const firstLocalDenyIdx = Math.min(...WORKER_LOCAL_LIFECYCLE_DENY_KEYS.map((k) => keys.indexOf(k)));
+    const lastLocalDenyIdx = Math.max(...WORKER_LOCAL_LIFECYCLE_DENY_KEYS.map((k) => keys.indexOf(k)));
+    expect(firstLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
+    expect(keys.indexOf("pnpm poiesis check *")).toBeGreaterThan(lastLocalDenyIdx);
+    expect(keys.indexOf("pnpm poiesis repository status")).toBeGreaterThan(lastLocalDenyIdx);
+
+    const aliasLifecycle = [
+      "pnpm poiesis",
+      "pnpm poiesis workspace create",
+      "pnpm poiesis -- verify",
+      "pnpm run poiesis",
+      "pnpm run poiesis workspace create",
+      "pnpm run poiesis -- verify",
+      "npm run poiesis",
+      "npm run poiesis workspace create",
+      "npm run poiesis -- verify",
+      "npm run-script poiesis",
+      "npm run-script poiesis workspace create",
+      "npm run-script poiesis -- verify",
+    ] as const;
+    for (const command of aliasLifecycle) {
+      expect(lastMatchBashPermission(pnpmWorker, command), `pnpm worker: ${command}`).toBe("deny");
+      expect(lastMatchBashPermission(npmWorker, command), `npm worker: ${command}`).toBe("deny");
+    }
+
+    // Canonical narrow allows only.
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm poiesis check --command tsc")).toBe("allow");
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm poiesis repository status")).toBe("allow");
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm poiesis repository query --question x")).toBe("allow");
+    expect(lastMatchBashPermission(npmWorker, "npm run poiesis -- check --command tsc")).toBe("allow");
+    expect(lastMatchBashPermission(npmWorker, "npm run poiesis -- repository explain --node n")).toBe("allow");
+
+    // Noncanonical aliases denied even for narrow check/repository suffixes.
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm run poiesis check --command tsc")).toBe("deny");
+    expect(lastMatchBashPermission(pnpmWorker, "npm run poiesis -- check --command tsc")).toBe("deny");
+    expect(lastMatchBashPermission(pnpmWorker, "npm run-script poiesis check --command tsc")).toBe("deny");
+    expect(lastMatchBashPermission(npmWorker, "pnpm poiesis check --command tsc")).toBe("deny");
+    expect(lastMatchBashPermission(npmWorker, "npm run poiesis check --command tsc")).toBe("deny");
+    expect(lastMatchBashPermission(npmWorker, "npm run-script poiesis repository status")).toBe("deny");
+
+    // Primary unchanged: owned local lifecycle still allowed; no new primary denies.
+    expect(lastMatchBashPermission(pnpmPrimary, "pnpm poiesis workspace create")).toBe("allow");
+    expect(pnpmPrimary["pnpm run poiesis *"]).toBeUndefined();
+    expect(pnpmPrimary["npm run-script poiesis *"]).toBeUndefined();
+  });
+});
+
+describe("dependency section ownership (ticket #215)", () => {
+  const nonDevSections = ["dependencies", "optionalDependencies", "peerDependencies"] as const;
+
+  for (const section of nonDevSections) {
+    it(`ensure refuses exact desired poiesis-cli in ${section} as foreign (not owned dev)`, () => {
+      const pkg = [
+        "{",
+        '  "name": "demo",',
+        '  "version": "0.1.0",',
+        '  "scripts": {},',
+        `  "${section}": { "poiesis-cli": "1.6.0" }`,
+        "}",
+        "",
+      ].join("\n");
+      try {
+        planPackageContribution({
+          snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+          poiesisVersion: "1.6.0",
+          mode: "ensure",
+        });
+        expect.fail("expected PACKAGE_DEPENDENCY_CONFLICT");
+      } catch (error) {
+        expect(error).toBeInstanceOf(PoiesisError);
+        expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+        const details = (error as PoiesisError).details as {
+          foreign?: Array<{ section: string; version: unknown }>;
+        };
+        expect(details.foreign).toEqual(expect.arrayContaining([{ section, version: "1.6.0" }]));
+      }
+    });
+
+    it(`ensure refuses different version in ${section} with section-typed details`, () => {
+      const pkg = [
+        "{",
+        '  "name": "demo",',
+        '  "version": "0.1.0",',
+        '  "scripts": {},',
+        `  "${section}": { "poiesis-cli": "^1.5.0" }`,
+        "}",
+        "",
+      ].join("\n");
+      try {
+        planPackageContribution({
+          snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+          poiesisVersion: "1.6.0",
+          mode: "ensure",
+        });
+        expect.fail("expected PACKAGE_DEPENDENCY_CONFLICT");
+      } catch (error) {
+        expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+        const details = (error as PoiesisError).details as {
+          foreign?: Array<{ section: string; version: unknown }>;
+        };
+        expect(details.foreign).toEqual(expect.arrayContaining([{ section, version: "^1.5.0" }]));
+      }
+    });
+
+    it(`ensure refuses malformed non-string poiesis-cli in ${section}`, () => {
+      const pkg = [
+        "{",
+        '  "name": "demo",',
+        '  "version": "0.1.0",',
+        '  "scripts": {},',
+        `  "${section}": { "poiesis-cli": true }`,
+        "}",
+        "",
+      ].join("\n");
+      try {
+        planPackageContribution({
+          snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+          poiesisVersion: "1.6.0",
+          mode: "ensure",
+        });
+        expect.fail("expected PACKAGE_DEPENDENCY_CONFLICT");
+      } catch (error) {
+        expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+        const details = (error as PoiesisError).details as {
+          foreign?: Array<{ section: string; version: unknown }>;
+        };
+        expect(details.foreign?.some((f) => f.section === section && f.version === true)).toBe(true);
+      }
+    });
+  }
+
+  it("ensure surfaces multiple foreign non-dev declarations together (none hidden)", () => {
+    const pkg = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": {},',
+      '  "dependencies": { "poiesis-cli": "1.6.0" },',
+      '  "optionalDependencies": { "poiesis-cli": "1.5.0" },',
+      '  "peerDependencies": { "poiesis-cli": true }',
+      "}",
+      "",
+    ].join("\n");
+    try {
+      planPackageContribution({
+        snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+        poiesisVersion: "1.6.0",
+        mode: "ensure",
+      });
+      expect.fail("expected PACKAGE_DEPENDENCY_CONFLICT");
+    } catch (error) {
+      expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+      const foreign = ((error as PoiesisError).details as { foreign: Array<{ section: string }> }).foreign;
+      expect(foreign.map((f) => f.section).sort()).toEqual([
+        "dependencies",
+        "optionalDependencies",
+        "peerDependencies",
+      ]);
+    }
+  });
+
+  it("exact owned devDependencies is noop; assert matches exact dev only", () => {
+    const pkg = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0", "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("noop");
+    if (plan.kind !== "noop") return;
+    expect(plan.record.devDependencyVersion).toBe("1.6.0");
+    expect(() => assertPackageContributionMatches(pkg, plan.record)).not.toThrow();
+  });
+
+  it("exact dev + foreign non-dev duplicate refuses and does not hide the foreign section", () => {
+    const pkg = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" },',
+      '  "dependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    try {
+      planPackageContribution({
+        snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+        poiesisVersion: "1.6.0",
+        mode: "ensure",
+      });
+      expect.fail("expected PACKAGE_DEPENDENCY_CONFLICT");
+    } catch (error) {
+      expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+      const foreign = ((error as PoiesisError).details as { foreign: Array<{ section: string }> }).foreign;
+      expect(foreign).toEqual([{ section: "dependencies", version: "1.6.0" }]);
+    }
+  });
+
+  it("repair prior permits only same-path devDependencies version cross", () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.5.0",
+    });
+    const ok = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.5.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ok, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "repair",
+      prior,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind === "apply") {
+      expect(parsePkg(plan.nextPackageJson).devDependencies?.["poiesis-cli"]).toBe("1.6.0");
+    }
+
+    const foreignNonDev = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "dependencies": { "poiesis-cli": "1.5.0" }',
+      "}",
+      "",
+    ].join("\n");
+    expect(() =>
+      planPackageContribution({
+        snapshot: snap({ packageJson: foreignNonDev, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+        poiesisVersion: "1.6.0",
+        mode: "repair",
+        prior,
+      }),
+    ).toThrow(PoiesisError);
+  });
+
+  it("selfhost rejects poiesis-cli in every dependency section", () => {
+    for (const section of ["devDependencies", "dependencies", "optionalDependencies", "peerDependencies"] as const) {
+      const pkg = [
+        "{",
+        '  "name": "poiesis-cli",',
+        '  "version": "1.6.0",',
+        '  "scripts": {},',
+        `  "${section}": { "poiesis-cli": "1.6.0" }`,
+        "}",
+        "",
+      ].join("\n");
+      try {
+        planPackageContribution({
+          snapshot: snap({ packageJson: pkg, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+          poiesisVersion: "1.6.0",
+          mode: "ensure",
+        });
+        expect.fail(`expected PACKAGE_SELF_DEPENDENCY for ${section}`);
+      } catch (error) {
+        expect((error as PoiesisError).code).toBe("PACKAGE_SELF_DEPENDENCY");
+      }
+    }
+  });
+
+  it("removal only drops exact owned devDependencies; relocated same version is preserved with no native remove", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    // Author relocated the exact version into dependencies.
+    const relocated = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis", "build": "tsc" },',
+      '  "dependencies": { "poiesis-cli": "1.6.0" },',
+      '  "devDependencies": { "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContributionRemoval({
+      snapshot: snap({ packageJson: relocated, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      record,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.lockfileOperation).toBeNull();
+    expect(plan.preserved).toEqual(
+      expect.arrayContaining([
+        {
+          path: ["dependencies", "poiesis-cli"],
+          reason: "foreign dependency section is outside owned devDependencies",
+        },
+      ]),
+    );
+    const next = parsePkg(plan.nextPackageJson);
+    expect(next.dependencies?.["poiesis-cli"]).toBe("1.6.0");
+    expect(next.scripts?.poiesis).toBeUndefined();
+    expect(next.scripts?.build).toBe("tsc");
+  });
+
+  it("when non-dev declaration remains, preserves matching dev too and schedules no native remove", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const dual = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" },',
+      '  "dependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContributionRemoval({
+      snapshot: snap({ packageJson: dual, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      record,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.lockfileOperation).toBeNull();
+    const next = parsePkg(plan.nextPackageJson);
+    expect(next.devDependencies?.["poiesis-cli"]).toBe("1.6.0");
+    expect(next.dependencies?.["poiesis-cli"]).toBe("1.6.0");
+    expect(next.scripts?.poiesis).toBeUndefined();
+    expect(plan.preserved?.some((p) => p.path[0] === "devDependencies")).toBe(true);
+    expect(plan.preserved?.some((p) => p.path[0] === "dependencies")).toBe(true);
+  });
+
+  it("removal of exact owned dev alone still schedules remove-dev", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const onlyDev = [
+      "{",
+      '  "name": "demo",',
+      '  "version": "0.1.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0", "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContributionRemoval({
+      snapshot: snap({ packageJson: onlyDev, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      record,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.lockfileOperation).toEqual({ op: "remove-dev", name: "poiesis-cli" });
+    expect(parsePkg(plan.nextPackageJson).devDependencies?.["poiesis-cli"]).toBeUndefined();
+    expect(parsePkg(plan.nextPackageJson).devDependencies?.typescript).toBe("^5.0.0");
   });
 });
 

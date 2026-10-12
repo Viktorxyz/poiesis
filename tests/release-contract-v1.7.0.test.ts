@@ -303,9 +303,20 @@ describe("Poiesis 1.7.0 release contract (pure)", () => {
     expect(workerBash.skill).toEqual({ "*": "allow" });
     expect(workerBash.bash[`pnpm dlx poiesis-cli@${RELEASE_VERSION} check *`]).toBe("allow");
     expect(workerBash.bash[`pnpm dlx poiesis-cli@${RELEASE_VERSION} *`]).toBeUndefined();
-    // Ticket #212: current Worker ordered local lifecycle denies stay present.
-    expect(workerBash.bash["pnpm poiesis *"]).toBe("deny");
-    expect(workerBash.bash["npm run poiesis -- *"]).toBe("deny");
+    // Ticket #212 + #215: current Worker ordered local lifecycle denies stay present.
+    for (const key of [
+      "pnpm poiesis",
+      "pnpm run poiesis",
+      "npm run poiesis",
+      "npm run-script poiesis",
+      "pnpm poiesis *",
+      "pnpm run poiesis *",
+      "npm run poiesis *",
+      "npm run-script poiesis *",
+      "npm run poiesis -- *",
+    ] as const) {
+      expect(workerBash.bash[key], key).toBe("deny");
+    }
   });
 
   it("local package contribution projects pnpm poiesis; absent contribution keeps exact dlx", () => {
