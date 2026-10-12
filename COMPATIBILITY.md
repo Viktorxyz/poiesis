@@ -53,7 +53,7 @@ The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not
 
 ### Same-release projection migration (pre-focused-check)
 
-A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.6.0 is the current release and the migration boundary for that install.
+A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.7.0 is the current release and the migration boundary for that install.
 
 ### Same-release projection migration (1.6.0 static skills → native skill wildcard)
 
@@ -73,15 +73,15 @@ A project installed by the earlier `1.4.0` image therefore records `poiesisVersi
 
 ### Release-to-release crossing
 
-An ordinary release bump needs no exceptional migration entry. `assertManifestAuthority` builds the strict projection from the MANIFEST's own `poiesisVersion`, so a project installed by the previously published `1.5.0` image carries the authentic `1.5.0` projection and satisfies the ordinary strict manifest-version check before any predecessor tolerance is consulted. v1.6.0 is the current release.
+An ordinary release bump needs no exceptional migration entry. `assertManifestAuthority` builds the strict projection from the MANIFEST's own `poiesisVersion`, so a project installed by the previously published `1.6.0` image (after any same-release static-skill migration above) carries the authentic `1.6.0` projection and satisfies the ordinary strict manifest-version check before any predecessor tolerance is consulted. v1.7.0 is the current release. The same ordinary path still admits authentic earlier projections (`1.5.0`, `1.2.1`, …) keyed off their own manifest versions.
 
-- **Admitted:** the exact authentic `1.5.0` projection, on the ordinary strict path — the same path a 1.2.1 install takes. Every operation accepts it, including the receipt-gated `poiesis update`.
-- **Not admitted:** `"1.5.0"` is deliberately NOT added to the accepted predecessor set. The strict path already admits that exact projection, so a predecessor entry would grant an exceptional migration route to a surface that needs no exception and would widen what projection drift can reach.
-- **Drift still fails closed:** a `1.5.0` manifest that does not match its own exact `1.5.0` projection is drift, and fails closed with `MANIFEST_AUTHORITY_INVALID` on every path — strict, predecessor-tolerant, and the receipt-gated `update`.
-- **The receipt-gated `update` crosses the release:** it advances `manifest.poiesisVersion` to `1.6.0`, re-keys the exact-version launcher onto `pnpm dlx poiesis-cli@1.6.0 …`, and advances the ownership receipt by exactly one generation.
-- **No launcher widening:** the crossed projection grants the exact-version canonical route only — never a broad `pnpm dlx poiesis-cli@<version> *`, `@latest`, or unversioned route.
-- **Published artifact parity:** the packed artifact for this release is `poiesis-cli-1.6.0.tgz` and its version agrees with `package.json`, so the exact-version launcher and the published tarball always name the same release.
-- **Historical predecessors are unchanged:** the `1.4.0` pre-focused-check migration above, the v1.1.3 / v1.1.4 projection, and the v1.0.0/1.0.1/1.0.2 legacy projection all behave exactly as they did under 1.5.0.
+- **Admitted:** the exact authentic predecessor projection for the MANIFEST's own `poiesisVersion`, on the ordinary strict path — the same path a 1.2.1 install takes. Every operation accepts it, including the receipt-gated `poiesis update`.
+- **Not admitted as exceptional release entries:** ordinary published predecessors such as `"1.5.0"` are deliberately NOT added solely for a release bump. The strict path already admits that exact projection, so a predecessor entry would grant an exceptional migration route to a surface that needs no exception and would widen what projection drift can reach. `"1.6.0"` remains in the accepted set only for the static-skill same-release migration above, not as a second ordinary release-crossing exception.
+- **Drift still fails closed:** a predecessor-versioned manifest that does not match its own exact projection is drift, and fails closed with `MANIFEST_AUTHORITY_INVALID` on every path — strict, predecessor-tolerant, and the receipt-gated `update`.
+- **The receipt-gated `update` crosses the release:** it advances `manifest.poiesisVersion` to `1.7.0`, re-keys the exact-version launcher onto the supported route for that install (`pnpm poiesis …` / `npm run poiesis -- …` when a local package contribution is owned, otherwise `pnpm dlx poiesis-cli@1.7.0 …`), and advances the ownership receipt by exactly one generation.
+- **No launcher widening:** the crossed projection grants the exact installed canonical route only — never a broad off-version `pnpm dlx poiesis-cli@*` allow, `@latest`, or unversioned route.
+- **Published artifact parity:** the packed artifact for this release is `poiesis-cli-1.7.0.tgz` and its version agrees with `package.json`, so the exact-version launcher and the published tarball always name the same release.
+- **Historical predecessors are unchanged:** the `1.6.0` static-skill migration above, the `1.4.0` pre-focused-check migration, the v1.1.3 / v1.1.4 projection, and the v1.0.0/1.0.1/1.0.2 legacy projection all behave exactly as they did under 1.6.0.
 
 ### Subagent visibility
 
@@ -111,33 +111,44 @@ Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctne
 
 ## Poiesis releases
 
-### The `1.6.0` release
+### The `1.7.0` release
 
-`poiesis-cli@1.6.0` is the current release. It publishes the read-only `poiesis latest` update-availability report (Spec #203) and carries every `1.5.0` capability forward unchanged: nothing is removed, and no migration surface is widened. The `1.5.0` predecessor needs no admitted-predecessor entry for the same reason `1.4.2` did not need one — the strict manifest-version gate is keyed off the manifest's own `poiesisVersion`, so an authentic `1.5.0` projection is admitted by the ordinary strict path (see Release-to-release crossing above).
+`poiesis-cli@1.7.0` is the current release (Spec #207). It publishes project knowledge and local invocation as one coherent package:
 
-`poiesis latest` adds no new permission. It is reached by the primary agent through the exact-version canonical route that projection already grants, and no Specialist is granted a `latest` route of any version.
+- **skills.sh sole catalog** with bounded discovery, catalog-eligible pinned acquisition, native `skill: { "*": "allow" }` permissions, and an explicit Author-controlled OpenCode **restart pause** after new skill installs (no plugins, no skill-body fallback, no automatic restart).
+- **Scoped `AGENTS.md` coverage** obligations in method/roles, with deterministic inventory via `poiesis inspect`, Author-owned project source outside install/uninstall ownership, and product vs development philosophy split (`POIESIS_DEVELOPMENT_PHILOSOPHY.md` ships in the package only; only product philosophy is projected into consumer installs). UI/UX workflow remains **TODO only** in development philosophy.
+- **Exact local package invocation** on ordinary Node projects with a single supported lockfile (`pnpm` / `npm`): exact `poiesis-cli` devDependency, `scripts.poiesis = "poiesis"`, lifecycle scripts disabled, foreign fields preserved, no full atomic claim over native `node_modules`. Self-host `poiesis-cli` never self-depends (`node dist/cli.js`). No `package.json` keeps exact dlx without fabricating package metadata. A `package.json` without a supported lockfile is a typed refusal, not a supported everyday route.
+- Carries every `1.6.0` capability forward, including the read-only `poiesis latest` report (Spec #203). Nothing is removed. Ordinary release bump needs no new exceptional predecessor entry beyond the existing `1.6.0` static-skill same-release migration (see above).
+
+`poiesis latest` adds no new permission. It is reached by the primary agent through the exact installed canonical route that projection already grants, and no Specialist is granted a `latest` route of any version.
+
+### The `1.6.0` release (predecessor)
+
+`poiesis-cli@1.6.0` published the read-only `poiesis latest` update-availability report and is the published predecessor this release absorbs on the ordinary strict path (and, for installs still on the authentic static-skill maps, through the same-release projection migration above).
 
 ### Post-publish dogfood crossing (maintainer obligation)
 
-Publishing `1.6.0` is not the end of the release. The Poiesis source installation must then run the release it just published, and that crossing is recorded here because it is a property of THIS repository's release, not of any consumer installation.
+Publishing `1.7.0` is not the end of the release. The Poiesis source installation must then run the release it just published, and that crossing is recorded here because it is a property of THIS repository's release, not of any consumer installation.
 
-After `npm publish` of `poiesis-cli@1.6.0` succeeds:
+After `npm publish` of `poiesis-cli@1.7.0` succeeds:
 
 1. Bring the Poiesis source installation onto the published release with the fresh-`dlx` form — without `--config.dlx-cache-max-age=0`, pnpm may serve a `dlx` entry up to 1440 minutes old, so the crossing would report having updated while running the release it already had:
 
    ```bash
-   pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@1.6.0 update
+   pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@1.7.0 update
    ```
 
-   This is the ordinary receipt-gated crossing: it advances `manifest.poiesisVersion` to `1.6.0`, re-keys the exact-version launcher, and advances the ownership receipt by exactly one generation.
+   This is the ordinary receipt-gated crossing: it advances `manifest.poiesisVersion` to `1.7.0`, re-keys the exact installed launcher, and advances the ownership receipt by exactly one generation.
 
 2. If the installation is still mode-less — it was written by a release that predated the sharing mode, which recorded no mode at all — the crossing deliberately leaves it that way. A sharing decision stays an explicit decision, made once, through the only route that can make it:
 
    ```bash
-   pnpm dlx poiesis-cli@1.6.0 migrate install-mode --to team
+   pnpm dlx poiesis-cli@1.7.0 migrate install-mode --to team
    ```
 
    The ordinary crossing cannot fabricate a sharing policy in either direction. An ordinary `update` keeps whatever the manifest records, including recording nothing, and `update --config` still refuses an explicit `mode` against a mode-less manifest (`INSTALL_MODE_TRANSITION_UNSUPPORTED`) — so no release crossing can quietly turn a private/local project into team/shared, and none can create the shareable profile a `team` decision publishes.
+
+3. After an explicitly authorized publication, existing installed projects under `repos/*` are updated through ordinary managed `update` / `update --config`, preserving each project's models / tracker / delivery / mode; blockers are reported. Actual-use testing in those projects belongs to the Author. This ticket does not edit consumer projects or restart OpenCode.
 
 **This is not consumer canon.** Nothing in this subsection is projected into a consumer project: the projected role and agent documents (`POIESIS_ROLE_*.md`, `OPENCODE_AGENT_*.md`) carry no publish step, no post-publish self-update, and no install-mode obligation, because a consumer project owes nobody a self-upgrade or a sharing policy. The one notice a consumer ever gets is the read-only `poiesis latest` report, which tells the Author that a newer release exists and hands over one copy-paste command — it never runs the update, never restarts OpenCode, and never chooses a mode.
 
