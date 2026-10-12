@@ -78,6 +78,18 @@ import { POIESIS_GENERATED_AGENT_PATHS, templateMappings } from "./templates.js"
 import { assertTeamOverridesUnchanged, readTeamOverrides, type TeamOverride } from "./team-profile.js";
 import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
+import {
+  applyPackageContributionWithJournal,
+  assertPackageContributionRuntimeReady,
+  planPackageContributionAtRoot,
+  probeSelfhostDistVersion,
+  readResolvedLocalCliPackageJson,
+  resolvePackageManagerExecutor,
+  PACKAGE_JSON_RELATIVE,
+  type PackageContributionPlan,
+} from "./package-invocation.js";
+import { run as runProcess } from "./process.js";
+import type { PackageContributionRecord } from "./manifest.js";
 import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
 type JsonObject = Record<string, unknown>;
@@ -637,9 +649,23 @@ async function runLockedUpdateTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
     const updatingPoiesisVersion = await packageVersion();
+    // Spec #207 / ticket #210 — plan package contribution (repair/version-cross)
+    // before OpenCode projection so local invocation permissions match the
+    // owned contribution the manifest will record.
+    const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
+      root: resolvedRoot,
+      poiesisVersion: updatingPoiesisVersion,
+      mode: "repair",
+      ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+    });
+    const packageContributionForProjection: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       expectedContent: openCodeConfigCurrentBytes,
+      ...(packageContributionForProjection === undefined
+        ? {}
+        : { packageContribution: packageContributionForProjection }),
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
       },
@@ -663,6 +689,35 @@ async function runLockedUpdateTransaction(
           { path: openCodeConfig },
         );
       }
+    }
+    // Spec #207 / ticket #210 — apply package.json + lockfile contributions
+    // inside the same transaction journal when the plan requires writes.
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
+    if (packagePlan.kind === "apply") {
+      const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+      const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+      const packageJsonEntry = await journal.capture(packageJsonPath, "whole-file");
+      const lockfileEntry = await journal.capture(lockfilePath, "whole-file");
+      const preimageLockfile =
+        lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+      const applied = await applyPackageContributionWithJournal({
+        root: resolvedRoot,
+        plan: packagePlan,
+        packageJsonEntry,
+        lockfileEntry,
+        executor: resolvePackageManagerExecutor(resolvedRoot),
+        preimageLockfile,
+        poiesisVersion: updatingPoiesisVersion,
+      });
+      nextPackageContribution = applied.record;
+    } else if (packagePlan.kind === "noop") {
+      await assertPackageContributionRuntimeReady({
+        record: packagePlan.record,
+        poiesisVersion: updatingPoiesisVersion,
+        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+      });
     }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
     const priorDurable = new Map(
@@ -699,8 +754,9 @@ async function runLockedUpdateTransaction(
         };
       }
     }
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const next: Manifest = {
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: await packageVersion(),
       adapter: {
@@ -713,6 +769,7 @@ async function runLockedUpdateTransaction(
       skills,
       configPatches,
       ...(ignoreBlock === undefined ? {} : { ignoreBlock }),
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
     // Serialize next once and derive its post-write identity from those
     // exact bytes. A foreign replacement in the write window cannot be
@@ -976,9 +1033,20 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
     const updatingPoiesisVersion = await packageVersion();
+    const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
+      root: resolvedRoot,
+      poiesisVersion: updatingPoiesisVersion,
+      mode: "repair",
+      ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+    });
+    const packageContributionForProjection: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       ...(openCodeConfigCurrentBytes !== null ? { expectedContent: openCodeConfigCurrentBytes } : {}),
+      ...(packageContributionForProjection === undefined
+        ? {}
+        : { packageContribution: packageContributionForProjection }),
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
       },
@@ -998,6 +1066,33 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
           { path: openCodeConfig },
         );
       }
+    }
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
+    if (packagePlan.kind === "apply") {
+      const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+      const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+      const packageJsonEntry = await journal.capture(packageJsonPath, "whole-file");
+      const lockfileEntry = await journal.capture(lockfilePath, "whole-file");
+      const preimageLockfile =
+        lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+      const applied = await applyPackageContributionWithJournal({
+        root: resolvedRoot,
+        plan: packagePlan,
+        packageJsonEntry,
+        lockfileEntry,
+        executor: resolvePackageManagerExecutor(resolvedRoot),
+        preimageLockfile,
+        poiesisVersion: updatingPoiesisVersion,
+      });
+      nextPackageContribution = applied.record;
+    } else if (packagePlan.kind === "noop") {
+      await assertPackageContributionRuntimeReady({
+        record: packagePlan.record,
+        poiesisVersion: updatingPoiesisVersion,
+        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+      });
     }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
     const priorDurable = new Map(
@@ -1025,8 +1120,9 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
         nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: openCodeEntry.transactionWrittenIdentity.hash };
       }
     }
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const next: Manifest = {
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: await packageVersion(),
       adapter: {
@@ -1039,6 +1135,7 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       skills,
       configPatches,
       ...(ignoreBlock === undefined ? {} : { ignoreBlock }),
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
     const nextManifestBytes = serializeManifest(next);
     const nextManifestHash = hashContent(nextManifestBytes);

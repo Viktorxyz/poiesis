@@ -81,7 +81,20 @@ import {
   type ManagedFile,
   type ManagedSkill,
   type Manifest,
+  type PackageContributionRecord,
 } from "./manifest.js";
+import {
+  applyPackageContributionWithJournal,
+  assertPackageContributionRuntimeReady,
+  planPackageContributionAtRoot,
+  planPackageContributionRemoval,
+  loadPackageFsSnapshot,
+  probeSelfhostDistVersion,
+  readResolvedLocalCliPackageJson,
+  resolvePackageManagerExecutor,
+  PACKAGE_JSON_RELATIVE,
+} from "./package-invocation.js";
+import { run as runProcess } from "./process.js";
 import {
   applyOpenCodeConfig,
   assertOpenCodeConfigAvailable,
@@ -1382,9 +1395,16 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const rel = deliveryScriptPath(target);
     initialDeliverySnapshots.set(rel, await snapshotFile(join(resolvedRoot, rel)));
   }
-  // Spec #190 / ticket #191: `package.json` is no longer read or written
-  // by init at all. Invoking Poiesis must not require a project manifest
-  // mutation, so the Author's own scripts are exactly as they were.
+  // Spec #207 / ticket #210 — pinned local package invocation. Plan the
+  // owned contribution BEFORE any write so conflicts/ambiguity fail closed
+  // with nothing mutated. Absent package.json keeps the exact dlx route.
+  const packagePlan = await planPackageContributionAtRoot({
+    root: resolvedRoot,
+    poiesisVersion: installingPoiesisVersion,
+    mode: "ensure",
+  });
+  const packageContributionForProjection: PackageContributionRecord | undefined =
+    packagePlan.kind === "absent" ? undefined : packagePlan.record;
   const initialSkills = options.skipSkills
     ? undefined
     : await assertDefaultSkillDestinationsAvailable(resolvedRoot);
@@ -1472,6 +1492,11 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   // out of `files` on purpose: Spec #138 lets the Author edit them freely, and
   // a `files` record would turn an edit into a doctor failure.
   const generatedScripts: GeneratedScriptRecord[] = [];
+  // Spec #207 / ticket #210 — owned package contribution recorded on the
+  // manifest after a successful package/lock write set.
+  let packageContributionRecord: PackageContributionRecord | undefined =
+    packagePlan.kind === "noop" ? packagePlan.record : undefined;
+  const packageJournal: ArtifactJournal = new ArtifactJournal(4);
   const createdInitDirectories = new Set<string>();
   let writtenOpenCodeConfigHash: string | undefined;
   let writtenOpenCodeConfigContent: string | undefined;
@@ -1565,6 +1590,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       {
         requireAvailable: true,
         expectedContent: initialOpenCodeConfigSnapshot,
+        ...(packageContributionForProjection === undefined
+          ? {}
+          : { packageContribution: packageContributionForProjection }),
         onWritten: (content) => {
           writtenOpenCodeConfigContent = content;
           writtenOpenCodeConfigHash = hashContent(content);
@@ -1761,6 +1789,37 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       });
     }
 
+    // Spec #207 / ticket #210 — apply owned package.json + lockfile contributions
+    // through a bounded journal write set before the manifest records them.
+    if (packagePlan.kind === "apply") {
+      const packageJsonPath = join(resolvedRoot, "package.json");
+      const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+      const packageJsonEntry = await packageJournal.capture(packageJsonPath, "whole-file");
+      const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
+      const preimageLockfile =
+        lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+      const applied = await applyPackageContributionWithJournal({
+        root: resolvedRoot,
+        plan: packagePlan,
+        packageJsonEntry,
+        lockfileEntry,
+        executor: resolvePackageManagerExecutor(resolvedRoot),
+        preimageLockfile,
+        poiesisVersion: installingPoiesisVersion,
+      });
+      packageContributionRecord = applied.record;
+    } else if (packagePlan.kind === "noop") {
+      packageContributionRecord = packagePlan.record;
+      // Every success that retains a local contribution proves runtime readiness
+      // (ordinary: resolved node_modules bin version; selfhost: dist/cli.js).
+      await assertPackageContributionRuntimeReady({
+        record: packagePlan.record,
+        poiesisVersion: installingPoiesisVersion,
+        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+      });
+    }
+
     const manifest: Manifest = {
       schema: 1,
       poiesisVersion: await packageVersion(),
@@ -1776,6 +1835,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       mode: installMode,
       ...(ignoreBlockRecord === undefined ? {} : { ignoreBlock: ignoreBlockRecord }),
       ...(generatedScripts.length === 0 ? {} : { generatedScripts }),
+      ...(packageContributionRecord === undefined ? {} : { packageContribution: packageContributionRecord }),
     };
     const manifestContent = serializeManifest(manifest);
     await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
@@ -1805,6 +1865,8 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     // removed only after commit. `commit()` swallows its own cleanup
     // failures so they cannot turn a committed init into a failure.
     await skillJournal.commit();
+    // Spec #207 / ticket #210 — commit package/lock journal after success.
+    await packageJournal.commit();
     return manifest;
   } catch (error) {
     const rollbackFailures: Array<Record<string, unknown>> = [];
@@ -1826,6 +1888,26 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         (await hashFile(manifestPath)) === writtenManifestHash
       ) {
         await unlink(manifestPath);
+      }
+    });
+    // Spec #207 / ticket #210 — reverse package.json + lockfile first so a
+    // failed init never leaves a partial owned contribution. Concurrent
+    // foreign edits are preserved via journal identity gates.
+    await rollbackStep(rollbackFailures, "package contribution (journal)", async () => {
+      const diagnostics = await packageJournal.rollback();
+      if (diagnostics.length > 0) {
+        const preserved = diagnostics.map((diagnostic) => ({
+          path: relative(resolvedRoot, diagnostic.path),
+          reason: diagnostic.reason,
+          ...(diagnostic.preimageRecoveredAt === undefined
+            ? {}
+            : { preimageRecoveredAt: diagnostic.preimageRecoveredAt }),
+        }));
+        throw new PoiesisError(
+          "PACKAGE_ROLLBACK_INCOMPLETE",
+          "Some package.json/lockfile mutations could not be rolled back",
+          { preserved },
+        );
       }
     });
     // Ticket #46: roll back default-skill mutations through the bounded
@@ -2404,7 +2486,10 @@ export async function doctor(root: string): Promise<DoctorReport> {
       // recorded `poiesisVersion` so the strict authority check recognizes
       // every owned patch as installed by THIS package, even when the
       // current runtime image is newer than the recorded install.
-      const desired = desiredOpenCodePatches(config, manifest.poiesisVersion);
+      const desired =
+        manifest.packageContribution === undefined
+          ? desiredOpenCodePatches(config, manifest.poiesisVersion)
+          : desiredOpenCodePatches(config, manifest.poiesisVersion, manifest.packageContribution);
       const recorded = new Map(manifest.configPatches.map((patch) => [patch.path.join("\0"), patch]));
       const mismatches = desired.filter((patch) => {
         const installed = recorded.get(patch.path.join("\0"));
@@ -3577,6 +3662,82 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
     result.preserved.push({ path: "workspace mutation lock", reason: `mutation lock could not be reclaimed: ${message}` });
   }
 
+  // Spec #207 / ticket #210 — remove only owned package contributions
+  // (script + exact devDependency + lockfile reconciliation). Foreign
+  // scripts/deps are preserved and reported. Runs after other teardown so
+  // the process can uninstall its own dependency safely once resolution is
+  // complete. Primary root only.
+  let packageContributionResolved = manifest.packageContribution === undefined;
+  if (manifest.packageContribution !== undefined) {
+    try {
+      const snapshot = await loadPackageFsSnapshot(resolvedRoot);
+      const removal = planPackageContributionRemoval({
+        snapshot,
+        record: manifest.packageContribution,
+      });
+      if (removal.kind === "apply") {
+        const packageJournal = new ArtifactJournal(4);
+        const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+        const lockfilePath = join(resolvedRoot, removal.record.lockfile);
+        const packageJsonEntry = await packageJournal.capture(packageJsonPath, "whole-file");
+        const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
+        const preimageLockfile =
+          lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+        // Removal plan is applied via the same journal helper; the plan's
+        // nextPackageJson already omits owned contributions. assertPackageContributionMatches
+        // expects owned values present — for removal we write directly.
+        const { atomicWrite } = await import("./fs.js");
+        if (removal.packageJsonChanged) {
+          await atomicWrite(packageJsonPath, removal.nextPackageJson);
+          packageJsonEntry.transactionWrittenIdentity = {
+            exists: true,
+            kind: "file",
+            hash: hashContent(removal.nextPackageJson),
+          };
+        }
+        if (removal.lockfileOperation !== null) {
+          const executor = resolvePackageManagerExecutor(resolvedRoot);
+          const result = await executor.apply({
+            manager: removal.record.manager,
+            operation: removal.lockfileOperation,
+            packageJson: removal.nextPackageJson,
+            lockfile: preimageLockfile,
+            ignoreScripts: true,
+          });
+          await atomicWrite(packageJsonPath, result.packageJson);
+          await atomicWrite(lockfilePath, result.lockfile);
+          packageJsonEntry.transactionWrittenIdentity = {
+            exists: true,
+            kind: "file",
+            hash: hashContent(result.packageJson),
+          };
+          lockfileEntry.transactionWrittenIdentity = {
+            exists: true,
+            kind: "file",
+            hash: hashContent(result.lockfile),
+          };
+        }
+        await packageJournal.commit();
+        result.removed.push(PACKAGE_JSON_RELATIVE);
+        if (removal.lockfileOperation !== null) result.removed.push(removal.record.lockfile);
+      }
+      for (const preserved of removal.kind === "apply" ? removal.preserved ?? [] : []) {
+        result.preserved.push({
+          path: `${PACKAGE_JSON_RELATIVE}:${preserved.path.join(".")}`,
+          reason: preserved.reason,
+        });
+      }
+      packageContributionResolved = (removal.kind === "apply" ? removal.preserved ?? [] : []).length === 0;
+    } catch (error) {
+      const message = error instanceof PoiesisError ? error.message : String(error);
+      result.preserved.push({
+        path: PACKAGE_JSON_RELATIVE,
+        reason: `package contribution could not be removed: ${message}`,
+      });
+      packageContributionResolved = false;
+    }
+  }
+
   // Spec #190 / ticket #195 — RETAINED USER DATA. The Local tracker store holds
   // the Author's own recorded Specs, tickets, comments, and history. An
   // ordinary uninstall deliberately keeps it — and it is reported here, through
@@ -3639,7 +3800,12 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
     // never be fully removed no matter what the Author did. An UNRESOLVED
     // block (edited, relabelled, or unreadable) is retained, so Poiesis still
     // knows it owns that policy and keeps reporting it.
-    const { ignoreBlock: priorIgnoreBlock, generatedScripts: priorGeneratedScripts, ...carried } = manifest;
+    const {
+      ignoreBlock: priorIgnoreBlock,
+      generatedScripts: priorGeneratedScripts,
+      packageContribution: priorPackageContribution,
+      ...carried
+    } = manifest;
     const unresolvedGeneratedScripts = (priorGeneratedScripts ?? []).filter(
       (script) => !resolvedGeneratedScripts.has(script.path),
     );
@@ -3652,6 +3818,9 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
       configPatches: configResult.preserved,
       ...(priorIgnoreBlock === undefined || ignoreBlockResolved ? {} : { ignoreBlock: priorIgnoreBlock }),
       ...(unresolvedGeneratedScripts.length === 0 ? {} : { generatedScripts: unresolvedGeneratedScripts }),
+      ...(priorPackageContribution === undefined || packageContributionResolved
+        ? {}
+        : { packageContribution: priorPackageContribution }),
     };
     await atomicWrite(poiesisPath(resolvedRoot, "manifest.json"), serializeManifest(retained));
     await replaceOwnershipReceipt(resolvedRoot, retained, receipt);

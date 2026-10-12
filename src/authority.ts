@@ -698,7 +698,13 @@ export async function assertManifestAuthorityToleratingPredecessor(
   // manifest's own version rather than the runtime's package version.
   // This keeps doctor / uninstall / installCapability authority stable
   // across patch bumps of the runtime image.
-  const currentPatches = desiredOpenCodePatches(config, manifest.poiesisVersion);
+  // Spec #207 / ticket #210: projection keys off the owned package contribution
+  // when present so local invocation routes authenticate; absent contribution
+  // keeps the exact dlx route (including authentic 1.6.0 predecessors).
+  const currentPatches =
+    manifest.packageContribution === undefined
+      ? desiredOpenCodePatches(config, manifest.poiesisVersion)
+      : desiredOpenCodePatches(config, manifest.poiesisVersion, manifest.packageContribution);
   try {
     await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
@@ -833,7 +839,9 @@ export async function assertManifestAuthority(
   await assertManifestAuthorityImpl(
     root,
     manifest,
-    desiredOpenCodePatches(config, manifest.poiesisVersion),
+    manifest.packageContribution === undefined
+      ? desiredOpenCodePatches(config, manifest.poiesisVersion)
+      : desiredOpenCodePatches(config, manifest.poiesisVersion, manifest.packageContribution),
     options,
   );
 }

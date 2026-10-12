@@ -195,7 +195,7 @@ Realize owns no new machinery: no new mode, no new stage, no new counter, no new
 
 Realize proves each ticket with its relevant focused checks, not with the configured full verification plan. That plan is reserved for one Proof run against the exact candidate, inside Prove.
 
-Worker runs focused checks through the one non-authoritative route it owns: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
+Worker runs focused checks through the one non-authoritative route it owns — the exact installed CLI route projected into its permissions (`pnpm poiesis check …` / `npm run poiesis -- check …` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`). A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
 
 The same command, state fingerprint, and failure classification does not justify another attempt. A repeat is honest only with a relevant mutation since the last attempt, a concrete new hypothesis, or escalation to Poiesis for reassessment; the reason is stated, never assumed.
 

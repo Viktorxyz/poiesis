@@ -79,8 +79,9 @@ function extractRoleSection(role: string, heading: string): string {
 
 // --- Contract vocabulary ----------------------------------------------------
 
-/** The one route a Worker owns: exact manifest version, one subcommand. */
+/** The one route a Worker owns: exact installed CLI, one subcommand (local or dlx). */
 const WORKER_CHECK_ROUTE = "pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command";
+const WORKER_CHECK_ROUTE_LOCAL = "pnpm poiesis check";
 
 const FOCUSED_CHECKS_REQUIRED = /relevant focused (?:ticket )?checks/i;
 const RESERVED_PLAN = /configured full verification plan/;
@@ -318,6 +319,7 @@ describe("Spec #168 / ticket #173 — convergent Realize check guidance", () => 
       expect(extractMethodSection(method, "8. Realize")).toMatch(FOCUSED_CHECKS_REQUIRED);
       expect(extractMethodSection(method, "8. Realize")).toMatch(/same command, state fingerprint, and failure classification does not justify another attempt/i);
       expect(roleWorker).toContain(WORKER_CHECK_ROUTE);
+      expect(roleWorker).toContain(WORKER_CHECK_ROUTE_LOCAL);
       expect(roleWorker).toMatch(/never report success/i);
       expect(rolePoiesis).toContain(SESSION_CLEANUP_ROUTE);
 

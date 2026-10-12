@@ -65,7 +65,7 @@ import {
   ownershipReceiptLocation,
   type OwnershipReceipt,
 } from "./receipt.js";
-import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
+import { loadManifest, serializeManifest, type ManagedFile, type Manifest, type PackageContributionRecord } from "./manifest.js";
 import { POIESIS_GENERATED_AGENT_PATHS } from "./templates.js";
 import {
   desiredOpenCodePatches,
@@ -75,6 +75,18 @@ import {
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
+import {
+  applyPackageContributionWithJournal,
+  assertPackageContributionRuntimeReady,
+  loadPackageFsSnapshot,
+  PACKAGE_JSON_RELATIVE,
+  planPackageContributionForVersionCross,
+  probeSelfhostDistVersion,
+  readResolvedLocalCliPackageJson,
+  resolvePackageManagerExecutor,
+  type PackageContributionPlan,
+} from "./package-invocation.js";
+import { run as runProcess } from "./process.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { ResolvedPoiesisConfig } from "./config.js";
@@ -655,7 +667,24 @@ async function runLockedUpdateConfigTransaction(
   //    transaction is installing) so the projected OpenCode config always
   //    matches the package on disk after a successful apply.
   const nextPoiesisVersion = await packageVersion();
-  const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion);
+  // Spec #207 / ticket #210 correction — version-crossing config updates must
+  // repair the owned package contribution (exact dep + script) in the same
+  // transaction. Plan against the primary root BEFORE projection so the
+  // OpenCode route and next manifest share one contribution record. Absent
+  // package.json keeps exact dlx (no fabricated metadata); conflicts fail closed.
+  const packageSnapshot = await loadPackageFsSnapshot(resolvedRoot);
+  const packageCross = planPackageContributionForVersionCross({
+    snapshot: packageSnapshot,
+    nextPoiesisVersion,
+    ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+  });
+  const packagePlan: PackageContributionPlan = packageCross.plan;
+  const packageContributionForProjection: PackageContributionRecord | undefined =
+    packageCross.contributionForProjection;
+  const desiredOpenCodeProjectionPatches =
+    packageContributionForProjection === undefined
+      ? desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion)
+      : desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion, packageContributionForProjection);
   const { serialized: preflightSerialized, configPatches: projectedOpenCodePatches } = projectOpenCodePayload({
     root: resolvedRoot,
     configPath: openCodeConfigPath,
@@ -801,13 +830,12 @@ async function runLockedUpdateConfigTransaction(
   const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-  // Spec #190 / ticket #193 — the limit covers the transition surface too:
+  // Spec #190 / ticket #193 + Spec #207 / ticket #210 — the limit covers the
+  // transition surface and the package.json + lockfile contribution write set:
   // poiesis config, OpenCode config, `.gitignore`, up to two shared profile
-  // files, the manifest, and the receipt. Captured in EXACT write order, so
-  // the journal's reverse-order rollback is reverse write order and the
-  // shared profile files a failed transition created are removed rather than
-  // left behind next to a manifest that never advanced.
-  const journal = new ArtifactJournal(8);
+  // files, package.json, lockfile, the manifest, and the receipt. Captured in
+  // EXACT write order so reverse-order rollback matches reverse write order.
+  const journal = new ArtifactJournal(12);
   const poiesisConfigArtifact = await journal.capture(poiesisConfigPath, "whole-file");
   const openCodeArtifact = await journal.capture(
     openCodeConfigPath,
@@ -819,6 +847,16 @@ async function runLockedUpdateConfigTransaction(
   const profileArtifacts: Array<{ path: string; entry: ArtifactJournalEntry }> = [];
   for (const file of transition?.createProfileFiles ?? []) {
     profileArtifacts.push({ path: file.path, entry: await journal.capture(join(resolvedRoot, file.path), "whole-file") });
+  }
+  // Package contribution captures only when this transaction will write them.
+  let packageJsonArtifact: ArtifactJournalEntry | undefined;
+  let lockfileArtifact: ArtifactJournalEntry | undefined;
+  let packagePreimageLockfile = "";
+  if (packagePlan.kind === "apply") {
+    packageJsonArtifact = await journal.capture(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "whole-file");
+    lockfileArtifact = await journal.capture(join(resolvedRoot, packagePlan.record.lockfile), "whole-file");
+    packagePreimageLockfile =
+      lockfileArtifact.preimage === undefined ? "" : lockfileArtifact.preimage.toString("utf8");
   }
   const manifestArtifact = await journal.capture(manifestPath, "whole-file");
   const receiptArtifact = await journal.capture(receiptPath, "whole-file");
@@ -911,6 +949,39 @@ async function runLockedUpdateConfigTransaction(
       await hooks?.postModeTransitionApply?.();
     }
 
+    // 11c. Spec #207 / ticket #210 — apply owned package.json + lockfile
+    // contributions inside this journal so a version-crossing config update
+    // never leaves manifest.poiesisVersion ahead of the exact devDependency.
+    // Identities bind on each known write before the next fallible step.
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packageContributionForProjection;
+    if (packagePlan.kind === "apply") {
+      if (packageJsonArtifact === undefined || lockfileArtifact === undefined) {
+        throw new PoiesisError(
+          "ARTIFACT_JOURNAL_MISSING",
+          "Journal does not contain the package contribution entries",
+          { path: PACKAGE_JSON_RELATIVE },
+        );
+      }
+      const applied = await applyPackageContributionWithJournal({
+        root: resolvedRoot,
+        plan: packagePlan,
+        packageJsonEntry: packageJsonArtifact,
+        lockfileEntry: lockfileArtifact,
+        executor: resolvePackageManagerExecutor(resolvedRoot),
+        preimageLockfile: packagePreimageLockfile,
+        poiesisVersion: nextPoiesisVersion,
+      });
+      nextPackageContribution = applied.record;
+    } else if (packagePlan.kind === "noop") {
+      await assertPackageContributionRuntimeReady({
+        record: packagePlan.record,
+        poiesisVersion: nextPoiesisVersion,
+        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+      });
+    }
+
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -919,11 +990,12 @@ async function runLockedUpdateConfigTransaction(
     //     config hash is taken from the on-disk write; every other file keeps its prior hash. Use the
     //     same `nextPoiesisVersion` captured at step 6 so the manifest's recorded version exactly
     //     matches the version baked into the OpenCode config bash projection.
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const nextManifest: Manifest = {
       // Spec #190 / ticket #191: an update reconciles the installation; it
       // never re-decides its sharing mode. `mode` and the exact
       // `.gitignore` block ownership ride through unchanged.
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: nextPoiesisVersion,
       adapter: {
@@ -961,6 +1033,9 @@ async function runLockedUpdateConfigTransaction(
       // is computed over. `ignoreBlock.hash` is the hash of the block this run
       // actually wrote, so `uninstall` reverses exactly these bytes.
       ...(transition === undefined ? {} : { mode: transition.to, ignoreBlock: transition.record }),
+      // Spec #207 / ticket #210 — contribution matches nextPoiesisVersion (or
+      // is omitted when the project has no package.json).
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
     await hooks?.preManifestWrite?.();
     // Serialize nextManifest exactly once; derive the post-write identity

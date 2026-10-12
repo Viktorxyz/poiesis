@@ -186,14 +186,11 @@ const forbiddenFunctions = [
   // The factories above are the only production callers; promoting it
   // through `src/index.ts` would freeze the prompt-stream contract.
   "settleOnceLinePrompt",
-  // Spec #190 / ticket #191: the `pnpm poiesis` package-script module is
-  // GONE — invoking Poiesis no longer mutates `package.json` — and the
-  // installation-mode / managed-ignore-block capability stays CLI- and
-  // runtime-internal for the same reason. These names must never reach the
-  // package root: promoting them would freeze the Author-owned
-  // `package.json` contract that Spec #190 removed, or the block
-  // delimiter/parse surface, into a public API before later tickets
-  // (#192) settle them.
+  // Spec #207 / ticket #210: package-invocation ownership stays CLI- and
+  // runtime-internal. Promoting planning/executor seams would freeze the
+  // package.json + lockfile contribution contract into the public API.
+  // Former Spec #190 package-script names remain banned (that @latest
+  // module is not resurrected).
   "POIESIS_SCRIPT_NAME",
   "POIESIS_SCRIPT_COMMAND",
   "PACKAGE_JSON_RELATIVE",
@@ -202,6 +199,12 @@ const forbiddenFunctions = [
   "repairPoiesisScript",
   "rollbackPackageJson",
   "EnsurePoiesisScriptOptions",
+  "planPackageContribution",
+  "planPackageContributionAtRoot",
+  "applyPackageContributionPlan",
+  "createNativePackageManagerExecutor",
+  "setPackageManagerExecutorForTest",
+  "resolvePackageManagerOwnership",
   "INSTALL_MODES",
   "parseInstallMode",
   "parseInstallModeAnswer",

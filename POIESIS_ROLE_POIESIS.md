@@ -168,7 +168,7 @@ receipt, and carries no authority. It is bounded local feedback for the
 Worker during Realize, and the Worker is granted exactly that one
 subcommand through the exact-version route — never a lifecycle route.
 Invoking one of those operations through the exact generated
-`pnpm dlx poiesis-cli@<manifest.poiesisVersion>` route — the canonical
+exact installed CLI route (`pnpm poiesis` / `npm run poiesis --` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`) — the canonical
 exact-version route the installed lifecycle projects into the primary
 agent's `permission.bash` — is the normal authoritative lifecycle
 execution path. Ordinary shell is for bounded diagnosis

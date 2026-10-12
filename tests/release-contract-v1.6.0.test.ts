@@ -331,16 +331,20 @@ describe("Poiesis 1.6.0 release / update contract", () => {
     expect(await packageVersion()).toBe(RELEASE_VERSION);
   });
 
-  it("Poiesis installs no project script into package.json", async () => {
-    // Spec #190 / ticket #191: invoking Poiesis must not require a project
-    // manifest mutation, so the installed surface carries no `poiesis`
-    // script at all. Asserted here on the CLI's OWN package.json (the tool
-    // is not an install of itself) so nobody re-introduces a
-    // self-referential route, and end-to-end on a real installed project in
-    // `tests/private-install-git-isolation.test.ts`.
+  it("selfhost package.json never self-depends on poiesis-cli", async () => {
+    // Spec #207 / ticket #210: the CLI package is selfhost — no
+    // poiesis-cli dependency in any section. Local invocation uses
+    // `node dist/cli.js` when this package is the install root; ordinary
+    // consumers get an exact devDependency instead.
     const pkg = await readPackageJson();
-    expect(pkg.scripts?.["poiesis"]).toBeUndefined();
-    expect(pkg.scripts?.["pnpm:poiesis"]).toBeUndefined();
+    expect(pkg.name).toBe("poiesis-cli");
+    const sections = pkg as unknown as Record<string, unknown>;
+    for (const section of ["dependencies", "devDependencies", "peerDependencies", "optionalDependencies"]) {
+      const block = sections[section];
+      if (typeof block === "object" && block !== null) {
+        expect((block as Record<string, unknown>)["poiesis-cli"]).toBeUndefined();
+      }
+    }
   });
 
   it("package.json::files enumerates every required canonical doc / role / runtime output", async () => {

@@ -39,7 +39,7 @@ Make the smallest coherent implementation that satisfies the ticket and Spec.
 
 Prove each ticket with its relevant focused checks. The configured full verification plan is reserved for the single whole-change Proof in Prove and is not a ticket check; never run it as one.
 
-Run focused checks through the one non-authoritative Poiesis route you own: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. You hold no other Poiesis route, and you do not acquire one.
+Run focused checks through the one non-authoritative Poiesis route you own — the exact installed CLI route projected into your permissions (`pnpm poiesis check …` / `npm run poiesis -- check …` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`). You hold no other Poiesis route, and you do not acquire one.
 
 A focused check is evidence, not proof. It writes nothing, produces no verification receipt, returns bounded per-command evidence with a deterministic action fingerprint, and can never satisfy Prove. Report it as evidence for this ticket only.
 
