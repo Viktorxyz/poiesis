@@ -45,6 +45,25 @@ const generatedScriptSchema = z.strictObject({
   hash: z.string().regex(/^[a-f0-9]{64}$/),
 });
 
+/**
+ * Spec #207 / ticket #210 — owned package invocation contributions.
+ *
+ * Not whole-file `package.json` ownership and not a configPatch: only the
+ * authenticated script (and optional exact `poiesis-cli` devDependency) plus
+ * the lockfile the native package manager owns. `uninstall` reverses exactly
+ * these contributions; foreign scripts/deps/lock edits are preserved.
+ */
+const packageContributionSchema = z.strictObject({
+  owned: z.literal(true),
+  manager: z.enum(["npm", "pnpm"]),
+  lockfile: z.enum(["package-lock.json", "pnpm-lock.yaml"]),
+  projectKind: z.enum(["ordinary", "selfhost"]),
+  packageJson: z.literal("package.json"),
+  scriptName: z.literal("poiesis"),
+  scriptValue: z.string().min(1),
+  devDependencyVersion: z.string().min(1).optional(),
+});
+
 const ignoreBlockSchema = z.strictObject({
   path: z.literal(".gitignore"),
   mode: z.enum(["private", "team"]),
@@ -103,6 +122,11 @@ export const manifestSchema = z.strictObject({
   ignoreBlock: ignoreBlockSchema.optional(),
   /** Delivery scripts this installation generated, with their installed digest. */
   generatedScripts: z.array(generatedScriptSchema).optional(),
+  /**
+   * Spec #207 / ticket #210 — owned local package invocation contribution.
+   * Absent when the project has no `package.json` (exact dlx route retained).
+   */
+  packageContribution: packageContributionSchema.optional(),
 });
 
 export type Manifest = z.infer<typeof manifestSchema>;
@@ -111,6 +135,7 @@ export type ManagedSkill = z.infer<typeof skillSchema>;
 export type ConfigPatch = z.infer<typeof configPatchSchema>;
 export type IgnoreBlockRecord = z.infer<typeof ignoreBlockSchema>;
 export type GeneratedScriptRecord = z.infer<typeof generatedScriptSchema>;
+export type PackageContributionRecord = z.infer<typeof packageContributionSchema>;
 
 export async function loadManifest(root: string): Promise<Manifest> {
   const path = poiesisPath(root, "manifest.json");

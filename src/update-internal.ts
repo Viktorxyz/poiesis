@@ -78,13 +78,29 @@ import { POIESIS_GENERATED_AGENT_PATHS, templateMappings } from "./templates.js"
 import { assertTeamOverridesUnchanged, readTeamOverrides, type TeamOverride } from "./team-profile.js";
 import { DELIVERY_RUNTIME_IGNORE_RULE } from "./delivery-runtime.js";
 import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAdapterPatches } from "./authority.js";
+import {
+  applyPackageContributionWithJournal,
+  assertPackageContributionCaptureIdentity,
+  assertPackageContributionRuntimeReady,
+  packageContributionMode,
+  packagePlanRetainsContribution,
+  planPackageContributionAtRoot,
+  probeSelfhostDistVersion,
+  readResolvedLocalCliPackageJson,
+  resolvePackageManagerExecutor,
+  writeManifestWithPackageContributionGate,
+  PACKAGE_JSON_RELATIVE,
+  type PackageContributionPlan,
+} from "./package-invocation.js";
+import { run as runProcess } from "./process.js";
+import type { PackageContributionRecord } from "./manifest.js";
 import type { DoctorReport, MaintenanceOptions, UpdateResult } from "./maintenance.js";
 
 type JsonObject = Record<string, unknown>;
 
 /**
  * Journal artifact limit. 13 template mappings + `.poiesis/config.jsonc`
- * + opencode config + manifest + receipt + 11 default skill directories
+  * + opencode config + manifest + receipt + default skill directories
  * = 28 artifacts in the worst case (ticket #46); 32 leaves comfortable
  * headroom for future Poiesis-managed files.
  */
@@ -435,7 +451,18 @@ async function runLockedUpdateTransaction(
   // accepted surface stays fail-closed: only that exact set is admitted, and
   // the projection the transaction writes grants no broad / `@latest` /
   // unversioned launcher.
-  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, ["1.0.1", "1.0.2", "1.1.1", "1.1.3", "1.1.4", "1.4.0"]);
+  // Spec #207 / ticket #208: accept authentic `1.6.0` static-skill
+  // projections so receipt-gated update migrates them onto the native
+  // skill-wildcard surface without widening bash/task authority.
+  await assertManifestAuthorityToleratingPredecessor(resolvedRoot, manifest, config, [
+    "1.0.1",
+    "1.0.2",
+    "1.1.1",
+    "1.1.3",
+    "1.1.4",
+    "1.4.0",
+    "1.6.0",
+  ]);
   await verifyGitRepository(resolvedRoot, config);
   // The transaction's actual capability probes (`models` via
   // `verifyModels`, V1 schema via `validateOpenCodeConfigPayload`) run
@@ -626,9 +653,23 @@ async function runLockedUpdateTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
     const updatingPoiesisVersion = await packageVersion();
+    // Spec #207 / ticket #210 — plan package contribution (repair/version-cross)
+    // before OpenCode projection so local invocation permissions match the
+    // owned contribution the manifest will record.
+    const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
+      root: resolvedRoot,
+      poiesisVersion: updatingPoiesisVersion,
+      mode: packageContributionMode(manifest.packageContribution),
+      ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+    });
+    const packageContributionForProjection: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       expectedContent: openCodeConfigCurrentBytes,
+      ...(packageContributionForProjection === undefined
+        ? {}
+        : { packageContribution: packageContributionForProjection }),
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
       },
@@ -651,6 +692,42 @@ async function runLockedUpdateTransaction(
           "OpenCode config changed between transaction write and manifest materialization",
           { path: openCodeConfig },
         );
+      }
+    }
+    // Spec #207 / ticket #210 + #214 — every non-absent plan that retains
+    // packageContribution binds original package.json identity before success.
+    // Apply: capture package.json + lock, write through journal. Noop: capture
+    // package.json only (no lock, no write, no transactionWrittenIdentity).
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
+    if (packagePlanRetainsContribution(packagePlan)) {
+      const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+      const packageJsonEntry = await journal.capture(packageJsonPath, "whole-file");
+      assertPackageContributionCaptureIdentity(packagePlan, packageJsonEntry);
+      if (packagePlan.kind === "apply") {
+        const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+        const lockfileEntry = await journal.capture(lockfilePath, "whole-file");
+        const preimageLockfile =
+          lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+        const applied = await applyPackageContributionWithJournal({
+          root: resolvedRoot,
+          plan: packagePlan,
+          packageJsonEntry,
+          lockfileEntry,
+          replaceOwnedFile: (entry, content) => journal.replace(entry, content),
+          executor: resolvePackageManagerExecutor(resolvedRoot),
+          preimageLockfile,
+          poiesisVersion: updatingPoiesisVersion,
+        });
+        nextPackageContribution = applied.record;
+      } else {
+        // Noop: ownership record only — never write package bytes / bind write identity.
+        await assertPackageContributionRuntimeReady({
+          record: packagePlan.record,
+          poiesisVersion: updatingPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        });
       }
     }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -688,8 +765,9 @@ async function runLockedUpdateTransaction(
         };
       }
     }
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const next: Manifest = {
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: await packageVersion(),
       adapter: {
@@ -702,6 +780,7 @@ async function runLockedUpdateTransaction(
       skills,
       configPatches,
       ...(ignoreBlock === undefined ? {} : { ignoreBlock }),
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
     // Serialize next once and derive its post-write identity from those
     // exact bytes. A foreign replacement in the write window cannot be
@@ -713,7 +792,29 @@ async function runLockedUpdateTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
     }
     await hooks?.preManifestWrite?.();
-    await journal.replace(manifestEntry, nextManifestBytes);
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
+        readPackageJson: async () => {
+          try {
+            return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        writeManifest: async () => {
+          await journal.replace(manifestEntry, nextManifestBytes);
+        },
+      });
+    } else {
+      await journal.replace(manifestEntry, nextManifestBytes);
+    }
     await hooks?.postManifestWrite?.();
 
     // Advance generation by exactly ONE and bind to the new manifest digest.
@@ -965,9 +1066,20 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the OpenCode config entry", { path: openCodeConfig });
     }
     const updatingPoiesisVersion = await packageVersion();
+    const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
+      root: resolvedRoot,
+      poiesisVersion: updatingPoiesisVersion,
+      mode: packageContributionMode(manifest.packageContribution),
+      ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+    });
+    const packageContributionForProjection: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
     await hooks?.preOpenCodeApply?.();
     const appliedPatches = await applyOpenCodeConfig(resolvedRoot, config, openCodeConfigPath, updatingPoiesisVersion, {
       ...(openCodeConfigCurrentBytes !== null ? { expectedContent: openCodeConfigCurrentBytes } : {}),
+      ...(packageContributionForProjection === undefined
+        ? {}
+        : { packageContribution: packageContributionForProjection }),
       onWritten: (content: string) => {
         openCodeEntry.transactionWrittenIdentity = { exists: true, kind: "file", hash: hashContent(content) };
       },
@@ -986,6 +1098,40 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
           "OpenCode config changed between transaction write and manifest materialization",
           { path: openCodeConfig },
         );
+      }
+    }
+    // Spec #207 / ticket #210 + #214 — bind original package.json identity for
+    // every non-absent retain/advance plan (apply writes; noop ownership only).
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packagePlan.kind === "absent" ? undefined : packagePlan.record;
+    if (packagePlanRetainsContribution(packagePlan)) {
+      const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
+      const packageJsonEntry = await journal.capture(packageJsonPath, "whole-file");
+      assertPackageContributionCaptureIdentity(packagePlan, packageJsonEntry);
+      if (packagePlan.kind === "apply") {
+        const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+        const lockfileEntry = await journal.capture(lockfilePath, "whole-file");
+        const preimageLockfile =
+          lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+        const applied = await applyPackageContributionWithJournal({
+          root: resolvedRoot,
+          plan: packagePlan,
+          packageJsonEntry,
+          lockfileEntry,
+          replaceOwnedFile: (entry, content) => journal.replace(entry, content),
+          executor: resolvePackageManagerExecutor(resolvedRoot),
+          preimageLockfile,
+          poiesisVersion: updatingPoiesisVersion,
+        });
+        nextPackageContribution = applied.record;
+      } else {
+        // Noop: ownership record only — never write package bytes / bind write identity.
+        await assertPackageContributionRuntimeReady({
+          record: packagePlan.record,
+          poiesisVersion: updatingPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        });
       }
     }
     const configPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -1014,8 +1160,9 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
         nextFiles[nextRecord] = { ...nextFiles[nextRecord]!, hash: openCodeEntry.transactionWrittenIdentity.hash };
       }
     }
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const next: Manifest = {
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: await packageVersion(),
       adapter: {
@@ -1028,6 +1175,7 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       skills,
       configPatches,
       ...(ignoreBlock === undefined ? {} : { ignoreBlock }),
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
     const nextManifestBytes = serializeManifest(next);
     const nextManifestHash = hashContent(nextManifestBytes);
@@ -1036,7 +1184,29 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
     }
     await hooks?.preManifestWrite?.();
-    await journal.replace(manifestEntry, nextManifestBytes);
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
+        readPackageJson: async () => {
+          try {
+            return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        writeManifest: async () => {
+          await journal.replace(manifestEntry, nextManifestBytes);
+        },
+      });
+    } else {
+      await journal.replace(manifestEntry, nextManifestBytes);
+    }
     await hooks?.postManifestWrite?.();
 
     // Bootstrap creates the receipt; generation=1, bound to the new

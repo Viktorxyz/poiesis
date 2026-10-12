@@ -14,8 +14,11 @@
  *   - `git status` after a private install shows EXACTLY ONE thing: the
  *     marked `.gitignore` block's file. Nothing else Poiesis owns is
  *     visible to Git.
- *   - `package.json` is byte-identical to what the Author had. Poiesis
- *     installs no project script.
+ *   - When the Author has no package.json, it stays absent (no fabricated
+ *     Node metadata). When a supported single-lock Node package is present,
+ *     Spec #207 / ticket #210 owns only the poiesis script + exact
+ *     poiesis-cli devDependency contribution (covered by pure package-
+ *     invocation tests; this suite still installs without a lockfile).
  *   - Ordinary OpenCode discovery still works: the projections sit at the
  *     normal project-relative paths, so `opencode` finds them with no
  *     launcher and no environment setup.
@@ -89,25 +92,16 @@ function exists(path: string): boolean {
 }
 
 /**
- * The Author-owned `package.json` an ordinary project has, including a
- * script of their own. Poiesis must return it byte-for-byte.
+ * Spec #207 / ticket #210 — private-install fixtures stay package-less so
+ * init retains the exact dlx route and does not require a native lockfile
+ * + package-manager install in this CLI e2e. Owned package contributions
+ * are covered by pure `tests/package-invocation.test.ts` with injected
+ * executors.
  */
-const AUTHOR_PACKAGE_JSON = `{
-  "name": "author-project",
-  "version": "0.1.0",
-  "scripts": {
-    "build": "tsc",
-    "test": "node --test"
-  }
-}
-`;
-
 async function writeAuthorProject(repository: TestRepository): Promise<void> {
-  await writeFile(join(repository.root, "package.json"), AUTHOR_PACKAGE_JSON);
-  // A real project has its own manifest tracked; an untracked one would be
-  // visible to Git for reasons that have nothing to do with Poiesis.
-  await run("git", ["add", "package.json"], { cwd: repository.root });
-  await run("git", ["commit", "--quiet", "-m", "author manifest"], { cwd: repository.root });
+  await writeFile(join(repository.root, "AUTHOR.md"), "author note\n");
+  await run("git", ["add", "AUTHOR.md"], { cwd: repository.root });
+  await run("git", ["commit", "--quiet", "-m", "author note"], { cwd: repository.root });
 }
 
 /** A `--config` file for a private, fixture-adapter installation. */
@@ -172,10 +166,9 @@ describe("Spec #190 / ticket #191 - private installation through the packaged CL
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
-  it("leaves only the marked .gitignore block visible to Git and never touches package.json", async () => {
+  it("leaves only the marked .gitignore block visible to Git and fabricates no package.json", async () => {
     const repo = await repository();
     await writeAuthorProject(repo);
-    const packageJsonBefore = await readFile(join(repo.root, "package.json"));
 
     const configPath = await writeInstallConfig(repo);
     const result = await poiesis(repo.root, "init", "--config", configPath, "--allow-fixtures");
@@ -184,12 +177,9 @@ describe("Spec #190 / ticket #191 - private installation through the packaged CL
     // The single visible surface, and nothing else.
     expect(await gitStatus(repo.root)).toEqual(VISIBLE_AFTER_PRIVATE_INIT);
 
-    // package.json is exactly what the Author wrote.
-    expect(await readFile(join(repo.root, "package.json"))).toEqual(packageJsonBefore);
-    const installed = json(await readFile(join(repo.root, "package.json"), "utf8")) as {
-      scripts?: Record<string, string>;
-    };
-    expect(installed.scripts).not.toHaveProperty("poiesis");
+    // Spec #207 / ticket #210: no package.json means no fabricated Node
+    // metadata and the exact dlx invocation route is retained.
+    expect(exists(join(repo.root, "package.json"))).toBe(false);
 
     // The visible file really is the policy, and it is ONE block.
     const gitignore = await readFile(join(repo.root, ".gitignore"), "utf8");
@@ -383,7 +373,7 @@ describe("Spec #190 / ticket #191 - private installation through the packaged CL
   it("rolls the ignore block back byte-for-byte when a post-write step fails", async () => {
     const repo = await repository();
     await writeAuthorProject(repo);
-    const packageJsonBefore = await readFile(join(repo.root, "package.json"));
+    const authorNoteBefore = await readFile(join(repo.root, "AUTHOR.md"));
 
     // init probes `opencode debug config` once inside the transaction
     // (`validateOpenCodeConfigPayload`) and once more inside the doctor
@@ -407,7 +397,8 @@ describe("Spec #190 / ticket #191 - private installation through the packaged CL
     for (const target of ["preview", "staging", "production"]) {
       expect(await exists(join(repo.root, "scripts", `poiesis-${target}.mjs`))).toBe(false);
     }
-    expect(await readFile(join(repo.root, "package.json"))).toEqual(packageJsonBefore);
+    expect(await readFile(join(repo.root, "AUTHOR.md"))).toEqual(authorNoteBefore);
+    expect(await exists(join(repo.root, "package.json"))).toBe(false);
     expect(await gitStatus(repo.root)).toEqual([]);
 
     // A clean retry succeeds, so the rollback left nothing behind.

@@ -39,7 +39,7 @@ import {
   workspacePrepare,
 } from "../src/git.js";
 import { init, packageVersion, update } from "../src/maintenance.js";
-import { desiredOpenCodePatches } from "../src/opencode.js";
+import { desiredOpenCodePatches, stripWorkerLocalLifecycleDenies } from "../src/opencode.js";
 import { loadManifest, serializeManifest, type Manifest } from "../src/manifest.js";
 import { parseJsonc } from "../src/config.js";
 import { readOwnershipReceipt, replaceOwnershipReceipt } from "../src/receipt.js";
@@ -84,7 +84,8 @@ const PREDECESSOR_VERSION = "1.4.0";
 /**
  * The exact 1.4.0 pre-focused-check predecessor projection, derived
  * independently of the runtime helper under test: the ordinary projection
- * builder's 1.4.0 output with the Worker's single focused-check allow removed.
+ * builder's 1.4.0 output with the Worker's focused-check allow and the two
+ * ticket-#212 local package-script lifecycle denies removed.
  */
 function preFocusedCheck(repository: TestRepository): Array<{ path: string[]; value: unknown }> {
   return desiredOpenCodePatches(testConfig(repository), PREDECESSOR_VERSION).map((patch) => {
@@ -94,7 +95,15 @@ function preFocusedCheck(repository: TestRepository): Array<{ path: string[]; va
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
     }
-    return { path: patch.path, value: { ...installed, permission: { ...installed.permission, bash } } };
+    // Ticket #212 + #215: authentic pre-focused-check Worker bash never
+    // carried local lifecycle denies; strip every current key with the check allow.
+    return {
+      path: patch.path,
+      value: {
+        ...installed,
+        permission: { ...installed.permission, bash: stripWorkerLocalLifecycleDenies(bash) },
+      },
+    };
   });
 }
 

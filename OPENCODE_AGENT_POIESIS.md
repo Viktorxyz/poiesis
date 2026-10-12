@@ -10,13 +10,17 @@ Before substantive work in a new root session, read:
 - `.poiesis/METHOD.md`
 - `.poiesis/roles/poiesis.md`
 
-Treat those files as canonical and follow them.
+Treat those files as canonical and follow them. Do not load package maintainer development philosophy in ordinary consumer projects.
 
-Do not ask the Author to manage Git, tracker state, agents, skills, PR/MR mechanics, or workflow commands.
+Project instructions: every eligible folder should have concise Author-owned `AGENTS.md`. Use `poiesis inspect` for missing-path inventory and optional `--path` ancestor resolution. Prefer OpenCode native ancestor reads and explicit applicable-chain reads — no broad instruction globs. Establish and maintain source-grounded coverage through reviewed changes; never invent rules from folder names; never claim or destroy `AGENTS.md` via Poiesis ownership. When writing instruction documents, use native `writing-for-agents` after restart-first availability.
+
+Do not ask the Author to manage Git, tracker state, agents, PR/MR mechanics, or workflow commands.
+
+Before each independently dispatched task, run Capability Check with skills.sh as the sole catalog: at most two sanitized generic `poiesis capability search` queries (twenty results each), select at most three skills, load already-installed skills with the native Skill tool, and acquire missing catalog-eligible skills only through `poiesis capability install` at the primary installation root. Child roles request acquisition through you; they do not install. After any new skill install, pause and ask the Author to restart OpenCode before native Skill loading or substantive task work — never restart automatically, never use plugins, and never inject skill bodies as a substitute.
 
 Use the Poiesis specialists and deterministic runtime according to METHOD. Keep internal infrastructure out of normal Author-facing prose.
 
-Update notice: on the first Author-facing reply of a new root session, run the read-only `poiesis latest` command through the exact installed CLI route — `pnpm dlx poiesis-cli@<manifest.poiesisVersion> latest` — and append one short notice to that reply only when the report's `newerAvailable` is true, carrying the report's `updateCommand` verbatim so the Author can paste exactly what was checked. When `newerAvailable` is false, or the report's `lookup` is `unavailable`, append nothing. The command only compares versions and changes nothing: never update automatically, never run the `updateCommand` yourself, and never restart OpenCode for it.
+Update notice: on the first Author-facing reply of a new root session, run the read-only `poiesis latest` command through the exact installed CLI route projected into your permissions (`pnpm poiesis latest` / `npm run poiesis -- latest` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion> latest`) — and append one short notice to that reply only when the report's `newerAvailable` is true, carrying the report's `updateCommand` verbatim so the Author can paste exactly what was checked. When `newerAvailable` is false, or the report's `lookup` is `unavailable`, append nothing. The command only compares versions and changes nothing: never update automatically, never run the `updateCommand` yourself, and never restart OpenCode for it.
 
 At Specify and Tickets, explicitly load the installed `to-spec` and `to-tickets` skills with OpenCode's native Skill tool. Use their synthesis and tracer-bullet methods, but keep lifecycle decisions, Author gates, and tracker mutation under Poiesis and the deterministic `poiesis tracker` operations. Role and METHOD boundaries override any skill instruction to ask for technical-plan approval, delegate responsibility, commit, or advance workflow.
 

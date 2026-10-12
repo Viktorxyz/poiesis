@@ -18,13 +18,13 @@
  * any hook field; the security-sensitive fault injection surface is
  * confined to this internal file.
  *
- * Spec #190 / ticket #191 — this transaction no longer touches
- * `package.json` at all. Invoking Poiesis must not require a project
- * manifest mutation, so the `scripts.poiesis` reconcile this file used to
- * perform (and its whole snapshot + written-hash rollback apparatus) is
- * gone. That makes a config no-op a genuine whole-project no-op again:
- * `setModel` reaching an already-current value now returns without any
- * second surface to reconcile, and the journal drives the only writes.
+ * Spec #190 / ticket #191 — this transaction no longer invents a
+ * `scripts.poiesis` reconcile for its own sake. Spec #207 / ticket #210 +
+ * #218 — when a package contribution plan is present, version-cross /
+ * repair `apply` still mutates package.json + lock inside this journal;
+ * a config-byte no-op may early-return only when the plan is absent or a
+ * genuine hashed noop that still passes fresh identity + runtime readiness
+ * before doctor (no package write, no receipt/manifest advancement).
  *
  * Spec #190 / ticket #193 — this transaction is ALSO the explicit
  * `Private <-> Team` transition surface. `mode` is part of the config an
@@ -65,7 +65,7 @@ import {
   ownershipReceiptLocation,
   type OwnershipReceipt,
 } from "./receipt.js";
-import { loadManifest, serializeManifest, type ManagedFile, type Manifest } from "./manifest.js";
+import { loadManifest, serializeManifest, type ManagedFile, type Manifest, type PackageContributionRecord } from "./manifest.js";
 import { POIESIS_GENERATED_AGENT_PATHS } from "./templates.js";
 import {
   desiredOpenCodePatches,
@@ -75,6 +75,22 @@ import {
 } from "./opencode.js";
 import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
+import {
+  applyPackageContributionWithJournal,
+  assertPackageContributionCaptureIdentity,
+  assertPackageContributionRuntimeReady,
+  gateUpdateConfigEarlyNoopPackage,
+  loadPackageFsSnapshot,
+  PACKAGE_JSON_RELATIVE,
+  packagePlanRetainsContribution,
+  planPackageContributionForVersionCross,
+  probeSelfhostDistVersion,
+  readResolvedLocalCliPackageJson,
+  resolvePackageManagerExecutor,
+  writeManifestWithPackageContributionGate,
+  type PackageContributionPlan,
+} from "./package-invocation.js";
+import { run as runProcess } from "./process.js";
 import { poiesisPath } from "./paths.js";
 import type { ConfigPatch } from "./manifest.js";
 import type { ResolvedPoiesisConfig } from "./config.js";
@@ -201,8 +217,10 @@ export interface UpdateTransactionHooks {
    */
   postManifestWrite?: () => void | Promise<void>;
   /**
-   * Called immediately BEFORE `doctor()` in the no-op branch — after
-   * the byte-hash match short-circuit AND before the extracted
+   * Called immediately BEFORE `doctor()` in the config-byte early no-op
+   * branch — after the byte-hash match, after Spec #207 / ticket #218
+   * `gateUpdateConfigEarlyNoopPackage` allows early-return (absent or
+   * validated hashed noop), AND before the extracted
    * `assertUpdateConfigDoctorGate` helper runs. This seam exists for
    * tests that need to deterministically make the no-op doctor
    * unhealthy (e.g. by toggling a `POIESIS_TEST_OPENCODE_FAIL`
@@ -655,7 +673,24 @@ async function runLockedUpdateConfigTransaction(
   //    transaction is installing) so the projected OpenCode config always
   //    matches the package on disk after a successful apply.
   const nextPoiesisVersion = await packageVersion();
-  const desiredOpenCodeProjectionPatches = desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion);
+  // Spec #207 / ticket #210 correction — version-crossing config updates must
+  // repair the owned package contribution (exact dep + script) in the same
+  // transaction. Plan against the primary root BEFORE projection so the
+  // OpenCode route and next manifest share one contribution record. Absent
+  // package.json keeps exact dlx (no fabricated metadata); conflicts fail closed.
+  const packageSnapshot = await loadPackageFsSnapshot(resolvedRoot);
+  const packageCross = planPackageContributionForVersionCross({
+    snapshot: packageSnapshot,
+    nextPoiesisVersion,
+    ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
+  });
+  const packagePlan: PackageContributionPlan = packageCross.plan;
+  const packageContributionForProjection: PackageContributionRecord | undefined =
+    packageCross.contributionForProjection;
+  const desiredOpenCodeProjectionPatches =
+    packageContributionForProjection === undefined
+      ? desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion)
+      : desiredOpenCodePatches(resolvedConfigWithDefaults, nextPoiesisVersion, packageContributionForProjection);
   const { serialized: preflightSerialized, configPatches: projectedOpenCodePatches } = projectOpenCodePayload({
     root: resolvedRoot,
     configPath: openCodeConfigPath,
@@ -740,23 +775,46 @@ async function runLockedUpdateConfigTransaction(
   // existing manifest here would leave the installation stating two different
   // sharing modes at once.
   if (poiesisConfigBytesMatch && openCodeBytesMatch && !transitionRequested) {
-    // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
-    // so tests can deterministically fail the gate (e.g. by toggling a
-    // doctor-failure environment variable) and prove the extracted
-    // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
-    // owned byte. Production callers leave the seam unset, so it is a
-    // no-op and doctor runs exactly as before. Note: in this branch, the
-    // `opencode-schema` check happens through `doctor()` → which calls the
-    // same `validateOpenCodeConfig` (debug config), so the no-op path and
-    // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
-    // on schema rejection.
-    await hooks?.preNoopDoctor?.();
-    // Spec #190 / ticket #191: this is now a genuine whole-project no-op.
-    // `package.json` is no longer an artifact Poiesis mutates at all, so a
-    // config no-op has nothing left to reconcile.
-    const report = await doctor(resolvedRoot);
-    assertUpdateConfigDoctorGate(report, manifest);
-    return { manifest, doctor: report };
+    // Spec #207 / ticket #218 — package plan is already computed. Config-byte
+    // equality may early-return only when the plan is absent or a genuine
+    // hashed noop that still passes fresh package.json identity + runtime
+    // readiness. Apply (repair / version-cross / lock) never early-returns;
+    // fall through so the full transaction still reconciles package state.
+    // Failures throw before doctor, package write, or receipt/manifest advance.
+    const earlyPackageGate = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan,
+      readPackageJson: async () => {
+        try {
+          return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+        } catch {
+          return null;
+        }
+      },
+      assertRuntimeReady: (record) =>
+        assertPackageContributionRuntimeReady({
+          record,
+          poiesisVersion: nextPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        }),
+    });
+    if (earlyPackageGate.decision === "allow-early-return") {
+      // No-op doctor gate. The `preNoopDoctor` seam fires BEFORE `doctor()`
+      // so tests can deterministically fail the gate (e.g. by toggling a
+      // doctor-failure environment variable) and prove the extracted
+      // helper throws `UPDATE_DOCTOR_FAILED` without ever mutating any
+      // owned byte. Production callers leave the seam unset, so it is a
+      // no-op and doctor runs exactly as before. Note: in this branch, the
+      // `opencode-schema` check happens through `doctor()` → which calls the
+      // same `validateOpenCodeConfig` (debug config), so the no-op path and
+      // the non-no-op path converge on the same `UPDATE_DOCTOR_FAILED` code
+      // on schema rejection. Doctor runs only after the package gates above.
+      await hooks?.preNoopDoctor?.();
+      const report = await doctor(resolvedRoot);
+      assertUpdateConfigDoctorGate(report, manifest);
+      return { manifest, doctor: report };
+    }
+    // earlyPackageGate.decision === "continue-transaction" (apply): fall through.
   }
 
   // 8. Validate the projected (post-write) OpenCode config payload against the
@@ -801,13 +859,12 @@ async function runLockedUpdateConfigTransaction(
   const poiesisConfigPath = join(resolvedRoot, POIESIS_CONFIG_RELATIVE_PATH);
   const manifestPath = poiesisPath(resolvedRoot, "manifest.json");
   const receiptPath = await ownershipReceiptLocation(resolvedRoot);
-  // Spec #190 / ticket #193 — the limit covers the transition surface too:
+  // Spec #190 / ticket #193 + Spec #207 / ticket #210 — the limit covers the
+  // transition surface and the package.json + lockfile contribution write set:
   // poiesis config, OpenCode config, `.gitignore`, up to two shared profile
-  // files, the manifest, and the receipt. Captured in EXACT write order, so
-  // the journal's reverse-order rollback is reverse write order and the
-  // shared profile files a failed transition created are removed rather than
-  // left behind next to a manifest that never advanced.
-  const journal = new ArtifactJournal(8);
+  // files, package.json, lockfile, the manifest, and the receipt. Captured in
+  // EXACT write order so reverse-order rollback matches reverse write order.
+  const journal = new ArtifactJournal(12);
   const poiesisConfigArtifact = await journal.capture(poiesisConfigPath, "whole-file");
   const openCodeArtifact = await journal.capture(
     openCodeConfigPath,
@@ -819,6 +876,22 @@ async function runLockedUpdateConfigTransaction(
   const profileArtifacts: Array<{ path: string; entry: ArtifactJournalEntry }> = [];
   for (const file of transition?.createProfileFiles ?? []) {
     profileArtifacts.push({ path: file.path, entry: await journal.capture(join(resolvedRoot, file.path), "whole-file") });
+  }
+  // Package contribution: capture package.json for every retain/advance plan
+  // (apply + noop). Lockfile only when apply will write. Single capture — no
+  // duplicate. Bind original plan hash before any owned write so Author drift
+  // cannot advance a stale ownership record.
+  let packageJsonArtifact: ArtifactJournalEntry | undefined;
+  let lockfileArtifact: ArtifactJournalEntry | undefined;
+  let packagePreimageLockfile = "";
+  if (packagePlanRetainsContribution(packagePlan)) {
+    packageJsonArtifact = await journal.capture(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "whole-file");
+    assertPackageContributionCaptureIdentity(packagePlan, packageJsonArtifact);
+    if (packagePlan.kind === "apply") {
+      lockfileArtifact = await journal.capture(join(resolvedRoot, packagePlan.record.lockfile), "whole-file");
+      packagePreimageLockfile =
+        lockfileArtifact.preimage === undefined ? "" : lockfileArtifact.preimage.toString("utf8");
+    }
   }
   const manifestArtifact = await journal.capture(manifestPath, "whole-file");
   const receiptArtifact = await journal.capture(receiptPath, "whole-file");
@@ -911,6 +984,54 @@ async function runLockedUpdateConfigTransaction(
       await hooks?.postModeTransitionApply?.();
     }
 
+    // 11c. Spec #207 / ticket #210 + #214 — apply or bind noop ownership.
+    // Apply writes package+lock through journal. Noop re-asserts capture
+    // identity (no package write, no transactionWrittenIdentity) before
+    // runtime readiness and before manifest/receipt success.
+    let nextPackageContribution: PackageContributionRecord | undefined =
+      packageContributionForProjection;
+    if (packagePlanRetainsContribution(packagePlan)) {
+      if (packageJsonArtifact === undefined) {
+        throw new PoiesisError(
+          "ARTIFACT_JOURNAL_MISSING",
+          "Journal does not contain the package.json contribution entry",
+          { path: PACKAGE_JSON_RELATIVE },
+        );
+      }
+      if (packagePlan.kind === "apply") {
+        if (lockfileArtifact === undefined) {
+          throw new PoiesisError(
+            "ARTIFACT_JOURNAL_MISSING",
+            "Journal does not contain the package contribution entries",
+            { path: PACKAGE_JSON_RELATIVE },
+          );
+        }
+        // Apply re-checks capture identity inside applyPackageContributionWithJournal;
+        // journal.replace guards the post-capture write window.
+        const applied = await applyPackageContributionWithJournal({
+          root: resolvedRoot,
+          plan: packagePlan,
+          packageJsonEntry: packageJsonArtifact,
+          lockfileEntry: lockfileArtifact,
+          replaceOwnedFile: (entry, content) => journal.replace(entry, content),
+          executor: resolvePackageManagerExecutor(resolvedRoot),
+          preimageLockfile: packagePreimageLockfile,
+          poiesisVersion: nextPoiesisVersion,
+        });
+        nextPackageContribution = applied.record;
+      } else {
+        // Noop: ownership record only — never write package bytes / bind write
+        // identity. Final package.json identity bind is the publication-boundary
+        // helper immediately before the ownership-bearing manifest write.
+        await assertPackageContributionRuntimeReady({
+          record: packagePlan.record,
+          poiesisVersion: nextPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        });
+      }
+    }
+
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
     //     values are preserved across updates.
     const mergedPatches = nextAdapterPatches(manifest, appliedPatches);
@@ -919,11 +1040,12 @@ async function runLockedUpdateConfigTransaction(
     //     config hash is taken from the on-disk write; every other file keeps its prior hash. Use the
     //     same `nextPoiesisVersion` captured at step 6 so the manifest's recorded version exactly
     //     matches the version baked into the OpenCode config bash projection.
+    const { packageContribution: _priorPackageContribution, ...manifestWithoutPackage } = manifest;
     const nextManifest: Manifest = {
       // Spec #190 / ticket #191: an update reconciles the installation; it
       // never re-decides its sharing mode. `mode` and the exact
       // `.gitignore` block ownership ride through unchanged.
-      ...manifest,
+      ...manifestWithoutPackage,
       schema: 1,
       poiesisVersion: nextPoiesisVersion,
       adapter: {
@@ -961,15 +1083,40 @@ async function runLockedUpdateConfigTransaction(
       // is computed over. `ignoreBlock.hash` is the hash of the block this run
       // actually wrote, so `uninstall` reverses exactly these bytes.
       ...(transition === undefined ? {} : { mode: transition.to, ignoreBlock: transition.record }),
+      // Spec #207 / ticket #210 — contribution matches nextPoiesisVersion (or
+      // is omitted when the project has no package.json).
+      ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
-    await hooks?.preManifestWrite?.();
     // Serialize nextManifest exactly once; derive the post-write identity
     // from those exact bytes BEFORE write, and write those same bytes. A
     // foreign replacement in the write window cannot be adopted as our
     // identity, and the post-write `hashFile` re-read is removed.
     const nextManifestBytes = serializeManifest(nextManifest);
     const nextManifestHash = hashContent(nextManifestBytes);
-    await journal.replace(manifestArtifact, nextManifestBytes);
+    await hooks?.preManifestWrite?.();
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
+        readPackageJson: async () => {
+          try {
+            return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        writeManifest: async () => {
+          await journal.replace(manifestArtifact, nextManifestBytes);
+        },
+      });
+    } else {
+      await journal.replace(manifestArtifact, nextManifestBytes);
+    }
     await hooks?.postManifestWrite?.();
 
     // 14. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.

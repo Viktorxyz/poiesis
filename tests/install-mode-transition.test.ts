@@ -107,6 +107,7 @@ function exists(path: string): boolean {
  * enters the ignore policy.
  */
 const DEFAULT_SKILL_NAMES = [
+  // Keep in sync with POIESIS_SKILLS.json defaults (Spec #207 / ticket #208).
   "grilling",
   "grill-with-docs",
   "domain-modeling",
@@ -118,6 +119,8 @@ const DEFAULT_SKILL_NAMES = [
   "diagnosing-bugs",
   "test-driven-development",
   "verification-before-completion",
+  "writing-for-agents",
+  "find-skills",
 ];
 
 async function writeAuthorSkills(root: string): Promise<Map<string, Buffer>> {

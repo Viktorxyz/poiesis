@@ -6,7 +6,7 @@ import { applyEdits, modify } from "jsonc-parser";
 import { atomicCreate, atomicWrite, exists, readUtf8 } from "./fs.js";
 import { parseJsonc, type PoiesisConfig } from "./config.js";
 import { PoiesisError } from "./errors.js";
-import type { ConfigPatch } from "./manifest.js";
+import type { ConfigPatch, PackageContributionRecord } from "./manifest.js";
 import { assertNoDuplicateProperties as assertNoDuplicatePropertiesShared } from "./opencode-config-validator.js";
 import { projectOpenCodePayload } from "./opencode-preflight.js";
 import { run } from "./process.js";
@@ -218,48 +218,105 @@ export async function assertOpenCodeAdapterContract(
 }
 
 /**
- * Spec #104 / tickets #105 / #110 / #173 / #174 — the ONE derivation of the
- * exact-version canonical Poiesis route.
+ * Spec #207 / ticket #212 + #215 — Worker local package-script lifecycle deny
+ * keys. Supported local spellings (`pnpm poiesis`, `pnpm run poiesis`,
+ * `npm run poiesis`, `npm run-script poiesis`) are denied bare and as
+ * `'<spelling> *'` (covering `--` forwarding). `npm run poiesis -- *` is
+ * retained as the compatibility / canonical-npm broad deny. Authentic
+ * historical predecessor images never carried these keys; migration helpers
+ * strip every entry via {@link stripWorkerLocalLifecycleDenies}.
  *
- * Every launcher allow key this module projects — the primary's canonical
- * lifecycle route, the Repository Intelligence subcommand routes, and the
- * Worker's focused-check route — is built from this single function. A second
- * literal `pnpm dlx poiesis-cli@${version}` template anywhere in the module
- * would be a place where the projected launcher could drift away from the
- * routes the rest of the module asserts, and the compatible migration in
- * `src/authority.ts` deletes keys derived from it.
- *
- * `poiesisVersion` is always the manifest's recorded `poiesisVersion` (or the
- * runtime version a transaction is installing), never a range, a dist-tag, or
- * an unversioned launcher. Every projected key stays inside this route, so
- * the ordered `…@*` deny remains the only thing that could ever admit an
- * off-version launcher, and the exact-version allows that follow it stay the
- * sole reachable route.
+ * Ordering in the Worker bash map is broad `*` allow, then launcher denies
+ * including this complete set, then narrow check/repository allows on the
+ * canonical generated route only.
  */
-function primaryExactRoute(poiesisVersion: string): string {
-  return `pnpm dlx poiesis-cli@${poiesisVersion}`;
+export const WORKER_LOCAL_LIFECYCLE_DENY_KEYS = [
+  "pnpm poiesis",
+  "pnpm run poiesis",
+  "npm run poiesis",
+  "npm run-script poiesis",
+  "pnpm poiesis *",
+  "pnpm run poiesis *",
+  "npm run poiesis *",
+  "npm run-script poiesis *",
+  "npm run poiesis -- *",
+] as const;
+
+/** Strip every current Worker local lifecycle deny key from a bash map. */
+export function stripWorkerLocalLifecycleDenies(bash: Record<string, string>): Record<string, string> {
+  const next = { ...bash };
+  for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+    delete next[key];
+  }
+  return next;
+}
+
+function workerLocalLifecycleDenies(): Record<string, string> {
+  const denies: Record<string, string> = {};
+  for (const key of WORKER_LOCAL_LIFECYCLE_DENY_KEYS) {
+    denies[key] = "deny";
+  }
+  return denies;
 }
 
 /**
- * Spec #104 / tickets #105 / #110: the runtime identity boundary for the
- * primary (Poiesis) agent. The generated normal installed lifecycle
- * route is exactly `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`. The
- * bare `poiesis`, `pnpm exec poiesis`, and `npx poiesis` canonical routes
- * are removed and explicitly denied, and the unversioned
- * `pnpm dlx poiesis-cli *` launcher is also denied so only the
- * exact-version route survives. The keys are emitted in the documented
- * order so OpenCode's last-match-wins resolver picks the exact-version
- * allow entry last for any matching command.
+ * Spec #104 / tickets #105 / #110 / #173 / #174, extended by Spec #207 /
+ * ticket #210 — the ONE derivation of the canonical Poiesis invocation
+ * prefix.
  *
- * The `*` allow first provides broad ordinary shell; the ordered denies
- * cover every known ambiguous launcher including version-qualified
- * alternate routes (`pnpm dlx poiesis-cli@latest`,
- * `pnpm dlx poiesis-cli@1.0.0`, etc.) so the broad `*` allow does not
- * let off-version dlx invocations slip through; the exact-version allow
- * last is the sole canonical CLI route. `@latest` remains reserved for
- * human/operator intentional init/update outside this projection.
+ * Every launcher allow key this module projects — the primary's canonical
+ * lifecycle route, the Repository Intelligence subcommand routes, and the
+ * Worker's focused-check route — is built from this single function.
+ *
+ * Default (no package contribution): exact-version
+ * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`.
+ *
+ * With an owned package contribution (ticket #210): the installed local
+ * package script route — `pnpm poiesis` or `npm run poiesis --` — so agents
+ * use the exact installed runtime rather than a floating dlx resolution.
+ * Projects without `package.json` retain the dlx route and never invent
+ * package metadata.
+ *
+ * `poiesisVersion` is always the manifest's recorded `poiesisVersion` (or the
+ * runtime version a transaction is installing), never a range, a dist-tag, or
+ * an unversioned launcher. Guard denials for bare / exec / npx / unversioned
+ * and off-version dlx stay in place for every route.
  */
-function primaryBashPermissions(poiesisVersion: string): Record<string, string> {
+export function canonicalInvocationPrefix(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): string {
+  if (packageContribution === undefined) {
+    return `pnpm dlx poiesis-cli@${poiesisVersion}`;
+  }
+  if (packageContribution.manager === "pnpm") return "pnpm poiesis";
+  return "npm run poiesis --";
+}
+
+/** @deprecated internal alias — prefer {@link canonicalInvocationPrefix}. */
+function primaryExactRoute(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): string {
+  return canonicalInvocationPrefix(poiesisVersion, packageContribution);
+}
+
+/**
+ * Spec #104 / tickets #105 / #110 + Spec #207 / ticket #210: the runtime
+ * identity boundary for the primary (Poiesis) agent.
+ *
+ * Without a package contribution the generated lifecycle route is exactly
+ * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`. With an owned local
+ * package contribution it is `pnpm poiesis *` or `npm run poiesis -- *`.
+ * Bare `poiesis`, `pnpm exec poiesis`, `npx poiesis`, and every unversioned /
+ * off-version `pnpm dlx poiesis-cli…` launcher stay denied so only the
+ * supported route survives. Keys are emitted in documented order for
+ * OpenCode's last-match-wins resolver.
+ */
+function primaryBashPermissions(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): Record<string, string> {
   return {
     "*": "allow",
     "poiesis *": "deny",
@@ -267,7 +324,7 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
     "npx poiesis *": "deny",
     "pnpm dlx poiesis-cli *": "deny",
     "pnpm dlx poiesis-cli@*": "deny",
-    [`${primaryExactRoute(poiesisVersion)} *`]: "allow",
+    [`${primaryExactRoute(poiesisVersion, packageContribution)} *`]: "allow",
   };
 }
 
@@ -296,8 +353,11 @@ function primaryBashPermissions(poiesisVersion: string): Record<string, string> 
  * alternate routes (`pnpm dlx poiesis-cli@latest`) are intentionally
  * absent: only the exact `<manifest.poiesisVersion>` route survives.
  */
-function repositoryIntelligenceBashPermissions(poiesisVersion: string): Record<string, string> {
-  const exact = primaryExactRoute(poiesisVersion);
+function repositoryIntelligenceBashPermissions(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): Record<string, string> {
+  const exact = primaryExactRoute(poiesisVersion, packageContribution);
   return {
     "*": "deny",
     [`${exact} repository status`]: "allow",
@@ -322,8 +382,11 @@ function repositoryIntelligenceBashPermissions(poiesisVersion: string): Record<s
  * non-manifest version) still sees a `deny` because the broad deny
  * precedes the exact-version allow keys.
  */
-function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<string, string> {
-  const exact = primaryExactRoute(poiesisVersion);
+function workerRepositoryIntelligenceAllows(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): Record<string, string> {
+  const exact = primaryExactRoute(poiesisVersion, packageContribution);
   return {
     [`${exact} repository status`]: "allow",
     [`${exact} repository query *`]: "allow",
@@ -364,33 +427,81 @@ function workerRepositoryIntelligenceAllows(poiesisVersion: string): Record<stri
  * Reviewer keep the read-only Repository Intelligence surface, and Research
  * keeps no bash surface at all.
  */
-function workerFocusedCheckAllows(poiesisVersion: string): Record<string, string> {
-  return { [workerFocusedCheckAllowKey(poiesisVersion)]: "allow" };
+function workerFocusedCheckAllows(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): Record<string, string> {
+  return { [workerFocusedCheckAllowKey(poiesisVersion, packageContribution)]: "allow" };
 }
 
 /**
- * Spec #168 / ticket #174 — the ONE derivation of the narrow focused-check
- * allow key.
+ * Spec #168 / ticket #174 + Spec #207 / ticket #210 — the ONE derivation of
+ * the narrow focused-check allow key.
  *
  * The current Worker projection and the pre-focused-check predecessor
  * projection in `src/authority.ts` both build this key here, so the
  * compatible migration can only ever delete a key the current projection
- * still emits. Two literal copies of the string would let the migration
- * silently stop matching the next time the allow moved, which is exactly the
- * kind of drift that makes a predecessor projection admit a manifest it must
- * not.
+ * still emits.
  *
- * The key stays inside the exact-version canonical route
- * `pnpm dlx poiesis-cli@<manifest.poiesisVersion>`; no `@latest`,
- * unversioned, or broad `…@<version> *` launcher is reachable through it.
+ * Without a package contribution the key stays inside
+ * `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check *`. With an owned
+ * local contribution it is `pnpm poiesis check *` or
+ * `npm run poiesis -- check *`. No `@latest`, unversioned, or broad
+ * lifecycle launcher is reachable through it.
  */
-export function workerFocusedCheckAllowKey(poiesisVersion: string): string {
-  return `${primaryExactRoute(poiesisVersion)} check *`;
+export function workerFocusedCheckAllowKey(
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): string {
+  return `${primaryExactRoute(poiesisVersion, packageContribution)} check *`;
 }
 
-function permissions(config: PoiesisConfig, poiesisVersion: string): Record<string, JsonObject> {
+/**
+ * Spec #207 / ticket #208 — native Skill permission for local discovered
+ * skills. A single wildcard under `skill` admits every project-local skill
+ * OpenCode discovers under `.agents/skills/` without enumerating fixed
+ * names. Bash, task, and every other permission surface stay unchanged: this
+ * does not grant lifecycle authority, capability install, or broader shell.
+ */
+export function nativeSkillPermissions(): Record<string, string> {
+  return { "*": "allow" };
+}
+
+/**
+ * Spec #207 / ticket #208 — the authentic published `1.6.0` static skill
+ * allow maps. Ticket #208 replaced those fixed maps with
+ * {@link nativeSkillPermissions} while `package.json` still records
+ * `1.6.0`, so a project installed by the earlier image carries these
+ * exact maps under `poiesisVersion = "1.6.0"`. The predecessor projection
+ * in `src/authority.ts` restores them byte-for-byte for receipt-gated
+ * migration and never widens bash/task.
+ */
+export const OPENCODE_V160_STATIC_SKILL_PERMISSIONS: Readonly<
+  Record<string, Readonly<Record<string, string>>>
+> = {
+  poiesis: {
+    grilling: "allow",
+    "grill-with-docs": "allow",
+    "domain-modeling": "allow",
+    "to-spec": "allow",
+    "to-tickets": "allow",
+    "verification-before-completion": "allow",
+  },
+  "poiesis-planner": { "codebase-design": "allow" },
+  "poiesis-worker": { "test-driven-development": "allow", "diagnosing-bugs": "allow" },
+  "poiesis-research": { research: "allow" },
+  "poiesis-reviewer": { "code-review": "allow" },
+  "poiesis-final-reviewer": { "code-review": "allow" },
+};
+
+function permissions(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): Record<string, JsonObject> {
   const reasoning = config.models.reasoning;
   const execution = config.models.execution;
+  const skill = nativeSkillPermissions();
   return {
     explore: { model: execution },
     poiesis: {
@@ -404,14 +515,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         list: "allow",
         question: "allow",
         todowrite: "allow",
-        skill: {
-          grilling: "allow",
-          "grill-with-docs": "allow",
-          "domain-modeling": "allow",
-          "to-spec": "allow",
-          "to-tickets": "allow",
-          "verification-before-completion": "allow",
-        },
+        skill,
         task: {
           explore: "allow",
           "poiesis-planner": "allow",
@@ -420,7 +524,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           "poiesis-reviewer": "allow",
           "poiesis-final-reviewer": "allow",
         },
-        bash: primaryBashPermissions(poiesisVersion),
+        bash: primaryBashPermissions(poiesisVersion, packageContribution),
       },
     },
     "poiesis-planner": {
@@ -433,7 +537,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "codebase-design": "allow" },
+        skill,
         task: { explore: "allow", "poiesis-research": "allow" },
         // Spec #120 / ticket #123 — Planner reaches Repository
         // Intelligence through the deterministic Poiesis CLI only.
@@ -442,7 +546,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         // on Explore/read/grep for any non-Repository-Intelligence
         // fact and may not bypass the canonical role's bash
         // boundaries.
-        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion, packageContribution),
       },
     },
     "poiesis-worker": {
@@ -456,7 +560,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         grep: "allow",
         list: "allow",
         edit: "allow",
-        skill: { "test-driven-development": "allow", "diagnosing-bugs": "allow" },
+        skill,
         task: { explore: "allow" },
         bash: {
           "*": "allow",
@@ -479,21 +583,29 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
           // preserved so the exact-version deny still precedes every allow.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
+          // Spec #207 / ticket #212 + #215: deny every supported local
+          // package-script spelling (bare + remainder, incl -- forwarding
+          // and npm compatibility `npm run poiesis -- *`) BEFORE the narrow
+          // check/repository allows. Without these, Worker's `*` allow
+          // admits full lifecycle through alias routes (`pnpm run poiesis`,
+          // `npm run poiesis`, `npm run-script poiesis`, …). Primary alone
+          // keeps the owned canonical local lifecycle allow; noncanonical
+          // aliases never receive narrow allows.
+          ...workerLocalLifecycleDenies(),
           // Spec #120 / ticket #123: append the four Repository
-          // Intelligence subcommand allows AFTER the `pnpm dlx
-          // poiesis-cli@*` deny so OpenCode's last-match-wins
-          // resolver grants only the exact-version repository
-          // operations and leaves every other Poiesis lifecycle
-          // invocation denied.
-          ...workerRepositoryIntelligenceAllows(poiesisVersion),
+          // Intelligence subcommand allows AFTER the launcher denies so
+          // OpenCode's last-match-wins resolver grants only the
+          // exact-version repository operations and leaves every other
+          // Poiesis lifecycle invocation denied.
+          ...workerRepositoryIntelligenceAllows(poiesisVersion, packageContribution),
           // Spec #168 / ticket #173: and then the one narrow focused-check
-          // allow, also AFTER the `pnpm dlx poiesis-cli@*` deny, so the
-          // Worker reaches real focused-check evidence without gaining any
-          // lifecycle authority. The Worker keeps broad project bash, so this
-          // is not a new capability for it; the bounded difference is that the
+          // allow, also AFTER the launcher denies, so the Worker reaches
+          // real focused-check evidence without gaining any lifecycle
+          // authority. The Worker keeps broad project bash, so this is not
+          // a new capability for it; the bounded difference is that the
           // evidence becomes a deterministic fingerprint rather than
           // unstructured terminal text.
-          ...workerFocusedCheckAllows(poiesisVersion),
+          ...workerFocusedCheckAllows(poiesisVersion, packageContribution),
         },
       },
     },
@@ -506,7 +618,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         read: "allow",
         webfetch: "allow",
         websearch: "allow",
-        skill: { research: "allow" },
+        skill,
         // Spec #120 / ticket #123 — Research owns external facts, not
         // repository structure. NO Repository Intelligence bash
         // permission is granted here so a Research subagent cannot
@@ -524,11 +636,11 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "code-review": "allow" },
+        skill,
         // Spec #120 / ticket #123 — Ticket Reviewer reaches Repository
         // Intelligence through the deterministic Poiesis CLI only;
         // no arbitrary bash is granted.
-        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion, packageContribution),
       },
     },
     "poiesis-final-reviewer": {
@@ -541,7 +653,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         glob: "allow",
         grep: "allow",
         list: "allow",
-        skill: { "code-review": "allow" },
+        skill,
         task: { explore: "allow" },
         // Spec #120 / ticket #123 — Final Reviewer reaches Repository
         // Intelligence through the deterministic Poiesis CLI only;
@@ -549,7 +661,7 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
         // workspace. The repository wrapper must run with the
         // dispatched candidate workspace as `cwd`; it may not inspect
         // a parent or another checkout.
-        bash: repositoryIntelligenceBashPermissions(poiesisVersion),
+        bash: repositoryIntelligenceBashPermissions(poiesisVersion, packageContribution),
       },
     },
   };
@@ -558,8 +670,9 @@ function permissions(config: PoiesisConfig, poiesisVersion: string): Record<stri
 export function desiredOpenCodePatches(
   config: PoiesisConfig,
   poiesisVersion: string,
+  packageContribution?: PackageContributionRecord | undefined,
 ): Array<{ path: string[]; value: unknown }> {
-  const agents = permissions(config, poiesisVersion);
+  const agents = permissions(config, poiesisVersion, packageContribution);
   return [
     { path: ["default_agent"], value: "poiesis" },
     { path: ["subagent_depth"], value: 2 },
@@ -625,11 +738,16 @@ function assertNoDuplicateProperties(content: string, configPath: string): void 
   assertNoDuplicatePropertiesShared(content, configPath);
 }
 
-function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisConfig, poiesisVersion: string): void {
+function assertDesiredOpenCodePathsAvailable(
+  original: unknown,
+  config: PoiesisConfig,
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): void {
   if (typeof original !== "object" || original === null || Array.isArray(original)) {
     throw new PoiesisError("INSTALL_PATH_CONFLICT", "OpenCode config root must be an object");
   }
-  for (const desired of desiredOpenCodePatches(config, poiesisVersion)) {
+  for (const desired of desiredOpenCodePatches(config, poiesisVersion, packageContribution)) {
     let current: unknown = original;
     for (const [index, part] of desired.path.entries()) {
       if (typeof current !== "object" || current === null || Array.isArray(current)) {
@@ -648,9 +766,20 @@ function assertDesiredOpenCodePathsAvailable(original: unknown, config: PoiesisC
   }
 }
 
-function assertOpenCodeContentAvailable(content: string, configPath: string, config: PoiesisConfig, poiesisVersion: string): void {
+function assertOpenCodeContentAvailable(
+  content: string,
+  configPath: string,
+  config: PoiesisConfig,
+  poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
+): void {
   assertNoDuplicateProperties(content, configPath);
-  assertDesiredOpenCodePathsAvailable(parseJsonc<unknown>(content, configPath), config, poiesisVersion);
+  assertDesiredOpenCodePathsAvailable(
+    parseJsonc<unknown>(content, configPath),
+    config,
+    poiesisVersion,
+    packageContribution,
+  );
 }
 
 async function readOpenCodeContent(configPath: string): Promise<string> {
@@ -669,6 +798,7 @@ export async function assertOpenCodeConfigAvailable(
   configPath: string,
   config: PoiesisConfig,
   poiesisVersion: string,
+  packageContribution?: PackageContributionRecord,
 ): Promise<boolean> {
   if (await pathEntryExists(configPath)) {
     const details = await lstat(configPath);
@@ -677,7 +807,13 @@ export async function assertOpenCodeConfigAvailable(
         path: relative(root, configPath),
       });
     }
-    assertOpenCodeContentAvailable(await readOpenCodeContent(configPath), configPath, config, poiesisVersion);
+    assertOpenCodeContentAvailable(
+      await readOpenCodeContent(configPath),
+      configPath,
+      config,
+      poiesisVersion,
+      packageContribution,
+    );
     return true;
   }
   return false;
@@ -689,9 +825,11 @@ export async function applyOpenCodeConfig(
   managedConfigPath: string | undefined,
   poiesisVersion: string,
   options: {
-    requireAvailable?: boolean;
-    expectedContent?: Buffer | null;
-    onWritten?: (content: string) => void;
+    requireAvailable?: boolean | undefined;
+    expectedContent?: Buffer | null | undefined;
+    onWritten?: ((content: string) => void) | undefined;
+    /** Spec #207 / ticket #210 — owned local package invocation contribution. */
+    packageContribution?: PackageContributionRecord | undefined;
   } = {},
 ): Promise<ConfigPatch[]> {
   const configPath = managedConfigPath ?? (await detectOpenCodeConfig(root));
@@ -715,7 +853,15 @@ export async function applyOpenCodeConfig(
       path: relative(root, configPath),
     });
   }
-  if (options.requireAvailable) assertOpenCodeContentAvailable(content, configPath, config, poiesisVersion);
+  if (options.requireAvailable) {
+    assertOpenCodeContentAvailable(
+      content,
+      configPath,
+      config,
+      poiesisVersion,
+      options.packageContribution,
+    );
+  }
   // The pure projection loop (parse original → for each desired patch compute
   // provenance + apply jsonc edits → emit serialized payload) is delegated to
   // `projectOpenCodePayload` so the transaction-time preflight in
@@ -726,7 +872,7 @@ export async function applyOpenCodeConfig(
     root,
     configPath,
     currentContent: content,
-    patches: desiredOpenCodePatches(config, poiesisVersion),
+    patches: desiredOpenCodePatches(config, poiesisVersion, options.packageContribution),
   });
   // Strengthened apply: re-read the on-disk bytes immediately before the
   // atomicWrite and compare against `options.expectedContent`. This is a TOCTOU

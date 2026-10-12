@@ -79,18 +79,39 @@ A `github` or `gitlab` coordinate may be inferred from a recognized `github.com`
 
 ### Capability Check
 
+Before each independently dispatched task (planning, research, implementation, review — not each tool call), prepare skills through the skills.sh catalog.
+
+skills.sh is the sole discovery catalog. Use the deterministic `poiesis capability search --query <topic>` surface (sanitized generic topics only; at most two searches, twenty results each, three selected skills). Do not improvise raw catalog HTTP calls, leak private repository paths/names/credentials into queries, or treat network failure as "none relevant" — catalog-unavailable is distinct from none-relevant.
+
+Primary owns selection and acquisition. Child roles may recommend a capability; they do not install. Prefer an already-installed local skill loaded with OpenCode's native Skill tool. When a missing catalog-eligible skill is selected, install it project-locally with `poiesis capability install --source <owner/repo> --name <skill> --revision <40-hex>` (exact revision, primary installation root, catalog or bundled-default provenance only — never arbitrary GitHub acceptance, never global `-g` install, never overwrite an Author preexisting skill).
+
+If a new skill was just installed, pause before substantive task work and request an Author-controlled OpenCode restart so native Skill loading can see it. Never restart OpenCode automatically, never use plugins, never inject or read a skill body as a substitute for native loading, and never claim loading succeeded without the restart. Resume through existing tracker/task context after the Author restarts.
+
 Always ask whether current capability is sufficient for the specialized work.
 
 If sufficient, continue.
 
 If insufficient:
-- research current high-trust sources;
+- run the bounded skills.sh discovery above;
 - select a maintained relevant capability when useful;
 - otherwise use current official documentation/research;
 - install the selected capability deterministically when required;
+- pause for Author restart when installation changed local skills;
 - then continue.
 
 Do not rely on stale model knowledge when current specialized knowledge materially matters.
+
+### Project instructions (`AGENTS.md`)
+
+Every eligible project folder, including the repository root, should have a concise `AGENTS.md` so confirmed local conventions survive sessions.
+
+Eligible means ordinary project source folders. Deterministic inventory skips Git internals, dependency and vendor trees, generated/build/cache directories, `.poiesis`, the installed skills subtree (`.agents/skills`), and nested separate repositories. It does not blanket-exclude hidden Author containers such as `.agents` or `.opencode` (Author overrides and custom source there remain eligible). It does not blanket-exclude hidden source directories. It does not follow external symlinks.
+
+Use `poiesis inspect` (and optional `--path` for a work target) for deterministic inventory of missing paths and path-scoped ancestor resolution. OpenCode native read already appends ancestor `AGENTS.md` files; when extra clarity is needed, read only the applicable chain for the work path. Do not glob every instruction document into the prompt.
+
+`AGENTS.md` files are **Author-owned project source**. Poiesis install, update, and uninstall never claim, invent, bulk-generate, or destroy them. Primary and Workers establish and maintain coverage through ordinary reviewed changes, grounded in current source and Author decisions — never mechanically invented from folder names. When writing or revising instruction documents, load the installed `writing-for-agents` skill through OpenCode's native Skill tool after it is available (restart-first when newly installed; never inject the skill body as a substitute).
+
+Product philosophy for Authors is `.poiesis/PHILOSOPHY.md`. Maintainer development philosophy (`POIESIS_DEVELOPMENT_PHILOSOPHY.md` in the package) is loaded only when developing Poiesis itself, not in ordinary unrelated consumer projects.
 
 ## 5. Plan
 
@@ -174,7 +195,7 @@ Realize owns no new machinery: no new mode, no new stage, no new counter, no new
 
 Realize proves each ticket with its relevant focused checks, not with the configured full verification plan. That plan is reserved for one Proof run against the exact candidate, inside Prove.
 
-Worker runs focused checks through the one non-authoritative route it owns: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
+Worker runs focused checks through the one non-authoritative route it owns — the exact installed CLI route projected into its permissions (`pnpm poiesis check …` / `npm run poiesis -- check …` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`). A focused check returns bounded per-command evidence and a deterministic action fingerprint over the command, the workspace state fingerprint, and the failure classification. It produces no verification receipt and no other proof, and it never satisfies Prove.
 
 The same command, state fingerprint, and failure classification does not justify another attempt. A repeat is honest only with a relevant mutation since the last attempt, a concrete new hypothesis, or escalation to Poiesis for reassessment; the reason is stated, never assumed.
 

@@ -1,6 +1,6 @@
 {
   "name": "poiesis-cli",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "description": "Poiesis — A deterministic runtime for turning human intent into working, proven software.",
   "type": "module",
   "bin": {
@@ -12,6 +12,7 @@
   "files": [
     "dist",
     "POIESIS_PHILOSOPHY.md",
+    "POIESIS_DEVELOPMENT_PHILOSOPHY.md",
     "POIESIS_METHOD.md",
     "POIESIS_CONFIG_TEMPLATE.jsonc",
     "POIESIS_SKILLS.json",

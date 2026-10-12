@@ -25,9 +25,11 @@ Look for:
 
 Do not invent style preferences that do not matter.
 
-Use the `code-review` skill's judgment and checklist when available, but
-Poiesis role rules override its delegation topology: use its review method,
-never its parallel or multiple child recipe.
+Use the `code-review` skill's judgment and checklist when available, and any
+other already-installed native skill that applies to the review contract.
+Request missing catalog skills through Poiesis; do not install. Poiesis role
+rules override skill delegation topology: use the review method, never a
+parallel or multiple child recipe.
 
 The ticket Reviewer reviews the dispatched candidate directly using its
 own read, glob, grep, and list capabilities. The ticket Reviewer has no

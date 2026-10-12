@@ -25,6 +25,7 @@ These source files are projected into the consumer repo by the runtime (`src/tem
 | Source file in `/poiesis` | Installed consumer path |
 |---|---|
 | `POIESIS_PHILOSOPHY.md` | `.poiesis/PHILOSOPHY.md` |
+| `POIESIS_DEVELOPMENT_PHILOSOPHY.md` | **Package source only** — not projected into consumer `.poiesis/`. Maintainer development philosophy for building Poiesis itself; ordinary consumer sessions must not load it. |
 | `POIESIS_METHOD.md` | `.poiesis/METHOD.md` |
 | `POIESIS_CONFIG_TEMPLATE.jsonc` | `.poiesis/config.jsonc` after init resolves values |
 | `POIESIS_ROLE_POIESIS.md` | `.poiesis/roles/poiesis.md` |
@@ -71,6 +72,8 @@ Do not vendor the skill bodies into Poiesis.
 ## `AGENTS.md`
 
 Do not modify project `AGENTS.md` by default.
+
+`AGENTS.md` files are Author-owned project source. They are never managed files in the manifest, never claimed by install/update ownership, and never destroyed by uninstall. Primary and Workers establish concise coverage in every eligible folder through ordinary reviewed changes. Deterministic inventory and path-scoped resolution are available through `poiesis inspect` (optional `--path` for ancestor chain). OpenCode native read appends ancestor `AGENTS.md`; do not bulk-load all instruction documents.
 
 ## OpenCode adapter v1 projection
 

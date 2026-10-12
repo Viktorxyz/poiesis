@@ -112,9 +112,16 @@ After that command succeeds, later `doctor`, `update`, `uninstall`, and capabili
 
 ### Everyday commands
 
-Poiesis installs no project script. `init` never writes a `poiesis` entry into your `package.json`, `update` never adds one, and no command maintains one — so there is nothing for a version to drift on and nothing for a stale cache to break. Every command is a `poiesis <command>` invocation through a launcher.
+On an ordinary Node package with a single native lockfile (`pnpm-lock.yaml` or `package-lock.json`), `init` / `update` / `update --config` run a standard npm or pnpm **exact** `poiesis-cli` devDependency install equal to the installed release, set `scripts.poiesis = "poiesis"`, and disable lifecycle scripts (`--ignore-scripts`). After install, Poiesis checks that the resolved `node_modules/poiesis-cli` version equals the target. Everyday commands use that local runtime:
 
-After `init`, the everyday human surface is the exact-version route:
+```bash
+pnpm poiesis doctor
+pnpm poiesis latest
+pnpm poiesis model set reasoning openai/gpt-5.6-sol
+pnpm poiesis update
+```
+
+(npm: `npm run poiesis -- doctor`, and so on.) Foreign scripts and dependencies are preserved; a conflicting `poiesis` script or non-exact `poiesis-cli` dependency fails closed **before** mutation. Workspace / ambiguous multi-lock layouts and a package.json without a supported lockfile are refused with a typed error rather than guessed. A native package-manager failure is an **incomplete** operation: the install manifest does not advance; Poiesis may restore package.json/lock bytes it authored, and it does **not** claim atomic rollback of `node_modules` or other native pm side effects. Self-host `package.name === "poiesis-cli"` never self-depends — it uses `scripts.poiesis = "node dist/cli.js"` and verifies readiness by probing that binary directly (`node dist/cli.js --version`), not by running package scripts; missing or stale `dist` fails closed. Projects with **no** `package.json` are not given fabricated package metadata; they keep the exact-version launcher:
 
 ```bash
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
@@ -123,7 +130,7 @@ pnpm dlx poiesis-cli@<manifest.poiesisVersion> model set reasoning openai/gpt-5.
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> update
 ```
 
-`<manifest.poiesisVersion>` is the `poiesisVersion` recorded in `.poiesis/manifest.json`: the single durable runtime identity. That exact-version route is the one the projected agent permissions admit, and every version-qualified and `@latest` `dlx` variant is denied, so the runtime identity an agent runs under is never ambiguous. When you deliberately want the current published release instead of the recorded one, use the fresh-latest `update` form documented above; that is the intentional human upgrade, and it is a different command from the same-version reconciliation above.
+`<manifest.poiesisVersion>` is the `poiesisVersion` recorded in `.poiesis/manifest.json`: the single durable runtime identity. Projected agent permissions admit only the supported route for that install (local package script, or exact dlx when there is no package). Bare `poiesis`, `pnpm exec poiesis`, `npx poiesis`, and every unversioned / `@latest` / off-version `dlx` launcher stay denied. When you deliberately want the current published release instead of the recorded one, use the fresh-latest `update` form documented above; that is the intentional human upgrade, and it is a different command from the same-version reconciliation above.
 
 `poiesis latest` is the read-only way to ask whether any of that matters yet. It compares the durable `manifest.poiesisVersion` against the published `poiesis-cli` release and returns `installed`, `latest`, `newerAvailable`, and `lookup` (`ok` or `unavailable`), plus — only when a newer published version actually exists — one copy-paste `updateCommand` pinned to that exact version. It changes nothing: it is one registry request, never a retry, and it fails open on the network, so an unreachable registry can only make the report quieter, never break your session. It never updates Poiesis for you and never restarts OpenCode; running the update stays your decision.
 

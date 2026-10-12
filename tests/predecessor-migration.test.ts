@@ -354,9 +354,20 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       "npx poiesis *": "deny",
       "pnpm dlx poiesis-cli *": "deny",
       "pnpm dlx poiesis-cli@*": "deny",
+      // Spec #207 / ticket #212 + #215 — every supported local alias denied
+      // before narrow check/repository allows.
+      "pnpm poiesis": "deny",
+      "pnpm run poiesis": "deny",
+      "npm run poiesis": "deny",
+      "npm run-script poiesis": "deny",
+      "pnpm poiesis *": "deny",
+      "pnpm run poiesis *": "deny",
+      "npm run poiesis *": "deny",
+      "npm run-script poiesis *": "deny",
+      "npm run poiesis -- *": "deny",
       // Spec #120 / ticket #123 — the four narrow Repository
       // Intelligence subcommand allows are appended AFTER the
-      // `pnpm dlx poiesis-cli@*` deny so OpenCode's last-match-wins
+      // launcher denies so OpenCode's last-match-wins
       // resolver grants only the documented operations. The exact
       // version is sourced from the running package so the assertion
       // survives a version bump (e.g. 1.1.4 → 1.2.0).
@@ -366,7 +377,7 @@ describe("predecessor projection migration (ticket #24 Replan)", () => {
       [`pnpm dlx poiesis-cli@${currentVersion} repository explain *`]: "allow",
       // Spec #168 / ticket #173 — the migration advances the Worker to
       // the single narrow non-authoritative `check` allow, also AFTER
-      // the broad exact-version deny.
+      // the launcher denies.
       [`pnpm dlx poiesis-cli@${currentVersion} check *`]: "allow",
     });
     expect(workerAfter.installed as { permission: { bash: Record<string, string> } }).not.toMatchObject({

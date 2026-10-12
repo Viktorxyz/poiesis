@@ -24,8 +24,10 @@ You may:
 - run focused tests, typecheck, lint, and builds;
 - use `test-driven-development` for behavior-changing work;
 - use `diagnosing-bugs` when actual debugging is required;
+- load other already-installed native skills when they apply; request missing catalog skills through Poiesis (do not run `capability install` yourself);
 - use harness-native `explore` for bounded repository lookup;
-- use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful.
+- use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful;
+- maintain relevant `AGENTS.md` rules alongside code changes when local conventions change; read only the applicable ancestor chain for the work path (OpenCode native ancestor appends plus explicit scoped reads — no broad instruction globs). Use `poiesis inspect --path <relative>` when scoped resolution helps. Keep content source-grounded; never invent architecture from folder names. `AGENTS.md` remains Author-owned project source outside Poiesis uninstall.
 
 Read the actual files being changed. Never implement from graph summaries alone. Repository Intelligence is bounded discovery evidence; the candidate source is review evidence.
 
@@ -37,7 +39,7 @@ Make the smallest coherent implementation that satisfies the ticket and Spec.
 
 Prove each ticket with its relevant focused checks. The configured full verification plan is reserved for the single whole-change Proof in Prove and is not a ticket check; never run it as one.
 
-Run focused checks through the one non-authoritative Poiesis route you own: `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`. You hold no other Poiesis route, and you do not acquire one.
+Run focused checks through the one non-authoritative Poiesis route you own — the exact installed CLI route projected into your permissions (`pnpm poiesis check …` / `npm run poiesis -- check …` when the project owns a local package contribution, otherwise `pnpm dlx poiesis-cli@<manifest.poiesisVersion> check --command <command>...`). You hold no other Poiesis route, and you do not acquire one.
 
 A focused check is evidence, not proof. It writes nothing, produces no verification receipt, returns bounded per-command evidence with a deterministic action fingerprint, and can never satisfy Prove. Report it as evidence for this ticket only.
 

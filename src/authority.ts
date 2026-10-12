@@ -9,6 +9,8 @@ import {
   CERTIFIED_OPENCODE_VERSION,
   desiredOpenCodePatches,
   isCertifiedOpenCodeVersion,
+  OPENCODE_V160_STATIC_SKILL_PERMISSIONS,
+  stripWorkerLocalLifecycleDenies,
   workerFocusedCheckAllowKey,
 } from "./opencode.js";
 import { loadDefaultSkills, skillPath, SKILLS_DIRECTORY } from "./skills.js";
@@ -540,10 +542,13 @@ export function predecessorProjectionV113V114(
  *
  * The projection is keyed off the SUPPLIED `poiesisVersion`, which is the
  * predecessor release itself (`"1.4.0"`), never the running runtime. For that
- * version it differs from that version's own strict projection in exactly ONE
- * field:
+ * version it differs from that version's own strict projection in:
  *   - `agent.poiesis-worker.permission.bash` omits the single focused-check
- *     allow key.
+ *     allow key;
+ *   - Spec #207 / ticket #212 + #215: the same Worker bash omits every
+ *     local package-script lifecycle deny key the current projection emits
+ *     (`WORKER_LOCAL_LIFECYCLE_DENY_KEYS`) that authentic historical images
+ *     never carried.
  *
  * Everything else — the primary's exact-version canonical route, the ordered
  * launcher denies, the Repository Intelligence additive allows, the Specialist
@@ -552,11 +557,12 @@ export function predecessorProjectionV113V114(
  * restores the current projection and grants no broad `…@<version> *`,
  * `@latest`, or unversioned route.
  *
- * The removed key is derived through `workerFocusedCheckAllowKey`, the same
- * builder the current projection uses, so this helper can only ever delete a
- * key the current projection still emits. If a future release drops that
- * allow, the deletion is a no-op and this projection simply collapses onto the
- * current one, which the gate already admitted before it ever reaches here.
+ * The removed focused-check key is derived through `workerFocusedCheckAllowKey`,
+ * the same builder the current projection uses, so this helper can only ever
+ * delete a key the current projection still emits. If a future release drops
+ * that allow, the deletion is a no-op and this projection simply collapses onto
+ * the current one (aside from the authentic local-deny strip), which the gate
+ * already admitted before it ever reaches here.
  *
  * Kept intentionally narrow: this is a migration-only exact predecessor
  * projection, not a general historical-normalization helper. New patches must
@@ -571,11 +577,63 @@ export function predecessorProjectionPreFocusedCheck(
     if (patch.path.length === 2 && patch.path[0] === "agent" && patch.path[1] === "poiesis-worker") {
       const installed = patch.value as Record<string, unknown>;
       const permission = installed.permission as Record<string, unknown> & { bash: Record<string, string> };
-      const bash = { ...permission.bash };
+      const bash = stripWorkerLocalLifecycleDenies(permission.bash);
       delete bash[focusedCheckAllow];
       return { ...patch, value: { ...installed, permission: { ...permission, bash } } };
     }
     return patch;
+  });
+}
+
+/**
+ * Spec #207 / ticket #208 — authentic published `1.6.0` static skill
+ * permission projection.
+ *
+ * Ticket #208 replaced fixed per-skill allow maps with a native
+ * `skill: { "*": "allow" }` wildcard so catalog-acquired skills load
+ * without enumerating names, while bash/task stay unchanged. A project
+ * installed by the earlier `1.6.0` image therefore records
+ * `poiesisVersion = "1.6.0"` with the static maps. Without this
+ * predecessor the receipt-gated `update` fails closed on an authentic
+ * install.
+ *
+ * Differs from the current projection in each agent's `permission.skill`
+ * map, and — Spec #207 / ticket #212 + #215 — in Worker bash by omitting
+ * every local package-script lifecycle deny key
+ * (`WORKER_LOCAL_LIFECYCLE_DENY_KEYS`) that authentic older `1.6.0` images
+ * never carried. Task, models, and every other field are taken from the
+ * current builder so the migration never widens lifecycle authority.
+ */
+export function predecessorProjectionV160StaticSkills(
+  config: PoiesisConfig,
+  poiesisVersion: string,
+): Array<{ path: string[]; value: unknown }> {
+  return desiredOpenCodePatches(config, poiesisVersion).map((patch) => {
+    if (patch.path.length !== 2 || patch.path[0] !== "agent") return patch;
+    const agentName = patch.path[1];
+    if (typeof agentName !== "string") return patch;
+    const staticSkills = OPENCODE_V160_STATIC_SKILL_PERMISSIONS[agentName];
+    if (staticSkills === undefined) return patch;
+    const installed = patch.value as Record<string, unknown>;
+    const permission = installed.permission as Record<string, unknown> | undefined;
+    if (permission === undefined) return patch;
+    const nextPermission: Record<string, unknown> = {
+      ...permission,
+      skill: { ...staticSkills },
+    };
+    // Ticket #212 + #215: authentic 1.6.0 Worker bash never carried the
+    // local package-script lifecycle denies; strip every current key so
+    // inheritance matches the older shape while current desired keeps them.
+    if (agentName === "poiesis-worker" && typeof permission.bash === "object" && permission.bash !== null) {
+      nextPermission.bash = stripWorkerLocalLifecycleDenies(permission.bash as Record<string, string>);
+    }
+    return {
+      ...patch,
+      value: {
+        ...installed,
+        permission: nextPermission,
+      },
+    };
   });
 }
 
@@ -645,11 +703,9 @@ export async function assertManifestAuthorityToleratingPredecessor(
   root: string,
   manifest: Manifest,
   config: PoiesisConfig,
-  acceptedPredecessorVersions: ReadonlyArray<"1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4" | "1.4.0"> = [
-    "1.0.0",
-    "1.0.1",
-    "1.0.2",
-  ],
+  acceptedPredecessorVersions: ReadonlyArray<
+    "1.0.0" | "1.0.1" | "1.0.2" | "1.1.1" | "1.1.3" | "1.1.4" | "1.4.0" | "1.6.0"
+  > = ["1.0.0", "1.0.1", "1.0.2"],
 ): Promise<void> {
   // Spec #104 / ticket #105: the exact-version canonical route
   // `pnpm dlx poiesis-cli@<X>` derives from the manifest's recorded
@@ -657,7 +713,13 @@ export async function assertManifestAuthorityToleratingPredecessor(
   // manifest's own version rather than the runtime's package version.
   // This keeps doctor / uninstall / installCapability authority stable
   // across patch bumps of the runtime image.
-  const currentPatches = desiredOpenCodePatches(config, manifest.poiesisVersion);
+  // Spec #207 / ticket #210: projection keys off the owned package contribution
+  // when present so local invocation routes authenticate; absent contribution
+  // keeps the exact dlx route (including authentic 1.6.0 predecessors).
+  const currentPatches =
+    manifest.packageContribution === undefined
+      ? desiredOpenCodePatches(config, manifest.poiesisVersion)
+      : desiredOpenCodePatches(config, manifest.poiesisVersion, manifest.packageContribution);
   try {
     await assertManifestAuthorityImpl(root, manifest, currentPatches);
     return;
@@ -711,6 +773,20 @@ export async function assertManifestAuthorityToleratingPredecessor(
   // and is rethrown by the strict check below.
   if (manifest.poiesisVersion === "1.4.0") {
     const predecessor = predecessorProjectionPreFocusedCheck(config, manifest.poiesisVersion);
+    if (isExactProjection(manifest, predecessor)) {
+      await assertManifestAuthorityImpl(root, manifest, predecessor);
+      return;
+    }
+    await assertManifestAuthorityImpl(root, manifest, currentPatches);
+    return;
+  }
+  // Spec #207 / ticket #208 — authentic 1.6.0 static-skill predecessor.
+  // Ticket #208 changed skill permission maps to a native wildcard while
+  // the release label stayed `1.6.0`. Only the exact static-skill set is
+  // admitted; drift fails closed and never falls through to older
+  // predecessors.
+  if (manifest.poiesisVersion === "1.6.0") {
+    const predecessor = predecessorProjectionV160StaticSkills(config, manifest.poiesisVersion);
     if (isExactProjection(manifest, predecessor)) {
       await assertManifestAuthorityImpl(root, manifest, predecessor);
       return;
@@ -778,7 +854,9 @@ export async function assertManifestAuthority(
   await assertManifestAuthorityImpl(
     root,
     manifest,
-    desiredOpenCodePatches(config, manifest.poiesisVersion),
+    manifest.packageContribution === undefined
+      ? desiredOpenCodePatches(config, manifest.poiesisVersion)
+      : desiredOpenCodePatches(config, manifest.poiesisVersion, manifest.packageContribution),
     options,
   );
 }
