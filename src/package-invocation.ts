@@ -8,6 +8,10 @@
  * closed without claiming `node_modules` rollback.
  * Spec #219 / ticket #222 — doctor read-only package-contribution check reuses
  * the same eligibility, ownership, and readiness logic; never repairs.
+ * Spec #219 / ticket #223 — effective lock settings include pnpm-workspace.yaml
+ * (`sharedWorkspaceLockfile` / `lockfileDir`) with fail-closed ambiguity and
+ * clear precedence; live eligibility/scope is revalidated immediately before
+ * package write and native executor (apply + removal).
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -697,6 +701,158 @@ export function readPackageJsonPnpmSharedLockfile(document: JsonObject): boolean
 }
 
 /**
+ * Spec #219 / ticket #223 — package.json `pnpm.lockfileDir` when set as a string.
+ * Non-string values are treated as unresolved ambiguity by the caller.
+ */
+export function readPackageJsonPnpmLockfileDir(document: JsonObject): {
+  lockfileDir: string | undefined;
+  ambiguous: boolean;
+} {
+  if (!Object.hasOwn(document, "pnpm")) return { lockfileDir: undefined, ambiguous: false };
+  const pnpm = document.pnpm;
+  if (typeof pnpm !== "object" || pnpm === null || Array.isArray(pnpm)) {
+    return { lockfileDir: undefined, ambiguous: false };
+  }
+  if (!Object.hasOwn(pnpm as JsonObject, "lockfileDir")) {
+    return { lockfileDir: undefined, ambiguous: false };
+  }
+  const value = (pnpm as JsonObject).lockfileDir;
+  if (typeof value === "string") {
+    return { lockfileDir: value.length === 0 ? undefined : value, ambiguous: false };
+  }
+  return { lockfileDir: undefined, ambiguous: true };
+}
+
+/**
+ * Spec #219 / ticket #223 — parse top-level shared-lock settings from
+ * `pnpm-workspace.yaml`. Accepts camelCase and kebab-case scalar forms only.
+ * Nested/complex values for these keys are ambiguous (fail closed).
+ */
+export function parsePnpmWorkspaceYamlLockSettings(yaml: string | null | undefined): {
+  sharedWorkspaceLockfile: boolean | undefined;
+  lockfileDir: string | undefined;
+  ambiguous: boolean;
+} {
+  if (yaml === null || yaml === undefined || yaml.length === 0) {
+    return { sharedWorkspaceLockfile: undefined, lockfileDir: undefined, ambiguous: false };
+  }
+  let sharedWorkspaceLockfile: boolean | undefined;
+  let lockfileDir: string | undefined;
+  let ambiguous = false;
+  const lines = yaml.split(/\r?\n/);
+  for (let i = 0; i < lines.length; i += 1) {
+    const rawLine = lines[i]!;
+    // Top-level keys only (no leading whitespace).
+    if (rawLine.length === 0 || /^\s/.test(rawLine) || rawLine.trimStart().startsWith("#")) continue;
+    const line = rawLine.replace(/\s+#.*$/, "").trimEnd();
+    const match = /^(sharedWorkspaceLockfile|shared-workspace-lockfile|lockfileDir|lockfile-dir)\s*:\s*(.*)$/.exec(
+      line,
+    );
+    if (match === null) continue;
+    const key = match[1]!;
+    let value = match[2]!.trim();
+    if (value.length === 0) {
+      // Multiline / nested form — refuse unresolved ambiguity.
+      const next = lines[i + 1];
+      if (next !== undefined && /^\s+\S/.test(next)) {
+        ambiguous = true;
+        continue;
+      }
+      // Empty scalar: treat shared lock as unset; empty lockfileDir as unset.
+      continue;
+    }
+    // Strip simple YAML quotes.
+    if (
+      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
+      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (key === "sharedWorkspaceLockfile" || key === "shared-workspace-lockfile") {
+      const lower = value.toLowerCase();
+      if (lower === "false" || lower === "0" || lower === "no") sharedWorkspaceLockfile = false;
+      else if (lower === "true" || lower === "1" || lower === "yes") sharedWorkspaceLockfile = true;
+      else ambiguous = true;
+    } else if (key === "lockfileDir" || key === "lockfile-dir") {
+      if (value.startsWith("{") || value.startsWith("[") || value === "|" || value === ">") {
+        ambiguous = true;
+      } else {
+        lockfileDir = value.length === 0 ? undefined : value;
+      }
+    }
+  }
+  return { sharedWorkspaceLockfile, lockfileDir, ambiguous };
+}
+
+/**
+ * Spec #219 / ticket #223 — effective shared-lock contract from `.npmrc`,
+ * package.json `pnpm.*`, and `pnpm-workspace.yaml`.
+ *
+ * Precedence (highest wins): root `.npmrc` → package.json `pnpm` → workspace YAML.
+ * Unresolved / unparseable values fail closed via `ambiguous: true`.
+ */
+export function resolveEffectivePnpmSharedLockSettings(
+  snapshot: PackageFsSnapshot,
+  document: JsonObject,
+): {
+  sharedWorkspaceLockfile: boolean | undefined;
+  lockfileDir: string | undefined;
+  /** Winning source for a refusing sharedWorkspaceLockfile=false / external lockfileDir. */
+  sharedSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
+  lockfileDirSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
+  ambiguous: boolean;
+} {
+  const npmrc = parsePnpmSharedLockSettings(snapshot.npmrc);
+  const pkgShared = readPackageJsonPnpmSharedLockfile(document);
+  const pkgLock = readPackageJsonPnpmLockfileDir(document);
+  const ws = parsePnpmWorkspaceYamlLockSettings(snapshot.lockfiles["pnpm-workspace.yaml"]);
+
+  if (pkgLock.ambiguous || ws.ambiguous) {
+    return {
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      sharedSource: undefined,
+      lockfileDirSource: undefined,
+      ambiguous: true,
+    };
+  }
+
+  let sharedWorkspaceLockfile: boolean | undefined;
+  let sharedSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
+  if (npmrc.sharedWorkspaceLockfile !== undefined) {
+    sharedWorkspaceLockfile = npmrc.sharedWorkspaceLockfile;
+    sharedSource = "npmrc";
+  } else if (pkgShared !== undefined) {
+    sharedWorkspaceLockfile = pkgShared;
+    sharedSource = "package.json";
+  } else if (ws.sharedWorkspaceLockfile !== undefined) {
+    sharedWorkspaceLockfile = ws.sharedWorkspaceLockfile;
+    sharedSource = "pnpm-workspace.yaml";
+  }
+
+  let lockfileDir: string | undefined;
+  let lockfileDirSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
+  if (npmrc.lockfileDir !== undefined) {
+    lockfileDir = npmrc.lockfileDir;
+    lockfileDirSource = "npmrc";
+  } else if (pkgLock.lockfileDir !== undefined) {
+    lockfileDir = pkgLock.lockfileDir;
+    lockfileDirSource = "package.json";
+  } else if (ws.lockfileDir !== undefined) {
+    lockfileDir = ws.lockfileDir;
+    lockfileDirSource = "pnpm-workspace.yaml";
+  }
+
+  return {
+    sharedWorkspaceLockfile,
+    lockfileDir,
+    sharedSource,
+    lockfileDirSource,
+    ambiguous: false,
+  };
+}
+
+/**
  * True when lockfile-dir redirects the lock outside the authoritative root.
  * Only `.` / `./` (and empty) are accepted as root-local; any other value
  * fails closed — Poiesis does not rewrite pnpm configuration to gain eligibility.
@@ -707,6 +863,72 @@ export function isExternalLockfileDir(lockfileDir: string | undefined): boolean 
   if (normalized.length === 0) return false;
   if (normalized === "." || normalized === "./") return false;
   return true;
+}
+
+/**
+ * Spec #219 / ticket #223 — revalidate live eligibility + execution scope
+ * immediately before package.json write or native executor invocation.
+ * Planning-time scope is not trusted after `.npmrc` / workspace configuration
+ * can drift. Shared by apply and removal mutation paths.
+ */
+export function assertLivePackageMutationEligibility(args: {
+  liveSnapshot: PackageFsSnapshot;
+  expectedManager: SupportedPackageManager;
+  expectedLockfile: PackageLockfileName;
+  expectedExecutionScope: PackageExecutionScope;
+}): void {
+  const resolution = resolvePackageManagerOwnership(args.liveSnapshot);
+  if (resolution.kind === "absent") {
+    throw new PoiesisError(
+      "PACKAGE_MANAGER_UNSUPPORTED",
+      "Live package eligibility is absent; refuse package mutation and native execution",
+      {
+        liveEligibilityDrift: true,
+        planned: {
+          manager: args.expectedManager,
+          lockfile: args.expectedLockfile,
+          executionScope: args.expectedExecutionScope,
+        },
+      },
+    );
+  }
+  if (resolution.kind === "unsupported") {
+    throw new PoiesisError(resolution.code, resolution.message, {
+      ...resolution.details,
+      liveEligibilityDrift: true,
+      planned: {
+        manager: args.expectedManager,
+        lockfile: args.expectedLockfile,
+        executionScope: args.expectedExecutionScope,
+      },
+    });
+  }
+  const scopeMatches = isDeepStrictEqual(resolution.executionScope, args.expectedExecutionScope);
+  if (
+    resolution.manager !== args.expectedManager ||
+    resolution.lockfile !== args.expectedLockfile ||
+    !scopeMatches
+  ) {
+    throw new PoiesisError(
+      resolution.manager !== args.expectedManager || resolution.lockfile !== args.expectedLockfile
+        ? "PACKAGE_MANAGER_AMBIGUOUS"
+        : "PACKAGE_WORKSPACE_UNSUPPORTED",
+      "Live package eligibility or execution scope no longer matches the planned contribution; refuse package mutation and native execution",
+      {
+        liveEligibilityDrift: true,
+        planned: {
+          manager: args.expectedManager,
+          lockfile: args.expectedLockfile,
+          executionScope: args.expectedExecutionScope,
+        },
+        live: {
+          manager: resolution.manager,
+          lockfile: resolution.lockfile,
+          executionScope: resolution.executionScope,
+        },
+      },
+    );
+  }
 }
 
 function unsupportedWorkspace(
@@ -768,29 +990,40 @@ export function resolvePackageManagerOwnership(snapshot: PackageFsSnapshot): Pac
   }
 
   if (pnpmWorkspaceFile) {
-    const npmrcSettings = parsePnpmSharedLockSettings(snapshot.npmrc);
-    const pkgShared = readPackageJsonPnpmSharedLockfile(document);
-    const sharedWorkspaceLockfile =
-      npmrcSettings.sharedWorkspaceLockfile !== undefined
-        ? npmrcSettings.sharedWorkspaceLockfile
-        : pkgShared;
+    // Spec #219 / ticket #223 — effective lock contract from .npmrc, package.json
+    // pnpm.*, and pnpm-workspace.yaml (precedence + fail-closed ambiguity).
+    const effective = resolveEffectivePnpmSharedLockSettings(snapshot, document);
 
-    if (sharedWorkspaceLockfile === false) {
+    if (effective.ambiguous) {
       return unsupportedWorkspace(
-        "pnpm shared-workspace-lockfile is disabled; Poiesis requires the shared root lockfile contract for workspace ownership",
+        "pnpm shared-workspace lock settings are ambiguous or unparseable; Poiesis refuses unresolved workspace lock ownership",
         {
-          sharedWorkspaceLockfile: false,
+          ambiguousWorkspaceLockSettings: true,
           pnpmWorkspace: true,
         },
       );
     }
 
-    if (isExternalLockfileDir(npmrcSettings.lockfileDir)) {
+    if (effective.sharedWorkspaceLockfile === false) {
+      return unsupportedWorkspace(
+        "pnpm shared-workspace-lockfile is disabled; Poiesis requires the shared root lockfile contract for workspace ownership",
+        {
+          sharedWorkspaceLockfile: false,
+          pnpmWorkspace: true,
+          ...(effective.sharedSource === undefined ? {} : { source: effective.sharedSource }),
+        },
+      );
+    }
+
+    if (isExternalLockfileDir(effective.lockfileDir)) {
       return unsupportedWorkspace(
         "pnpm lockfile-dir redirects the lockfile away from the authoritative installation root; Poiesis refuses external lock ownership",
         {
-          lockfileDir: npmrcSettings.lockfileDir,
+          lockfileDir: effective.lockfileDir,
           pnpmWorkspace: true,
+          ...(effective.lockfileDirSource === undefined
+            ? {}
+            : { source: effective.lockfileDirSource }),
         },
       );
     }
@@ -1581,6 +1814,12 @@ export async function applyPackageContributionPlan(args: {
   preimage: { packageJson: string; lockfile: string };
   executor: PackageManagerExecutor;
   /**
+   * Spec #219 / ticket #223 — live FS snapshot revalidated immediately before
+   * package.json write and native executor. Planning-time eligibility is not
+   * trusted after `.npmrc` / workspace configuration can drift.
+   */
+  liveSnapshot: PackageFsSnapshot;
+  /**
    * Persist Poiesis-known bytes. Return `false` when the adapter skipped the
    * write (preimage drifted / native already wrote) so identity is not bound.
    */
@@ -1622,6 +1861,15 @@ export async function applyPackageContributionPlan(args: {
     if (outcome === false) return;
     args.onWritten?.(path, content);
   };
+
+  // Spec #219 / ticket #223 — live eligibility/scope before any package write
+  // or native executor (config can drift after planning).
+  assertLivePackageMutationEligibility({
+    liveSnapshot: args.liveSnapshot,
+    expectedManager: args.plan.record.manager,
+    expectedLockfile: args.plan.record.lockfile,
+    expectedExecutionScope: args.plan.executionScope,
+  });
 
   // Selfhost: verify dist readiness BEFORE mutating package.json so a missing
   // build does not leave a half-written contribution.
@@ -1926,6 +2174,12 @@ export async function applyPackageContributionWithJournal(args: {
   probeSelfhostDist?: () => Promise<
     { ok: false; code: "missing" | "spawn-failed"; detail?: string } | { ok: true; stdout: string }
   >;
+  /**
+   * Spec #219 / ticket #223 — optional live eligibility snapshot. Production
+   * omits this and reloads from `root` immediately before mutation. Tests may
+   * inject when the journal root is not a real package tree.
+   */
+  liveSnapshot?: PackageFsSnapshot;
 }): Promise<{
   record: PackageContributionRecord;
   packageJson: string;
@@ -1938,6 +2192,12 @@ export async function applyPackageContributionWithJournal(args: {
   // nextPackageJson. Fail closed before write/native pm/manifest advance.
   assertPackageContributionCaptureIdentity(args.plan, args.packageJsonEntry);
 
+  // Spec #219 / ticket #223 — live eligibility surface (.npmrc /
+  // pnpm-workspace.yaml / locks) immediately before mutation. Package.json
+  // identity is already gated above; config drift is gated inside apply.
+  const liveSnapshot =
+    args.liveSnapshot ?? (await loadPackageFsSnapshot(args.root));
+
   const { run } = await import("./process.js");
   const executor = args.executor ?? resolvePackageManagerExecutor(args.root);
   const lockfileRelative = args.plan.record.lockfile;
@@ -1949,6 +2209,7 @@ export async function applyPackageContributionWithJournal(args: {
       packageJson: args.plan.nextPackageJson,
       lockfile: args.preimageLockfile,
     },
+    liveSnapshot,
     executor,
     writeFile: async (relativePath, content) => {
       const entry =

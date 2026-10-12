@@ -42,6 +42,7 @@ import {
   detectOuterPnpmWorkspace,
   gateUpdateConfigEarlyNoopPackage,
   inspectPackageContributionHealth,
+  assertLivePackageMutationEligibility,
   isExternalLockfileDir,
   nativePackageManagerArgv,
   packageContributionDoctorRemediation,
@@ -49,6 +50,7 @@ import {
   packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
   parsePnpmSharedLockSettings,
+  parsePnpmWorkspaceYamlLockSettings,
   planPackageContribution,
   planPackageContributionForVersionCross,
   planPackageContributionRemoval,
@@ -108,6 +110,28 @@ function snap(args: {
     ...(args.npmrc === undefined ? {} : { npmrc: args.npmrc }),
     ...(args.outerPnpmWorkspace === undefined ? {} : { outerPnpmWorkspace: args.outerPnpmWorkspace }),
   };
+}
+
+/** Spec #219 / ticket #223 — live eligibility snapshot matching a planned apply. */
+function liveFromPlan(
+  plan: { record: { lockfile: "pnpm-lock.yaml" | "package-lock.json" }; executionScope: { kind: string } },
+  packageJson: string,
+  lockfile: string,
+  extra?: { npmrc?: string | null; workspaceYaml?: string },
+): PackageFsSnapshot {
+  const lockfiles: Partial<
+    Record<"pnpm-lock.yaml" | "package-lock.json" | "pnpm-workspace.yaml", string | null>
+  > = {
+    [plan.record.lockfile]: lockfile,
+  };
+  if (plan.executionScope.kind === "pnpm-workspace-root") {
+    lockfiles["pnpm-workspace.yaml"] = extra?.workspaceYaml ?? "packages:\n  - 'packages/*'\n";
+  }
+  return snap({
+    packageJson,
+    lockfiles,
+    ...(extra?.npmrc === undefined ? {} : { npmrc: extra.npmrc }),
+  });
 }
 
 const ORDINARY_PKG = [
@@ -481,6 +505,7 @@ describe("pnpm workspace-root eligibility (Spec #219 / ticket #220)", () => {
     await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, PNPM_LOCK),
       executor: {
         async apply(request) {
           executorCalls.push(request);
@@ -921,6 +946,7 @@ describe("injected package transaction apply (ticket #210)", () => {
         packageJson: ORDINARY_PKG,
         lockfile: "lock-before\n",
       },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
       executor,
       writeFile: async (path, content) => {
         writes.push({ path, content });
@@ -953,6 +979,7 @@ describe("injected package transaction apply (ticket #210)", () => {
     await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
       executor: {
         async apply(request) {
           return { packageJson: reformatted, lockfile: "lock-after\n" };
@@ -980,6 +1007,7 @@ describe("injected package transaction apply (ticket #210)", () => {
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: ORDINARY_PKG, lockfile: "lock\n" },
+        liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock\n"),
         executor: {
           async apply() {
             return {
@@ -1020,6 +1048,7 @@ describe("injected package transaction apply (ticket #210)", () => {
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: ORDINARY_PKG, lockfile: "lock\n" },
+        liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock\n"),
         executor,
         writeFile: async (path) => {
           writes.push(path);
@@ -1047,6 +1076,7 @@ describe("injected package transaction apply (ticket #210)", () => {
     await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
       executor: {
         async apply(request) {
           return { packageJson: request.packageJson, lockfile: "native-lock\n" };
@@ -1075,6 +1105,7 @@ describe("injected package transaction apply (ticket #210)", () => {
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: ORDINARY_PKG, lockfile: "lock\n" },
+        liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock\n"),
         executor: {
           async apply(request) {
             return { packageJson: request.packageJson, lockfile: "lock-after\n" };
@@ -1099,6 +1130,7 @@ describe("injected package transaction apply (ticket #210)", () => {
     const result = await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: ORDINARY_PKG, lockfile: "lock\n" },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock\n"),
       executor: {
         async apply(request) {
           return { packageJson: request.packageJson, lockfile: "lock-after\n" };
@@ -1756,6 +1788,7 @@ describe("owned-write journal identity and native pm incomplete (ticket #210 rep
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+        liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
         executor: {
           async apply() {
             expect(packageJsonEntry.transactionWrittenIdentity?.hash).toBe(hashContent(plan.nextPackageJson));
@@ -1794,6 +1827,7 @@ describe("owned-write journal identity and native pm incomplete (ticket #210 rep
     await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
       executor: {
         async apply(request) {
           return { packageJson: request.packageJson, lockfile: "lock-after\n" };
@@ -1901,6 +1935,7 @@ describe("native pm argv and resolved version seams (ticket #210 replan)", () =>
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: SELFHOST_PKG, lockfile: "lock\n" },
+        liveSnapshot: liveFromPlan(plan, SELFHOST_PKG, "lock\n"),
         executor: {
           async apply() {
             throw new Error("executor must not run for selfhost script-only");
@@ -1926,6 +1961,7 @@ describe("native pm argv and resolved version seams (ticket #210 replan)", () =>
     const result = await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: SELFHOST_PKG, lockfile: "lock\n" },
+      liveSnapshot: liveFromPlan(plan, SELFHOST_PKG, "lock\n"),
       executor: {
         async apply() {
           throw new Error("no lock op for selfhost");
@@ -2015,6 +2051,7 @@ describe("ordinary readiness required on every retained contribution (ticket #21
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: already, lockfile: "lock\n" },
+        liveSnapshot: liveFromPlan(plan, already, "lock\n"),
         executor: {
           async apply() {
             throw new Error("no lock op");
@@ -2043,6 +2080,7 @@ describe("ordinary readiness required on every retained contribution (ticket #21
     const result = await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: already, lockfile: "lock\n" },
+      liveSnapshot: liveFromPlan(plan, already, "lock\n"),
       executor: {
         async apply() {
           throw new Error("no lock op");
@@ -2252,6 +2290,7 @@ describe("package plan-to-capture identity bind (ticket #214 correction A)", () 
       preimageLockfile: "lock-before\n",
       poiesisVersion: "1.6.0",
       readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+      liveSnapshot: liveFromPlan(plan, ORDINARY_PKG, "lock-before\n"),
     });
     expect(writes.length).toBeGreaterThan(0);
   });
@@ -3157,6 +3196,7 @@ describe("real pnpm workspace-root install (Spec #219 / ticket #220)", () => {
       const result = await applyPackageContributionPlan({
         plan,
         preimage: { packageJson: rootPkg, lockfile: lockBefore },
+        liveSnapshot: liveFromPlan(plan, rootPkg, lockBefore),
         executor,
         writeFile: async (relative, content) => {
           // Only root package.json + root lock — never child paths.
@@ -3398,6 +3438,7 @@ describe("pnpm workspace-root lifecycle (Spec #219 / ticket #221)", () => {
     await applyPackageContributionPlan({
       plan,
       preimage: { packageJson: rootBefore, lockfile: PNPM_LOCK },
+      liveSnapshot: liveFromPlan(plan, rootBefore, PNPM_LOCK),
       executor: {
         async apply(request) {
           executorCalls.push(request);
@@ -3495,6 +3536,7 @@ describe("pnpm workspace-root lifecycle (Spec #219 / ticket #221)", () => {
       applyPackageContributionPlan({
         plan,
         preimage: { packageJson: rootBefore, lockfile: PNPM_LOCK },
+        liveSnapshot: liveFromPlan(plan, rootBefore, PNPM_LOCK),
         executor: {
           async apply() {
             throw new PoiesisError("PACKAGE_MANAGER_FAILED", "injected workspace native failure", {
@@ -3767,6 +3809,7 @@ describe("real pnpm workspace-root update + uninstall lifecycle (Spec #219 / tic
       const installResult = await applyPackageContributionPlan({
         plan: installPlan,
         preimage: { packageJson: rootSeed, lockfile: lockSeed },
+        liveSnapshot: liveFromPlan(installPlan, rootSeed, lockSeed),
         executor,
         writeFile: async (relative, content) => {
           expect(relative === PACKAGE_JSON_RELATIVE || relative === "pnpm-lock.yaml").toBe(true);
@@ -3809,6 +3852,7 @@ describe("real pnpm workspace-root update + uninstall lifecycle (Spec #219 / tic
       await applyPackageContributionPlan({
         plan: cross.plan,
         preimage: { packageJson: rootAfterInstall, lockfile: lockAfterInstall },
+        liveSnapshot: liveFromPlan(cross.plan, rootAfterInstall, lockAfterInstall),
         executor,
         writeFile: async (relative, content) => {
           expect(relative === PACKAGE_JSON_RELATIVE || relative === "pnpm-lock.yaml").toBe(true);
@@ -4251,4 +4295,389 @@ describe("Spec #219 / ticket #222 package contribution documentation", () => {
     expect(text).toMatch(/pnpm poiesis/);
     expect(text).toMatch(/never repairs/i);
   });
+});
+
+describe("Spec #219 / ticket #223 workspace-YAML lock settings + live pre-mutation eligibility", () => {
+  const PNPM_WS = "packages:\n  - 'packages/*'\n";
+  const PNPM_LOCK = "lockfileVersion: '9.0'\n";
+  const ORDINARY_ROOT = [
+    "{",
+    '  "name": "demo",',
+    '  "version": "0.1.0",',
+    '  "scripts": {',
+    '    "poiesis": "poiesis"',
+    "  },",
+    '  "devDependencies": {',
+    '    "poiesis-cli": "1.7.0",',
+    '    "typescript": "^5.0.0"',
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+
+  it("parsePnpmWorkspaceYamlLockSettings reads sharedWorkspaceLockfile and lockfileDir", () => {
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\nlockfileDir: ../external-locks\n",
+      ),
+    ).toEqual({
+      sharedWorkspaceLockfile: false,
+      lockfileDir: "../external-locks",
+      ambiguous: false,
+    });
+    expect(
+      parsePnpmWorkspaceYamlLockSettings("packages:\n  - '*'\nshared-workspace-lockfile: true\n"),
+    ).toEqual({
+      sharedWorkspaceLockfile: true,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings(PNPM_WS)).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+  });
+
+  it("fails closed when pnpm-workspace.yaml disables sharedWorkspaceLockfile", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: {
+          "pnpm-lock.yaml": PNPM_LOCK,
+          "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.sharedWorkspaceLockfile).toBe(false);
+      expect(resolved.details.source).toBe("pnpm-workspace.yaml");
+    }
+  });
+
+  it("fails closed when pnpm-workspace.yaml sets external lockfileDir", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: {
+          "pnpm-lock.yaml": PNPM_LOCK,
+          "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nlockfileDir: ../external-locks\n",
+        },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.lockfileDir).toBe("../external-locks");
+      expect(resolved.details.source).toBe("pnpm-workspace.yaml");
+    }
+  });
+
+  it("respects .npmrc precedence over workspace-YAML when .npmrc restores the shared lock contract", () => {
+    // Workspace YAML disables shared lock, but root .npmrc explicitly enables it —
+    // .npmrc wins (same precedence family as package.json today).
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: {
+          "pnpm-lock.yaml": PNPM_LOCK,
+          "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+        },
+        npmrc: "shared-workspace-lockfile=true\n",
+      }),
+    );
+    expect(resolved).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    });
+  });
+
+  it("fails closed on unresolved workspace-YAML lock setting ambiguity", () => {
+    const resolved = resolvePackageManagerOwnership(
+      snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: {
+          "pnpm-lock.yaml": PNPM_LOCK,
+          "pnpm-workspace.yaml":
+            "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile:\n  nested: true\n",
+        },
+      }),
+    );
+    expect(resolved.kind).toBe("unsupported");
+    if (resolved.kind === "unsupported") {
+      expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(resolved.details.ambiguousWorkspaceLockSettings).toBe(true);
+    }
+  });
+
+  it("planning refuses workspace-YAML disabled shared lock (doctor/removal share eligibility)", () => {
+    const snapshot = snap({
+      packageJson: ORDINARY_ROOT,
+      lockfiles: {
+        "pnpm-lock.yaml": PNPM_LOCK,
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+      },
+    });
+    expect(() =>
+      planPackageContribution({ snapshot, poiesisVersion: "1.7.0", mode: "ensure" }),
+    ).toThrow(expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }));
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    expect(() => planPackageContributionRemoval({ snapshot, record })).toThrow(
+      expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }),
+    );
+  });
+
+  it("apply refuses live eligibility drift (.npmrc shared lock disabled) before write/executor", async () => {
+    const eligible = snap({
+      packageJson: ORDINARY_PKG,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+    });
+    const plan = planPackageContribution({
+      snapshot: eligible,
+      poiesisVersion: "1.7.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const writes: string[] = [];
+    let executorCalls = 0;
+    const drifted = snap({
+      packageJson: ORDINARY_PKG,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      npmrc: "shared-workspace-lockfile=false\n",
+    });
+    await expect(
+      applyPackageContributionPlan({
+        plan,
+        preimage: { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK },
+        liveSnapshot: drifted,
+        executor: {
+          async apply() {
+            executorCalls += 1;
+            return { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK };
+          },
+        },
+        writeFile: async (path) => {
+          writes.push(path);
+        },
+        readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.7.0" }),
+      }),
+    ).rejects.toMatchObject({
+      code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+      details: expect.objectContaining({ liveEligibilityDrift: true }),
+    });
+    expect(writes).toEqual([]);
+    expect(executorCalls).toBe(0);
+  });
+
+  it("apply refuses live workspace-YAML lockfileDir drift before write/executor", async () => {
+    const eligible = snap({
+      packageJson: ORDINARY_PKG,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+    });
+    const plan = planPackageContribution({
+      snapshot: eligible,
+      poiesisVersion: "1.7.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const writes: string[] = [];
+    let executorCalls = 0;
+    const drifted = snap({
+      packageJson: ORDINARY_PKG,
+      lockfiles: {
+        "pnpm-lock.yaml": PNPM_LOCK,
+        "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\nlockfileDir: ../elsewhere\n",
+      },
+    });
+    await expect(
+      applyPackageContributionPlan({
+        plan,
+        preimage: { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK },
+        liveSnapshot: drifted,
+        executor: {
+          async apply() {
+            executorCalls += 1;
+            return { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK };
+          },
+        },
+        writeFile: async (path) => {
+          writes.push(path);
+        },
+      }),
+    ).rejects.toMatchObject({
+      code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+      details: expect.objectContaining({ liveEligibilityDrift: true, lockfileDir: "../elsewhere" }),
+    });
+    expect(writes).toEqual([]);
+    expect(executorCalls).toBe(0);
+  });
+
+  it("removal live guard refuses scope/lock drift before write/executor", async () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const eligible = snap({
+      packageJson: ORDINARY_ROOT,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+    });
+    const plan = planPackageContributionRemoval({ snapshot: eligible, record });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const drifted = snap({
+      packageJson: ORDINARY_ROOT,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      npmrc: "shared-workspace-lockfile=false\n",
+    });
+    const writes: string[] = [];
+    let executorCalls = 0;
+    expect(() =>
+      assertLivePackageMutationEligibility({
+        liveSnapshot: drifted,
+        expectedManager: plan.record.manager,
+        expectedLockfile: plan.record.lockfile,
+        expectedExecutionScope: plan.executionScope,
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+        details: expect.objectContaining({ liveEligibilityDrift: true }),
+      }),
+    );
+    // Simulate production removal gate: refuse before any side effect.
+    try {
+      assertLivePackageMutationEligibility({
+        liveSnapshot: drifted,
+        expectedManager: plan.record.manager,
+        expectedLockfile: plan.record.lockfile,
+        expectedExecutionScope: plan.executionScope,
+      });
+      writes.push(PACKAGE_JSON_RELATIVE);
+      executorCalls += 1;
+    } catch {
+      // expected
+    }
+    expect(writes).toEqual([]);
+    expect(executorCalls).toBe(0);
+  });
+
+  it("assertLivePackageMutationEligibility accepts matching live workspace-root scope", () => {
+    const live = snap({
+      packageJson: ORDINARY_ROOT,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+    });
+    expect(() =>
+      assertLivePackageMutationEligibility({
+        liveSnapshot: live,
+        expectedManager: "pnpm",
+        expectedLockfile: "pnpm-lock.yaml",
+        expectedExecutionScope: { kind: "pnpm-workspace-root" },
+      }),
+    ).not.toThrow();
+  });
+
+  it(
+    "real-pnpm refuses workspace-YAML sharedWorkspaceLockfile:false before mutation",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "poiesis-pnpm-ws-223-refuse-"));
+      const childDir = join(root, "packages", "app");
+      await mkdir(childDir, { recursive: true });
+      const rootPkg = [
+        "{",
+        '  "name": "ws-root-223",',
+        '  "private": true,',
+        '  "version": "0.0.0"',
+        "}",
+        "",
+      ].join("\n");
+      const childPkg = ['{', '  "name": "@ws/app",', '  "private": true,', '  "version": "0.0.1"', "}", ""].join(
+        "\n",
+      );
+      // Eligible seed first so a real lock exists, then disable shared lock via workspace YAML.
+      const workspaceEligible = "packages:\n  - 'packages/*'\n";
+      const workspaceDisabled =
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n";
+      await writeFileUtf8(join(root, "package.json"), rootPkg, "utf8");
+      await writeFileUtf8(join(root, "pnpm-workspace.yaml"), workspaceEligible, "utf8");
+      await writeFileUtf8(join(root, ".npmrc"), "node-linker=isolated\n", "utf8");
+      await writeFileUtf8(join(childDir, "package.json"), childPkg, "utf8");
+      const { run } = await import("../src/process.js");
+      await run("pnpm", ["install", "--ignore-scripts"], { cwd: root });
+      const lockBefore = await readFile(join(root, "pnpm-lock.yaml"), "utf8");
+      const pkgBefore = await readFile(join(root, "package.json"), "utf8");
+      const childBefore = await readFile(join(childDir, "package.json"), "utf8");
+
+      await writeFileUtf8(join(root, "pnpm-workspace.yaml"), workspaceDisabled, "utf8");
+      const live = await readPackageFsSnapshot(root, {
+        readText: async (absolutePath) => {
+          try {
+            return await readFile(absolutePath, "utf8");
+          } catch {
+            return null;
+          }
+        },
+      });
+      const resolved = resolvePackageManagerOwnership(live);
+      expect(resolved.kind).toBe("unsupported");
+      if (resolved.kind === "unsupported") {
+        expect(resolved.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+        expect(resolved.details.sharedWorkspaceLockfile).toBe(false);
+      }
+      expect(() =>
+        planPackageContribution({
+          snapshot: live,
+          poiesisVersion: "1.7.0",
+          mode: "ensure",
+        }),
+      ).toThrow(expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }));
+
+      // Plan while eligible, then live-guard refuses after workspace-YAML drift — no writes.
+      const eligiblePlan = planPackageContribution({
+        snapshot: snap({
+          packageJson: rootPkg,
+          lockfiles: { "pnpm-lock.yaml": lockBefore, "pnpm-workspace.yaml": workspaceEligible },
+          npmrc: "node-linker=isolated\n",
+        }),
+        poiesisVersion: "1.7.0",
+        mode: "ensure",
+      });
+      if (eligiblePlan.kind !== "apply") throw new Error("expected apply");
+      const writes: string[] = [];
+      let executorCalls = 0;
+      await expect(
+        applyPackageContributionPlan({
+          plan: eligiblePlan,
+          preimage: { packageJson: rootPkg, lockfile: lockBefore },
+          liveSnapshot: live,
+          executor: {
+            async apply() {
+              executorCalls += 1;
+              return { packageJson: rootPkg, lockfile: lockBefore };
+            },
+          },
+          writeFile: async (path) => {
+            writes.push(path);
+          },
+        }),
+      ).rejects.toMatchObject({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" });
+      expect(writes).toEqual([]);
+      expect(executorCalls).toBe(0);
+      expect(await readFile(join(root, "package.json"), "utf8")).toBe(pkgBefore);
+      expect(await readFile(join(childDir, "package.json"), "utf8")).toBe(childBefore);
+      await rm(root, { recursive: true, force: true });
+    },
+    120_000,
+  );
 });

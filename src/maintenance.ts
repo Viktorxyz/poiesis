@@ -85,6 +85,7 @@ import {
 } from "./manifest.js";
 import {
   applyPackageContributionWithJournal,
+  assertLivePackageMutationEligibility,
   assertPackageContributionCaptureIdentity,
   assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
@@ -3755,6 +3756,16 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
         // snapshot. Intervening Author bytes must not become the journal preimage
         // for a stale nextPackageJson overwrite. Fail before write/native pm.
         assertPackageContributionCaptureIdentity(removal, packageJsonEntry);
+        // Spec #219 / ticket #223 — live eligibility/scope immediately before
+        // package write and native executor (`.npmrc` / workspace YAML can drift
+        // after planning). Shared guard with apply.
+        const liveRemovalSnapshot = await loadPackageFsSnapshot(resolvedRoot);
+        assertLivePackageMutationEligibility({
+          liveSnapshot: liveRemovalSnapshot,
+          expectedManager: removal.record.manager,
+          expectedLockfile: removal.record.lockfile,
+          expectedExecutionScope: removal.executionScope,
+        });
         // Removal writes planned package.json through journal.replace (preimage
         // guard). Native pm may rewrite lock/package on disk — validate owned
         // fields are gone; do not re-write reread bytes merely to journal-bind
