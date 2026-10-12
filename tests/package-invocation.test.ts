@@ -37,6 +37,7 @@ import {
   planPackageContributionRemoval,
   resolvePackageManagerOwnership,
   writeManifestWithNoopPackageContributionGate,
+  writeManifestWithPackageContributionGate,
   type PackageContributionRecord,
   type PackageFsSnapshot,
   type PackageManagerExecutor,
@@ -2076,23 +2077,255 @@ describe("package plan-to-capture identity bind (ticket #214 correction A)", () 
     expect(threw).toEqual(["read"]);
   });
 
-  it("production callers wire writeManifestWithNoopPackageContributionGate at publication boundary", async () => {
+  it("writeManifestWithPackageContributionGate apply: read→validate→write; mismatch/missing skip writer; writer error preserved", async () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: ORDINARY_SCRIPT_VALUE,
+      devDependencyVersion: "1.6.0",
+    });
+    const matching = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+
+    // Valid apply order: read → validate → write.
+    const events: string[] = [];
+    await writeManifestWithPackageContributionGate({
+      check: { kind: "apply", record },
+      readPackageJson: async () => {
+        events.push("read");
+        return matching;
+      },
+      writeManifest: async () => {
+        events.push("write");
+      },
+    });
+    expect(events).toEqual(["read", "write"]);
+
+    // Script drift: writer never called.
+    const scriptDrift: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => {
+          scriptDrift.push("read");
+          return matching.replace('"poiesis": "poiesis"', '"poiesis": "node dist/cli.js"');
+        },
+        writeManifest: async () => {
+          scriptDrift.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_CONTRIBUTION_MISMATCH" });
+    expect(scriptDrift).toEqual(["read"]);
+
+    // DevDependency version drift: writer never called.
+    const depDrift: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => {
+          depDrift.push("read");
+          return matching.replace('"poiesis-cli": "1.6.0"', '"poiesis-cli": "1.5.0"');
+        },
+        writeManifest: async () => {
+          depDrift.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_CONTRIBUTION_MISMATCH" });
+    expect(depDrift).toEqual(["read"]);
+
+    // Foreign non-dev section: writer never called.
+    const foreignNonDev = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "dependencies": { "poiesis-cli": "1.6.0" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const foreign: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => {
+          foreign.push("read");
+          return foreignNonDev;
+        },
+        writeManifest: async () => {
+          foreign.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_CONTRIBUTION_MISMATCH" });
+    expect(foreign).toEqual(["read"]);
+
+    // Missing package.json: writer never called.
+    const missing: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => {
+          missing.push("read");
+          return null;
+        },
+        writeManifest: async () => {
+          missing.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT", details: { path: PACKAGE_JSON_RELATIVE } });
+    expect(missing).toEqual(["read"]);
+
+    // Reader throw → drift, writer not called.
+    const threw: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => {
+          threw.push("read");
+          throw new Error("EACCES");
+        },
+        writeManifest: async () => {
+          threw.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT" });
+    expect(threw).toEqual(["read"]);
+
+    // Writer error propagates (outside read catch).
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record },
+        readPackageJson: async () => matching,
+        writeManifest: async () => {
+          throw new Error("injected: manifest write failed");
+        },
+      }),
+    ).rejects.toThrow("injected: manifest write failed");
+
+    // Selfhost apply: matching script + no dependency.
+    const selfhostRecord = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "selfhost",
+      scriptValue: SELFHOST_SCRIPT_VALUE,
+    });
+    const selfhostOk = [
+      "{",
+      '  "name": "poiesis-cli",',
+      '  "scripts": { "poiesis": "node dist/cli.js" }',
+      "}",
+      "",
+    ].join("\n");
+    const selfhostEvents: string[] = [];
+    await writeManifestWithPackageContributionGate({
+      check: { kind: "apply", record: selfhostRecord },
+      readPackageJson: async () => {
+        selfhostEvents.push("read");
+        return selfhostOk;
+      },
+      writeManifest: async () => {
+        selfhostEvents.push("write");
+      },
+    });
+    expect(selfhostEvents).toEqual(["read", "write"]);
+
+    // Selfhost with foreign dependency fails closed before writer.
+    const selfhostWithDep = [
+      "{",
+      '  "name": "poiesis-cli",',
+      '  "scripts": { "poiesis": "node dist/cli.js" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const selfhostBad: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "apply", record: selfhostRecord },
+        readPackageJson: async () => {
+          selfhostBad.push("read");
+          return selfhostWithDep;
+        },
+        writeManifest: async () => {
+          selfhostBad.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_SELF_DEPENDENCY" });
+    expect(selfhostBad).toEqual(["read"]);
+
+    // Noop path through unified gate preserves original-snapshot hash assertion.
+    const noopPlan = planPackageContribution({
+      snapshot: snap({ packageJson: matching, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(packagePlanIsNoopWithPreimage(noopPlan)).toBe(true);
+    if (!packagePlanIsNoopWithPreimage(noopPlan)) throw new Error("expected noop");
+    const noopEvents: string[] = [];
+    await writeManifestWithPackageContributionGate({
+      check: { kind: "noop", plan: noopPlan },
+      readPackageJson: async () => {
+        noopEvents.push("read");
+        return matching;
+      },
+      writeManifest: async () => {
+        noopEvents.push("write");
+      },
+    });
+    expect(noopEvents).toEqual(["read", "write"]);
+    const noopDrift: string[] = [];
+    await expect(
+      writeManifestWithPackageContributionGate({
+        check: { kind: "noop", plan: noopPlan },
+        readPackageJson: async () => {
+          noopDrift.push("read");
+          return matching.replace('"name": "demo"', '"name": "hijacked"');
+        },
+        writeManifest: async () => {
+          noopDrift.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT" });
+    expect(noopDrift).toEqual(["read"]);
+  });
+
+  it("production callers wire writeManifestWithPackageContributionGate at publication boundary for apply and noop", async () => {
     const root = join(import.meta.dirname, "..");
     const maintenance = await readFile(join(root, "src/maintenance.ts"), "utf8");
     const updateInternal = await readFile(join(root, "src/update-internal.ts"), "utf8");
     const updateConfig = await readFile(join(root, "src/update-config-internal.ts"), "utf8");
-    expect(maintenance).toContain("writeManifestWithNoopPackageContributionGate");
-    expect(updateConfig).toContain("writeManifestWithNoopPackageContributionGate");
-    // Ordinary update + bootstrap legacy both publish through the helper
-    // (import once + two call sites).
-    expect(updateInternal.match(/writeManifestWithNoopPackageContributionGate/g)?.length).toBe(3);
-    expect((updateInternal.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(2);
-    expect((maintenance.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(1);
-    expect((updateConfig.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(1);
-    // Apply path must not run the noop final guard unconditionally — gated by packagePlanIsNoopWithPreimage.
-    expect(updateInternal).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
-    expect(maintenance).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
-    expect(updateConfig).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
+    // Four production call sites: init, ordinary update, bootstrap update, update-config.
+    expect(maintenance).toContain("writeManifestWithPackageContributionGate");
+    expect(updateConfig).toContain("writeManifestWithPackageContributionGate");
+    // Ordinary update + bootstrap both publish through the helper (import once + two call sites).
+    expect(updateInternal.match(/writeManifestWithPackageContributionGate/g)?.length).toBe(3);
+    expect((updateInternal.match(/await writeManifestWithPackageContributionGate\(/g) ?? []).length).toBe(2);
+    expect((maintenance.match(/await writeManifestWithPackageContributionGate\(/g) ?? []).length).toBe(1);
+    expect((updateConfig.match(/await writeManifestWithPackageContributionGate\(/g) ?? []).length).toBe(1);
+    // Gate when package plan retains contribution (apply or hashed noop); absent writes direct.
+    expect(updateInternal).toContain("packagePlanRetainsContribution(packagePlan)");
+    expect(maintenance).toContain("packagePlanRetainsContribution(packagePlan)");
+    expect(updateConfig).toContain("packagePlanRetainsContribution(packagePlan)");
+    // No apply bypass: retain gate must not be noop-only.
+    expect(updateInternal).not.toMatch(
+      /if\s*\(\s*packagePlanIsNoopWithPreimage\s*\(\s*packagePlan\s*\)\s*\)\s*\{\s*\n\s*await writeManifestWith/,
+    );
+    expect(maintenance).not.toMatch(
+      /if\s*\(\s*packagePlanIsNoopWithPreimage\s*\(\s*packagePlan\s*\)\s*\)\s*\{\s*\n\s*await writeManifestWith/,
+    );
+    expect(updateConfig).not.toMatch(
+      /if\s*\(\s*packagePlanIsNoopWithPreimage\s*\(\s*packagePlan\s*\)\s*\)\s*\{\s*\n\s*await writeManifestWith/,
+    );
+    // Apply branch must pass applied/next record into the gate (not skip it).
+    expect(updateInternal).toMatch(/kind:\s*"apply"/);
+    expect(maintenance).toMatch(/kind:\s*"apply"/);
+    expect(updateConfig).toMatch(/kind:\s*"apply"/);
   });
 });
 

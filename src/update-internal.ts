@@ -83,13 +83,12 @@ import {
   assertPackageContributionCaptureIdentity,
   assertPackageContributionRuntimeReady,
   packageContributionMode,
-  packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
   planPackageContributionAtRoot,
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
   resolvePackageManagerExecutor,
-  writeManifestWithNoopPackageContributionGate,
+  writeManifestWithPackageContributionGate,
   PACKAGE_JSON_RELATIVE,
   type PackageContributionPlan,
 } from "./package-invocation.js";
@@ -793,11 +792,15 @@ async function runLockedUpdateTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
     }
     await hooks?.preManifestWrite?.();
-    // Noop publication boundary: fresh package.json identity then immediate
-    // ownership-bearing manifest write. Apply path writes directly (no final noop guard).
-    if (packagePlanIsNoopWithPreimage(packagePlan)) {
-      await writeManifestWithNoopPackageContributionGate({
-        plan: packagePlan,
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
         readPackageJson: async () => {
           try {
             return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
@@ -1181,11 +1184,15 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
       throw new PoiesisError("ARTIFACT_JOURNAL_MISSING", "Journal does not contain the manifest entry", { path: ".poiesis/manifest.json" });
     }
     await hooks?.preManifestWrite?.();
-    // Noop publication boundary: fresh package.json identity then immediate
-    // ownership-bearing manifest write. Apply path writes directly (no final noop guard).
-    if (packagePlanIsNoopWithPreimage(packagePlan)) {
-      await writeManifestWithNoopPackageContributionGate({
-        plan: packagePlan,
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
         readPackageJson: async () => {
           try {
             return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");

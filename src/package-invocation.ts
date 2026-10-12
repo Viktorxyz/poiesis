@@ -369,22 +369,32 @@ export function packagePlanIsNoopWithPreimage(
 }
 
 /**
- * Publication boundary for a **noop** package contribution that retains
- * `manifest.packageContribution`. Call only after:
+ * Shared publication boundary for package contribution that retains
+ * `manifest.packageContribution` — both **apply** and hashed **noop**.
+ * Call only after:
  *   - runtime readiness,
- *   - all manifest object construction / serialization / version resolution,
+ *   - all manifest object construction / serialization / version resolution / hash,
  *   - and any `preManifestWrite` hooks.
  *
- * Freshly reads `package.json`, asserts the original noop plan hash, then
- * immediately invokes `writeManifest` with **no** unrelated awaited work or
- * hook between the assert and the first ownership-bearing manifest write.
- * Missing/unreadable package.json → `ARTIFACT_IDENTITY_DRIFT` and the writer
- * is not called. Does not write package.json and does not bind
- * `transactionWrittenIdentity`. Apply paths must not call this helper —
- * receipt stays after the manifest write, based on authored manifest bytes.
+ * Freshly reads `package.json`, then validates:
+ *   - noop: original plan preimage hash via {@link assertPackageContributionCaptureIdentity}
+ *   - apply: {@link assertPackageContributionMatches} against the applied/next
+ *     record (exact script, exact devDependency path, no foreign non-dev section;
+ *     selfhost: script + no poiesis-cli dependency)
+ *
+ * Immediately invokes `writeManifest` with **no** unrelated awaited work or
+ * hook between the validate and the first ownership-bearing manifest write.
+ * Missing/unreadable package.json → `ARTIFACT_IDENTITY_DRIFT` (writer not called).
+ * Contribution mismatch propagates typed `PACKAGE_CONTRIBUTION_MISMATCH` /
+ * `PACKAGE_SELF_DEPENDENCY`. Does **not** write package.json, does **not** bind
+ * `transactionWrittenIdentity` from the reread, and claims no lock/`node_modules`
+ * rollback. The writer callback is outside the read catch so writer errors
+ * propagate. Receipt stays after the ownership-bearing writer.
  */
-export async function writeManifestWithNoopPackageContributionGate(args: {
-  plan: PackageContributionNoopPlan | { expectedPackageJsonPreimageHash: string };
+export async function writeManifestWithPackageContributionGate(args: {
+  check:
+    | { kind: "noop"; plan: PackageContributionNoopPlan | { expectedPackageJsonPreimageHash: string } }
+    | { kind: "apply"; record: PackageContributionRecord };
   /** Fresh reader; `null` or throw → identity drift (writer not invoked). */
   readPackageJson: () => Promise<string | null>;
   /** First ownership-bearing manifest write (atomicCreate / journal.replace). */
@@ -403,9 +413,34 @@ export async function writeManifestWithNoopPackageContributionGate(args: {
       { path: PACKAGE_JSON_RELATIVE },
     );
   }
-  assertPackageContributionCaptureIdentity(args.plan, { packageJsonContent: content });
-  // Immediate ownership-bearing write — no hooks or other awaits between assert and write.
+  if (args.check.kind === "noop") {
+    assertPackageContributionCaptureIdentity(args.check.plan, { packageJsonContent: content });
+  } else {
+    assertPackageContributionMatches(content, args.check.record);
+  }
+  // Immediate ownership-bearing write — no hooks or other awaits between validate and write.
+  // Writer is outside the read catch so its errors propagate unchanged.
   await args.writeManifest();
+}
+
+/**
+ * Publication boundary for a **noop** package contribution that retains
+ * `manifest.packageContribution`. Thin wrapper over
+ * {@link writeManifestWithPackageContributionGate} preserving the original
+ * snapshot hash assertion. Prefer the unified gate at production call sites.
+ */
+export async function writeManifestWithNoopPackageContributionGate(args: {
+  plan: PackageContributionNoopPlan | { expectedPackageJsonPreimageHash: string };
+  /** Fresh reader; `null` or throw → identity drift (writer not invoked). */
+  readPackageJson: () => Promise<string | null>;
+  /** First ownership-bearing manifest write (atomicCreate / journal.replace). */
+  writeManifest: () => Promise<void>;
+}): Promise<void> {
+  await writeManifestWithPackageContributionGate({
+    check: { kind: "noop", plan: args.plan },
+    readPackageJson: args.readPackageJson,
+    writeManifest: args.writeManifest,
+  });
 }
 
 export type PackageManagerExecutor = {

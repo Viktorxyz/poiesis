@@ -87,7 +87,6 @@ import {
   applyPackageContributionWithJournal,
   assertPackageContributionCaptureIdentity,
   assertPackageContributionRuntimeReady,
-  packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
   planPackageContributionAtRoot,
   planPackageContributionRemoval,
@@ -95,7 +94,7 @@ import {
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
   resolvePackageManagerExecutor,
-  writeManifestWithNoopPackageContributionGate,
+  writeManifestWithPackageContributionGate,
   PACKAGE_JSON_RELATIVE,
 } from "./package-invocation.js";
 import { run as runProcess } from "./process.js";
@@ -1849,11 +1848,15 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
     const manifestContent = serializeManifest(manifest);
     writtenManifestHash = hashContent(manifestContent);
     const manifestPathForWrite = poiesisPath(resolvedRoot, "manifest.json");
-    // Noop publication boundary: fresh package.json identity then immediate
-    // ownership-bearing manifest create. Apply path creates directly.
-    if (packagePlanIsNoopWithPreimage(packagePlan)) {
-      await writeManifestWithNoopPackageContributionGate({
-        plan: packagePlan,
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest create. Absent plans
+    // create the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: packageContributionRecord! }
+            : { kind: "noop", plan: packagePlan },
         readPackageJson: async () => {
           try {
             return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");

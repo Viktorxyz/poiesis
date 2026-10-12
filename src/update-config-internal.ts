@@ -81,13 +81,12 @@ import {
   assertPackageContributionRuntimeReady,
   loadPackageFsSnapshot,
   PACKAGE_JSON_RELATIVE,
-  packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
   planPackageContributionForVersionCross,
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
   resolvePackageManagerExecutor,
-  writeManifestWithNoopPackageContributionGate,
+  writeManifestWithPackageContributionGate,
   type PackageContributionPlan,
 } from "./package-invocation.js";
 import { run as runProcess } from "./process.js";
@@ -1069,11 +1068,15 @@ async function runLockedUpdateConfigTransaction(
     const nextManifestBytes = serializeManifest(nextManifest);
     const nextManifestHash = hashContent(nextManifestBytes);
     await hooks?.preManifestWrite?.();
-    // Noop publication boundary: fresh package.json identity then immediate
-    // ownership-bearing manifest write. Apply path writes directly (no final noop guard).
-    if (packagePlanIsNoopWithPreimage(packagePlan)) {
-      await writeManifestWithNoopPackageContributionGate({
-        plan: packagePlan,
+    // Shared publication boundary (apply + hashed noop): fresh package.json
+    // validate then immediate ownership-bearing manifest write. Absent plans
+    // write the manifest directly. Receipt stays after this writer.
+    if (packagePlanRetainsContribution(packagePlan)) {
+      await writeManifestWithPackageContributionGate({
+        check:
+          packagePlan.kind === "apply"
+            ? { kind: "apply", record: nextPackageContribution! }
+            : { kind: "noop", plan: packagePlan },
         readPackageJson: async () => {
           try {
             return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
