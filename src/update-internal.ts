@@ -81,6 +81,7 @@ import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAda
 import {
   applyPackageContributionWithJournal,
   assertPackageContributionRuntimeReady,
+  packageContributionMode,
   planPackageContributionAtRoot,
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
@@ -655,7 +656,7 @@ async function runLockedUpdateTransaction(
     const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
       root: resolvedRoot,
       poiesisVersion: updatingPoiesisVersion,
-      mode: "repair",
+      mode: packageContributionMode(manifest.packageContribution),
       ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
     });
     const packageContributionForProjection: PackageContributionRecord | undefined =
@@ -706,6 +707,7 @@ async function runLockedUpdateTransaction(
         plan: packagePlan,
         packageJsonEntry,
         lockfileEntry,
+        replaceOwnedFile: (entry, content) => journal.replace(entry, content),
         executor: resolvePackageManagerExecutor(resolvedRoot),
         preimageLockfile,
         poiesisVersion: updatingPoiesisVersion,
@@ -1036,7 +1038,7 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
     const packagePlan: PackageContributionPlan = await planPackageContributionAtRoot({
       root: resolvedRoot,
       poiesisVersion: updatingPoiesisVersion,
-      mode: "repair",
+      mode: packageContributionMode(manifest.packageContribution),
       ...(manifest.packageContribution === undefined ? {} : { prior: manifest.packageContribution }),
     });
     const packageContributionForProjection: PackageContributionRecord | undefined =
@@ -1081,6 +1083,7 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
         plan: packagePlan,
         packageJsonEntry,
         lockfileEntry,
+        replaceOwnedFile: (entry, content) => journal.replace(entry, content),
         executor: resolvePackageManagerExecutor(resolvedRoot),
         preimageLockfile,
         poiesisVersion: updatingPoiesisVersion,

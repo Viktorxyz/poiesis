@@ -215,6 +215,7 @@ export type LockfileOperation =
 
 /**
  * Exact native package-manager argv for a lock/dep operation.
+ * Add-dev always pins exact (`-E` / `--save-exact` equivalent).
  * Lifecycle scripts are always disabled (`--ignore-scripts`).
  */
 export function nativePackageManagerArgv(
@@ -223,14 +224,24 @@ export function nativePackageManagerArgv(
 ): readonly string[] {
   if (manager === "pnpm") {
     return operation.op === "add-dev"
-      ? ["add", "-D", `${operation.name}@${operation.version}`, "--ignore-scripts"]
+      ? ["add", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
       : ["remove", operation.name, "--ignore-scripts"];
   }
   return operation.op === "add-dev"
-    ? ["install", "-D", `${operation.name}@${operation.version}`, "--ignore-scripts"]
+    ? ["install", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
     : ["uninstall", operation.name, "--ignore-scripts"];
 }
 
+/**
+ * Mode for package contribution planning: repair only when an authenticated
+ * prior ownership record exists. Without prior, callers must use ensure so
+ * foreign scripts/deps stay fail-closed.
+ */
+export function packageContributionMode(
+  prior: PackageContributionRecord | undefined,
+): "ensure" | "repair" {
+  return prior !== undefined ? "repair" : "ensure";
+}
 export type PackageContributionPlan =
   | { kind: "absent" }
   | {
@@ -714,19 +725,18 @@ export function planPackageContribution(args: {
     }
   }
 
-  // Ensure with foreign conflict already thrown. For ensure with matching prior-owned drift, treat as repair.
+  // Overwrite is allowed only when the field is absent, already desired, or
+  // authenticated by prior ownership of the current value. Mode `"repair"`
+  // alone never bypasses foreign conflict — no prior ⇒ same refusal as ensure.
   const mayOverwriteScript =
-    args.mode === "repair" ||
     !existingScript.exists ||
     existingScript.value === scriptValue ||
     (args.prior !== undefined && existingScript.value === args.prior.scriptValue);
   const mayOverwriteDep =
     desiredDepVersion === undefined ||
-    args.mode === "repair" ||
     existingDep === undefined ||
     existingDep.version === desiredDepVersion ||
     (args.prior !== undefined && existingDep.version === args.prior.devDependencyVersion);
-
   if (!mayOverwriteScript) {
     throw new PoiesisError("PACKAGE_SCRIPT_CONFLICT", "package.json already defines a different poiesis script", {
       path: ["scripts", POIESIS_SCRIPT_NAME],
@@ -909,22 +919,28 @@ export function assertPackageContributionMatches(packageJson: string, record: Pa
 }
 
 /**
- * Apply a planned package contribution. Writes package.json first (when
- * changed), then runs the injected executor for native pm ops with
+ * Apply a planned package contribution. Writes planned package.json first
+ * (when changed), then runs the injected executor for native pm ops with
  * `ignoreScripts: true`.
  *
- * `onWritten` fires immediately after each Poiesis-authored write so the
- * journal can bind identity before the next fallible step. A native pm
- * failure is {@link PACKAGE_MANAGER_INCOMPLETE}: owned package.json/lock
- * bytes may still be journal-restored, but `node_modules` / native pm side
- * effects are **not** claimed rolled back. Only bytes this function wrote
- * become written identities — never racing foreign disk state.
+ * `writeFile` may return `false` to signal it did **not** perform an owned
+ * write (e.g. lockfile already moved by native pm — do not overwrite/adopt).
+ * `onWritten` fires only after a successful owned write so the journal binds
+ * only Poiesis-known bytes. Native pm failure or post-PM contribution mismatch
+ * is {@link PACKAGE_MANAGER_INCOMPLETE}: owned package.json bytes may still be
+ * journal-restored; `node_modules` / native lock side effects are **not**
+ * claimed rolled back. Executor-returned package/lock rereads are never
+ * re-written merely to journal-bind them as ours.
  */
 export async function applyPackageContributionPlan(args: {
   plan: Extract<PackageContributionPlan, { kind: "apply" }>;
   preimage: { packageJson: string; lockfile: string };
   executor: PackageManagerExecutor;
-  writeFile: (path: string, content: string) => Promise<void>;
+  /**
+   * Persist Poiesis-known bytes. Return `false` when the adapter skipped the
+   * write (preimage drifted / native already wrote) so identity is not bound.
+   */
+  writeFile: (path: string, content: string) => Promise<void | boolean>;
   onWritten?: (path: string, content: string) => void;
   /** After ordinary add-dev: installed `node_modules/poiesis-cli/package.json` text, or null. */
   readResolvedLocalPackageJson?: () => Promise<string | null>;
@@ -951,6 +967,12 @@ export async function applyPackageContributionPlan(args: {
   let packageJson = args.plan.nextPackageJson;
   let lockfile = args.preimage.lockfile;
 
+  const writeOwned = async (path: string, content: string): Promise<void> => {
+    const outcome = await args.writeFile(path, content);
+    if (outcome === false) return;
+    args.onWritten?.(path, content);
+  };
+
   // Selfhost: verify dist readiness BEFORE mutating package.json so a missing
   // build does not leave a half-written contribution.
   if (args.plan.record.projectKind === "selfhost") {
@@ -966,8 +988,7 @@ export async function applyPackageContributionPlan(args: {
   }
 
   if (args.plan.packageJsonChanged) {
-    await args.writeFile(PACKAGE_JSON_RELATIVE, packageJson);
-    args.onWritten?.(PACKAGE_JSON_RELATIVE, packageJson);
+    await writeOwned(PACKAGE_JSON_RELATIVE, packageJson);
   }
 
   if (args.plan.lockfileOperation !== null) {
@@ -998,13 +1019,29 @@ export async function applyPackageContributionPlan(args: {
     }
     packageJson = result.packageJson;
     lockfile = result.lockfile;
-    if (packageJson !== args.plan.nextPackageJson) {
-      await args.writeFile(PACKAGE_JSON_RELATIVE, packageJson);
-      args.onWritten?.(PACKAGE_JSON_RELATIVE, packageJson);
+    // Validate post-PM package.json contribution fields. Do **not** re-write
+    // executor-reread package.json bytes merely to journal-bind them — native
+    // reformats / foreign races must not become Poiesis-authored identities.
+    try {
+      assertPackageContributionMatches(packageJson, args.plan.record);
+    } catch (error) {
+      throw new PoiesisError(
+        "PACKAGE_MANAGER_INCOMPLETE",
+        "Native package-manager finished but package.json no longer matches the planned contribution; Poiesis will not advance the install manifest. Owned planned package.json bytes may be journal-restored; native lock/node_modules side effects are not claimed rolled back.",
+        {
+          manager: args.plan.record.manager,
+          operation: args.plan.lockfileOperation,
+          argv: [...nativePackageManagerArgv(args.plan.record.manager, args.plan.lockfileOperation)],
+          ownedArtifactsMayRollback: true,
+          nativeSideEffectsNotClaimedRolledBack: true,
+          postPmMismatch: true,
+          cause: error instanceof PoiesisError ? error.code : error instanceof Error ? error.message : String(error),
+        },
+      );
     }
-    await args.writeFile(args.plan.record.lockfile, lockfile);
-    args.onWritten?.(args.plan.record.lockfile, lockfile);
-
+    // Lockfile: pure tests land bytes via writeFile; journal adapters skip when
+    // preimage drifted (native already wrote) and must not adopt reread bytes.
+    await writeOwned(args.plan.record.lockfile, lockfile);
   }
 
   // Ordinary contribution: every successful apply that retains a local
@@ -1033,7 +1070,6 @@ export async function applyPackageContributionPlan(args: {
     ...(args.plan.preserved === undefined ? {} : { preserved: args.plan.preserved }),
   };
 }
-
 /**
  * Read a filesystem snapshot for package ownership decisions. Callers that
  * already hold primary-root resolution should pass that root — never a
@@ -1154,16 +1190,25 @@ export function resolvePackageManagerExecutor(root: string): PackageManagerExecu
  * identities for package.json + lockfile. Callers must have already
  * `journal.capture`d both paths.
  *
- * Each Poiesis-authored write binds `transactionWrittenIdentity` immediately
- * so journal rollback can restore those owned bytes. Native pm / node_modules
- * effects are never claimed fully rolled back on failure
- * (`PACKAGE_MANAGER_INCOMPLETE`). Racing foreign bytes are never adopted.
+ * Poiesis-known bytes (planned package.json, and lockfile only while still at
+ * the captured preimage) go through `replaceOwnedFile` — typically
+ * `journal.replace` — so the pre-write identity gate detects a stale plan.
+ * Native pm / node_modules effects are never claimed fully rolled back on
+ * failure (`PACKAGE_MANAGER_INCOMPLETE`). Executor rereads are validated for
+ * contribution fields + resolved bin; they are never re-written merely to
+ * journal-bind foreign or native-mutated bytes as ours.
  */
 export async function applyPackageContributionWithJournal(args: {
   root: string;
   plan: Extract<PackageContributionPlan, { kind: "apply" }>;
   packageJsonEntry: ArtifactJournalEntry;
   lockfileEntry: ArtifactJournalEntry;
+  /**
+   * Guarded replace for Poiesis-known bytes (typically `journal.replace`).
+   * Binds `transactionWrittenIdentity` on success. Throws
+   * `ARTIFACT_IDENTITY_DRIFT` when the on-disk preimage no longer matches.
+   */
+  replaceOwnedFile: (entry: ArtifactJournalEntry, content: string) => Promise<void>;
   executor?: PackageManagerExecutor;
   preimageLockfile: string;
   /** Installing runtime version (selfhost dist check + ordinary target). */
@@ -1180,36 +1225,50 @@ export async function applyPackageContributionWithJournal(args: {
   lockfile: string;
   preserved?: Array<{ path: string[]; reason: string }>;
 }> {
-  const { join } = await import("node:path");
-  const { atomicWrite } = await import("./fs.js");
-  const { hashContent } = await import("./hash.js");
   const { run } = await import("./process.js");
   const executor = args.executor ?? resolvePackageManagerExecutor(args.root);
   const lockfileRelative = args.plan.record.lockfile;
 
-  const bindWritten = (relativePath: string, content: string): void => {
-    const identity = { exists: true as const, kind: "file" as const, hash: hashContent(content) };
-    if (relativePath === PACKAGE_JSON_RELATIVE) {
-      args.packageJsonEntry.transactionWrittenIdentity = identity;
-      return;
-    }
-    if (relativePath === lockfileRelative) {
-      args.lockfileEntry.transactionWrittenIdentity = identity;
-    }
-  };
-
   const planArgs: Parameters<typeof applyPackageContributionPlan>[0] = {
     plan: args.plan,
     preimage: {
+      // Immutable planned package.json expected bytes + captured lock preimage.
       packageJson: args.plan.nextPackageJson,
       lockfile: args.preimageLockfile,
     },
     executor,
     writeFile: async (relativePath, content) => {
-      const absolute = join(args.root, relativePath);
-      await atomicWrite(absolute, content);
+      const entry =
+        relativePath === PACKAGE_JSON_RELATIVE
+          ? args.packageJsonEntry
+          : relativePath === lockfileRelative
+            ? args.lockfileEntry
+            : undefined;
+      if (entry === undefined) {
+        throw new PoiesisError(
+          "ARTIFACT_JOURNAL_MISSING",
+          "Package contribution write path is not a captured journal entry",
+          { path: relativePath },
+        );
+      }
+      try {
+        await args.replaceOwnedFile(entry, content);
+        return;
+      } catch (error) {
+        // Lockfile preimage drift after native pm (or a concurrent writer) —
+        // do not overwrite or adopt returned bytes as a Poiesis-owned write.
+        // Planned package.json drift is a stale plan and must fail closed.
+        if (
+          relativePath === lockfileRelative &&
+          error instanceof PoiesisError &&
+          error.code === "ARTIFACT_IDENTITY_DRIFT"
+        ) {
+          return false;
+        }
+        throw error;
+      }
     },
-    onWritten: bindWritten,
+    // journal.replace already binds transactionWrittenIdentity for owned writes.
     selfhostExpectedVersion: args.poiesisVersion,
   };
   if (args.plan.record.projectKind === "selfhost") {
@@ -1230,7 +1289,6 @@ export async function applyPackageContributionWithJournal(args: {
     ...(result.preserved === undefined ? {} : { preserved: result.preserved }),
   };
 }
-
 /**
  * Production reader: `node_modules/poiesis-cli/package.json` under the primary
  * installation root. Returns null when absent (caller fails closed).
@@ -1308,7 +1366,7 @@ export function planPackageContributionForVersionCross(args: {
   // With authenticated prior ownership, repair may version-cross the exact
   // dep. Without prior, ensure refuses foreign conflicts rather than
   // overwriting Author scripts/deps.
-  const mode = args.prior !== undefined ? "repair" : "ensure";
+  const mode = packageContributionMode(args.prior);
   const planArgs: {
     snapshot: PackageFsSnapshot;
     poiesisVersion: string;

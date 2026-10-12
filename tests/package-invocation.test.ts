@@ -27,6 +27,7 @@ import {
   classifyPackageProject,
   desiredScriptValue,
   nativePackageManagerArgv,
+  packageContributionMode,
   planPackageContribution,
   planPackageContributionForVersionCross,
   planPackageContributionRemoval,
@@ -325,6 +326,65 @@ describe("package project classification and desired contributions", () => {
     }
   });
 
+  it("repair without authenticated prior still refuses foreign script (planner does not bypass)", () => {
+    const conflicted = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "echo foreign" },',
+      '  "devDependencies": {}',
+      "}",
+      "",
+    ].join("\n");
+    try {
+      planPackageContribution({
+        snapshot: snap({ packageJson: conflicted, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+        poiesisVersion: "1.6.0",
+        mode: "repair",
+      });
+      expect.fail("expected conflict");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PoiesisError);
+      expect((error as PoiesisError).code).toBe("PACKAGE_SCRIPT_CONFLICT");
+    }
+  });
+
+  it("repair without authenticated prior still refuses foreign dependency version", () => {
+    const conflicted = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": {},',
+      '  "devDependencies": { "poiesis-cli": "^1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    try {
+      planPackageContribution({
+        snapshot: snap({ packageJson: conflicted, lockfiles: { "package-lock.json": "{}" } }),
+        poiesisVersion: "1.6.0",
+        mode: "repair",
+      });
+      expect.fail("expected conflict");
+    } catch (error) {
+      expect(error).toBeInstanceOf(PoiesisError);
+      expect((error as PoiesisError).code).toBe("PACKAGE_DEPENDENCY_CONFLICT");
+    }
+  });
+
+  it("packageContributionMode is ensure without prior and repair only with prior", () => {
+    expect(packageContributionMode(undefined)).toBe("ensure");
+    expect(
+      packageContributionMode(
+        buildPackageContributionRecord({
+          manager: "pnpm",
+          lockfile: "pnpm-lock.yaml",
+          projectKind: "ordinary",
+          scriptValue: "poiesis",
+          devDependencyVersion: "1.6.0",
+        }),
+      ),
+    ).toBe("repair");
+  });
+
   it("repair mode version-crosses an exact owned dep when provenance still matches", () => {
     // Prior owned contribution is still present (script + exact 1.5.0 dep).
     // Author did not edit those fields; update advances the exact version.
@@ -513,6 +573,69 @@ describe("injected package transaction apply (ticket #210)", () => {
     expect(parsePkg(result.packageJson).devDependencies?.["poiesis-cli"]).toBe("1.6.0");
   });
 
+  it("does not re-write package.json from executor reread when contribution still matches", async () => {
+    const writes: Array<{ path: string; content: string }> = [];
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock-before\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    // Executor returns reformatted package.json that still carries owned fields.
+    const reformatted = `${plan.nextPackageJson}\n`;
+    await applyPackageContributionPlan({
+      plan,
+      preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+      executor: {
+        async apply(request) {
+          return { packageJson: reformatted, lockfile: "lock-after\n" };
+        },
+      },
+      writeFile: async (path, content) => {
+        writes.push({ path, content });
+      },
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+    });
+    // Only planned package.json + lockfile — never a second package.json adoption write.
+    expect(writes.map((w) => w.path)).toEqual([PACKAGE_JSON_RELATIVE, "pnpm-lock.yaml"]);
+    expect(writes[0]!.content).toBe(plan.nextPackageJson);
+    expect(writes[0]!.content).not.toBe(reformatted);
+  });
+
+  it("reports PACKAGE_MANAGER_INCOMPLETE when post-PM package.json no longer matches contribution", async () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    await expect(
+      applyPackageContributionPlan({
+        plan,
+        preimage: { packageJson: ORDINARY_PKG, lockfile: "lock\n" },
+        executor: {
+          async apply() {
+            return {
+              packageJson: [
+                "{",
+                '  "name": "demo",',
+                '  "scripts": { "poiesis": "echo hijacked" },',
+                '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+                "}",
+                "",
+              ].join("\n"),
+              lockfile: "lock-after\n",
+            };
+          },
+        },
+        writeFile: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: "PACKAGE_MANAGER_INCOMPLETE",
+      details: { postPmMismatch: true, nativeSideEffectsNotClaimedRolledBack: true },
+    });
+  });
+
   it("reports PACKAGE_MANAGER_INCOMPLETE on executor failure without claiming native pm rollback", async () => {
     const executor: PackageManagerExecutor = {
       async apply() {
@@ -540,10 +663,38 @@ describe("injected package transaction apply (ticket #210)", () => {
       details: {
         ownedArtifactsMayRollback: true,
         nativeSideEffectsNotClaimedRolledBack: true,
-        argv: ["add", "-D", "poiesis-cli@1.6.0", "--ignore-scripts"],
+        argv: ["add", "-D", "-E", "poiesis-cli@1.6.0", "--ignore-scripts"],
       },
     });
     expect(writes.length).toBeLessThanOrEqual(1);
+  });
+
+  it("skips lockfile onWritten when writeFile signals it did not own-write (native already wrote)", async () => {
+    const written: string[] = [];
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock-before\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    await applyPackageContributionPlan({
+      plan,
+      preimage: { packageJson: ORDINARY_PKG, lockfile: "lock-before\n" },
+      executor: {
+        async apply(request) {
+          return { packageJson: request.packageJson, lockfile: "native-lock\n" };
+        },
+      },
+      writeFile: async (path) => {
+        if (path === "pnpm-lock.yaml") return false;
+        return;
+      },
+      onWritten: (path) => {
+        written.push(path);
+      },
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+    });
+    expect(written).toEqual([PACKAGE_JSON_RELATIVE]);
   });
 
   it("after ordinary add-dev verifies resolved local package version equals target", async () => {
@@ -878,21 +1029,28 @@ describe("owned-write journal identity and native pm incomplete (ticket #210 rep
 });
 
 describe("native pm argv and resolved version seams (ticket #210 replan)", () => {
-  it("exports exact npm/pnpm argv with --ignore-scripts", () => {
+  it("exports exact npm/pnpm argv with --save-exact/-E and --ignore-scripts", () => {
     expect(nativePackageManagerArgv("pnpm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" })).toEqual([
       "add",
       "-D",
+      "-E",
       "poiesis-cli@1.6.0",
       "--ignore-scripts",
     ]);
     expect(nativePackageManagerArgv("npm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" })).toEqual([
       "install",
       "-D",
+      "-E",
       "poiesis-cli@1.6.0",
       "--ignore-scripts",
     ]);
     expect(nativePackageManagerArgv("pnpm", { op: "remove-dev", name: "poiesis-cli" })).toEqual([
       "remove",
+      "poiesis-cli",
+      "--ignore-scripts",
+    ]);
+    expect(nativePackageManagerArgv("npm", { op: "remove-dev", name: "poiesis-cli" })).toEqual([
+      "uninstall",
       "poiesis-cli",
       "--ignore-scripts",
     ]);

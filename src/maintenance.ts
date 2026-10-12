@@ -1803,6 +1803,7 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
         plan: packagePlan,
         packageJsonEntry,
         lockfileEntry,
+        replaceOwnedFile: (entry, content) => packageJournal.replace(entry, content),
         executor: resolvePackageManagerExecutor(resolvedRoot),
         preimageLockfile,
         poiesisVersion: installingPoiesisVersion,
@@ -3683,39 +3684,48 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
         const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
         const preimageLockfile =
           lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
-        // Removal plan is applied via the same journal helper; the plan's
-        // nextPackageJson already omits owned contributions. assertPackageContributionMatches
-        // expects owned values present — for removal we write directly.
-        const { atomicWrite } = await import("./fs.js");
+        // Removal writes planned package.json through journal.replace (preimage
+        // guard). Native pm may rewrite lock/package on disk — validate owned
+        // fields are gone; do not re-write reread bytes merely to journal-bind
+        // them as ours. Lockfile preimage drift after native pm is skipped.
         if (removal.packageJsonChanged) {
-          await atomicWrite(packageJsonPath, removal.nextPackageJson);
-          packageJsonEntry.transactionWrittenIdentity = {
-            exists: true,
-            kind: "file",
-            hash: hashContent(removal.nextPackageJson),
-          };
+          await packageJournal.replace(packageJsonEntry, removal.nextPackageJson);
         }
         if (removal.lockfileOperation !== null) {
           const executor = resolvePackageManagerExecutor(resolvedRoot);
-          const result = await executor.apply({
-            manager: removal.record.manager,
-            operation: removal.lockfileOperation,
-            packageJson: removal.nextPackageJson,
-            lockfile: preimageLockfile,
-            ignoreScripts: true,
-          });
-          await atomicWrite(packageJsonPath, result.packageJson);
-          await atomicWrite(lockfilePath, result.lockfile);
-          packageJsonEntry.transactionWrittenIdentity = {
-            exists: true,
-            kind: "file",
-            hash: hashContent(result.packageJson),
-          };
-          lockfileEntry.transactionWrittenIdentity = {
-            exists: true,
-            kind: "file",
-            hash: hashContent(result.lockfile),
-          };
+          let result: { packageJson: string; lockfile: string };
+          try {
+            result = await executor.apply({
+              manager: removal.record.manager,
+              operation: removal.lockfileOperation,
+              packageJson: removal.nextPackageJson,
+              lockfile: preimageLockfile,
+              ignoreScripts: true,
+            });
+          } catch (error) {
+            throw new PoiesisError(
+              "PACKAGE_MANAGER_INCOMPLETE",
+              "Native package-manager remove failed during uninstall; owned package.json bytes may be journal-restored; node_modules and other native pm side effects are not claimed rolled back.",
+              {
+                manager: removal.record.manager,
+                operation: removal.lockfileOperation,
+                ownedArtifactsMayRollback: true,
+                nativeSideEffectsNotClaimedRolledBack: true,
+                cause: error instanceof Error ? error.message : String(error),
+              },
+            );
+          }
+          // Do not adopt executor-reread package/lock as Poiesis-owned writes.
+          // Planned package.json was already replace-guarded above when changed.
+          // Attempt lockfile replace only while still at capture preimage;
+          // native pm drift skips without labeling foreign/native bytes ours.
+          try {
+            await packageJournal.replace(lockfileEntry, result.lockfile);
+          } catch (error) {
+            if (!(error instanceof PoiesisError) || error.code !== "ARTIFACT_IDENTITY_DRIFT") {
+              throw error;
+            }
+          }
         }
         await packageJournal.commit();
         result.removed.push(PACKAGE_JSON_RELATIVE);

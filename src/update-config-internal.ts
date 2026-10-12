@@ -968,6 +968,7 @@ async function runLockedUpdateConfigTransaction(
         plan: packagePlan,
         packageJsonEntry: packageJsonArtifact,
         lockfileEntry: lockfileArtifact,
+        replaceOwnedFile: (entry, content) => journal.replace(entry, content),
         executor: resolvePackageManagerExecutor(resolvedRoot),
         preimageLockfile: packagePreimageLockfile,
         poiesisVersion: nextPoiesisVersion,
