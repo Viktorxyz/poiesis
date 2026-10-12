@@ -30,49 +30,6 @@ Scale the depth of the work, not the existence of the method.
 
 Consistency and durable history are features.
 
-## Learn before specialized work
-
-Before consequential specialized planning, verify that current capability is sufficient.
-
-Use maintained skills, current official documentation, or focused research when needed.
-
-Do not silently rely on stale model knowledge when recency or specialization matters.
-
-## Strong judgment, economical execution
-
-Use the strongest reasoning where judgment matters most:
-
-- understanding intent;
-- architecture and planning;
-- consequential decisions;
-- final semantic review.
-
-Use execution-oriented models for:
-
-- repository exploration;
-- implementation;
-- routine review;
-- debugging;
-- external fact gathering.
-
-Every expensive token should sit close to an important decision.
-
-## Preserve context by preserving boundaries
-
-Agents should return the smallest result that lets the parent make the next decision.
-
-Do not pass full transcripts, raw exploration, large logs, or unnecessary implementation detail between agents.
-
-Durable project truth must live in ordinary project infrastructure, not in agent memory.
-
-## Deterministic mechanics, model-owned judgment
-
-Use deterministic tools for operations that should be exact and repeatable.
-
-Use models for interpretation, judgment, design, synthesis, and decisions.
-
-Do not turn deterministic tooling into a second workflow engine.
-
 ## Proof before trust
 
 A claim of success must be supported by fresh evidence for the exact candidate being discussed.
@@ -98,14 +55,6 @@ Natural acceptance of the realized feature authorizes integration.
 Production always requires an explicit Author decision.
 
 Poiesis never releases to production merely because implementation is complete.
-
-## Internal recovery is not canonical history
-
-Poiesis may keep internal checkpoints for safe recovery while work is in progress.
-
-Failed attempts and development noise should not become permanent project history.
-
-Canonical history should represent accepted, coherent changes.
 
 ## No repetition without progress
 
@@ -138,6 +87,14 @@ Before adding a file, agent, tool, database, state machine, prompt layer, or abs
 Prefer ordinary Git, trackers, project files, maintained skills, and harness-native capabilities when they already solve the problem.
 
 Preserve the reason. Re-earn the machinery.
+
+## Standards and native tools first
+
+Prefer standards, project-local conventions, and harness-native surfaces before inventing Poiesis-specific machinery.
+
+Simple justified machinery is welcome. Valuable dependencies are welcome when the runtime owns acquisition, verification, and fail-closed behavior. Wrappers earn their place only when they add reliability, safety, or Author clarity.
+
+Portable project artifacts remain project source. OpenCode is the sole currently supported harness; adapters stay capability-based rather than plugin-shaped.
 
 ## Derived intelligence, canonical source
 

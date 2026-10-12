@@ -7,6 +7,12 @@ import { PoiesisError } from "./errors.js";
 import { resolveGitRoot } from "./paths.js";
 import { resolveConfigForRoot } from "./maintenance.js";
 import { TEAM_PROFILE_CONFIG_PATH, TEAM_PROFILE_DIRECTORY, TEAM_PROFILE_SKILLS_LOCK_PATH } from "./team-profile.js";
+import {
+  inventoryAgents,
+  resolveAgentsChain,
+  type AgentsInventoryResult,
+  type AgentsResolutionResult,
+} from "./agents.js";
 
 export interface ProjectInspection {
   git: InspectResult;
@@ -32,9 +38,23 @@ export interface ProjectInspection {
      */
     sharedProfile?: string[];
   };
+  /**
+   * Spec #207 / ticket #209 — deterministic AGENTS.md inventory (eligible
+   * folders + missing paths) and optional path-scoped ancestor resolution.
+   * Semantic AGENTS content remains Author-owned project source.
+   */
+  agents: {
+    inventory: AgentsInventoryResult;
+    resolution: AgentsResolutionResult | null;
+  };
 }
 
-export async function inspectProject(cwd: string): Promise<ProjectInspection> {
+export interface InspectProjectOptions {
+  /** Optional work path (relative to project root) for ancestor AGENTS chain. */
+  path?: string;
+}
+
+export async function inspectProject(cwd: string, options: InspectProjectOptions = {}): Promise<ProjectInspection> {
   const root = await resolveGitRoot(cwd);
   let config: ResolvedPoiesisConfig | undefined;
   let manifest;
@@ -99,6 +119,12 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
           ...((await exists(join(git.root, TEAM_PROFILE_SKILLS_LOCK_PATH))) ? [TEAM_PROFILE_SKILLS_LOCK_PATH] : []),
         ]
       : undefined;
+  const agentsInventory = await inventoryAgents(git.root);
+  const agentsResolution =
+    options.path === undefined || options.path.trim() === ""
+      ? null
+      : await resolveAgentsChain(git.root, options.path);
+
   return {
     git,
     packageManager: await detectPackageManager(git.root),
@@ -116,6 +142,10 @@ export async function inspectProject(cwd: string): Promise<ProjectInspection> {
             ...(manifest.mode === undefined ? {} : { mode: manifest.mode }),
             ...(sharedProfile === undefined ? {} : { sharedProfile }),
           },
+    agents: {
+      inventory: agentsInventory,
+      resolution: agentsResolution,
+    },
   };
 }
 

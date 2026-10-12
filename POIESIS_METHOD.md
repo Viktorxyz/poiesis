@@ -101,6 +101,18 @@ If insufficient:
 
 Do not rely on stale model knowledge when current specialized knowledge materially matters.
 
+### Project instructions (`AGENTS.md`)
+
+Every eligible project folder, including the repository root, should have a concise `AGENTS.md` so confirmed local conventions survive sessions.
+
+Eligible means ordinary project source folders. Deterministic inventory skips Git internals, dependency and vendor trees, generated/build/cache directories, `.poiesis`, the installed skills subtree (`.agents/skills`), and nested separate repositories. It does not blanket-exclude hidden Author containers such as `.agents` or `.opencode` (Author overrides and custom source there remain eligible). It does not blanket-exclude hidden source directories. It does not follow external symlinks.
+
+Use `poiesis inspect` (and optional `--path` for a work target) for deterministic inventory of missing paths and path-scoped ancestor resolution. OpenCode native read already appends ancestor `AGENTS.md` files; when extra clarity is needed, read only the applicable chain for the work path. Do not glob every instruction document into the prompt.
+
+`AGENTS.md` files are **Author-owned project source**. Poiesis install, update, and uninstall never claim, invent, bulk-generate, or destroy them. Primary and Workers establish and maintain coverage through ordinary reviewed changes, grounded in current source and Author decisions — never mechanically invented from folder names. When writing or revising instruction documents, load the installed `writing-for-agents` skill through OpenCode's native Skill tool after it is available (restart-first when newly installed; never inject the skill body as a substitute).
+
+Product philosophy for Authors is `.poiesis/PHILOSOPHY.md`. Maintainer development philosophy (`POIESIS_DEVELOPMENT_PHILOSOPHY.md` in the package) is loaded only when developing Poiesis itself, not in ordinary unrelated consumer projects.
+
 ## 5. Plan
 
 Use a fresh strong Planner.

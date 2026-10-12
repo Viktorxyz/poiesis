@@ -12,6 +12,7 @@
   "files": [
     "dist",
     "POIESIS_PHILOSOPHY.md",
+    "POIESIS_DEVELOPMENT_PHILOSOPHY.md",
     "POIESIS_METHOD.md",
     "POIESIS_CONFIG_TEMPLATE.jsonc",
     "POIESIS_SKILLS.json",

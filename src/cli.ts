@@ -54,7 +54,7 @@ Usage:
   poiesis migrate install-mode --to private|team   # Spec #190 / ticket #194 — the EXPLICIT migration of a released installation that records no sharing mode onto private/local or team/shared. Not reachable through \`update --config\`, which keeps refusing an explicit mode against a mode-less manifest, and never a side effect of any other command. It appends the ONE visible Poiesis-managed ignore block, records it in the manifest, writes the same mode into the local config, and for \`team\` publishes only the accepted declarative project profile. Artifacts such a release used to TRACK are removed from the Git INDEX only — the worktree bytes stay, every staged removal is reported in the result, and Poiesis never commits and never pushes.
 poiesis uninstall
   poiesis uninstall --purge-history [--yes]                 # Spec #190 / ticket #195 — the ONLY operation that destroys Local tracker history. Ordinary \`uninstall\` removes every safely attributable artifact and RETURNS the recorded Local tracker history as user data (reported under \`retained\`, and never a reason the runtime uninstall is incomplete). This flag removes that retained history too, and only after an interactive confirmation naming exactly what is destroyed and what is not, or after the explicit non-interactive confirmation flag \`--yes\` — without a TTY and without \`--yes\` the command refuses before touching anything. The purge removes ONLY a validated, repository-bound Local tracker store (the canonical \`<git-common-dir>/poiesis-tracker-v1\` document) and works against a tracker-only remainder: an installation that is already fully uninstalled needs no manifest for this to run. A symlink, an unknown entry, foreign content, a held store lock, or a store that does not resolve to this repository's canonical path is refused without deleting anything. Git history, remote tracker issues, pull/merge requests, releases, and deployment state are never purge targets.
-  poiesis inspect
+  poiesis inspect [--path <relative>]   # Spec #207 / ticket #209 — project inspection plus deterministic AGENTS.md inventory (missing eligible folders) and optional path-scoped ancestor resolution. AGENTS.md remains Author-owned project source.
   poiesis capability search --query <topic> [--limit 20]   # Spec #207 / ticket #208 — bounded skills.sh catalog search (sanitized generic topics only; max 20 results). Distinguishes ok / none-relevant / catalog-unavailable. Never installs.
   poiesis capability install --source <owner/repo> --name <skill> --revision <sha>   # Project-local pinned install at the primary installation root. Requires bundled-default or skills.sh catalog provenance. Restart OpenCode after a new install; Poiesis does not restart it.
   poiesis model                                         # default: interactive TTY; pick exactly one slot (reasoning or execution) from the live OpenCode inventory through the shared selector and write through the authenticated \`update --config\` transaction. Restart OpenCode after success; Poiesis does not restart it.
@@ -545,8 +545,18 @@ async function commandMigrate(args: string[]): Promise<void> {
 }
 
 async function commandInspect(args: string[]): Promise<void> {
-  const values = options(args, { cwd: { type: "string" } });
-  writeSuccess("inspect", await inspectProject(cwdOf(values)));
+  const values = options(args, {
+    cwd: { type: "string" },
+    // Spec #207 / ticket #209 — optional work path for AGENTS ancestor chain.
+    path: { type: "string" },
+  });
+  const pathValue = values.path;
+  writeSuccess(
+    "inspect",
+    await inspectProject(cwdOf(values), {
+      ...(typeof pathValue === "string" && pathValue.trim() !== "" ? { path: pathValue } : {}),
+    }),
+  );
 }
 
 async function commandCapability(args: string[]): Promise<void> {

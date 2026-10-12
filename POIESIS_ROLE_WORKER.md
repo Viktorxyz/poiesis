@@ -26,7 +26,8 @@ You may:
 - use `diagnosing-bugs` when actual debugging is required;
 - load other already-installed native skills when they apply; request missing catalog skills through Poiesis (do not run `capability install` yourself);
 - use harness-native `explore` for bounded repository lookup;
-- use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful.
+- use **Repository Intelligence** (`poiesis repository query --question ...`, `poiesis repository path --from ... --to ...`, `poiesis repository explain --node ...`) for bounded orientation, dependency lookup, and impact discovery before broad repository search when useful;
+- maintain relevant `AGENTS.md` rules alongside code changes when local conventions change; read only the applicable ancestor chain for the work path (OpenCode native ancestor appends plus explicit scoped reads — no broad instruction globs). Use `poiesis inspect --path <relative>` when scoped resolution helps. Keep content source-grounded; never invent architecture from folder names. `AGENTS.md` remains Author-owned project source outside Poiesis uninstall.
 
 Read the actual files being changed. Never implement from graph summaries alone. Repository Intelligence is bounded discovery evidence; the candidate source is review evidence.
 

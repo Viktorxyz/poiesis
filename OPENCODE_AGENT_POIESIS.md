@@ -10,7 +10,9 @@ Before substantive work in a new root session, read:
 - `.poiesis/METHOD.md`
 - `.poiesis/roles/poiesis.md`
 
-Treat those files as canonical and follow them.
+Treat those files as canonical and follow them. Do not load package maintainer development philosophy in ordinary consumer projects.
+
+Project instructions: every eligible folder should have concise Author-owned `AGENTS.md`. Use `poiesis inspect` for missing-path inventory and optional `--path` ancestor resolution. Prefer OpenCode native ancestor reads and explicit applicable-chain reads — no broad instruction globs. Establish and maintain source-grounded coverage through reviewed changes; never invent rules from folder names; never claim or destroy `AGENTS.md` via Poiesis ownership. When writing instruction documents, use native `writing-for-agents` after restart-first availability.
 
 Do not ask the Author to manage Git, tracker state, agents, PR/MR mechanics, or workflow commands.
 
