@@ -6,6 +6,8 @@
  * execution scope; config-byte no-op revalidates ownership + readiness; child
  * manifests stay byte-identical; scope/identity/native/runtime failures fail
  * closed without claiming `node_modules` rollback.
+ * Spec #219 / ticket #222 — doctor read-only package-contribution check reuses
+ * the same eligibility, ownership, and readiness logic; never repairs.
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -2027,6 +2029,266 @@ export async function readResolvedLocalCliPackageJson(root: string): Promise<str
   const path = join(root, LOCAL_CLI_PACKAGE_JSON_RELATIVE);
   if (!(await exists(path))) return null;
   return readFile(path, "utf8");
+}
+
+/**
+ * Spec #219 / ticket #222 — read-only doctor surface for an owned package
+ * contribution. Reuses shared eligibility (`resolvePackageManagerOwnership`),
+ * ownership (`assertPackageContributionMatches`), and readiness
+ * (`assertPackageContributionRuntimeReady`). Never mutates files, never
+ * repairs, and never invents a contribution when the manifest records none.
+ */
+export type PackageContributionDoctorCheck = {
+  id: "package-contribution";
+  status: "pass" | "fail";
+  message: string;
+  details: Record<string, unknown>;
+};
+
+/**
+ * Actionable remediation tokens for package-contribution doctor findings.
+ * Operators re-run an authenticated lifecycle command; doctor itself never
+ * mutates package.json, lockfiles, or node_modules.
+ */
+export function packageContributionDoctorRemediation(code: string): {
+  action: string;
+  hint: string;
+} {
+  switch (code) {
+    case "PACKAGE_WORKSPACE_UNSUPPORTED":
+      return {
+        action: "restore-eligible-root-workspace-or-single-package-layout",
+        hint: "unsupported-scope",
+      };
+    case "PACKAGE_MANAGER_AMBIGUOUS":
+    case "PACKAGE_MANAGER_UNSUPPORTED":
+      return {
+        action: "restore-supported-lock-ownership",
+        hint: "unsupported-or-ambiguous-lock",
+      };
+    case "PACKAGE_CONTRIBUTION_MISMATCH":
+    case "PACKAGE_SELF_DEPENDENCY":
+      return {
+        action: "run-poiesis-update",
+        hint: "root-ownership-drift",
+      };
+    case "PACKAGE_LOCAL_BIN_UNRESOLVED":
+      return {
+        action: "run-poiesis-update",
+        hint: "missing-or-unusable-local-executable",
+      };
+    case "PACKAGE_LOCAL_BIN_VERSION_MISMATCH":
+      return {
+        action: "run-poiesis-update",
+        hint: "exact-version-mismatch",
+      };
+    case "SELFHOST_DIST_MISSING":
+    case "SELFHOST_DIST_UNREADABLE":
+    case "SELFHOST_DIST_VERSION_MISMATCH":
+      return {
+        action: "rebuild-selfhost-dist",
+        hint: "selfhost-dist-not-ready",
+      };
+    default:
+      return {
+        action: "run-poiesis-update",
+        hint: "package-contribution-unhealthy",
+      };
+  }
+}
+
+function packageContributionDoctorFail(
+  message: string,
+  code: string,
+  extra: Record<string, unknown> = {},
+): PackageContributionDoctorCheck {
+  const remediation = packageContributionDoctorRemediation(code);
+  return {
+    id: "package-contribution",
+    status: "fail",
+    message,
+    details: {
+      code,
+      repaired: false,
+      ...remediation,
+      ...extra,
+    },
+  };
+}
+
+/**
+ * Spec #219 / ticket #222 — pure read-only diagnosis against a package FS
+ * snapshot and optional readiness seams. Callers must not write package bytes
+ * from this path. When `record` is absent, reports a pass that the exact-version
+ * launcher is retained (no fabricated contribution).
+ */
+export async function inspectPackageContributionHealth(args: {
+  record: PackageContributionRecord | undefined;
+  poiesisVersion: string;
+  snapshot: PackageFsSnapshot;
+  readResolvedLocalPackageJson?: () => Promise<string | null>;
+  assertLocalCliExecutable?: () => Promise<void>;
+  probeSelfhostDist?: () => Promise<
+    { ok: false; code: "missing" | "spawn-failed"; detail?: string } | { ok: true; stdout: string }
+  >;
+}): Promise<PackageContributionDoctorCheck> {
+  if (args.record === undefined) {
+    return {
+      id: "package-contribution",
+      status: "pass",
+      message: "No owned package contribution; exact-version launcher retained",
+      details: {
+        packageContribution: null,
+        repaired: false,
+      },
+    };
+  }
+
+  const record = args.record;
+  try {
+    if (args.snapshot.packageJson === null) {
+      return packageContributionDoctorFail(
+        "Owned package contribution is recorded but root package.json is missing",
+        "PACKAGE_CONTRIBUTION_MISMATCH",
+        {
+          path: PACKAGE_JSON_RELATIVE,
+          recorded: {
+            manager: record.manager,
+            lockfile: record.lockfile,
+            scriptValue: record.scriptValue,
+            ...(record.devDependencyVersion === undefined
+              ? {}
+              : { devDependencyVersion: record.devDependencyVersion }),
+          },
+        },
+      );
+    }
+
+    const resolution = resolvePackageManagerOwnership(args.snapshot);
+    if (resolution.kind === "absent") {
+      return packageContributionDoctorFail(
+        "Owned package contribution is recorded but package ownership is absent",
+        "PACKAGE_CONTRIBUTION_MISMATCH",
+        { path: PACKAGE_JSON_RELATIVE },
+      );
+    }
+    if (resolution.kind === "unsupported") {
+      return packageContributionDoctorFail(resolution.message, resolution.code, {
+        ...resolution.details,
+        executionScope: null,
+      });
+    }
+    if (resolution.manager !== record.manager || resolution.lockfile !== record.lockfile) {
+      return packageContributionDoctorFail(
+        "Installed package contribution manager/lockfile no longer matches on-disk lock ownership",
+        "PACKAGE_MANAGER_AMBIGUOUS",
+        {
+          recorded: { manager: record.manager, lockfile: record.lockfile },
+          actual: { manager: resolution.manager, lockfile: resolution.lockfile },
+          executionScope: resolution.executionScope,
+        },
+      );
+    }
+
+    assertPackageContributionMatches(args.snapshot.packageJson, record);
+
+    await assertPackageContributionRuntimeReady({
+      record,
+      poiesisVersion: args.poiesisVersion,
+      ...(args.readResolvedLocalPackageJson === undefined
+        ? {}
+        : { readResolvedLocalPackageJson: args.readResolvedLocalPackageJson }),
+      ...(args.assertLocalCliExecutable === undefined
+        ? {}
+        : { assertLocalCliExecutable: args.assertLocalCliExecutable }),
+      ...(args.probeSelfhostDist === undefined ? {} : { probeSelfhostDist: args.probeSelfhostDist }),
+    });
+
+    return {
+      id: "package-contribution",
+      status: "pass",
+      message:
+        resolution.executionScope.kind === "pnpm-workspace-root"
+          ? "Root pnpm workspace package contribution ownership and local readiness are healthy"
+          : "Package contribution ownership and local readiness are healthy",
+      details: {
+        repaired: false,
+        manager: record.manager,
+        lockfile: record.lockfile,
+        projectKind: record.projectKind,
+        executionScope: resolution.executionScope,
+        ...(record.devDependencyVersion === undefined
+          ? {}
+          : { devDependencyVersion: record.devDependencyVersion }),
+      },
+    };
+  } catch (error) {
+    if (error instanceof PoiesisError) {
+      return packageContributionDoctorFail(error.message, error.code, { ...error.details });
+    }
+    return packageContributionDoctorFail(
+      error instanceof Error ? error.message : String(error),
+      "UNEXPECTED",
+    );
+  }
+}
+
+/**
+ * Spec #219 / ticket #222 — production doctor entry: load the primary-root
+ * package snapshot and readiness probes, then diagnose without mutation.
+ */
+export async function inspectPackageContributionHealthAtRoot(args: {
+  root: string;
+  record: PackageContributionRecord | undefined;
+  poiesisVersion: string;
+  run: (command: string, argv: string[], options: { cwd: string; allowFailure: true }) => Promise<{
+    exitCode: number | null;
+    stdout: string;
+    stderr: string;
+  }>;
+}): Promise<PackageContributionDoctorCheck> {
+  if (args.record === undefined) {
+    return inspectPackageContributionHealth({
+      record: undefined,
+      poiesisVersion: args.poiesisVersion,
+      snapshot: {
+        packageJson: null,
+        lockfiles: {
+          "pnpm-lock.yaml": null,
+          "package-lock.json": null,
+          "yarn.lock": null,
+          "bun.lock": null,
+          "bun.lockb": null,
+          "pnpm-workspace.yaml": null,
+        },
+      },
+    });
+  }
+
+  const snapshot = await loadPackageFsSnapshot(args.root);
+  const record = args.record;
+  const ordinaryReady =
+    record.projectKind === "ordinary" && record.devDependencyVersion !== undefined;
+  const expectedVersion = record.devDependencyVersion;
+  return inspectPackageContributionHealth({
+    record,
+    poiesisVersion: args.poiesisVersion,
+    snapshot,
+    ...(ordinaryReady && expectedVersion !== undefined
+      ? {
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(args.root),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: args.root,
+              expectedVersion,
+              run: args.run,
+            }),
+        }
+      : {}),
+    ...(record.projectKind === "selfhost"
+      ? { probeSelfhostDist: () => probeSelfhostDistVersion(args.root, args.run) }
+      : {}),
+  });
 }
 
 /**

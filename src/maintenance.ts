@@ -88,6 +88,7 @@ import {
   assertPackageContributionCaptureIdentity,
   assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
+  inspectPackageContributionHealthAtRoot,
   packagePlanRetainsContribution,
   planPackageContributionAtRoot,
   planPackageContributionRemoval,
@@ -2633,6 +2634,35 @@ export async function doctor(root: string): Promise<DoctorReport> {
     checks.push({ id: "git-base", status: "fail", message: "Integration branch cannot be checked without valid config" });
     checks.push({ id: "tracker", status: "fail", message: "Tracker configuration is invalid or missing" });
     checks.push({ id: "delivery", status: "fail", message: "Delivery configuration is invalid or missing" });
+  }
+
+  // Spec #219 / ticket #222 — read-only package-contribution diagnosis.
+  // Reuses shared eligibility, ownership, and readiness. Never repairs
+  // package.json, lockfiles, or node_modules from doctor.
+  if (manifest !== undefined) {
+    try {
+      const packageCheck = await inspectPackageContributionHealthAtRoot({
+        root: resolvedRoot,
+        record: manifest.packageContribution,
+        poiesisVersion: manifest.poiesisVersion,
+        run: runProcess,
+      });
+      checks.push(packageCheck);
+    } catch (error) {
+      checks.push({
+        id: "package-contribution",
+        status: "fail",
+        message: "Package contribution could not be inspected",
+        details: { repaired: false, ...errorDetails(error) },
+      });
+    }
+  } else {
+    checks.push({
+      id: "package-contribution",
+      status: "fail",
+      message: "Package contribution cannot be checked without a manifest",
+      details: { repaired: false },
+    });
   }
 
   // Spec #120 / ticket #121: `uv` is a STANDARD Poiesis requirement as

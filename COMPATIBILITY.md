@@ -396,3 +396,13 @@ When the host does provide the capability but the startup cannot be confirmed, t
 The processor is resolved and validated BEFORE any process exists, so a host with no usable one refuses rather than failing as an opaque spawn error. `COMMAND_PROCESSOR_UNAVAILABLE` carries `details.reason` (`PROCESSOR_NOT_EXECUTABLE` on POSIX; `COMSPEC_MISSING`, `COMSPEC_NOT_ABSOLUTE`, `COMSPEC_NOT_COMMAND_PROCESSOR`, `COMSPEC_UNAVAILABLE` on Windows), `details.platform`, `details.processor` (the path that was rejected), `details.detail`, and a `details.remediation` for the host.
 
 `poiesis check` passes that refusal through with its own code and those fields intact, and with the bounded `details.check` evidence attached — it is a host limitation, not a failing command. It deliberately attaches none of the `details.migration` advice that a genuine `FOCUSED_CHECK_FAILED` carries, because `poiesis verify` resolves command text through the same processor and would refuse identically. `verify` keeps its own fail-closed propagation of the same error. Nothing is spawned either way.
+
+## Package contribution and root-aligned pnpm workspaces (Spec #219)
+
+Poiesis 1.7.0+ admits a **root-aligned pnpm workspace** as one repository-wide installation when eligibility holds: root `package.json`, root `pnpm-workspace.yaml`, sole root `pnpm-lock.yaml`, effective workspace root equal to the installation root, and an intact shared-workspace lockfile contract. Ownership stays root-relative (script + exact `poiesis-cli` pin + root lock); member manifests are never owned. Native pnpm ops use explicit workspace-root scope. The normal isolated linker is supported; hoisting is not required.
+
+**Doctor.** `poiesis doctor` includes a read-only `package-contribution` check that reuses the same eligibility, ownership, and readiness logic as install/update. Failures surface unsupported scope, root ownership drift, missing local installation, exact-version mismatch, and unusable/missing root-local executable with `details.code`, `details.action`, `details.hint`, and `details.repaired: false`. Doctor never repairs.
+
+**OpenCode.** With an owned pnpm contribution the canonical route remains `pnpm poiesis …` from the authoritative root — no member-filter grants and no dlx fallback while the contribution is owned.
+
+**Refused layouts** stay fail-closed: npm package.json workspaces, outer/non-root effective scope, ambiguous/missing locks, `shared-workspace-lockfile=false`, external `lockfile-dir`. Native package-manager failures remain incomplete operations without claimed `node_modules` rollback. Uninstall removes only the authenticated root contribution and preserves foreign content and child manifests.

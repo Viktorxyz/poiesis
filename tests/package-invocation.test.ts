@@ -5,6 +5,9 @@
  * Spec #219 / ticket #221 — update / version-cross / removal lifecycle on the
  * same eligibility + explicit workspace-root scope; child manifests stay
  * byte-identical; fail-closed drift and incomplete native ops.
+ * Spec #219 / ticket #222 — doctor read-only package-contribution check,
+ * OpenCode root canonical route (no member grants), docs, root/subdir
+ * invocation equivalence.
  *
  * Pure / in-memory / injected-executor tests plus bounded real-pnpm workspace
  * fixtures. No mock agent sessions.
@@ -38,8 +41,10 @@ import {
   desiredScriptValue,
   detectOuterPnpmWorkspace,
   gateUpdateConfigEarlyNoopPackage,
+  inspectPackageContributionHealth,
   isExternalLockfileDir,
   nativePackageManagerArgv,
+  packageContributionDoctorRemediation,
   packageContributionMode,
   packagePlanIsNoopWithPreimage,
   packagePlanRetainsContribution,
@@ -3871,4 +3876,379 @@ describe("real pnpm workspace-root update + uninstall lifecycle (Spec #219 / tic
     },
     180_000,
   );
+});
+
+/**
+ * Spec #219 / ticket #222 — doctor read-only package-contribution diagnosis,
+ * OpenCode root-canonical route without member grants, and root/subdir
+ * invocation equivalence. Never repairs.
+ */
+describe("package-contribution doctor (Spec #219 / ticket #222)", () => {
+  const PNPM_WS = "packages:\n  - 'packages/*'\n";
+  const PNPM_LOCK = "lockfileVersion: '9.0'\n";
+  const ownedRootPkg = (version: string) =>
+    [
+      "{",
+      '  "name": "ws-root-demo",',
+      '  "private": true,',
+      '  "version": "0.0.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      `  "devDependencies": { "poiesis-cli": "${version}" }`,
+      "}",
+      "",
+    ].join("\n");
+
+  const wsRecord = (version: string): PackageContributionRecord =>
+    buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: version,
+    });
+
+  const ready = {
+    readResolvedLocalPackageJson: async () =>
+      JSON.stringify({ name: "poiesis-cli", version: "1.7.0" }),
+    assertLocalCliExecutable: async () => undefined,
+  };
+
+  it("passes when no contribution is recorded (exact launcher retained)", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: undefined,
+      poiesisVersion: "1.7.0",
+      snapshot: snap({ packageJson: null }),
+    });
+    expect(check).toMatchObject({
+      id: "package-contribution",
+      status: "pass",
+      details: { packageContribution: null, repaired: false },
+    });
+  });
+
+  it("passes for a healthy root-aligned pnpm workspace contribution", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      ...ready,
+    });
+    expect(check.status).toBe("pass");
+    expect(check.details.repaired).toBe(false);
+    expect(check.details.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+    expect(check.message).toMatch(/workspace/i);
+  });
+
+  it("reports unsupported npm workspaces scope without repair", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: [
+          "{",
+          '  "name": "demo",',
+          '  "workspaces": ["packages/*"],',
+          '  "scripts": { "poiesis": "poiesis" },',
+          '  "devDependencies": { "poiesis-cli": "1.7.0" }',
+          "}",
+          "",
+        ].join("\n"),
+        lockfiles: { "package-lock.json": "{}\n" },
+      }),
+      ...ready,
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details).toMatchObject({
+      code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+      repaired: false,
+      ...packageContributionDoctorRemediation("PACKAGE_WORKSPACE_UNSUPPORTED"),
+    });
+  });
+
+  it("reports outer/non-root effective workspace scope", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK },
+        outerPnpmWorkspace: true,
+      }),
+      ...ready,
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+    expect(check.details.hint).toBe("unsupported-scope");
+    expect(check.details.repaired).toBe(false);
+  });
+
+  it("reports disabled shared-workspace-lockfile", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+        npmrc: "shared-workspace-lockfile=false\n",
+      }),
+      ...ready,
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+    expect(check.details.repaired).toBe(false);
+  });
+
+  it("reports root ownership drift on script mismatch", async () => {
+    const drifted = ownedRootPkg("1.7.0").replace('"poiesis": "poiesis"', '"poiesis": "echo foreign"');
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: drifted,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      ...ready,
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details).toMatchObject({
+      code: "PACKAGE_CONTRIBUTION_MISMATCH",
+      repaired: false,
+      action: "run-poiesis-update",
+      hint: "root-ownership-drift",
+    });
+  });
+
+  it("reports missing local installation", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      readResolvedLocalPackageJson: async () => null,
+      assertLocalCliExecutable: async () => {
+        throw new Error("executable must not run when package is missing");
+      },
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details).toMatchObject({
+      code: "PACKAGE_LOCAL_BIN_UNRESOLVED",
+      repaired: false,
+      action: "run-poiesis-update",
+      hint: "missing-or-unusable-local-executable",
+    });
+  });
+
+  it("reports exact-version mismatch", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      readResolvedLocalPackageJson: async () =>
+        JSON.stringify({ name: "poiesis-cli", version: "1.6.0" }),
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details).toMatchObject({
+      code: "PACKAGE_LOCAL_BIN_VERSION_MISMATCH",
+      repaired: false,
+      action: "run-poiesis-update",
+      hint: "exact-version-mismatch",
+      expectedVersion: "1.7.0",
+      actualVersion: "1.6.0",
+    });
+  });
+
+  it("reports unusable or missing root-local executable", async () => {
+    const check = await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: ownedRootPkg("1.7.0"),
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+      }),
+      readResolvedLocalPackageJson: async () =>
+        JSON.stringify({ name: "poiesis-cli", version: "1.7.0" }),
+      assertLocalCliExecutable: async () => {
+        assertResolvedLocalCliExecutable({
+          expectedVersion: "1.7.0",
+          present: false,
+        });
+      },
+    });
+    expect(check.status).toBe("fail");
+    expect(check.details).toMatchObject({
+      code: "PACKAGE_LOCAL_BIN_UNRESOLVED",
+      repaired: false,
+      hint: "missing-or-unusable-local-executable",
+    });
+  });
+
+  it("never mutates package snapshot bytes during diagnosis", async () => {
+    const packageJson = ownedRootPkg("1.7.0");
+    const lock = PNPM_LOCK;
+    const workspace = PNPM_WS;
+    const snapshot = snap({
+      packageJson,
+      lockfiles: { "pnpm-lock.yaml": lock, "pnpm-workspace.yaml": workspace },
+    });
+    await inspectPackageContributionHealth({
+      record: wsRecord("1.7.0"),
+      poiesisVersion: "1.7.0",
+      snapshot,
+      ...ready,
+    });
+    expect(snapshot.packageJson).toBe(packageJson);
+    expect(snapshot.lockfiles["pnpm-lock.yaml"]).toBe(lock);
+    expect(snapshot.lockfiles["pnpm-workspace.yaml"]).toBe(workspace);
+  });
+
+  it("OpenCode keeps canonical pnpm poiesis from root with no member-specific grants", () => {
+    const record = wsRecord("1.7.0");
+    expect(canonicalInvocationPrefix("1.7.0", record)).toBe("pnpm poiesis");
+    const patches = desiredOpenCodePatches(testConfig(), "1.7.0", record);
+    const primary = patches.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis");
+    const worker = patches.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker");
+    const primaryBash = (primary?.value as { permission: { bash: Record<string, string> } }).permission.bash;
+    const workerBash = (worker?.value as { permission: { bash: Record<string, string> } }).permission.bash;
+    const allBash = { ...primaryBash, ...workerBash };
+    expect(primaryBash["pnpm poiesis *"]).toBe("allow");
+    expect(workerBash["pnpm poiesis check *"]).toBe("allow");
+    // No member-filter, filter-name, or package-directory grants.
+    for (const [key, value] of Object.entries(allBash)) {
+      if (value !== "allow") continue;
+      expect(key).not.toMatch(/--filter\b/);
+      expect(key).not.toMatch(/packages\//);
+      expect(key).not.toMatch(/--dir\b/);
+      expect(key).not.toMatch(/workspace:/);
+    }
+    // No dlx fallback while local contribution is owned.
+    expect(primaryBash["pnpm dlx poiesis-cli@1.7.0 *"]).toBeUndefined();
+  });
+});
+
+describe("root and subdirectory invocation equivalence (Spec #219 / ticket #222)", () => {
+  const ownedRoots: string[] = [];
+  afterAll(async () => {
+    for (const root of ownedRoots) {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    "resolveGitRoot from a member subdirectory equals the repository root",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "poiesis-subdir-222-"));
+      ownedRoots.push(root);
+      const childDir = join(root, "packages", "app");
+      await mkdir(childDir, { recursive: true });
+      await writeFileUtf8(
+        join(root, "package.json"),
+        ['{', '  "name": "ws-root",', '  "private": true', "}", ""].join("\n"),
+        "utf8",
+      );
+      await writeFileUtf8(join(root, "pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n", "utf8");
+      await writeFileUtf8(
+        join(childDir, "package.json"),
+        ['{', '  "name": "@ws/app",', '  "private": true', "}", ""].join("\n"),
+        "utf8",
+      );
+      const { run } = await import("../src/process.js");
+      await run("git", ["init"], { cwd: root });
+      await run("git", ["config", "user.email", "test@example.com"], { cwd: root });
+      await run("git", ["config", "user.name", "test"], { cwd: root });
+      const { resolveGitRoot } = await import("../src/paths.js");
+      const fromRoot = await resolveGitRoot(root);
+      const fromChild = await resolveGitRoot(childDir);
+      expect(fromChild).toBe(fromRoot);
+      expect(fromRoot).toBe(root);
+    },
+    30_000,
+  );
+
+  it("doctor health diagnosis is root-scoped and ignores foreign child package.json", async () => {
+    const rootPkg = [
+      "{",
+      '  "name": "ws-root-demo",',
+      '  "private": true,',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.7.0" }',
+      "}",
+      "",
+    ].join("\n");
+    // Child foreign Poiesis must not affect root diagnosis.
+    const childForeign = [
+      "{",
+      '  "name": "@ws/app",',
+      '  "scripts": { "poiesis": "echo child" },',
+      '  "devDependencies": { "poiesis-cli": "0.0.1" }',
+      "}",
+      "",
+    ].join("\n");
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const check = await inspectPackageContributionHealth({
+      record,
+      poiesisVersion: "1.7.0",
+      snapshot: snap({
+        packageJson: rootPkg,
+        lockfiles: {
+          "pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+          "pnpm-workspace.yaml": "packages:\n  - 'packages/*'\n",
+        },
+      }),
+      readResolvedLocalPackageJson: async () =>
+        JSON.stringify({ name: "poiesis-cli", version: "1.7.0" }),
+      assertLocalCliExecutable: async () => undefined,
+    });
+    expect(check.status).toBe("pass");
+    expect(check.details.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+    // Sanity: child foreign content would fail if it were the ownership root.
+    expect(() => assertPackageContributionMatches(childForeign, record)).toThrow(PoiesisError);
+  });
+});
+
+describe("Spec #219 / ticket #222 package contribution documentation", () => {
+  async function readme(): Promise<string> {
+    return readFile(join(import.meta.dirname, "..", "README.md"), "utf8");
+  }
+  async function compatibility(): Promise<string> {
+    return readFile(join(import.meta.dirname, "..", "COMPATIBILITY.md"), "utf8");
+  }
+
+  it("README covers eligibility, exact root pin, isolated linker, unsupported settings, uninstall preservation, native rollback limits, and doctor remediation", async () => {
+    const text = await readme();
+    expect(text).toMatch(/root-aligned pnpm workspace/i);
+    expect(text).toMatch(/pnpm-workspace\.yaml/);
+    expect(text).toMatch(/exact.*poiesis-cli|poiesis-cli.*exact/i);
+    expect(text).toMatch(/isolated/i);
+    expect(text).toMatch(/shared-workspace-lockfile|lockfile-dir/i);
+    expect(text).toMatch(/npm package\.json workspaces|npm `package\.json` workspaces/i);
+    expect(text).toMatch(/child.*manifest|member.*package\.json/i);
+    expect(text).toMatch(/does \*\*not\*\* claim atomic rollback|does not claim atomic rollback/i);
+    expect(text).toMatch(/uninstall.*authenticated root|removes only the authenticated root/i);
+    expect(text).toMatch(/package-contribution/i);
+    expect(text).toMatch(/never.*repair|never\*\* repairs/i);
+    expect(text).toMatch(/subdirectory.*authoritative|authoritative root/i);
+    expect(text).toMatch(/member-package filter|no member/i);
+  });
+
+  it("COMPATIBILITY.md documents Spec #219 doctor and root canonical OpenCode route", async () => {
+    const text = await compatibility();
+    expect(text).toMatch(/Spec #219/);
+    expect(text).toMatch(/package-contribution/);
+    expect(text).toMatch(/pnpm poiesis/);
+    expect(text).toMatch(/never repairs/i);
+  });
 });
