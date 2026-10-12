@@ -8,6 +8,8 @@
  * Spec #219 / ticket #222 — doctor read-only package-contribution check,
  * OpenCode root canonical route (no member grants), docs, root/subdir
  * invocation equivalence.
+ * Spec #219 / ticket #224 — maintained YAML parser + conservative policy for
+ * workspace lock settings (quoted/flow/aliases/merges/tags/docs/types/bounds).
  *
  * Pure / in-memory / injected-executor tests plus bounded real-pnpm workspace
  * fixtures. No mock agent sessions.
@@ -4680,4 +4682,388 @@ describe("Spec #219 / ticket #223 workspace-YAML lock settings + live pre-mutati
     },
     120_000,
   );
+});
+
+describe("Spec #219 / ticket #224 maintained workspace-YAML parser + conservative policy", () => {
+  const PNPM_WS = "packages:\n  - 'packages/*'\n";
+  const PNPM_LOCK = "lockfileVersion: '9.0'\n";
+  const ORDINARY_ROOT = [
+    "{",
+    '  "name": "demo",',
+    '  "version": "0.1.0",',
+    '  "scripts": {',
+    '    "poiesis": "poiesis"',
+    "  },",
+    '  "devDependencies": {',
+    '    "poiesis-cli": "1.7.0",',
+    '    "typescript": "^5.0.0"',
+    "  }",
+    "}",
+    "",
+  ].join("\n");
+
+  function ownershipForWorkspaceYaml(workspaceYaml: string, extra?: { npmrc?: string | null; packageJson?: string }) {
+    return resolvePackageManagerOwnership(
+      snap({
+        packageJson: extra?.packageJson ?? ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": workspaceYaml },
+        ...(extra?.npmrc === undefined ? {} : { npmrc: extra.npmrc }),
+      }),
+    );
+  }
+
+  it("accepts absent/empty YAML and ordinary packages-only documents", () => {
+    expect(parsePnpmWorkspaceYamlLockSettings(null)).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings(undefined)).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings("")).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings("# comment only\n")).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings(PNPM_WS)).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(parsePnpmWorkspaceYamlLockSettings("packages:\n  - 'packages/*'\nunrelated: 1\n")).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(
+      ownershipForWorkspaceYaml(PNPM_WS),
+    ).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    });
+  });
+
+  it("accepts normal boolean/string lock settings in block form (camel + kebab)", () => {
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\nlockfileDir: ../external-locks\n",
+      ),
+    ).toEqual({
+      sharedWorkspaceLockfile: false,
+      lockfileDir: "../external-locks",
+      ambiguous: false,
+    });
+    expect(
+      parsePnpmWorkspaceYamlLockSettings("packages:\n  - '*'\nshared-workspace-lockfile: true\n"),
+    ).toEqual({
+      sharedWorkspaceLockfile: true,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(
+      parsePnpmWorkspaceYamlLockSettings("packages: ['packages/*']\nlockfile-dir: .\n"),
+    ).toEqual({
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: ".",
+      ambiguous: false,
+    });
+  });
+
+  it("interprets quoted keys and flow mappings (no lexical bypass)", () => {
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        'packages: ["packages/*"]\n"sharedWorkspaceLockfile": false\n',
+      ),
+    ).toEqual({
+      sharedWorkspaceLockfile: false,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        '{"packages":["packages/*"],"sharedWorkspaceLockfile":false,"lockfileDir":"../elsewhere"}\n',
+      ),
+    ).toEqual({
+      sharedWorkspaceLockfile: false,
+      lockfileDir: "../elsewhere",
+      ambiguous: false,
+    });
+    // Unicode escape in a double-quoted key must decode to the real setting name.
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        'packages: []\n"sharedWork\\u0073paceLockfile": false\n',
+      ),
+    ).toEqual({
+      sharedWorkspaceLockfile: false,
+      lockfileDir: undefined,
+      ambiguous: false,
+    });
+    const quoted = ownershipForWorkspaceYaml(
+      'packages:\n  - "packages/*"\n"sharedWorkspaceLockfile": false\n',
+    );
+    expect(quoted.kind).toBe("unsupported");
+    if (quoted.kind === "unsupported") {
+      expect(quoted.code).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+      expect(quoted.details.sharedWorkspaceLockfile).toBe(false);
+    }
+    const flow = ownershipForWorkspaceYaml(
+      '{packages: ["packages/*"], lockfileDir: "../flow-locks"}\n',
+    );
+    expect(flow.kind).toBe("unsupported");
+    if (flow.kind === "unsupported") {
+      expect(flow.details.lockfileDir).toBe("../flow-locks");
+    }
+  });
+
+  it("rejects aliases, merge keys, explicit custom tags, duplicates, multi-docs, wrong roots", () => {
+    const cases: Array<{ label: string; yaml: string }> = [
+      {
+        label: "alias",
+        yaml: "x: &a false\npackages: []\nsharedWorkspaceLockfile: *a\n",
+      },
+      {
+        label: "merge-key",
+        yaml: "defaults: &d\n  sharedWorkspaceLockfile: false\n<<: *d\npackages: []\n",
+      },
+      {
+        label: "merge-inline",
+        yaml: "<<: {sharedWorkspaceLockfile: false}\npackages: []\n",
+      },
+      {
+        label: "custom-tag",
+        yaml: "packages: []\nsharedWorkspaceLockfile: !bool false\n",
+      },
+      {
+        label: "duplicate-keys",
+        yaml: "sharedWorkspaceLockfile: true\nsharedWorkspaceLockfile: false\npackages: []\n",
+      },
+      {
+        label: "duplicate-decoded-keys",
+        yaml: 'sharedWorkspaceLockfile: true\n"sharedWorkspaceLockfile": false\npackages: []\n',
+      },
+      {
+        label: "multiple-docs",
+        yaml: "packages: []\n---\nsharedWorkspaceLockfile: false\n",
+      },
+      {
+        label: "seq-root",
+        yaml: "- packages\n- more\n",
+      },
+      {
+        label: "scalar-root",
+        yaml: "just-a-string\n",
+      },
+      {
+        label: "malformed",
+        yaml: "packages:\n  - 'packages/*'\n  broken: [\n",
+      },
+    ];
+    for (const c of cases) {
+      const parsed = parsePnpmWorkspaceYamlLockSettings(c.yaml);
+      expect(parsed.ambiguous, c.label).toBe(true);
+      const resolved = ownershipForWorkspaceYaml(c.yaml);
+      expect(resolved.kind, c.label).toBe("unsupported");
+      if (resolved.kind === "unsupported") {
+        expect(resolved.code, c.label).toBe("PACKAGE_WORKSPACE_UNSUPPORTED");
+        expect(resolved.details.ambiguousWorkspaceLockSettings, c.label).toBe(true);
+      }
+    }
+  });
+
+  it("strict types: no coercion, null is not absence, nested values fail closed", () => {
+    expect(parsePnpmWorkspaceYamlLockSettings("sharedWorkspaceLockfile: null\npackages: []\n").ambiguous).toBe(
+      true,
+    );
+    expect(parsePnpmWorkspaceYamlLockSettings('sharedWorkspaceLockfile: "false"\npackages: []\n').ambiguous).toBe(
+      true,
+    );
+    expect(parsePnpmWorkspaceYamlLockSettings("sharedWorkspaceLockfile: 0\npackages: []\n").ambiguous).toBe(true);
+    expect(parsePnpmWorkspaceYamlLockSettings("sharedWorkspaceLockfile: yes\npackages: []\n").ambiguous).toBe(true);
+    expect(
+      parsePnpmWorkspaceYamlLockSettings("sharedWorkspaceLockfile:\n  nested: true\npackages: []\n").ambiguous,
+    ).toBe(true);
+    expect(parsePnpmWorkspaceYamlLockSettings("lockfileDir: null\npackages: []\n").ambiguous).toBe(true);
+    expect(parsePnpmWorkspaceYamlLockSettings("lockfileDir: 12\npackages: []\n").ambiguous).toBe(true);
+    expect(
+      parsePnpmWorkspaceYamlLockSettings("lockfileDir:\n  path: ../x\npackages: []\n").ambiguous,
+    ).toBe(true);
+    // Both camel and kebab forms present → unresolved ambiguity.
+    expect(
+      parsePnpmWorkspaceYamlLockSettings(
+        "sharedWorkspaceLockfile: true\nshared-workspace-lockfile: false\npackages: []\n",
+      ).ambiguous,
+    ).toBe(true);
+  });
+
+  it("rejects oversized input and pathological depth (resource bounds)", () => {
+    const huge = `${"x: 1\n".repeat(1)}packages: []\n` + "a".repeat(300_000);
+    expect(parsePnpmWorkspaceYamlLockSettings(huge).ambiguous).toBe(true);
+    let deep = "";
+    for (let i = 0; i < 80; i += 1) {
+      deep += `${"  ".repeat(i)}k${i}:\n`;
+    }
+    deep += `${"  ".repeat(80)}v: 1\n`;
+    expect(parsePnpmWorkspaceYamlLockSettings(deep).ambiguous).toBe(true);
+  });
+
+  it("invalid workspace YAML cannot be rescued by .npmrc or package.json precedence", () => {
+    const malformed =
+      "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: [broken\n";
+    const rescued = ownershipForWorkspaceYaml(malformed, {
+      npmrc: "shared-workspace-lockfile=true\nlockfile-dir=.\n",
+    });
+    expect(rescued.kind).toBe("unsupported");
+    if (rescued.kind === "unsupported") {
+      expect(rescued.details.ambiguousWorkspaceLockSettings).toBe(true);
+    }
+    const pkgRescue = ownershipForWorkspaceYaml(malformed, {
+      packageJson: [
+        "{",
+        '  "name": "demo",',
+        '  "private": true,',
+        '  "pnpm": { "sharedWorkspaceLockfile": true, "lockfileDir": "." }',
+        "}",
+        "",
+      ].join("\n"),
+    });
+    expect(pkgRescue.kind).toBe("unsupported");
+    if (pkgRescue.kind === "unsupported") {
+      expect(pkgRescue.details.ambiguousWorkspaceLockSettings).toBe(true);
+    }
+  });
+
+  it("preserves .npmrc → package.json → workspace-YAML precedence on valid input", () => {
+    // YAML disables; .npmrc restores — still eligible.
+    expect(
+      ownershipForWorkspaceYaml("packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n", {
+        npmrc: "shared-workspace-lockfile=true\n",
+      }),
+    ).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    });
+    // package.json wins over YAML when .npmrc is silent.
+    const pkgWins = ownershipForWorkspaceYaml(
+      "packages:\n  - 'packages/*'\nsharedWorkspaceLockfile: false\n",
+      {
+        packageJson: [
+          "{",
+          '  "name": "demo",',
+          '  "private": true,',
+          '  "pnpm": { "sharedWorkspaceLockfile": true }',
+          "}",
+          "",
+        ].join("\n"),
+      },
+    );
+    expect(pkgWins).toEqual({
+      kind: "supported",
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      executionScope: { kind: "pnpm-workspace-root" },
+    });
+    // Relative lockfileDir path rules unchanged: only . / ./ accepted as root-local.
+    expect(isExternalLockfileDir(".")).toBe(false);
+    expect(isExternalLockfileDir("./")).toBe(false);
+    expect(isExternalLockfileDir("../x")).toBe(true);
+    expect(isExternalLockfileDir("locks")).toBe(true);
+  });
+
+  it("planning/doctor/removal share the parsed eligibility seam", () => {
+    const snapshot = snap({
+      packageJson: ORDINARY_ROOT,
+      lockfiles: {
+        "pnpm-lock.yaml": PNPM_LOCK,
+        "pnpm-workspace.yaml":
+          '{"packages":["packages/*"],"sharedWorkspaceLockfile":false}\n',
+      },
+    });
+    expect(() =>
+      planPackageContribution({ snapshot, poiesisVersion: "1.7.0", mode: "ensure" }),
+    ).toThrow(expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }));
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    expect(() => planPackageContributionRemoval({ snapshot, record })).toThrow(
+      expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }),
+    );
+  });
+
+  it("post-plan quoted/flow workspace-YAML drift refuses before write/executor", async () => {
+    const eligible = snap({
+      packageJson: ORDINARY_PKG,
+      lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+    });
+    const plan = planPackageContribution({
+      snapshot: eligible,
+      poiesisVersion: "1.7.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+
+    for (const driftedYaml of [
+      'packages:\n  - "packages/*"\n"sharedWorkspaceLockfile": false\n',
+      '{packages: ["packages/*"], lockfileDir: "../post-plan"}\n',
+      "packages: []\nsharedWorkspaceLockfile: !custom false\n",
+    ] as const) {
+      const writes: string[] = [];
+      let executorCalls = 0;
+      const drifted = snap({
+        packageJson: ORDINARY_PKG,
+        lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": driftedYaml },
+      });
+      await expect(
+        applyPackageContributionPlan({
+          plan,
+          preimage: { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK },
+          liveSnapshot: drifted,
+          executor: {
+            async apply() {
+              executorCalls += 1;
+              return { packageJson: ORDINARY_PKG, lockfile: PNPM_LOCK };
+            },
+          },
+          writeFile: async (path) => {
+            writes.push(path);
+          },
+        }),
+      ).rejects.toMatchObject({
+        code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+        details: expect.objectContaining({ liveEligibilityDrift: true }),
+      });
+      expect(writes).toEqual([]);
+      expect(executorCalls).toBe(0);
+    }
+  });
+
+  it("package.json declares yaml as a direct runtime dependency", async () => {
+    const pkg = JSON.parse(
+      await readFile(join(import.meta.dirname, "..", "package.json"), "utf8"),
+    ) as { dependencies?: Record<string, string> };
+    expect(pkg.dependencies?.yaml).toMatch(/^\^?2\./);
+  });
+
+  it("COMPATIBILITY.md documents conservative workspace-YAML parse policy", async () => {
+    const text = await readFile(join(import.meta.dirname, "..", "COMPATIBILITY.md"), "utf8");
+    expect(text).toMatch(/pnpm-workspace\.yaml/i);
+    expect(text).toMatch(/YAML|yaml/);
+    expect(text).toMatch(/conservative|fail-closed|fail closed/i);
+    expect(text).toMatch(/alias|merge|custom tag|multiple document/i);
+  });
 });

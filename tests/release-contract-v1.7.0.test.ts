@@ -137,6 +137,11 @@ describe("Poiesis 1.7.0 release contract (pure)", () => {
     }
   });
 
+  it("package.json declares yaml as a direct runtime dependency (Spec #219 / ticket #224)", async () => {
+    const pkg = await readPackageJson();
+    expect(pkg.dependencies?.yaml).toMatch(/^\^?2\./);
+  });
+
   it("package.json::files enumerates every required canonical doc / role / runtime output", async () => {
     const pkg = await readPackageJson();
     const files = new Set(pkg.files ?? []);

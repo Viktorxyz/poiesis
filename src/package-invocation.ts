@@ -12,6 +12,9 @@
  * (`sharedWorkspaceLockfile` / `lockfileDir`) with fail-closed ambiguity and
  * clear precedence; live eligibility/scope is revalidated immediately before
  * package write and native executor (apply + removal).
+ * Spec #219 / ticket #224 — workspace YAML lock settings use a maintained
+ * standards-compliant parser (`yaml`) plus a conservative fail-closed semantic
+ * policy shared by planning, doctor, removal, and live pre-mutation validation.
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -52,6 +55,18 @@ import {
   type Node,
 } from "jsonc-parser";
 import { isDeepStrictEqual } from "node:util";
+import {
+  isAlias,
+  isMap,
+  isNode,
+  isPair,
+  isScalar,
+  isSeq,
+  parseAllDocuments,
+  visit,
+  type ParsedNode,
+  type YAMLMap,
+} from "yaml";
 import { parseJsonc } from "./config.js";
 import { PoiesisError } from "./errors.js";
 import { hashContent } from "./hash.js";
@@ -724,72 +739,275 @@ export function readPackageJsonPnpmLockfileDir(document: JsonObject): {
 }
 
 /**
- * Spec #219 / ticket #223 — parse top-level shared-lock settings from
- * `pnpm-workspace.yaml`. Accepts camelCase and kebab-case scalar forms only.
- * Nested/complex values for these keys are ambiguous (fail closed).
+ * Spec #219 / ticket #224 — bounded input for workspace YAML lock-setting parse.
+ * Ordinary `pnpm-workspace.yaml` files are tiny; oversized input fails closed.
  */
-export function parsePnpmWorkspaceYamlLockSettings(yaml: string | null | undefined): {
-  sharedWorkspaceLockfile: boolean | undefined;
-  lockfileDir: string | undefined;
-  ambiguous: boolean;
+export const PNPM_WORKSPACE_YAML_MAX_CHARS = 256 * 1024;
+/**
+ * Spec #219 / ticket #224 — controlled pathological nesting depth for the
+ * shared workspace-YAML seam. Deeper documents fail closed.
+ */
+export const PNPM_WORKSPACE_YAML_MAX_DEPTH = 64;
+
+/** YAML 1.2 core tags accepted on nodes; any other explicit tag fails closed. */
+const YAML_CORE_TAGS = new Set([
+  "tag:yaml.org,2002:str",
+  "tag:yaml.org,2002:int",
+  "tag:yaml.org,2002:float",
+  "tag:yaml.org,2002:bool",
+  "tag:yaml.org,2002:null",
+  "tag:yaml.org,2002:map",
+  "tag:yaml.org,2002:seq",
+]);
+
+function yamlNodeTag(node: ParsedNode | null | undefined): string | undefined {
+  if (node === null || node === undefined || !isNode(node)) return undefined;
+  return node.tag;
+}
+
+function isAllowedYamlTag(tag: string | undefined): boolean {
+  if (tag === undefined) return true;
+  return YAML_CORE_TAGS.has(tag);
+}
+
+function workspaceYamlNodeDepth(node: ParsedNode | null | undefined, depth: number): number {
+  if (node === null || node === undefined || !isNode(node)) return depth;
+  if (isScalar(node) || isAlias(node)) return depth;
+  if (isSeq(node)) {
+    let max = depth;
+    for (const item of node.items) {
+      max = Math.max(max, workspaceYamlNodeDepth(item as ParsedNode, depth + 1));
+    }
+    return max;
+  }
+  if (isMap(node)) {
+    let max = depth;
+    for (const item of node.items) {
+      if (!isPair(item)) continue;
+      max = Math.max(
+        max,
+        workspaceYamlNodeDepth(item.key as ParsedNode, depth + 1),
+        workspaceYamlNodeDepth(item.value as ParsedNode, depth + 1),
+      );
+    }
+    return max;
+  }
+  return depth;
+}
+
+function ambiguousWorkspaceYaml(
+  reason: string,
+): {
+  sharedWorkspaceLockfile: undefined;
+  lockfileDir: undefined;
+  ambiguous: true;
+  reason: string;
 } {
-  if (yaml === null || yaml === undefined || yaml.length === 0) {
-    return { sharedWorkspaceLockfile: undefined, lockfileDir: undefined, ambiguous: false };
-  }
-  let sharedWorkspaceLockfile: boolean | undefined;
-  let lockfileDir: string | undefined;
-  let ambiguous = false;
-  const lines = yaml.split(/\r?\n/);
-  for (let i = 0; i < lines.length; i += 1) {
-    const rawLine = lines[i]!;
-    // Top-level keys only (no leading whitespace).
-    if (rawLine.length === 0 || /^\s/.test(rawLine) || rawLine.trimStart().startsWith("#")) continue;
-    const line = rawLine.replace(/\s+#.*$/, "").trimEnd();
-    const match = /^(sharedWorkspaceLockfile|shared-workspace-lockfile|lockfileDir|lockfile-dir)\s*:\s*(.*)$/.exec(
-      line,
-    );
-    if (match === null) continue;
-    const key = match[1]!;
-    let value = match[2]!.trim();
-    if (value.length === 0) {
-      // Multiline / nested form — refuse unresolved ambiguity.
-      const next = lines[i + 1];
-      if (next !== undefined && /^\s+\S/.test(next)) {
-        ambiguous = true;
-        continue;
-      }
-      // Empty scalar: treat shared lock as unset; empty lockfileDir as unset.
-      continue;
-    }
-    // Strip simple YAML quotes.
-    if (
-      (value.startsWith('"') && value.endsWith('"') && value.length >= 2) ||
-      (value.startsWith("'") && value.endsWith("'") && value.length >= 2)
-    ) {
-      value = value.slice(1, -1);
-    }
-    if (key === "sharedWorkspaceLockfile" || key === "shared-workspace-lockfile") {
-      const lower = value.toLowerCase();
-      if (lower === "false" || lower === "0" || lower === "no") sharedWorkspaceLockfile = false;
-      else if (lower === "true" || lower === "1" || lower === "yes") sharedWorkspaceLockfile = true;
-      else ambiguous = true;
-    } else if (key === "lockfileDir" || key === "lockfile-dir") {
-      if (value.startsWith("{") || value.startsWith("[") || value === "|" || value === ">") {
-        ambiguous = true;
-      } else {
-        lockfileDir = value.length === 0 ? undefined : value;
-      }
-    }
-  }
-  return { sharedWorkspaceLockfile, lockfileDir, ambiguous };
+  return {
+    sharedWorkspaceLockfile: undefined,
+    lockfileDir: undefined,
+    ambiguous: true,
+    reason,
+  };
 }
 
 /**
- * Spec #219 / ticket #223 — effective shared-lock contract from `.npmrc`,
+ * Spec #219 / ticket #224 — parse shared-lock settings from `pnpm-workspace.yaml`
+ * via a maintained standards-compliant YAML parser, then enforce a conservative
+ * fail-closed semantic policy:
+ *
+ * - absent / empty input accepted (no relevant settings);
+ * - otherwise exactly one mapping document with decoded string keys;
+ * - reject malformed YAML, duplicate decoded keys, aliases, merge keys,
+ *   explicit custom tags, multiple documents, wrong root types, resource-limit
+ *   violations;
+ * - `sharedWorkspaceLockfile` / `shared-workspace-lockfile`: strict boolean only
+ *   (no coercion, null is not absence);
+ * - `lockfileDir` / `lockfile-dir`: strict string only (empty string → unset);
+ * - quoted/escaped keys and flow mappings are interpreted by the parser.
+ *
+ * This is the single shared read-only seam used by planning, doctor, removal,
+ * and live pre-mutation eligibility.
+ */
+export function parsePnpmWorkspaceYamlLockSettings(yamlText: string | null | undefined): {
+  sharedWorkspaceLockfile: boolean | undefined;
+  lockfileDir: string | undefined;
+  ambiguous: boolean;
+  reason?: string;
+} {
+  if (yamlText === null || yamlText === undefined || yamlText.length === 0) {
+    return { sharedWorkspaceLockfile: undefined, lockfileDir: undefined, ambiguous: false };
+  }
+  if (yamlText.length > PNPM_WORKSPACE_YAML_MAX_CHARS) {
+    return ambiguousWorkspaceYaml("input-too-large");
+  }
+
+  let documents;
+  try {
+    documents = parseAllDocuments(yamlText, {
+      version: "1.2",
+      schema: "core",
+      merge: false,
+      uniqueKeys: true,
+      strict: true,
+      stringKeys: true,
+      resolveKnownTags: false,
+      prettyErrors: true,
+      logLevel: "silent",
+    });
+  } catch {
+    return ambiguousWorkspaceYaml("malformed");
+  }
+
+  // Comment-only / whitespace-only streams yield zero documents — treat as empty.
+  if (documents.length === 0) {
+    return { sharedWorkspaceLockfile: undefined, lockfileDir: undefined, ambiguous: false };
+  }
+  if (documents.length !== 1) {
+    return ambiguousWorkspaceYaml("multiple-documents");
+  }
+
+  const doc = documents[0]!;
+  if (doc.errors.length > 0) {
+    return ambiguousWorkspaceYaml("malformed");
+  }
+  if (doc.warnings.length > 0) {
+    return ambiguousWorkspaceYaml("yaml-warning");
+  }
+
+  const root = doc.contents;
+  if (root === null || root === undefined) {
+    return ambiguousWorkspaceYaml("wrong-root-type");
+  }
+  if (!isMap(root)) {
+    return ambiguousWorkspaceYaml("wrong-root-type");
+  }
+
+  if (workspaceYamlNodeDepth(root, 1) > PNPM_WORKSPACE_YAML_MAX_DEPTH) {
+    return ambiguousWorkspaceYaml("pathological-depth");
+  }
+
+  let sawAlias = false;
+  let sawMergeKey = false;
+  let sawCustomTag = false;
+  let sawNonStringKey = false;
+  visit(doc, {
+    Alias() {
+      sawAlias = true;
+    },
+    Pair(_, pair) {
+      const keyNode = pair.key;
+      if (isScalar(keyNode) && keyNode.value === "<<") {
+        sawMergeKey = true;
+      }
+      if (keyNode !== null && keyNode !== undefined && isNode(keyNode)) {
+        if (!isScalar(keyNode) || typeof keyNode.value !== "string") {
+          sawNonStringKey = true;
+        }
+        if (!isAllowedYamlTag(yamlNodeTag(keyNode as ParsedNode))) {
+          sawCustomTag = true;
+        }
+      }
+      const valueNode = pair.value;
+      if (valueNode !== null && valueNode !== undefined && isNode(valueNode)) {
+        if (!isAllowedYamlTag(yamlNodeTag(valueNode as ParsedNode))) {
+          sawCustomTag = true;
+        }
+      }
+    },
+    Map(_, node) {
+      if (!isAllowedYamlTag(node.tag)) sawCustomTag = true;
+    },
+    Seq(_, node) {
+      if (!isAllowedYamlTag(node.tag)) sawCustomTag = true;
+    },
+    Scalar(_, node) {
+      if (!isAllowedYamlTag(node.tag)) sawCustomTag = true;
+    },
+  });
+  if (sawAlias) return ambiguousWorkspaceYaml("alias");
+  if (sawMergeKey) return ambiguousWorkspaceYaml("merge-key");
+  if (sawCustomTag) return ambiguousWorkspaceYaml("custom-tag");
+  if (sawNonStringKey) return ambiguousWorkspaceYaml("non-string-key");
+
+  let sharedWorkspaceLockfile: boolean | undefined;
+  let lockfileDir: string | undefined;
+  let sawSharedCamel = false;
+  let sawSharedKebab = false;
+  let sawLockCamel = false;
+  let sawLockKebab = false;
+
+  const map = root as YAMLMap.Parsed;
+  for (const item of map.items) {
+    if (!isPair(item)) continue;
+    const keyNode = item.key;
+    if (!isScalar(keyNode) || typeof keyNode.value !== "string") {
+      return ambiguousWorkspaceYaml("non-string-key");
+    }
+    const key = keyNode.value;
+    const valueNode = item.value;
+
+    if (key === "sharedWorkspaceLockfile" || key === "shared-workspace-lockfile") {
+      if (key === "sharedWorkspaceLockfile") {
+        if (sawSharedCamel) return ambiguousWorkspaceYaml("duplicate-keys");
+        sawSharedCamel = true;
+      } else {
+        if (sawSharedKebab) return ambiguousWorkspaceYaml("duplicate-keys");
+        sawSharedKebab = true;
+      }
+      if (valueNode === null || valueNode === undefined) {
+        return ambiguousWorkspaceYaml("sharedWorkspaceLockfile-type");
+      }
+      if (!isScalar(valueNode)) {
+        return ambiguousWorkspaceYaml("sharedWorkspaceLockfile-type");
+      }
+      // Strict boolean only — no string/number/null coercion; null is not absence.
+      if (typeof valueNode.value !== "boolean") {
+        return ambiguousWorkspaceYaml("sharedWorkspaceLockfile-type");
+      }
+      sharedWorkspaceLockfile = valueNode.value;
+      continue;
+    }
+
+    if (key === "lockfileDir" || key === "lockfile-dir") {
+      if (key === "lockfileDir") {
+        if (sawLockCamel) return ambiguousWorkspaceYaml("duplicate-keys");
+        sawLockCamel = true;
+      } else {
+        if (sawLockKebab) return ambiguousWorkspaceYaml("duplicate-keys");
+        sawLockKebab = true;
+      }
+      if (valueNode === null || valueNode === undefined) {
+        return ambiguousWorkspaceYaml("lockfileDir-type");
+      }
+      if (!isScalar(valueNode)) {
+        return ambiguousWorkspaceYaml("lockfileDir-type");
+      }
+      if (typeof valueNode.value !== "string") {
+        return ambiguousWorkspaceYaml("lockfileDir-type");
+      }
+      lockfileDir = valueNode.value.length === 0 ? undefined : valueNode.value;
+    }
+  }
+
+  // Camel + kebab forms of the same setting in one document are unresolved.
+  if (sawSharedCamel && sawSharedKebab) {
+    return ambiguousWorkspaceYaml("duplicate-setting-forms");
+  }
+  if (sawLockCamel && sawLockKebab) {
+    return ambiguousWorkspaceYaml("duplicate-setting-forms");
+  }
+
+  return { sharedWorkspaceLockfile, lockfileDir, ambiguous: false };
+}
+
+/**
+ * Spec #219 / ticket #223 / #224 — effective shared-lock contract from `.npmrc`,
  * package.json `pnpm.*`, and `pnpm-workspace.yaml`.
  *
  * Precedence (highest wins): root `.npmrc` → package.json `pnpm` → workspace YAML.
- * Unresolved / unparseable values fail closed via `ambiguous: true`.
+ * Invalid / unparseable workspace YAML fails closed **before** precedence and
+ * cannot be rescued by another source (`ambiguous: true`).
  */
 export function resolveEffectivePnpmSharedLockSettings(
   snapshot: PackageFsSnapshot,
@@ -801,13 +1019,26 @@ export function resolveEffectivePnpmSharedLockSettings(
   sharedSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
   lockfileDirSource: "npmrc" | "package.json" | "pnpm-workspace.yaml" | undefined;
   ambiguous: boolean;
+  /** Present when workspace YAML failed the conservative parse policy. */
+  workspaceYamlReason?: string;
 } {
   const npmrc = parsePnpmSharedLockSettings(snapshot.npmrc);
   const pkgShared = readPackageJsonPnpmSharedLockfile(document);
   const pkgLock = readPackageJsonPnpmLockfileDir(document);
   const ws = parsePnpmWorkspaceYamlLockSettings(snapshot.lockfiles["pnpm-workspace.yaml"]);
 
-  if (pkgLock.ambiguous || ws.ambiguous) {
+  // Ticket #224 — invalid workspace YAML is rejected before precedence.
+  if (ws.ambiguous) {
+    return {
+      sharedWorkspaceLockfile: undefined,
+      lockfileDir: undefined,
+      sharedSource: undefined,
+      lockfileDirSource: undefined,
+      ambiguous: true,
+      ...(ws.reason === undefined ? {} : { workspaceYamlReason: ws.reason }),
+    };
+  }
+  if (pkgLock.ambiguous) {
     return {
       sharedWorkspaceLockfile: undefined,
       lockfileDir: undefined,
@@ -1000,6 +1231,9 @@ export function resolvePackageManagerOwnership(snapshot: PackageFsSnapshot): Pac
         {
           ambiguousWorkspaceLockSettings: true,
           pnpmWorkspace: true,
+          ...(effective.workspaceYamlReason === undefined
+            ? {}
+            : { workspaceYamlReason: effective.workspaceYamlReason }),
         },
       );
     }
