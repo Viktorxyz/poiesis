@@ -3742,7 +3742,10 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
               packageJson: removal.nextPackageJson,
               lockfile: preimageLockfile,
               ignoreScripts: true,
-              // Spec #219 — removal reuses the plan's validated execution scope.
+              // Spec #219 / ticket #221 — removal reuses centralized workspace
+              // eligibility via the plan's validated execution scope (`-w` on the
+              // post-edit lock reconcile install for root-aligned pnpm workspaces).
+              // Never claims node_modules rollback.
               executionScope: removal.executionScope,
             });
           } catch (error) {

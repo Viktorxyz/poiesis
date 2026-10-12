@@ -1,6 +1,11 @@
 /**
  * Spec #207 / ticket #210 — pinned local package invocation (Author replan).
  * Spec #219 / ticket #220 — root-aligned pnpm workspace eligibility.
+ * Spec #219 / ticket #221 — update / version-cross `update --config` / removal
+ * lifecycle reuses the same centralized eligibility and explicit workspace-root
+ * execution scope; config-byte no-op revalidates ownership + readiness; child
+ * manifests stay byte-identical; scope/identity/native/runtime failures fail
+ * closed without claiming `node_modules` rollback.
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -315,10 +320,19 @@ export type LockfileOperation =
 
 /**
  * Exact native package-manager argv for a lock/dep operation.
- * Add-dev always pins exact (`-E` / `--save-exact` equivalent).
- * Lifecycle scripts are always disabled (`--ignore-scripts`).
+ * Add-dev always pins exact (`-E` / `--save-exact` equivalent) and runs with
+ * `--ignore-scripts`.
  * Spec #219 / ticket #220 — pnpm workspace-root scope adds explicit `-w`
  * (`--workspace-root`) so a member package is never selected accidentally.
+ *
+ * Spec #219 / ticket #221 — remove-dev runs **after** the journal already wrote
+ * planned package.json without the owned dep. `pnpm remove` rejects
+ * `--ignore-scripts` and fails with `ERR_PNPM_CANNOT_REMOVE_MISSING_DEPS` once
+ * the name is gone from package.json; npm uninstall of a missing name is
+ * equally unreliable. Reconcile lockfile + node_modules via
+ * `install --ignore-scripts` under the same execution scope (pnpm keeps `-w`
+ * for workspace-root). The planned package.json bytes stay authoritative;
+ * native side effects are still not claimed rolled back on failure.
  */
 export function nativePackageManagerArgv(
   manager: SupportedPackageManager,
@@ -328,13 +342,22 @@ export function nativePackageManagerArgv(
   if (manager === "pnpm") {
     const workspaceRoot =
       executionScope.kind === "pnpm-workspace-root" ? (["-w"] as const) : ([] as const);
-    return operation.op === "add-dev"
-      ? ["add", ...workspaceRoot, "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
-      : ["remove", ...workspaceRoot, operation.name, "--ignore-scripts"];
+    if (operation.op === "add-dev") {
+      return [
+        "add",
+        ...workspaceRoot,
+        "-D",
+        "-E",
+        `${operation.name}@${operation.version}`,
+        "--ignore-scripts",
+      ];
+    }
+    return ["install", ...workspaceRoot, "--ignore-scripts"];
   }
-  return operation.op === "add-dev"
-    ? ["install", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"]
-    : ["uninstall", operation.name, "--ignore-scripts"];
+  if (operation.op === "add-dev") {
+    return ["install", "-D", "-E", `${operation.name}@${operation.version}`, "--ignore-scripts"];
+  }
+  return ["install", "--ignore-scripts"];
 }
 
 /**

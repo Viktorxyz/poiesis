@@ -2,9 +2,12 @@
  * Spec #207 / ticket #210 — pinned local package invocation with ownership-safe
  * package.json + lockfile lifecycle.
  * Spec #219 / ticket #220 — root-aligned pnpm workspace eligibility + scope.
+ * Spec #219 / ticket #221 — update / version-cross / removal lifecycle on the
+ * same eligibility + explicit workspace-root scope; child manifests stay
+ * byte-identical; fail-closed drift and incomplete native ops.
  *
- * Pure / in-memory / injected-executor tests plus one bounded real-pnpm
- * workspace fixture. No mock agent sessions.
+ * Pure / in-memory / injected-executor tests plus bounded real-pnpm workspace
+ * fixtures. No mock agent sessions.
  */
 import { afterAll, describe, expect, it } from "vitest";
 import { parseJsonc, type PoiesisConfig } from "../src/config.js";
@@ -443,9 +446,8 @@ describe("pnpm workspace-root eligibility (Spec #219 / ticket #220)", () => {
       nativePackageManagerArgv("pnpm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" }, scope),
     ).toEqual(["add", "-w", "-D", "-E", "poiesis-cli@1.6.0", "--ignore-scripts"]);
     expect(nativePackageManagerArgv("pnpm", { op: "remove-dev", name: "poiesis-cli" }, scope)).toEqual([
-      "remove",
+      "install",
       "-w",
-      "poiesis-cli",
       "--ignore-scripts",
     ]);
     // Single-package default remains unchanged.
@@ -1805,7 +1807,7 @@ describe("owned-write journal identity and native pm incomplete (ticket #210 rep
 });
 
 describe("native pm argv and resolved version seams (ticket #210 replan)", () => {
-  it("exports exact npm/pnpm argv with --save-exact/-E and --ignore-scripts", () => {
+  it("exports exact npm/pnpm add argv and post-edit lock reconcile install for remove-dev", () => {
     expect(nativePackageManagerArgv("pnpm", { op: "add-dev", name: "poiesis-cli", version: "1.6.0" })).toEqual([
       "add",
       "-D",
@@ -1820,14 +1822,13 @@ describe("native pm argv and resolved version seams (ticket #210 replan)", () =>
       "poiesis-cli@1.6.0",
       "--ignore-scripts",
     ]);
+    // remove-dev: package.json already lacks the owned dep; reconcile lock via install.
     expect(nativePackageManagerArgv("pnpm", { op: "remove-dev", name: "poiesis-cli" })).toEqual([
-      "remove",
-      "poiesis-cli",
+      "install",
       "--ignore-scripts",
     ]);
     expect(nativePackageManagerArgv("npm", { op: "remove-dev", name: "poiesis-cli" })).toEqual([
-      "uninstall",
-      "poiesis-cli",
+      "install",
       "--ignore-scripts",
     ]);
   });
@@ -3205,5 +3206,669 @@ describe("real pnpm workspace-root install (Spec #219 / ticket #220)", () => {
       expect(scriptRun.stdout.trim().split(/\r?\n/)[0]?.trim()).toBe(targetVersion);
     },
     120_000,
+  );
+});
+
+/**
+ * Spec #219 / ticket #221 — lifecycle surfaces (version-cross update --config,
+ * config-byte no-op readiness, removal) reuse ticket #220 eligibility and
+ * explicit workspace-root execution scope. Child manifests including foreign
+ * child Poiesis declarations stay byte-identical; drift and native failures
+ * fail closed without claiming node_modules rollback.
+ */
+describe("pnpm workspace-root lifecycle (Spec #219 / ticket #221)", () => {
+  const PNPM_WS = "packages:\n  - 'packages/*'\n";
+  const PNPM_LOCK = "lockfileVersion: '9.0'\n";
+
+  const ownedRootPkg = (version: string) =>
+    [
+      "{",
+      '  "name": "ws-root-demo",',
+      '  "private": true,',
+      '  "version": "0.0.0",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      `  "devDependencies": { "poiesis-cli": "${version}" }`,
+      "}",
+      "",
+    ].join("\n");
+
+  const foreignChildPkg = [
+    "{",
+    '  "name": "@ws/app",',
+    '  "version": "0.0.1",',
+    '  "private": true,',
+    '  "scripts": { "poiesis": "echo child-foreign" },',
+    '  "devDependencies": { "poiesis-cli": "1.5.0" }',
+    "}",
+    "",
+  ].join("\n");
+
+  const wsSnap = (packageJson: string, lock = PNPM_LOCK) =>
+    snap({
+      packageJson,
+      lockfiles: { "pnpm-lock.yaml": lock, "pnpm-workspace.yaml": PNPM_WS },
+    });
+
+  it("version-cross update planning reuses workspace-root eligibility and explicit scope", () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const { plan, contributionForProjection } = planPackageContributionForVersionCross({
+      snapshot: wsSnap(ownedRootPkg("1.6.0")),
+      nextPoiesisVersion: "1.7.0",
+      prior,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    expect(plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+    expect(plan.lockfileOperation).toEqual({
+      op: "add-dev",
+      name: "poiesis-cli",
+      version: "1.7.0",
+    });
+    expect(
+      nativePackageManagerArgv("pnpm", plan.lockfileOperation!, plan.executionScope),
+    ).toEqual(["add", "-w", "-D", "-E", "poiesis-cli@1.7.0", "--ignore-scripts"]);
+    expect(contributionForProjection?.devDependencyVersion).toBe("1.7.0");
+    // Durable schema stays root-relative — no executionScope field.
+    expect("executionScope" in (contributionForProjection ?? {})).toBe(false);
+    expect(parsePkg(plan.nextPackageJson).devDependencies?.["poiesis-cli"]).toBe("1.7.0");
+  });
+
+  it("version-cross fails closed on workspace scope drift (shared lock disabled)", () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    expect(() =>
+      planPackageContributionForVersionCross({
+        snapshot: snap({
+          packageJson: ownedRootPkg("1.6.0"),
+          lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+          npmrc: "shared-workspace-lockfile=false\n",
+        }),
+        nextPoiesisVersion: "1.7.0",
+        prior,
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        code: "PACKAGE_WORKSPACE_UNSUPPORTED",
+      }),
+    );
+  });
+
+  it("version-cross fails closed on outer/non-root effective workspace scope", () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    expect(() =>
+      planPackageContributionForVersionCross({
+        snapshot: snap({
+          packageJson: ownedRootPkg("1.6.0"),
+          lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+          outerPnpmWorkspace: true,
+        }),
+        nextPoiesisVersion: "1.7.0",
+        prior,
+      }),
+    ).toThrow(expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }));
+  });
+
+  it("removal plans explicit workspace-root -w and only mutates authenticated root contributions", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const plan = planPackageContributionRemoval({
+      snapshot: wsSnap(ownedRootPkg("1.7.0")),
+      record,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    expect(plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+    expect(plan.lockfileOperation).toEqual({ op: "remove-dev", name: "poiesis-cli" });
+    expect(
+      nativePackageManagerArgv("pnpm", plan.lockfileOperation!, plan.executionScope),
+    ).toEqual(["install", "-w", "--ignore-scripts"]);
+    const next = parsePkg(plan.nextPackageJson);
+    expect(next.scripts?.poiesis).toBeUndefined();
+    expect(next.devDependencies?.["poiesis-cli"]).toBeUndefined();
+    // Child foreign declarations are never part of the root plan.
+    expect(JSON.stringify(plan)).not.toContain("child-foreign");
+    expect(JSON.stringify(plan)).not.toContain("@ws/app");
+  });
+
+  it("removal fails closed when workspace eligibility drifts after install", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    expect(() =>
+      planPackageContributionRemoval({
+        snapshot: snap({
+          packageJson: ownedRootPkg("1.7.0"),
+          lockfiles: { "pnpm-lock.yaml": PNPM_LOCK, "pnpm-workspace.yaml": PNPM_WS },
+          npmrc: "shared-workspace-lockfile=false\n",
+        }),
+        record,
+      }),
+    ).toThrow(expect.objectContaining({ code: "PACKAGE_WORKSPACE_UNSUPPORTED" }));
+  });
+
+  it("version-cross apply writes only root package.json + lock; child foreign Poiesis stays untouched", async () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const rootBefore = ownedRootPkg("1.6.0");
+    const childBefore = foreignChildPkg;
+    const { plan } = planPackageContributionForVersionCross({
+      snapshot: wsSnap(rootBefore),
+      nextPoiesisVersion: "1.7.0",
+      prior,
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const writes: Array<{ path: string; content: string }> = [];
+    const executorCalls: unknown[] = [];
+    await applyPackageContributionPlan({
+      plan,
+      preimage: { packageJson: rootBefore, lockfile: PNPM_LOCK },
+      executor: {
+        async apply(request) {
+          executorCalls.push(request);
+          return { packageJson: request.packageJson, lockfile: "lock-after-cross\n" };
+        },
+      },
+      writeFile: async (path, content) => {
+        writes.push({ path, content });
+      },
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.7.0" }),
+      assertLocalCliExecutable: async () => undefined,
+    });
+    expect(executorCalls).toEqual([
+      expect.objectContaining({
+        manager: "pnpm",
+        executionScope: { kind: "pnpm-workspace-root" },
+        ignoreScripts: true,
+        operation: { op: "add-dev", name: "poiesis-cli", version: "1.7.0" },
+      }),
+    ]);
+    expect(writes.map((w) => w.path)).toEqual([PACKAGE_JSON_RELATIVE, "pnpm-lock.yaml"]);
+    expect(writes.some((w) => w.path.includes("packages/") || w.path.includes("@ws"))).toBe(false);
+    expect(childBefore).toBe(foreignChildPkg);
+    expect(parsePkg(writes[0]!.content).devDependencies?.["poiesis-cli"]).toBe("1.7.0");
+  });
+
+  it("removal apply path (uninstall-shaped) uses workspace-root scope and never writes child paths", async () => {
+    // Uninstall does not route removal through applyPackageContributionPlan
+    // (post-remove package.json no longer matches the ownership record). It
+    // writes planned root package.json, then native remove with plan.executionScope.
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const rootBefore = ownedRootPkg("1.7.0");
+    const childBefore = foreignChildPkg;
+    const plan = planPackageContributionRemoval({
+      snapshot: wsSnap(rootBefore),
+      record,
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    expect(plan.packageJsonChanged).toBe(true);
+    expect(plan.lockfileOperation).toEqual({ op: "remove-dev", name: "poiesis-cli" });
+
+    const writes: Array<{ path: string; content: string }> = [];
+    // Root package.json replace (journal.replace equivalent).
+    writes.push({ path: PACKAGE_JSON_RELATIVE, content: plan.nextPackageJson });
+    const executor: PackageManagerExecutor = {
+      async apply(request) {
+        expect(request.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+        expect(request.operation).toEqual({ op: "remove-dev", name: "poiesis-cli" });
+        expect(request.ignoreScripts).toBe(true);
+        expect(
+          nativePackageManagerArgv("pnpm", request.operation, request.executionScope),
+        ).toEqual(["install", "-w", "--ignore-scripts"]);
+        writes.push({ path: "pnpm-lock.yaml", content: "lock-after-remove\n" });
+        return { packageJson: request.packageJson, lockfile: "lock-after-remove\n" };
+      },
+    };
+    await executor.apply({
+      manager: plan.record.manager,
+      operation: plan.lockfileOperation!,
+      packageJson: plan.nextPackageJson,
+      lockfile: PNPM_LOCK,
+      ignoreScripts: true,
+      executionScope: plan.executionScope,
+    });
+    expect(writes.map((w) => w.path)).toEqual([PACKAGE_JSON_RELATIVE, "pnpm-lock.yaml"]);
+    expect(writes.some((w) => w.path.includes("packages/"))).toBe(false);
+    expect(childBefore).toBe(foreignChildPkg);
+    const next = parsePkg(writes[0]!.content);
+    expect(next.scripts?.poiesis).toBeUndefined();
+    expect(next.devDependencies?.["poiesis-cli"]).toBeUndefined();
+  });
+
+  it("workspace version-cross native failure is PACKAGE_MANAGER_INCOMPLETE with -w argv and no node_modules rollback claim", async () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const rootBefore = ownedRootPkg("1.6.0");
+    const { plan } = planPackageContributionForVersionCross({
+      snapshot: wsSnap(rootBefore),
+      nextPoiesisVersion: "1.7.0",
+      prior,
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    await expect(
+      applyPackageContributionPlan({
+        plan,
+        preimage: { packageJson: rootBefore, lockfile: PNPM_LOCK },
+        executor: {
+          async apply() {
+            throw new PoiesisError("PACKAGE_MANAGER_FAILED", "injected workspace native failure", {
+              manager: "pnpm",
+            });
+          },
+        },
+        writeFile: async () => undefined,
+      }),
+    ).rejects.toMatchObject({
+      code: "PACKAGE_MANAGER_INCOMPLETE",
+      details: {
+        ownedArtifactsMayRollback: true,
+        nativeSideEffectsNotClaimedRolledBack: true,
+        executionScope: { kind: "pnpm-workspace-root" },
+        argv: ["add", "-w", "-D", "-E", "poiesis-cli@1.7.0", "--ignore-scripts"],
+      },
+    });
+  });
+
+  it("workspace removal native failure surfaces uninstall incomplete contract (no node_modules rollback claim)", async () => {
+    // Mirrors maintenance.uninstall catch: PACKAGE_MANAGER_INCOMPLETE with
+    // executionScope + nativeSideEffectsNotClaimedRolledBack; partial uninstall
+    // retains packageContribution authority (tested via message/details contract).
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const rootBefore = ownedRootPkg("1.7.0");
+    const plan = planPackageContributionRemoval({
+      snapshot: wsSnap(rootBefore),
+      record,
+    });
+    if (plan.kind !== "apply" || plan.lockfileOperation === null) throw new Error("expected remove op");
+    const executor: PackageManagerExecutor = {
+      async apply() {
+        throw new Error("pnpm remove -w failed");
+      },
+    };
+    await expect(
+      executor.apply({
+        manager: plan.record.manager,
+        operation: plan.lockfileOperation,
+        packageJson: plan.nextPackageJson,
+        lockfile: PNPM_LOCK,
+        ignoreScripts: true,
+        executionScope: plan.executionScope,
+      }),
+    ).rejects.toThrow(/pnpm remove -w failed/);
+    // Uninstall wraps this as PACKAGE_MANAGER_INCOMPLETE with the same scope + flags.
+    const wrapped = new PoiesisError(
+      "PACKAGE_MANAGER_INCOMPLETE",
+      "Native package-manager remove failed during uninstall; owned package.json bytes may be journal-restored; node_modules and other native pm side effects are not claimed rolled back.",
+      {
+        manager: plan.record.manager,
+        operation: plan.lockfileOperation,
+        executionScope: plan.executionScope,
+        ownedArtifactsMayRollback: true,
+        nativeSideEffectsNotClaimedRolledBack: true,
+        cause: "pnpm remove -w failed",
+      },
+    );
+    expect(wrapped.code).toBe("PACKAGE_MANAGER_INCOMPLETE");
+    expect(wrapped.details).toMatchObject({
+      executionScope: { kind: "pnpm-workspace-root" },
+      ownedArtifactsMayRollback: true,
+      nativeSideEffectsNotClaimedRolledBack: true,
+    });
+    expect(wrapped.message).toMatch(/not claimed rolled back/i);
+    // Partial uninstall retains unresolved packageContribution when removal fails.
+    expect(plan.record.devDependencyVersion).toBe("1.7.0");
+  });
+
+  it("config-byte hashed noop revalidates root package identity and executable readiness under workspace plan", async () => {
+    const rootOwned = ownedRootPkg("1.7.0");
+    const plan = planPackageContribution({
+      snapshot: wsSnap(rootOwned),
+      poiesisVersion: "1.7.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("noop");
+    expect(packagePlanIsNoopWithPreimage(plan)).toBe(true);
+    if (!packagePlanIsNoopWithPreimage(plan)) throw new Error("expected hashed noop");
+    expect(plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+
+    let readinessCalls = 0;
+    const allow = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: plan,
+      readPackageJson: async () => rootOwned,
+      assertRuntimeReady: async () => {
+        readinessCalls += 1;
+        await assertPackageContributionRuntimeReady({
+          record: plan.record,
+          poiesisVersion: "1.7.0",
+          readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.7.0" }),
+          assertLocalCliExecutable: async () => {
+            assertResolvedLocalCliExecutable({
+              expectedVersion: "1.7.0",
+              present: true,
+              versionProbe: { ok: true, stdout: "1.7.0\n" },
+            });
+          },
+        });
+      },
+    });
+    expect(allow).toEqual({ decision: "allow-early-return" });
+    expect(readinessCalls).toBe(1);
+
+    // Identity drift fails closed before readiness / early return.
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => rootOwned.replace('"name": "ws-root-demo"', '"name": "drifted"'),
+        assertRuntimeReady: async () => {
+          throw new Error("readiness must not run after identity drift");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT" });
+
+    // Executable absence fails closed under readiness.
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => rootOwned,
+        assertRuntimeReady: async () => {
+          await assertPackageContributionRuntimeReady({
+            record: plan.record,
+            poiesisVersion: "1.7.0",
+            readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.7.0" }),
+            assertLocalCliExecutable: async () => {
+              assertResolvedLocalCliExecutable({ expectedVersion: "1.7.0", present: false });
+            },
+          });
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_LOCAL_BIN_UNRESOLVED" });
+
+    // Runtime version mismatch fails closed.
+    await expect(
+      gateUpdateConfigEarlyNoopPackage({
+        packagePlan: plan,
+        readPackageJson: async () => rootOwned,
+        assertRuntimeReady: async () => {
+          await assertPackageContributionRuntimeReady({
+            record: plan.record,
+            poiesisVersion: "1.7.0",
+            readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+          });
+        },
+      }),
+    ).rejects.toMatchObject({ code: "PACKAGE_LOCAL_BIN_VERSION_MISMATCH" });
+  });
+
+  it("version-cross apply (package target not yet next runtime) continues past config-byte no-op gate", async () => {
+    const prior = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const { plan } = planPackageContributionForVersionCross({
+      snapshot: wsSnap(ownedRootPkg("1.6.0")),
+      nextPoiesisVersion: "1.7.0",
+      prior,
+    });
+    expect(plan.kind).toBe("apply");
+    const decision = await gateUpdateConfigEarlyNoopPackage({
+      packagePlan: plan,
+      readPackageJson: async () => ownedRootPkg("1.6.0"),
+      assertRuntimeReady: async () => {
+        throw new Error("apply must continue-transaction without readiness");
+      },
+    });
+    expect(decision).toEqual({ decision: "continue-transaction" });
+  });
+
+  it("capture identity drift on workspace removal plan fails closed before native pm", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.7.0",
+    });
+    const planned = ownedRootPkg("1.7.0");
+    const plan = planPackageContributionRemoval({
+      snapshot: wsSnap(planned),
+      record,
+    });
+    expect(packagePlanRetainsContribution(plan)).toBe(true);
+    if (!packagePlanRetainsContribution(plan)) throw new Error("expected retainable removal");
+    const drifted = planned.replace('"name": "ws-root-demo"', '"name": "author-edit"');
+    expect(() =>
+      assertPackageContributionCaptureIdentity(plan, { packageJsonContent: drifted }),
+    ).toThrow(expect.objectContaining({ code: "ARTIFACT_IDENTITY_DRIFT" }));
+  });
+});
+
+describe("real pnpm workspace-root update + uninstall lifecycle (Spec #219 / ticket #221)", () => {
+  const ownedRoots: string[] = [];
+  afterAll(async () => {
+    for (const root of ownedRoots) {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it(
+    "version-cross then removal keep child foreign Poiesis declarations byte-identical",
+    async () => {
+      const root = await mkdtemp(join(tmpdir(), "poiesis-pnpm-ws-221-"));
+      ownedRoots.push(root);
+      const childDir = join(root, "packages", "app");
+      await mkdir(childDir, { recursive: true });
+
+      const rootSeed = [
+        "{",
+        '  "name": "ws-root-demo",',
+        '  "private": true,',
+        '  "version": "0.0.0"',
+        "}",
+        "",
+      ].join("\n");
+      // Foreign child Poiesis declarations must survive root lifecycle untouched.
+      const childPkg = [
+        "{",
+        '  "name": "@ws/app",',
+        '  "version": "0.0.1",',
+        '  "private": true,',
+        '  "scripts": { "poiesis": "echo child-foreign" },',
+        '  "devDependencies": { "poiesis-cli": "1.5.0" }',
+        "}",
+        "",
+      ].join("\n");
+      const workspaceYaml = "packages:\n  - 'packages/*'\n";
+      const npmrc = "node-linker=isolated\n";
+
+      await writeFileUtf8(join(root, "package.json"), rootSeed, "utf8");
+      await writeFileUtf8(join(root, "pnpm-workspace.yaml"), workspaceYaml, "utf8");
+      await writeFileUtf8(join(root, ".npmrc"), npmrc, "utf8");
+      await writeFileUtf8(join(childDir, "package.json"), childPkg, "utf8");
+
+      const { run } = await import("../src/process.js");
+      await run("pnpm", ["install", "--ignore-scripts"], { cwd: root });
+      const lockSeed = await readFile(join(root, "pnpm-lock.yaml"), "utf8");
+      const childBefore = await readFile(join(childDir, "package.json"), "utf8");
+      expect(childBefore).toBe(childPkg);
+
+      const vFrom = "1.6.0";
+      const vTo = "1.7.0";
+
+      // 1) Install root contribution at vFrom.
+      const installPlan = planPackageContribution({
+        snapshot: snap({
+          packageJson: rootSeed,
+          lockfiles: { "pnpm-lock.yaml": lockSeed, "pnpm-workspace.yaml": workspaceYaml },
+          npmrc,
+        }),
+        poiesisVersion: vFrom,
+        mode: "ensure",
+      });
+      expect(installPlan.kind).toBe("apply");
+      if (installPlan.kind !== "apply") throw new Error("expected install apply");
+      expect(installPlan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+
+      const executor = createNativePackageManagerExecutor(root);
+      const installResult = await applyPackageContributionPlan({
+        plan: installPlan,
+        preimage: { packageJson: rootSeed, lockfile: lockSeed },
+        executor,
+        writeFile: async (relative, content) => {
+          expect(relative === PACKAGE_JSON_RELATIVE || relative === "pnpm-lock.yaml").toBe(true);
+          await writeFileUtf8(join(root, relative), content, "utf8");
+        },
+        readResolvedLocalPackageJson: async () => {
+          try {
+            return await readFile(join(root, LOCAL_CLI_PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        assertLocalCliExecutable: () =>
+          assertLocalCliExecutableAtRoot({ root, expectedVersion: vFrom, run }),
+      });
+      expect(installResult.record.devDependencyVersion).toBe(vFrom);
+      expect(await readFile(join(childDir, "package.json"), "utf8")).toBe(childBefore);
+
+      const rootAfterInstall = await readFile(join(root, PACKAGE_JSON_RELATIVE), "utf8");
+      const lockAfterInstall = await readFile(join(root, "pnpm-lock.yaml"), "utf8");
+
+      // 2) Version-cross to vTo (update / update --config package seam).
+      const prior = installResult.record;
+      const cross = planPackageContributionForVersionCross({
+        snapshot: snap({
+          packageJson: rootAfterInstall,
+          lockfiles: { "pnpm-lock.yaml": lockAfterInstall, "pnpm-workspace.yaml": workspaceYaml },
+          npmrc,
+        }),
+        nextPoiesisVersion: vTo,
+        prior,
+      });
+      expect(cross.plan.kind).toBe("apply");
+      if (cross.plan.kind !== "apply") throw new Error("expected cross apply");
+      expect(cross.plan.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+      expect(
+        nativePackageManagerArgv("pnpm", cross.plan.lockfileOperation!, cross.plan.executionScope),
+      ).toEqual(["add", "-w", "-D", "-E", `poiesis-cli@${vTo}`, "--ignore-scripts"]);
+
+      await applyPackageContributionPlan({
+        plan: cross.plan,
+        preimage: { packageJson: rootAfterInstall, lockfile: lockAfterInstall },
+        executor,
+        writeFile: async (relative, content) => {
+          expect(relative === PACKAGE_JSON_RELATIVE || relative === "pnpm-lock.yaml").toBe(true);
+          await writeFileUtf8(join(root, relative), content, "utf8");
+        },
+        readResolvedLocalPackageJson: async () => {
+          try {
+            return await readFile(join(root, LOCAL_CLI_PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        assertLocalCliExecutable: () =>
+          assertLocalCliExecutableAtRoot({ root, expectedVersion: vTo, run }),
+      });
+
+      const rootAfterCross = await readFile(join(root, PACKAGE_JSON_RELATIVE), "utf8");
+      const lockAfterCross = await readFile(join(root, "pnpm-lock.yaml"), "utf8");
+      expect(parsePkg(rootAfterCross).devDependencies?.["poiesis-cli"]).toBe(vTo);
+      expect(await readFile(join(childDir, "package.json"), "utf8")).toBe(childBefore);
+      await assertLocalCliExecutableAtRoot({ root, expectedVersion: vTo, run });
+
+      // 3) Removal (uninstall-shaped): capture bind → root package.json replace →
+      // native remove with explicit workspace-root scope. Never touches child paths.
+      const removal = planPackageContributionRemoval({
+        snapshot: snap({
+          packageJson: rootAfterCross,
+          lockfiles: { "pnpm-lock.yaml": lockAfterCross, "pnpm-workspace.yaml": workspaceYaml },
+          npmrc,
+        }),
+        record: cross.contributionForProjection!,
+      });
+      expect(removal.kind).toBe("apply");
+      if (removal.kind !== "apply") throw new Error("expected removal apply");
+      expect(removal.executionScope).toEqual({ kind: "pnpm-workspace-root" });
+      expect(removal.lockfileOperation).toEqual({ op: "remove-dev", name: "poiesis-cli" });
+      expect(
+        nativePackageManagerArgv("pnpm", removal.lockfileOperation!, removal.executionScope),
+      ).toEqual(["install", "-w", "--ignore-scripts"]);
+
+      // Capture-identity bind (uninstall journal preimage) before lock reconcile.
+      assertPackageContributionCaptureIdentity(removal, { packageJsonContent: rootAfterCross });
+
+      if (removal.packageJsonChanged) {
+        await writeFileUtf8(join(root, PACKAGE_JSON_RELATIVE), removal.nextPackageJson, "utf8");
+      }
+      const removeResult = await executor.apply({
+        manager: removal.record.manager,
+        operation: removal.lockfileOperation!,
+        packageJson: removal.nextPackageJson,
+        lockfile: lockAfterCross,
+        ignoreScripts: true,
+        executionScope: removal.executionScope,
+      });
+      // Root lock only — never adopt child paths.
+      await writeFileUtf8(join(root, "pnpm-lock.yaml"), removeResult.lockfile, "utf8");
+
+      const rootAfterRemove = parsePkg(await readFile(join(root, PACKAGE_JSON_RELATIVE), "utf8"));
+      expect(rootAfterRemove.scripts?.poiesis).toBeUndefined();
+      expect(rootAfterRemove.devDependencies?.["poiesis-cli"]).toBeUndefined();
+      // Child foreign Poiesis declarations remain byte-identical through the full lifecycle.
+      expect(await readFile(join(childDir, "package.json"), "utf8")).toBe(childBefore);
+      expect(childBefore).toContain("child-foreign");
+      expect(childBefore).toContain('"poiesis-cli": "1.5.0"');
+    },
+    180_000,
   );
 });
