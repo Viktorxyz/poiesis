@@ -103,6 +103,19 @@ function memoryFs(spec: {
       const resolved = resolveSymlink(path);
       return dirs.has(resolved);
     },
+    async lstat(path: string) {
+      const n = normalize(path);
+      if (symlinks.has(n)) {
+        return { exists: true as const, isDirectory: false, isFile: false, isSymbolicLink: true };
+      }
+      if (dirs.has(n)) {
+        return { exists: true as const, isDirectory: true, isFile: false, isSymbolicLink: false };
+      }
+      if (files.has(n)) {
+        return { exists: true as const, isDirectory: false, isFile: true, isSymbolicLink: false };
+      }
+      return { exists: false as const };
+    },
   };
 }
 
@@ -322,5 +335,100 @@ describe("resolveAgentsChain (ticket #209)", () => {
     await expect(resolveAgentsChain(root, "../outside", { fs })).rejects.toMatchObject({
       code: "AGENTS_PATH_OUTSIDE_ROOT",
     } satisfies Partial<PoiesisError>);
+  });
+
+  it("treats a hidden/dotted directory as itself so its own AGENTS.md applies", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [root, `${root}/.github`, `${root}/.github/workflows`],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`${root}/.github/AGENTS.md`]: "# github rules\n",
+        [`${root}/.github/workflows/ci.yml`]: "name: ci\n",
+      },
+    });
+
+    const chain = await resolveAgentsChain(root, ".github", { fs });
+    expect(chain.target).toBe(".github");
+    expect(chain.chain).toEqual([
+      { folder: "", agentsMdPath: "AGENTS.md", status: "present" },
+      { folder: ".github", agentsMdPath: ".github/AGENTS.md", status: "present" },
+    ]);
+    expect(chain.applicable).toEqual(["AGENTS.md", ".github/AGENTS.md"]);
+
+    // Nested work under the dotted dir still includes the dotted ancestor.
+    const nested = await resolveAgentsChain(root, ".github/workflows/ci.yml", { fs });
+    expect(nested.chain.map((e) => e.folder)).toEqual(["", ".github", ".github/workflows"]);
+    expect(nested.applicable).toEqual(["AGENTS.md", ".github/AGENTS.md"]);
+  });
+
+  it("uses dirname for an extensionless regular file so the containing folder chain applies", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [root, `${root}/src`, `${root}/src/cli`],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`${root}/src/cli/AGENTS.md`]: "# cli\n",
+        // Extensionless executable-style file (not a directory).
+        [`${root}/src/cli/run`]: "#!/bin/sh\n",
+      },
+    });
+
+    const chain = await resolveAgentsChain(root, "src/cli/run", { fs });
+    expect(chain.target).toBe("src/cli/run");
+    expect(chain.chain).toEqual([
+      { folder: "", agentsMdPath: "AGENTS.md", status: "present" },
+      { folder: "src", agentsMdPath: "src/AGENTS.md", status: "missing" },
+      { folder: "src/cli", agentsMdPath: "src/cli/AGENTS.md", status: "present" },
+    ]);
+    expect(chain.applicable).toEqual(["AGENTS.md", "src/cli/AGENTS.md"]);
+  });
+
+  it("refuses an external directory symlink and never reports the external path", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [root, `/outside/lib`],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`/outside/lib/AGENTS.md`]: "# external\n",
+      },
+      symlinks: {
+        [`${root}/linked-out`]: `/outside/lib`,
+      },
+    });
+
+    await expect(resolveAgentsChain(root, "linked-out", { fs })).rejects.toMatchObject({
+      code: "AGENTS_PATH_OUTSIDE_ROOT",
+    } satisfies Partial<PoiesisError>);
+    await expect(resolveAgentsChain(root, "linked-out/nested", { fs })).rejects.toMatchObject({
+      code: "AGENTS_PATH_OUTSIDE_ROOT",
+    } satisfies Partial<PoiesisError>);
+  });
+
+  it("excludes an external AGENTS.md file symlink (missing, never external path)", async () => {
+    const root = "/proj";
+    const fs = memoryFs({
+      root,
+      dirs: [root, `${root}/src`],
+      files: {
+        [`${root}/AGENTS.md`]: "# root\n",
+        [`/outside/AGENTS.md`]: "# external agents\n",
+        [`${root}/src/main.ts`]: "export {}",
+      },
+      symlinks: {
+        [`${root}/src/AGENTS.md`]: `/outside/AGENTS.md`,
+      },
+    });
+
+    const chain = await resolveAgentsChain(root, "src/main.ts", { fs });
+    expect(chain.chain).toEqual([
+      { folder: "", agentsMdPath: "AGENTS.md", status: "present" },
+      { folder: "src", agentsMdPath: "src/AGENTS.md", status: "missing" },
+    ]);
+    expect(chain.applicable).toEqual(["AGENTS.md"]);
+    expect(JSON.stringify(chain)).not.toContain("/outside");
   });
 });

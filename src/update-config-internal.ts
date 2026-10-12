@@ -77,13 +77,17 @@ import { assertNoDuplicateProperties } from "./opencode-config-validator.js";
 import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "./opencode-preflight.js";
 import {
   applyPackageContributionWithJournal,
+  assertPackageContributionCaptureIdentity,
   assertPackageContributionRuntimeReady,
   loadPackageFsSnapshot,
   PACKAGE_JSON_RELATIVE,
+  packagePlanIsNoopWithPreimage,
+  packagePlanRetainsContribution,
   planPackageContributionForVersionCross,
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
   resolvePackageManagerExecutor,
+  writeManifestWithNoopPackageContributionGate,
   type PackageContributionPlan,
 } from "./package-invocation.js";
 import { run as runProcess } from "./process.js";
@@ -848,15 +852,21 @@ async function runLockedUpdateConfigTransaction(
   for (const file of transition?.createProfileFiles ?? []) {
     profileArtifacts.push({ path: file.path, entry: await journal.capture(join(resolvedRoot, file.path), "whole-file") });
   }
-  // Package contribution captures only when this transaction will write them.
+  // Package contribution: capture package.json for every retain/advance plan
+  // (apply + noop). Lockfile only when apply will write. Single capture — no
+  // duplicate. Bind original plan hash before any owned write so Author drift
+  // cannot advance a stale ownership record.
   let packageJsonArtifact: ArtifactJournalEntry | undefined;
   let lockfileArtifact: ArtifactJournalEntry | undefined;
   let packagePreimageLockfile = "";
-  if (packagePlan.kind === "apply") {
+  if (packagePlanRetainsContribution(packagePlan)) {
     packageJsonArtifact = await journal.capture(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "whole-file");
-    lockfileArtifact = await journal.capture(join(resolvedRoot, packagePlan.record.lockfile), "whole-file");
-    packagePreimageLockfile =
-      lockfileArtifact.preimage === undefined ? "" : lockfileArtifact.preimage.toString("utf8");
+    assertPackageContributionCaptureIdentity(packagePlan, packageJsonArtifact);
+    if (packagePlan.kind === "apply") {
+      lockfileArtifact = await journal.capture(join(resolvedRoot, packagePlan.record.lockfile), "whole-file");
+      packagePreimageLockfile =
+        lockfileArtifact.preimage === undefined ? "" : lockfileArtifact.preimage.toString("utf8");
+    }
   }
   const manifestArtifact = await journal.capture(manifestPath, "whole-file");
   const receiptArtifact = await journal.capture(receiptPath, "whole-file");
@@ -949,38 +959,52 @@ async function runLockedUpdateConfigTransaction(
       await hooks?.postModeTransitionApply?.();
     }
 
-    // 11c. Spec #207 / ticket #210 — apply owned package.json + lockfile
-    // contributions inside this journal so a version-crossing config update
-    // never leaves manifest.poiesisVersion ahead of the exact devDependency.
-    // Identities bind on each known write before the next fallible step.
+    // 11c. Spec #207 / ticket #210 + #214 — apply or bind noop ownership.
+    // Apply writes package+lock through journal. Noop re-asserts capture
+    // identity (no package write, no transactionWrittenIdentity) before
+    // runtime readiness and before manifest/receipt success.
     let nextPackageContribution: PackageContributionRecord | undefined =
       packageContributionForProjection;
-    if (packagePlan.kind === "apply") {
-      if (packageJsonArtifact === undefined || lockfileArtifact === undefined) {
+    if (packagePlanRetainsContribution(packagePlan)) {
+      if (packageJsonArtifact === undefined) {
         throw new PoiesisError(
           "ARTIFACT_JOURNAL_MISSING",
-          "Journal does not contain the package contribution entries",
+          "Journal does not contain the package.json contribution entry",
           { path: PACKAGE_JSON_RELATIVE },
         );
       }
-      const applied = await applyPackageContributionWithJournal({
-        root: resolvedRoot,
-        plan: packagePlan,
-        packageJsonEntry: packageJsonArtifact,
-        lockfileEntry: lockfileArtifact,
-        replaceOwnedFile: (entry, content) => journal.replace(entry, content),
-        executor: resolvePackageManagerExecutor(resolvedRoot),
-        preimageLockfile: packagePreimageLockfile,
-        poiesisVersion: nextPoiesisVersion,
-      });
-      nextPackageContribution = applied.record;
-    } else if (packagePlan.kind === "noop") {
-      await assertPackageContributionRuntimeReady({
-        record: packagePlan.record,
-        poiesisVersion: nextPoiesisVersion,
-        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
-        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
-      });
+      if (packagePlan.kind === "apply") {
+        if (lockfileArtifact === undefined) {
+          throw new PoiesisError(
+            "ARTIFACT_JOURNAL_MISSING",
+            "Journal does not contain the package contribution entries",
+            { path: PACKAGE_JSON_RELATIVE },
+          );
+        }
+        // Apply re-checks capture identity inside applyPackageContributionWithJournal;
+        // journal.replace guards the post-capture write window.
+        const applied = await applyPackageContributionWithJournal({
+          root: resolvedRoot,
+          plan: packagePlan,
+          packageJsonEntry: packageJsonArtifact,
+          lockfileEntry: lockfileArtifact,
+          replaceOwnedFile: (entry, content) => journal.replace(entry, content),
+          executor: resolvePackageManagerExecutor(resolvedRoot),
+          preimageLockfile: packagePreimageLockfile,
+          poiesisVersion: nextPoiesisVersion,
+        });
+        nextPackageContribution = applied.record;
+      } else {
+        // Noop: ownership record only — never write package bytes / bind write
+        // identity. Final package.json identity bind is the publication-boundary
+        // helper immediately before the ownership-bearing manifest write.
+        await assertPackageContributionRuntimeReady({
+          record: packagePlan.record,
+          poiesisVersion: nextPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        });
+      }
     }
 
     // 12. Merge the prior `previous` provenance into the freshly applied patches so user-supplied
@@ -1038,14 +1062,32 @@ async function runLockedUpdateConfigTransaction(
       // is omitted when the project has no package.json).
       ...(nextPackageContribution === undefined ? {} : { packageContribution: nextPackageContribution }),
     };
-    await hooks?.preManifestWrite?.();
     // Serialize nextManifest exactly once; derive the post-write identity
     // from those exact bytes BEFORE write, and write those same bytes. A
     // foreign replacement in the write window cannot be adopted as our
     // identity, and the post-write `hashFile` re-read is removed.
     const nextManifestBytes = serializeManifest(nextManifest);
     const nextManifestHash = hashContent(nextManifestBytes);
-    await journal.replace(manifestArtifact, nextManifestBytes);
+    await hooks?.preManifestWrite?.();
+    // Noop publication boundary: fresh package.json identity then immediate
+    // ownership-bearing manifest write. Apply path writes directly (no final noop guard).
+    if (packagePlanIsNoopWithPreimage(packagePlan)) {
+      await writeManifestWithNoopPackageContributionGate({
+        plan: packagePlan,
+        readPackageJson: async () => {
+          try {
+            return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        writeManifest: async () => {
+          await journal.replace(manifestArtifact, nextManifestBytes);
+        },
+      });
+    } else {
+      await journal.replace(manifestArtifact, nextManifestBytes);
+    }
     await hooks?.postManifestWrite?.();
 
     // 14. Replace the ownership receipt, advancing generation by exactly ONE and binding to the new manifest digest.

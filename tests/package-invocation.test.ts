@@ -19,6 +19,8 @@ import {
   SELFHOST_PACKAGE_NAME,
   SELFHOST_SCRIPT_VALUE,
   applyPackageContributionPlan,
+  applyPackageContributionWithJournal,
+  assertPackageContributionCaptureIdentity,
   assertPackageContributionMatches,
   assertPackageContributionRuntimeReady,
   assertResolvedLocalCliVersion,
@@ -28,15 +30,21 @@ import {
   desiredScriptValue,
   nativePackageManagerArgv,
   packageContributionMode,
+  packagePlanIsNoopWithPreimage,
+  packagePlanRetainsContribution,
   planPackageContribution,
   planPackageContributionForVersionCross,
   planPackageContributionRemoval,
   resolvePackageManagerOwnership,
+  writeManifestWithNoopPackageContributionGate,
   type PackageContributionRecord,
   type PackageFsSnapshot,
   type PackageManagerExecutor,
 } from "../src/package-invocation.js";
 import { canonicalInvocationPrefix, desiredOpenCodePatches } from "../src/opencode.js";
+import type { ArtifactJournalEntry } from "../src/mutation-transaction.js";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 
 function parsePkg(content: string): {
   name?: string;
@@ -1303,6 +1311,368 @@ describe("ordinary readiness required on every retained contribution (ticket #21
         readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
       }),
     ).resolves.toBeUndefined();
+  });
+});
+
+describe("package plan-to-capture identity bind (ticket #214 correction A)", () => {
+  function journalEntryFor(content: string): Pick<ArtifactJournalEntry, "preimage" | "expectedPreWriteIdentity"> {
+    const preimage = Buffer.from(content, "utf8");
+    return {
+      preimage,
+      expectedPreWriteIdentity: { exists: true, kind: "file", hash: hashContent(preimage) },
+    };
+  }
+
+  it("apply plans carry the ORIGINAL package.json preimage hash, never nextPackageJson", () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.expectedPackageJsonPreimageHash).toBe(hashContent(ORDINARY_PKG));
+    expect(plan.expectedPackageJsonPreimageHash).not.toBe(hashContent(plan.nextPackageJson));
+  });
+
+  it("removal apply plans carry the snapshot preimage hash from the planner", () => {
+    const record = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const owned = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContributionRemoval({
+      snapshot: snap({ packageJson: owned, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      record,
+    });
+    expect(plan.kind).toBe("apply");
+    if (plan.kind !== "apply") return;
+    expect(plan.expectedPackageJsonPreimageHash).toBe(hashContent(owned));
+    expect(plan.expectedPackageJsonPreimageHash).not.toBe(hashContent(plan.nextPackageJson));
+  });
+
+  it("assertPackageContributionCaptureIdentity accepts matching capture preimage/identity", () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    expect(() => assertPackageContributionCaptureIdentity(plan, journalEntryFor(ORDINARY_PKG))).not.toThrow();
+  });
+
+  it("assertPackageContributionCaptureIdentity rejects drifted capture and does not treat nextPackageJson as preimage", () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const intervening = ORDINARY_PKG.replace('"name": "demo"', '"name": "hijacked"');
+    expect(() => assertPackageContributionCaptureIdentity(plan, journalEntryFor(intervening))).toThrow(
+      expect.objectContaining({
+        code: "ARTIFACT_IDENTITY_DRIFT",
+        details: { path: PACKAGE_JSON_RELATIVE },
+      }),
+    );
+    // nextPackageJson must never be accepted as the expected preimage.
+    expect(() =>
+      assertPackageContributionCaptureIdentity(plan, journalEntryFor(plan.nextPackageJson)),
+    ).toThrow(expect.objectContaining({ code: "ARTIFACT_IDENTITY_DRIFT" }));
+  });
+
+  it("change after plan before capture rejects applyPackageContributionWithJournal before write/executor", async () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock-before\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const intervening = ORDINARY_PKG.replace('"name": "demo"', '"name": "author-edit"');
+    const packageJsonEntry = {
+      path: "/tmp/package.json",
+      physicalExists: true,
+      ownershipMode: "whole-file" as const,
+      ...journalEntryFor(intervening),
+    };
+    const lockfileEntry = {
+      path: "/tmp/pnpm-lock.yaml",
+      physicalExists: true,
+      ownershipMode: "whole-file" as const,
+      preimage: Buffer.from("lock-before\n", "utf8"),
+      expectedPreWriteIdentity: { exists: true, kind: "file" as const, hash: hashContent("lock-before\n") },
+    };
+    const writes: string[] = [];
+    let executorCalled = false;
+    await expect(
+      applyPackageContributionWithJournal({
+        root: "/tmp",
+        plan,
+        packageJsonEntry,
+        lockfileEntry,
+        replaceOwnedFile: async () => {
+          writes.push("replace");
+        },
+        executor: {
+          async apply() {
+            executorCalled = true;
+            return { packageJson: plan.nextPackageJson, lockfile: "lock-after\n" };
+          },
+        },
+        preimageLockfile: "lock-before\n",
+        poiesisVersion: "1.6.0",
+        readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+      }),
+    ).rejects.toMatchObject({
+      code: "ARTIFACT_IDENTITY_DRIFT",
+      details: { path: PACKAGE_JSON_RELATIVE },
+    });
+    expect(writes).toEqual([]);
+    expect(executorCalled).toBe(false);
+  });
+
+  it("matching capture allows applyPackageContributionWithJournal to proceed to write", async () => {
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock-before\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    if (plan.kind !== "apply") throw new Error("expected apply");
+    const packageJsonEntry = {
+      path: "/tmp/package.json",
+      physicalExists: true,
+      ownershipMode: "whole-file" as const,
+      ...journalEntryFor(ORDINARY_PKG),
+    };
+    const lockfileEntry = {
+      path: "/tmp/pnpm-lock.yaml",
+      physicalExists: true,
+      ownershipMode: "whole-file" as const,
+      preimage: Buffer.from("lock-before\n", "utf8"),
+      expectedPreWriteIdentity: { exists: true, kind: "file" as const, hash: hashContent("lock-before\n") },
+    };
+    const writes: string[] = [];
+    await applyPackageContributionWithJournal({
+      root: "/tmp",
+      plan,
+      packageJsonEntry,
+      lockfileEntry,
+      replaceOwnedFile: async (_entry, content) => {
+        writes.push(content.slice(0, 20));
+      },
+      executor: {
+        async apply(request) {
+          return { packageJson: request.packageJson, lockfile: "lock-after\n" };
+        },
+      },
+      preimageLockfile: "lock-before\n",
+      poiesisVersion: "1.6.0",
+      readResolvedLocalPackageJson: async () => JSON.stringify({ version: "1.6.0" }),
+    });
+    expect(writes.length).toBeGreaterThan(0);
+  });
+
+  it("noop plans carry original package.json preimage hash and retain contribution", () => {
+    const owned = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis", "build": "tsc" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0", "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: owned, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(plan.kind).toBe("noop");
+    if (plan.kind !== "noop") return;
+    expect(plan.expectedPackageJsonPreimageHash).toBe(hashContent(owned));
+    expect(packagePlanRetainsContribution(plan)).toBe(true);
+    expect(packagePlanRetainsContribution({ kind: "absent" })).toBe(false);
+  });
+
+  it("assertPackageContributionCaptureIdentity gates noop retain/advance on original hash", () => {
+    const owned = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis", "build": "tsc" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0", "typescript": "^5.0.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: owned, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(packagePlanRetainsContribution(plan)).toBe(true);
+    if (!packagePlanRetainsContribution(plan)) throw new Error("expected retainable noop");
+    // Matching journal capture and current-content observation both pass.
+    expect(() => assertPackageContributionCaptureIdentity(plan, journalEntryFor(owned))).not.toThrow();
+    expect(() =>
+      assertPackageContributionCaptureIdentity(plan, { packageJsonContent: owned }),
+    ).not.toThrow();
+    // Author edit after plan → ARTIFACT_IDENTITY_DRIFT before any ownership advance.
+    const intervening = owned.replace('"name": "demo"', '"name": "author-edit"');
+    expect(() => assertPackageContributionCaptureIdentity(plan, journalEntryFor(intervening))).toThrow(
+      expect.objectContaining({
+        code: "ARTIFACT_IDENTITY_DRIFT",
+        details: { path: PACKAGE_JSON_RELATIVE },
+      }),
+    );
+    expect(() =>
+      assertPackageContributionCaptureIdentity(plan, { packageJsonContent: intervening }),
+    ).toThrow(expect.objectContaining({ code: "ARTIFACT_IDENTITY_DRIFT" }));
+  });
+
+  it("caller retain gate: apply and hashed noop require identity bind; absent does not", () => {
+    const apply = planPackageContribution({
+      snapshot: snap({ packageJson: ORDINARY_PKG, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(packagePlanRetainsContribution(apply)).toBe(true);
+    expect(packagePlanIsNoopWithPreimage(apply)).toBe(false);
+    const owned = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const noop = planPackageContribution({
+      snapshot: snap({ packageJson: owned, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(noop.kind).toBe("noop");
+    expect(packagePlanRetainsContribution(noop)).toBe(true);
+    expect(packagePlanIsNoopWithPreimage(noop)).toBe(true);
+    // Removal with no package.json: noop without preimage — does not retain via gate.
+    const removalNoPkg = planPackageContributionRemoval({
+      snapshot: snap({}),
+      record: buildPackageContributionRecord({
+        manager: "pnpm",
+        lockfile: "pnpm-lock.yaml",
+        projectKind: "ordinary",
+        scriptValue: "poiesis",
+        devDependencyVersion: "1.6.0",
+      }),
+    });
+    expect(removalNoPkg.kind).toBe("noop");
+    expect(packagePlanRetainsContribution(removalNoPkg)).toBe(false);
+    expect(packagePlanIsNoopWithPreimage(removalNoPkg)).toBe(false);
+  });
+
+  it("writeManifestWithNoopPackageContributionGate: read→assert→write order; drift/missing skip writer", async () => {
+    const owned = [
+      "{",
+      '  "name": "demo",',
+      '  "scripts": { "poiesis": "poiesis" },',
+      '  "devDependencies": { "poiesis-cli": "1.6.0" }',
+      "}",
+      "",
+    ].join("\n");
+    const plan = planPackageContribution({
+      snapshot: snap({ packageJson: owned, lockfiles: { "pnpm-lock.yaml": "lock\n" } }),
+      poiesisVersion: "1.6.0",
+      mode: "ensure",
+    });
+    expect(packagePlanIsNoopWithPreimage(plan)).toBe(true);
+    if (!packagePlanIsNoopWithPreimage(plan)) throw new Error("expected noop");
+
+    const events: string[] = [];
+    await writeManifestWithNoopPackageContributionGate({
+      plan,
+      readPackageJson: async () => {
+        events.push("read");
+        return owned;
+      },
+      writeManifest: async () => {
+        events.push("write");
+      },
+    });
+    expect(events).toEqual(["read", "write"]);
+
+    // Drift: writer never called.
+    const drifted: string[] = [];
+    await expect(
+      writeManifestWithNoopPackageContributionGate({
+        plan,
+        readPackageJson: async () => {
+          drifted.push("read");
+          return owned.replace('"name": "demo"', '"name": "hijacked"');
+        },
+        writeManifest: async () => {
+          drifted.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT", details: { path: PACKAGE_JSON_RELATIVE } });
+    expect(drifted).toEqual(["read"]);
+
+    // Missing: writer never called.
+    const missing: string[] = [];
+    await expect(
+      writeManifestWithNoopPackageContributionGate({
+        plan,
+        readPackageJson: async () => {
+          missing.push("read");
+          return null;
+        },
+        writeManifest: async () => {
+          missing.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT" });
+    expect(missing).toEqual(["read"]);
+
+    // Reader throw → drift, writer not called.
+    const threw: string[] = [];
+    await expect(
+      writeManifestWithNoopPackageContributionGate({
+        plan,
+        readPackageJson: async () => {
+          threw.push("read");
+          throw new Error("ENOENT");
+        },
+        writeManifest: async () => {
+          threw.push("write");
+        },
+      }),
+    ).rejects.toMatchObject({ code: "ARTIFACT_IDENTITY_DRIFT" });
+    expect(threw).toEqual(["read"]);
+  });
+
+  it("production callers wire writeManifestWithNoopPackageContributionGate at publication boundary", async () => {
+    const root = join(import.meta.dirname, "..");
+    const maintenance = await readFile(join(root, "src/maintenance.ts"), "utf8");
+    const updateInternal = await readFile(join(root, "src/update-internal.ts"), "utf8");
+    const updateConfig = await readFile(join(root, "src/update-config-internal.ts"), "utf8");
+    expect(maintenance).toContain("writeManifestWithNoopPackageContributionGate");
+    expect(updateConfig).toContain("writeManifestWithNoopPackageContributionGate");
+    // Ordinary update + bootstrap legacy both publish through the helper
+    // (import once + two call sites).
+    expect(updateInternal.match(/writeManifestWithNoopPackageContributionGate/g)?.length).toBe(3);
+    expect((updateInternal.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(2);
+    expect((maintenance.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(1);
+    expect((updateConfig.match(/await writeManifestWithNoopPackageContributionGate\(/g) ?? []).length).toBe(1);
+    // Apply path must not run the noop final guard unconditionally — gated by packagePlanIsNoopWithPreimage.
+    expect(updateInternal).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
+    expect(maintenance).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
+    expect(updateConfig).toContain("packagePlanIsNoopWithPreimage(packagePlan)");
   });
 });
 

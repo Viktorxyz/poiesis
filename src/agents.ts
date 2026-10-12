@@ -67,6 +67,19 @@ export interface AgentsDirEntry {
 }
 
 /**
+ * lstat-style path kind for target resolution. Does not follow the final
+ * symlink for the `isSymbolicLink` flag.
+ */
+export type AgentsLstatResult =
+  | { exists: false }
+  | {
+      exists: true;
+      isDirectory: boolean;
+      isFile: boolean;
+      isSymbolicLink: boolean;
+    };
+
+/**
  * Injected filesystem seam for pure tests. Production uses Node fs.
  */
 export interface AgentsFs {
@@ -75,6 +88,8 @@ export interface AgentsFs {
   exists(path: string): Promise<boolean>;
   /** True when the path resolves to a directory (follows one logical target). */
   isDirectory(path: string): Promise<boolean>;
+  /** lstat-style kind; does not follow the final component's symlink. */
+  lstat(path: string): Promise<AgentsLstatResult>;
 }
 
 export interface AgentsFolderRecord {
@@ -154,6 +169,20 @@ function defaultFs(): AgentsFs {
         return stats.isDirectory();
       } catch {
         return false;
+      }
+    },
+    async lstat(path: string): Promise<AgentsLstatResult> {
+      try {
+        const stats = await lstat(path);
+        return {
+          exists: true,
+          isDirectory: stats.isDirectory(),
+          isFile: stats.isFile(),
+          isSymbolicLink: stats.isSymbolicLink(),
+        };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return { exists: false };
+        throw error;
       }
     },
   };
@@ -280,12 +309,141 @@ export async function inventoryAgents(root: string, options: AgentsOptions = {})
 }
 
 /**
+ * True when `candidate` is the project root or a path strictly inside it.
+ * Uses the caller's already-canonical root realpath.
+ */
+function assertInsideProjectRoot(rootReal: string, candidateReal: string, target: string): void {
+  if (!isInsideRoot(rootReal, candidateReal)) {
+    throw new PoiesisError("AGENTS_PATH_OUTSIDE_ROOT", "AGENTS resolution target must stay inside the project root", {
+      target,
+    });
+  }
+}
+
+/**
+ * AGENTS.md presence for a folder under root. External AGENTS file symlinks
+ * (and any candidate whose realpath escapes the root) are treated as missing
+ * and never surface an external path. Internal symlinks that stay inside root
+ * count as present when the link resolves.
+ */
+async function agentsMdStatusInFolder(
+  fs: AgentsFs,
+  rootReal: string,
+  absoluteRoot: string,
+  folderRelative: string,
+): Promise<"present" | "missing"> {
+  const agentsAbs =
+    folderRelative === ""
+      ? join(absoluteRoot, "AGENTS.md")
+      : join(absoluteRoot, ...folderRelative.split("/"), "AGENTS.md");
+  const st = await fs.lstat(agentsAbs);
+  if (!st.exists) return "missing";
+  let agentsReal: string;
+  try {
+    agentsReal = await fs.realpath(agentsAbs);
+  } catch {
+    return "missing";
+  }
+  if (!isInsideRoot(rootReal, agentsReal)) {
+    // External AGENTS symlink (or other escape) — exclude, never report outside path.
+    return "missing";
+  }
+  if (st.isSymbolicLink) {
+    // Resolved inside root: present when the target is a regular file (or still a file path).
+    const targetKind = await fs.lstat(agentsReal);
+    if (!targetKind.exists) return "missing";
+    if (targetKind.isFile) return "present";
+    if (targetKind.isDirectory) return "missing";
+    return "missing";
+  }
+  return st.isFile ? "present" : "missing";
+}
+
+/**
+ * Resolve the leaf folder relative path for a work target using real path kind
+ * (lstat/stat + safe symlink handling) — never a basename-dot heuristic.
+ *
+ * - Existing directory (or internal directory symlink) → itself
+ * - Existing regular file (or internal file symlink) → dirname
+ * - Dotted/hidden directories (e.g. `.github`) → themselves when they are dirs
+ * - Extensionless regular files → dirname
+ * - Nonexistent target → conservative dirname (`path.resolve` strips trailing
+ *   separators, so a trailing-slash directory hint is unavailable)
+ * - External directory/file symlink → refuse (`AGENTS_PATH_OUTSIDE_ROOT`)
+ */
+async function resolveLeafFolderRelative(
+  fs: AgentsFs,
+  rootReal: string,
+  absoluteRoot: string,
+  absoluteTarget: string,
+  normalizedTarget: string,
+  targetLabel: string,
+): Promise<string> {
+  const dirnameOf = (rel: string): string => {
+    const dir = posix.dirname(rel);
+    return dir === "." ? "" : dir;
+  };
+
+  const st = await fs.lstat(absoluteTarget);
+  if (!st.exists) {
+    // Conservative fail-closed policy for nonexistent paths after resolve.
+    return dirnameOf(normalizedTarget);
+  }
+
+  if (st.isSymbolicLink) {
+    let linkReal: string;
+    try {
+      linkReal = await fs.realpath(absoluteTarget);
+    } catch {
+      // Dangling symlink — treat like nonexistent (dirname).
+      return dirnameOf(normalizedTarget);
+    }
+    assertInsideProjectRoot(rootReal, linkReal, targetLabel);
+    const isDir = await fs.isDirectory(absoluteTarget);
+    if (isDir) return normalizedTarget;
+    return dirnameOf(normalizedTarget);
+  }
+
+  if (st.isDirectory) {
+    // Canonical containment for the directory itself.
+    let dirReal: string;
+    try {
+      dirReal = await fs.realpath(absoluteTarget);
+    } catch {
+      dirReal = absoluteTarget;
+    }
+    assertInsideProjectRoot(rootReal, dirReal, targetLabel);
+    return normalizedTarget;
+  }
+
+  if (st.isFile) {
+    let fileReal: string;
+    try {
+      fileReal = await fs.realpath(absoluteTarget);
+    } catch {
+      fileReal = absoluteTarget;
+    }
+    assertInsideProjectRoot(rootReal, fileReal, targetLabel);
+    return dirnameOf(normalizedTarget);
+  }
+
+  // Other node types — conservative dirname.
+  return dirnameOf(normalizedTarget);
+}
+
+/**
  * Path-scoped ancestor chain for a work target under `root`.
  *
  * Returns every ancestor folder from project root to the target's containing
  * folder with AGENTS.md presence. `applicable` is the present subset — the
  * chain OpenCode native read would append — without loading every project
  * instruction document into a prompt.
+ *
+ * Target kind uses lstat/stat with safe symlink handling (no basename-dot
+ * heuristic). Project-root containment is enforced on the root realpath and on
+ * every candidate target/ancestor directory and AGENTS.md realpath; external
+ * directory or AGENTS file symlinks are refused or excluded and never report
+ * an external path. Internal inventory exclusion policy is unchanged.
  */
 export async function resolveAgentsChain(
   root: string,
@@ -294,19 +452,26 @@ export async function resolveAgentsChain(
 ): Promise<AgentsResolutionResult> {
   const fs = options.fs ?? defaultFs();
   const absoluteRoot = resolve(root);
+  let rootReal: string;
+  try {
+    rootReal = await fs.realpath(absoluteRoot);
+  } catch {
+    rootReal = absoluteRoot;
+  }
+
   const normalizedTarget = targetRelativePath.replace(/\\/g, "/").replace(/^\.\/+/, "");
   if (normalizedTarget === "" || normalizedTarget === ".") {
-    // Target is the project root itself.
-    const agentsPresent = await fs.exists(join(absoluteRoot, "AGENTS.md"));
+    // Target is the project root itself (a directory).
+    const status = await agentsMdStatusInFolder(fs, rootReal, absoluteRoot, "");
     const entry: AgentsChainEntry = {
       folder: "",
       agentsMdPath: "AGENTS.md",
-      status: agentsPresent ? "present" : "missing",
+      status,
     };
     return {
       target: "",
       chain: [entry],
-      applicable: agentsPresent ? ["AGENTS.md"] : [],
+      applicable: status === "present" ? ["AGENTS.md"] : [],
     };
   }
 
@@ -317,26 +482,33 @@ export async function resolveAgentsChain(
   }
 
   const absoluteTarget = resolve(absoluteRoot, ...normalizedTarget.split("/"));
+  // Lexical containment before kind resolution.
   if (!isInsideRoot(absoluteRoot, absoluteTarget) && absoluteTarget !== absoluteRoot) {
     throw new PoiesisError("AGENTS_PATH_OUTSIDE_ROOT", "AGENTS resolution target must stay inside the project root", {
       target: targetRelativePath,
     });
   }
 
-  let leafFolderRel: string;
-  const base = posix.basename(normalizedTarget);
-  const looksLikeFile = base.includes(".");
-  leafFolderRel = looksLikeFile ? posix.dirname(normalizedTarget) : normalizedTarget;
-  if (leafFolderRel === ".") leafFolderRel = "";
+  const leafFolderRel = await resolveLeafFolderRelative(
+    fs,
+    rootReal,
+    absoluteRoot,
+    absoluteTarget,
+    normalizedTarget,
+    targetRelativePath,
+  );
 
   const segments = leafFolderRel === "" ? [] : leafFolderRel.split("/").filter((s) => s.length > 0);
   const chain: AgentsChainEntry[] = [];
   const applicable: string[] = [];
+  // Bound internal symlink cycles while verifying ancestor containment.
+  const seenCanonical = new Set<string>();
+  seenCanonical.add(rootReal);
 
   // Root
   {
     const agentsMdPath = "AGENTS.md";
-    const status = (await fs.exists(join(absoluteRoot, "AGENTS.md"))) ? "present" : "missing";
+    const status = await agentsMdStatusInFolder(fs, rootReal, absoluteRoot, "");
     chain.push({ folder: "", agentsMdPath, status });
     if (status === "present") applicable.push(agentsMdPath);
   }
@@ -344,8 +516,22 @@ export async function resolveAgentsChain(
   let acc = "";
   for (const segment of segments) {
     acc = acc === "" ? segment : `${acc}/${segment}`;
+    const absFolder = join(absoluteRoot, ...acc.split("/"));
+    try {
+      const folderReal = await fs.realpath(absFolder);
+      assertInsideProjectRoot(rootReal, folderReal, targetRelativePath);
+      if (seenCanonical.has(folderReal)) {
+        // Cycle via internal symlink — stop extending the chain (bounded).
+        break;
+      }
+      seenCanonical.add(folderReal);
+    } catch (error) {
+      if (error instanceof PoiesisError) throw error;
+      // Intermediate folder may not exist yet (e.g. nonexistent leaf under a
+      // conservative dirname). Still report the logical chain without realpath.
+    }
     const agentsMdPath = agentsMdRelative(acc);
-    const status = (await fs.exists(join(absoluteRoot, ...acc.split("/"), "AGENTS.md"))) ? "present" : "missing";
+    const status = await agentsMdStatusInFolder(fs, rootReal, absoluteRoot, acc);
     chain.push({ folder: acc, agentsMdPath, status });
     if (status === "present") applicable.push(agentsMdPath);
   }

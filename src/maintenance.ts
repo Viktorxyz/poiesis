@@ -85,13 +85,17 @@ import {
 } from "./manifest.js";
 import {
   applyPackageContributionWithJournal,
+  assertPackageContributionCaptureIdentity,
   assertPackageContributionRuntimeReady,
+  packagePlanIsNoopWithPreimage,
+  packagePlanRetainsContribution,
   planPackageContributionAtRoot,
   planPackageContributionRemoval,
   loadPackageFsSnapshot,
   probeSelfhostDistVersion,
   readResolvedLocalCliPackageJson,
   resolvePackageManagerExecutor,
+  writeManifestWithNoopPackageContributionGate,
   PACKAGE_JSON_RELATIVE,
 } from "./package-invocation.js";
 import { run as runProcess } from "./process.js";
@@ -1492,10 +1496,9 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
   // out of `files` on purpose: Spec #138 lets the Author edit them freely, and
   // a `files` record would turn an edit into a doctor failure.
   const generatedScripts: GeneratedScriptRecord[] = [];
-  // Spec #207 / ticket #210 — owned package contribution recorded on the
-  // manifest after a successful package/lock write set.
-  let packageContributionRecord: PackageContributionRecord | undefined =
-    packagePlan.kind === "noop" ? packagePlan.record : undefined;
+  // Spec #207 / ticket #210 + #214 — owned package contribution recorded on the
+  // manifest only after plan-to-capture identity bind + successful apply/noop gate.
+  let packageContributionRecord: PackageContributionRecord | undefined;
   const packageJournal: ArtifactJournal = new ArtifactJournal(4);
   const createdInitDirectories = new Set<string>();
   let writtenOpenCodeConfigHash: string | undefined;
@@ -1789,41 +1792,45 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       });
     }
 
-    // Spec #207 / ticket #210 — apply owned package.json + lockfile contributions
-    // through a bounded journal write set before the manifest records them.
-    if (packagePlan.kind === "apply") {
-      const packageJsonPath = join(resolvedRoot, "package.json");
-      const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+    // Spec #207 / ticket #210 + #214 — bind original package.json identity for
+    // every non-absent retain/advance plan before manifest success. Apply writes
+    // package+lock; noop captures package.json only (no write / no write identity).
+    if (packagePlanRetainsContribution(packagePlan)) {
+      const packageJsonPath = join(resolvedRoot, PACKAGE_JSON_RELATIVE);
       const packageJsonEntry = await packageJournal.capture(packageJsonPath, "whole-file");
-      const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
-      const preimageLockfile =
-        lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
-      const applied = await applyPackageContributionWithJournal({
-        root: resolvedRoot,
-        plan: packagePlan,
-        packageJsonEntry,
-        lockfileEntry,
-        replaceOwnedFile: (entry, content) => packageJournal.replace(entry, content),
-        executor: resolvePackageManagerExecutor(resolvedRoot),
-        preimageLockfile,
-        poiesisVersion: installingPoiesisVersion,
-      });
-      packageContributionRecord = applied.record;
-    } else if (packagePlan.kind === "noop") {
-      packageContributionRecord = packagePlan.record;
-      // Every success that retains a local contribution proves runtime readiness
-      // (ordinary: resolved node_modules bin version; selfhost: dist/cli.js).
-      await assertPackageContributionRuntimeReady({
-        record: packagePlan.record,
-        poiesisVersion: installingPoiesisVersion,
-        readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
-        probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
-      });
+      assertPackageContributionCaptureIdentity(packagePlan, packageJsonEntry);
+      if (packagePlan.kind === "apply") {
+        const lockfilePath = join(resolvedRoot, packagePlan.record.lockfile);
+        const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
+        const preimageLockfile =
+          lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+        const applied = await applyPackageContributionWithJournal({
+          root: resolvedRoot,
+          plan: packagePlan,
+          packageJsonEntry,
+          lockfileEntry,
+          replaceOwnedFile: (entry, content) => packageJournal.replace(entry, content),
+          executor: resolvePackageManagerExecutor(resolvedRoot),
+          preimageLockfile,
+          poiesisVersion: installingPoiesisVersion,
+        });
+        packageContributionRecord = applied.record;
+      } else {
+        packageContributionRecord = packagePlan.record;
+        // Noop: ownership record only — never write package bytes / bind write identity.
+        await assertPackageContributionRuntimeReady({
+          record: packagePlan.record,
+          poiesisVersion: installingPoiesisVersion,
+          readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
+        });
+      }
     }
 
+    const installingManifestVersion = await packageVersion();
     const manifest: Manifest = {
       schema: 1,
-      poiesisVersion: await packageVersion(),
+      poiesisVersion: installingManifestVersion,
       adapter: {
         harness: "opencode",
         adapterVersion: OPENCODE_ADAPTER_VERSION,
@@ -1838,9 +1845,29 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
       ...(generatedScripts.length === 0 ? {} : { generatedScripts }),
       ...(packageContributionRecord === undefined ? {} : { packageContribution: packageContributionRecord }),
     };
+    // Serialize once; derive post-write identity from authored bytes (no mutable reread).
     const manifestContent = serializeManifest(manifest);
-    await atomicCreate(poiesisPath(resolvedRoot, "manifest.json"), manifestContent);
     writtenManifestHash = hashContent(manifestContent);
+    const manifestPathForWrite = poiesisPath(resolvedRoot, "manifest.json");
+    // Noop publication boundary: fresh package.json identity then immediate
+    // ownership-bearing manifest create. Apply path creates directly.
+    if (packagePlanIsNoopWithPreimage(packagePlan)) {
+      await writeManifestWithNoopPackageContributionGate({
+        plan: packagePlan,
+        readPackageJson: async () => {
+          try {
+            return await readFile(join(resolvedRoot, PACKAGE_JSON_RELATIVE), "utf8");
+          } catch {
+            return null;
+          }
+        },
+        writeManifest: async () => {
+          await atomicCreate(manifestPathForWrite, manifestContent);
+        },
+      });
+    } else {
+      await atomicCreate(manifestPathForWrite, manifestContent);
+    }
     // Ticket #45: capture the receipt authored by THIS invocation BEFORE
     // any subsequent step so the catch block can gate removal on exact
     // identity. `createOwnershipReceipt` returns the canonical
@@ -3684,6 +3711,10 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
         const lockfileEntry = await packageJournal.capture(lockfilePath, "whole-file");
         const preimageLockfile =
           lockfileEntry.preimage === undefined ? "" : lockfileEntry.preimage.toString("utf8");
+        // Plan-to-capture bind: removal was planned against a specific package.json
+        // snapshot. Intervening Author bytes must not become the journal preimage
+        // for a stale nextPackageJson overwrite. Fail before write/native pm.
+        assertPackageContributionCaptureIdentity(removal, packageJsonEntry);
         // Removal writes planned package.json through journal.replace (preimage
         // guard). Native pm may rewrite lock/package on disk — validate owned
         // fields are gone; do not re-write reread bytes merely to journal-bind

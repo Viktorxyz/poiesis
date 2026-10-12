@@ -32,6 +32,7 @@ import {
 import { isDeepStrictEqual } from "node:util";
 import { parseJsonc } from "./config.js";
 import { PoiesisError } from "./errors.js";
+import { hashContent } from "./hash.js";
 import type { PackageContributionRecord } from "./manifest.js";
 import type { ArtifactJournalEntry } from "./mutation-transaction.js";
 
@@ -251,6 +252,15 @@ export type PackageContributionPlan =
       lockfileOperation: null;
       nextPackageJson?: undefined;
       preserved?: undefined;
+      /**
+       * `sha256` of the package.json bytes this noop was observed against when
+       * package.json was present at plan time. Required for every contribution
+       * noop that retains/advances `packageContribution` — bind via
+       * {@link assertPackageContributionCaptureIdentity} before runtime
+       * readiness and before successful manifest/receipt. Omitted only when
+       * removal observes no package.json (nothing to bind).
+       */
+      expectedPackageJsonPreimageHash?: string;
     }
   | {
       kind: "apply";
@@ -258,9 +268,145 @@ export type PackageContributionPlan =
       packageJsonChanged: boolean;
       lockfileOperation: LockfileOperation;
       nextPackageJson: string;
+      /**
+       * `sha256` of the **original** package.json snapshot bytes this plan was
+       * computed from — never `nextPackageJson`. Callers that await work between
+       * plan and `journal.capture` must bind capture preimage/identity to this
+       * hash via {@link assertPackageContributionCaptureIdentity} before any
+       * Poiesis-authored package replacement or native pm step.
+       */
+      expectedPackageJsonPreimageHash: string;
       /** Paths left untouched because foreign content no longer matches ownership. */
       preserved?: Array<{ path: string[]; reason: string }>;
     };
+
+/**
+ * Non-absent package plan that carries an original package.json preimage hash
+ * and may retain/advance `manifest.packageContribution` (apply writes, or noop
+ * ownership record). Used by the shared plan-to-capture gate.
+ */
+export type PackageContributionPlanWithPreimage =
+  | Extract<PackageContributionPlan, { kind: "apply" }>
+  | (Extract<PackageContributionPlan, { kind: "noop" }> & {
+      expectedPackageJsonPreimageHash: string;
+    });
+
+/**
+ * True when the plan is apply or a noop that retains contribution against a
+ * known package.json preimage hash. Absent plans and removal noops without
+ * package.json are excluded.
+ */
+export function packagePlanRetainsContribution(
+  plan: PackageContributionPlan,
+): plan is PackageContributionPlanWithPreimage {
+  if (plan.kind === "apply") return true;
+  return plan.kind === "noop" && plan.expectedPackageJsonPreimageHash !== undefined;
+}
+
+/**
+ * Bind a package contribution **apply or noop** plan to the observed
+ * `package.json` identity (journal capture preimage/identity, or current file
+ * bytes). The plan is a statement about one specific original snapshot; a
+ * writer that lands between plan and observation must not cause a stale
+ * ownership record or a stale `nextPackageJson` overwrite to advance.
+ *
+ * Compares `plan.expectedPackageJsonPreimageHash` (original snapshot identity)
+ * against the observation — never against `plan.nextPackageJson`. Raises
+ * `ARTIFACT_IDENTITY_DRIFT` before write/native executor/runtime-ready success
+ * and before successful manifest/receipt so ownership cannot advance on drifted
+ * bytes. Noop paths must not write package bytes or bind
+ * `transactionWrittenIdentity`. Existing journal capture-to-write guards remain
+ * for the post-capture apply window.
+ */
+export function assertPackageContributionCaptureIdentity(
+  plan: PackageContributionPlanWithPreimage | { expectedPackageJsonPreimageHash: string },
+  observed:
+    | Pick<ArtifactJournalEntry, "preimage" | "expectedPreWriteIdentity">
+    | { packageJsonContent: string },
+): void {
+  const expected = plan.expectedPackageJsonPreimageHash;
+  if ("packageJsonContent" in observed) {
+    if (hashContent(observed.packageJsonContent) !== expected) {
+      throw new PoiesisError(
+        "ARTIFACT_IDENTITY_DRIFT",
+        "package.json changed while preparing the package contribution",
+        { path: PACKAGE_JSON_RELATIVE },
+      );
+    }
+    return;
+  }
+  const identity = observed.expectedPreWriteIdentity;
+  const preimage = observed.preimage;
+  const preimageHash = preimage === undefined ? undefined : hashContent(preimage);
+  const identityHash = identity.exists && identity.kind === "file" ? identity.hash : undefined;
+  const matchesPlan =
+    preimageHash === expected &&
+    identityHash === expected &&
+    identity.exists === true &&
+    identity.kind === "file";
+  if (!matchesPlan) {
+    throw new PoiesisError(
+      "ARTIFACT_IDENTITY_DRIFT",
+      "package.json changed while preparing the package contribution",
+      { path: PACKAGE_JSON_RELATIVE },
+    );
+  }
+}
+
+/**
+ * Noop plan that retains/advances `packageContribution` against a known
+ * original package.json preimage hash.
+ */
+export type PackageContributionNoopPlan = Extract<PackageContributionPlan, { kind: "noop" }> & {
+  expectedPackageJsonPreimageHash: string;
+};
+
+/** True when the plan is a hashed noop that retains contribution (not apply, not absent). */
+export function packagePlanIsNoopWithPreimage(
+  plan: PackageContributionPlan,
+): plan is PackageContributionNoopPlan {
+  return plan.kind === "noop" && plan.expectedPackageJsonPreimageHash !== undefined;
+}
+
+/**
+ * Publication boundary for a **noop** package contribution that retains
+ * `manifest.packageContribution`. Call only after:
+ *   - runtime readiness,
+ *   - all manifest object construction / serialization / version resolution,
+ *   - and any `preManifestWrite` hooks.
+ *
+ * Freshly reads `package.json`, asserts the original noop plan hash, then
+ * immediately invokes `writeManifest` with **no** unrelated awaited work or
+ * hook between the assert and the first ownership-bearing manifest write.
+ * Missing/unreadable package.json → `ARTIFACT_IDENTITY_DRIFT` and the writer
+ * is not called. Does not write package.json and does not bind
+ * `transactionWrittenIdentity`. Apply paths must not call this helper —
+ * receipt stays after the manifest write, based on authored manifest bytes.
+ */
+export async function writeManifestWithNoopPackageContributionGate(args: {
+  plan: PackageContributionNoopPlan | { expectedPackageJsonPreimageHash: string };
+  /** Fresh reader; `null` or throw → identity drift (writer not invoked). */
+  readPackageJson: () => Promise<string | null>;
+  /** First ownership-bearing manifest write (atomicCreate / journal.replace). */
+  writeManifest: () => Promise<void>;
+}): Promise<void> {
+  let content: string | null;
+  try {
+    content = await args.readPackageJson();
+  } catch {
+    content = null;
+  }
+  if (content === null) {
+    throw new PoiesisError(
+      "ARTIFACT_IDENTITY_DRIFT",
+      "package.json changed while preparing the package contribution",
+      { path: PACKAGE_JSON_RELATIVE },
+    );
+  }
+  assertPackageContributionCaptureIdentity(args.plan, { packageJsonContent: content });
+  // Immediate ownership-bearing write — no hooks or other awaits between assert and write.
+  await args.writeManifest();
+}
 
 export type PackageManagerExecutor = {
   apply(request: {
@@ -638,6 +784,7 @@ export function planPackageContribution(args: {
   throwIfUnsupported(resolution);
 
   const content = args.snapshot.packageJson!;
+  const expectedPackageJsonPreimageHash = hashContent(content);
   const document = parsePackageObject(content);
   const projectKind = classifyPackageProject(document);
   const scriptValue = desiredScriptValue(projectKind);
@@ -786,7 +933,13 @@ export function planPackageContribution(args: {
   });
 
   if (!packageJsonChanged && lockfileOperation === null) {
-    return { kind: "noop", record, packageJsonChanged: false, lockfileOperation: null };
+    return {
+      kind: "noop",
+      record,
+      packageJsonChanged: false,
+      lockfileOperation: null,
+      expectedPackageJsonPreimageHash,
+    };
   }
 
   // Version-crossing ordinary packages always need lockfile reconciliation when dep version changes.
@@ -798,6 +951,7 @@ export function planPackageContribution(args: {
     packageJsonChanged,
     lockfileOperation,
     nextPackageJson: next,
+    expectedPackageJsonPreimageHash,
   };
 }
 
@@ -828,6 +982,7 @@ export function planPackageContributionRemoval(args: {
   }
 
   const content = args.snapshot.packageJson;
+  const expectedPackageJsonPreimageHash = hashContent(content);
   const document = parsePackageObject(content);
   const preserved: Array<{ path: string[]; reason: string }> = [];
   let next = content;
@@ -865,7 +1020,13 @@ export function planPackageContributionRemoval(args: {
 
   if (!packageJsonChanged && lockfileOperation === null) {
     if (preserved.length === 0) {
-      return { kind: "noop", record: args.record, packageJsonChanged: false, lockfileOperation: null };
+      return {
+        kind: "noop",
+        record: args.record,
+        packageJsonChanged: false,
+        lockfileOperation: null,
+        expectedPackageJsonPreimageHash,
+      };
     }
     return {
       kind: "apply",
@@ -873,6 +1034,7 @@ export function planPackageContributionRemoval(args: {
       packageJsonChanged: false,
       lockfileOperation: null,
       nextPackageJson: content,
+      expectedPackageJsonPreimageHash,
       preserved,
     };
   }
@@ -883,6 +1045,7 @@ export function planPackageContributionRemoval(args: {
     packageJsonChanged,
     lockfileOperation,
     nextPackageJson: next,
+    expectedPackageJsonPreimageHash,
     ...(preserved.length === 0 ? {} : { preserved }),
   };
 }
@@ -1225,6 +1388,12 @@ export async function applyPackageContributionWithJournal(args: {
   lockfile: string;
   preserved?: Array<{ path: string[]; reason: string }>;
 }> {
+  // Plan-to-capture bind: the apply plan was computed from a specific
+  // package.json snapshot. Capture must still hold those original bytes —
+  // never authenticate intervening Author edits then overwrite with a stale
+  // nextPackageJson. Fail closed before write/native pm/manifest advance.
+  assertPackageContributionCaptureIdentity(args.plan, args.packageJsonEntry);
+
   const { run } = await import("./process.js");
   const executor = args.executor ?? resolvePackageManagerExecutor(args.root);
   const lockfileRelative = args.plan.record.lockfile;
