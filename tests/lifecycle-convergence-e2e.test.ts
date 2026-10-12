@@ -84,7 +84,8 @@ const PREDECESSOR_VERSION = "1.4.0";
 /**
  * The exact 1.4.0 pre-focused-check predecessor projection, derived
  * independently of the runtime helper under test: the ordinary projection
- * builder's 1.4.0 output with the Worker's single focused-check allow removed.
+ * builder's 1.4.0 output with the Worker's focused-check allow and the two
+ * ticket-#212 local package-script lifecycle denies removed.
  */
 function preFocusedCheck(repository: TestRepository): Array<{ path: string[]; value: unknown }> {
   return desiredOpenCodePatches(testConfig(repository), PREDECESSOR_VERSION).map((patch) => {
@@ -94,6 +95,10 @@ function preFocusedCheck(repository: TestRepository): Array<{ path: string[]; va
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
     }
+    // Ticket #212: authentic pre-focused-check Worker bash never carried
+    // these local lifecycle denies; strip them with the check allow.
+    delete bash["pnpm poiesis *"];
+    delete bash["npm run poiesis -- *"];
     return { path: patch.path, value: { ...installed, permission: { ...installed.permission, bash } } };
   });
 }

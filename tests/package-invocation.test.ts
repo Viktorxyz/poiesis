@@ -619,7 +619,25 @@ describe("injected package transaction apply (ticket #210)", () => {
   });
 });
 
-describe("local invocation permission route (ticket #210)", () => {
+/**
+ * OpenCode bash last-match-wins evaluator used only to prove Worker local
+ * lifecycle denial ordering. Patterns treat each `*` as "any remainder".
+ */
+function lastMatchBashPermission(
+  bash: Record<string, string>,
+  command: string,
+): "allow" | "deny" | undefined {
+  let result: "allow" | "deny" | undefined;
+  for (const [pattern, permission] of Object.entries(bash)) {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+    if (new RegExp(`^${escaped}$`).test(command)) {
+      result = permission as "allow" | "deny";
+    }
+  }
+  return result;
+}
+
+describe("local invocation permission route (ticket #210 / #212)", () => {
   it("keeps exact dlx prefix when there is no package contribution", () => {
     expect(canonicalInvocationPrefix("1.6.0", undefined)).toBe("pnpm dlx poiesis-cli@1.6.0");
     const primary = desiredOpenCodePatches(testConfig(), "1.6.0").find(
@@ -655,8 +673,22 @@ describe("local invocation permission route (ticket #210)", () => {
     expect(primaryBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
     expect(workerBash["pnpm poiesis check *"]).toBe("allow");
     expect(workerBash["pnpm poiesis repository status"]).toBe("allow");
-    expect(workerBash["pnpm poiesis *"]).toBeUndefined();
+    // Ticket #212: Worker denies both broad local prefixes (ordered before
+    // narrow check/repository allows) so `*` cannot grant full lifecycle.
+    expect(workerBash["pnpm poiesis *"]).toBe("deny");
+    expect(workerBash["npm run poiesis -- *"]).toBe("deny");
     expect(workerBash["pnpm dlx poiesis-cli@*"]).toBe("deny");
+    const keys = Object.keys(workerBash);
+    const pnpmLocalDenyIdx = keys.indexOf("pnpm poiesis *");
+    const npmLocalDenyIdx = keys.indexOf("npm run poiesis -- *");
+    const checkAllowIdx = keys.indexOf("pnpm poiesis check *");
+    const repoAllowIdx = keys.indexOf("pnpm poiesis repository status");
+    expect(pnpmLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
+    expect(npmLocalDenyIdx).toBeGreaterThan(keys.indexOf("pnpm dlx poiesis-cli@*"));
+    expect(checkAllowIdx).toBeGreaterThan(pnpmLocalDenyIdx);
+    expect(checkAllowIdx).toBeGreaterThan(npmLocalDenyIdx);
+    expect(repoAllowIdx).toBeGreaterThan(pnpmLocalDenyIdx);
+    expect(repoAllowIdx).toBeGreaterThan(npmLocalDenyIdx);
   });
 
   it("projects npm run poiesis local invocation allows", () => {
@@ -670,9 +702,78 @@ describe("local invocation permission route (ticket #210)", () => {
     expect(canonicalInvocationPrefix("1.6.0", record)).toBe("npm run poiesis --");
     const patches = desiredOpenCodePatches(testConfig(), "1.6.0", record);
     const primary = patches.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis");
+    const worker = patches.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker");
     const bash = (primary?.value as { permission: { bash: Record<string, string> } }).permission.bash;
+    const workerBash = (worker?.value as { permission: { bash: Record<string, string> } }).permission.bash;
     expect(bash["npm run poiesis -- *"]).toBe("allow");
     expect(bash["pnpm dlx poiesis-cli@1.6.0 *"]).toBeUndefined();
+    expect(workerBash["npm run poiesis -- check *"]).toBe("allow");
+    expect(workerBash["npm run poiesis -- repository status"]).toBe("allow");
+    expect(workerBash["pnpm poiesis *"]).toBe("deny");
+    expect(workerBash["npm run poiesis -- *"]).toBe("deny");
+    const keys = Object.keys(workerBash);
+    expect(keys.indexOf("npm run poiesis -- check *")).toBeGreaterThan(keys.indexOf("npm run poiesis -- *"));
+    expect(keys.indexOf("npm run poiesis -- repository status")).toBeGreaterThan(
+      keys.indexOf("npm run poiesis -- *"),
+    );
+  });
+
+  it("denies Worker pnpm/npm full lifecycle through last-match evaluation", () => {
+    const pnpmRecord = buildPackageContributionRecord({
+      manager: "pnpm",
+      lockfile: "pnpm-lock.yaml",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const npmRecord = buildPackageContributionRecord({
+      manager: "npm",
+      lockfile: "package-lock.json",
+      projectKind: "ordinary",
+      scriptValue: "poiesis",
+      devDependencyVersion: "1.6.0",
+    });
+    const pnpmWorker = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", pnpmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+    const npmWorker = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", npmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+    const pnpmPrimary = (
+      desiredOpenCodePatches(testConfig(), "1.6.0", pnpmRecord).find(
+        (p) => p.path[0] === "agent" && p.path[1] === "poiesis",
+      )?.value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+
+    const lifecycleCommands = [
+      "pnpm poiesis workspace create",
+      "pnpm poiesis checkpoint create",
+      "pnpm poiesis verify",
+      "pnpm poiesis tracker set-status done",
+      "pnpm poiesis update",
+      "npm run poiesis -- workspace create",
+      "npm run poiesis -- verify",
+      "npm run poiesis -- tracker set-status done",
+    ] as const;
+
+    for (const command of lifecycleCommands) {
+      expect(lastMatchBashPermission(pnpmWorker, command), `pnpm worker: ${command}`).toBe("deny");
+      expect(lastMatchBashPermission(npmWorker, command), `npm worker: ${command}`).toBe("deny");
+    }
+
+    // Narrow owned routes still win after the broad local denies.
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm poiesis check --command tsc")).toBe("allow");
+    expect(lastMatchBashPermission(pnpmWorker, "pnpm poiesis repository status")).toBe("allow");
+    expect(lastMatchBashPermission(npmWorker, "npm run poiesis -- check --command tsc")).toBe("allow");
+    expect(lastMatchBashPermission(npmWorker, "npm run poiesis -- repository status")).toBe("allow");
+
+    // Primary keeps the owned local lifecycle allow (last-match wins).
+    expect(lastMatchBashPermission(pnpmPrimary, "pnpm poiesis workspace create")).toBe("allow");
+    expect(lastMatchBashPermission(pnpmPrimary, "pnpm poiesis verify")).toBe("allow");
   });
 });
 

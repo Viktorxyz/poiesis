@@ -541,18 +541,25 @@ function permissions(
           // preserved so the exact-version deny still precedes every allow.
           "pnpm dlx poiesis-cli *": "deny",
           "pnpm dlx poiesis-cli@*": "deny",
+          // Spec #207 / ticket #212: deny BOTH broad local package-script
+          // prefixes BEFORE the narrow check/repository allows. Without
+          // these, Worker's `*` allow admits full lifecycle through
+          // `pnpm poiesis …` / `npm run poiesis -- …` when a local
+          // contribution projects those prefixes. Primary alone keeps the
+          // owned local lifecycle allow; other tools stay unchanged.
+          "pnpm poiesis *": "deny",
+          "npm run poiesis -- *": "deny",
           // Spec #120 / ticket #123: append the four Repository
-          // Intelligence subcommand allows AFTER the `pnpm dlx
-          // poiesis-cli@*` deny so OpenCode's last-match-wins
-          // resolver grants only the exact-version repository
-          // operations and leaves every other Poiesis lifecycle
-          // invocation denied.
+          // Intelligence subcommand allows AFTER the launcher denies so
+          // OpenCode's last-match-wins resolver grants only the
+          // exact-version repository operations and leaves every other
+          // Poiesis lifecycle invocation denied.
           ...workerRepositoryIntelligenceAllows(poiesisVersion, packageContribution),
           // Spec #168 / ticket #173: and then the one narrow focused-check
-          // allow, also AFTER the `pnpm dlx poiesis-cli@*` deny, so the
-          // Worker reaches real focused-check evidence without gaining any
-          // lifecycle authority. The Worker keeps broad project bash, so this
-          // is not a new capability for it; the bounded difference is that the
+          // allow, also AFTER the launcher denies, so the Worker reaches
+          // real focused-check evidence without gaining any lifecycle
+          // authority. The Worker keeps broad project bash, so this is not
+          // a new capability for it; the bounded difference is that the
           // evidence becomes a deterministic fingerprint rather than
           // unstructured terminal text.
           ...workerFocusedCheckAllows(poiesisVersion, packageContribution),

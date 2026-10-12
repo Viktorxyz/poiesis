@@ -577,6 +577,8 @@ describe("Spec #131 / ticket #132 — v1.1.3 / v1.1.4 predecessor projection", (
         "npx poiesis *": "deny",
         "pnpm dlx poiesis-cli *": "deny",
         "pnpm dlx poiesis-cli@*": "deny",
+        "pnpm poiesis *": "deny",
+        "npm run poiesis -- *": "deny",
         [`pnpm dlx poiesis-cli@${current} repository status`]: "allow",
         [`pnpm dlx poiesis-cli@${current} repository query *`]: "allow",
         [`pnpm dlx poiesis-cli@${current} repository path *`]: "allow",

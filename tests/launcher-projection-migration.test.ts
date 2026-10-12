@@ -116,10 +116,11 @@ async function writeOpenCodeFromManifest(repository: TestRepository, manifest: M
  * The exact `1.4.0` pre-focused-check predecessor projection, derived
  * INDEPENDENTLY of `predecessorProjectionPreFocusedCheck` (the runtime helper
  * under test): the `1.4.0` projection built by the ordinary projection
- * builder, minus the single focused-check allow. Keeping the fixture free of
- * the helper is what makes the migration tests below honest — they fail
- * because the authority gate refuses the projection, not because the helper is
- * missing or because the predecessor version is really the running runtime.
+ * builder, minus the focused-check allow and the two ticket-#212 local
+ * package-script lifecycle denies. Keeping the fixture free of the helper is
+ * what makes the migration tests below honest — they fail because the
+ * authority gate refuses the projection, not because the helper is missing or
+ * because the predecessor version is really the running runtime.
  */
 function preFocusedCheckProjection(repository: TestRepository): Array<{ path: string[]; value: unknown }> {
   return desiredOpenCodePatches(testConfig(repository), PREDECESSOR_VERSION).map((patch) => {
@@ -129,6 +130,10 @@ function preFocusedCheckProjection(repository: TestRepository): Array<{ path: st
     for (const key of Object.keys(bash)) {
       if (/\scheck \*$/.test(key)) delete bash[key];
     }
+    // Ticket #212: authentic pre-focused-check Worker bash never carried
+    // these local lifecycle denies; strip them with the check allow.
+    delete bash["pnpm poiesis *"];
+    delete bash["npm run poiesis -- *"];
     return { path: patch.path, value: { ...installed, permission: { ...installed.permission, bash } } };
   });
 }
@@ -172,15 +177,20 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     await Promise.all(repositories.splice(0).map((repo) => rm(repo.parent, { recursive: true, force: true })));
   });
 
-  it("names a pre-focused-check predecessor that differs from that version's own projection in exactly one key", async () => {
+  it("names a pre-focused-check predecessor that differs from that version's own projection by check allow plus two local denies", async () => {
     const repository = await createTestRepository();
     repositories.push(repository);
     const manifest = await init(repository.root, testConfig(repository), { skipSkills: true, allowFixtureAdapters: true });
-    // The admitted predecessor is the published `1.4.0`, so the one-key delta
+    // The admitted predecessor is the published `1.4.0`, so the three-key delta
     // is proven against the projection `1.4.0` itself would install — the
     // running runtime's own projection is re-proven below under its own label.
     const version = PREDECESSOR_VERSION;
     const predecessor = predecessorProjectionPreFocusedCheck(testConfig(repository), version);
+    const excludedFromPredecessor = new Set([
+      `pnpm dlx poiesis-cli@${version} check *`,
+      "pnpm poiesis *",
+      "npm run poiesis -- *",
+    ]);
 
     expect(predecessor.map((patch) => patch.path.join("\0"))).toEqual(manifest.configPatches.map((patch) => patch.path.join("\0")));
 
@@ -197,18 +207,28 @@ describe("Spec #168 / ticket #174 — compatible launcher projection migration",
     ).permission.bash;
 
     expect(currentWorker[`pnpm dlx poiesis-cli@${version} check *`]).toBe("allow");
+    expect(currentWorker["pnpm poiesis *"]).toBe("deny");
+    expect(currentWorker["npm run poiesis -- *"]).toBe("deny");
     expect(predecessorWorker).not.toHaveProperty(`pnpm dlx poiesis-cli@${version} check *`);
-    expect(Object.keys(predecessorWorker)).toEqual(Object.keys(currentWorker).filter((key) => key !== `pnpm dlx poiesis-cli@${version} check *`));
+    expect(predecessorWorker).not.toHaveProperty("pnpm poiesis *");
+    expect(predecessorWorker).not.toHaveProperty("npm run poiesis -- *");
+    expect(Object.keys(predecessorWorker)).toEqual(
+      Object.keys(currentWorker).filter((key) => !excludedFromPredecessor.has(key)),
+    );
     for (const [key, value] of Object.entries(predecessorWorker)) {
       expect(currentWorker[key], `predecessor key ${key}`).toBe(value);
     }
 
-    // The same one-key delta holds for the running runtime's own version, so
+    // The same three-key delta holds for the running runtime's own version, so
     // the helper stays keyed off its supplied version rather than a literal.
     const current = await packageVersion();
-    const currentPredecessor = predecessorProjectionPreFocusedCheck(testConfig(repository), current);
-    expect((currentPredecessor.find((p) => p.path[1] === "poiesis-worker")!.value as { permission: { bash: Record<string, string> } }).permission.bash)
-      .not.toHaveProperty(`pnpm dlx poiesis-cli@${current} check *`);
+    const currentPredecessorWorker = (
+      predecessorProjectionPreFocusedCheck(testConfig(repository), current).find((p) => p.path[1] === "poiesis-worker")!
+        .value as { permission: { bash: Record<string, string> } }
+    ).permission.bash;
+    expect(currentPredecessorWorker).not.toHaveProperty(`pnpm dlx poiesis-cli@${current} check *`);
+    expect(currentPredecessorWorker).not.toHaveProperty("pnpm poiesis *");
+    expect(currentPredecessorWorker).not.toHaveProperty("npm run poiesis -- *");
   }, 60_000);
 
   it("admit-miss: the strict current gate rejects the 1.4.0 pre-focused-check projection", async () => {

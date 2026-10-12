@@ -6,7 +6,11 @@
  * Pure / in-memory only: injected fetch, no git-init fixtures, no network.
  */
 import { describe, expect, it } from "vitest";
-import { isExactProjection, predecessorProjectionV160StaticSkills } from "../src/authority.js";
+import {
+  isExactProjection,
+  predecessorProjectionPreFocusedCheck,
+  predecessorProjectionV160StaticSkills,
+} from "../src/authority.js";
 import type { PoiesisConfig } from "../src/config.js";
 import type { Manifest } from "../src/manifest.js";
 import {
@@ -297,6 +301,9 @@ describe("native skill permissions and 1.6.0 static-skill predecessor (ticket #2
     expect(worker.permission.bash["pnpm dlx poiesis-cli@1.6.0 *"]).toBeUndefined();
     expect(worker.permission.bash["pnpm dlx poiesis-cli@1.6.0 capability *"]).toBeUndefined();
     expect(worker.permission.bash["pnpm dlx poiesis-cli@*"]).toBe("deny");
+    // Ticket #212: current Worker keeps ordered local lifecycle denies.
+    expect(worker.permission.bash["pnpm poiesis *"]).toBe("deny");
+    expect(worker.permission.bash["npm run poiesis -- *"]).toBe("deny");
 
     for (const agent of [
       "poiesis-planner",
@@ -314,7 +321,7 @@ describe("native skill permissions and 1.6.0 static-skill predecessor (ticket #2
     );
   });
 
-  it("builds an authentic 1.6.0 static-skill predecessor that differs only in skill maps", () => {
+  it("builds an authentic 1.6.0 static-skill predecessor (skill maps + pre-#212 Worker bash)", () => {
     const config = testConfig();
     const current = desiredOpenCodePatches(config, "1.6.0");
     const staticSkills = predecessorProjectionV160StaticSkills(config, "1.6.0");
@@ -327,7 +334,9 @@ describe("native skill permissions and 1.6.0 static-skill predecessor (ticket #2
       const agentName = patch.path[1]!;
       const expected = OPENCODE_V160_STATIC_SKILL_PERMISSIONS[agentName];
       if (expected === undefined) continue;
-      const permission = (patch.value as { permission: { skill: Record<string, string>; bash?: unknown } }).permission;
+      const permission = (patch.value as {
+        permission: { skill: Record<string, string>; bash?: Record<string, string> };
+      }).permission;
       expect(permission.skill).toEqual({ ...expected });
       const currentPatch = current.find(
         (candidate) =>
@@ -335,10 +344,25 @@ describe("native skill permissions and 1.6.0 static-skill predecessor (ticket #2
           candidate.path.every((segment, index) => segment === patch.path[index]),
       );
       expect(currentPatch).toBeDefined();
-      const currentPermission = (currentPatch!.value as { permission: { skill: Record<string, string>; bash?: unknown } })
-        .permission;
+      const currentPermission = (currentPatch!.value as {
+        permission: { skill: Record<string, string>; bash?: Record<string, string> };
+      }).permission;
       expect(currentPermission.skill).toEqual({ "*": "allow" });
-      expect(permission.bash).toEqual(currentPermission.bash);
+      if (agentName === "poiesis-worker") {
+        // Ticket #212: historic Worker bash omits local lifecycle denies;
+        // current desired keeps them ordered.
+        expect(permission.bash?.["pnpm poiesis *"]).toBeUndefined();
+        expect(permission.bash?.["npm run poiesis -- *"]).toBeUndefined();
+        expect(currentPermission.bash?.["pnpm poiesis *"]).toBe("deny");
+        expect(currentPermission.bash?.["npm run poiesis -- *"]).toBe("deny");
+        const historicBash = { ...(permission.bash ?? {}) };
+        const currentBashWithoutLocalDenies = { ...(currentPermission.bash ?? {}) };
+        delete currentBashWithoutLocalDenies["pnpm poiesis *"];
+        delete currentBashWithoutLocalDenies["npm run poiesis -- *"];
+        expect(historicBash).toEqual(currentBashWithoutLocalDenies);
+      } else {
+        expect(permission.bash).toEqual(currentPermission.bash);
+      }
     }
 
     const drifted = manifestFromPatches(
@@ -355,5 +379,25 @@ describe("native skill permissions and 1.6.0 static-skill predecessor (ticket #2
     };
     expect(isExactProjection(drifted, staticSkills)).toBe(false);
     expect(isExactProjection(drifted, current)).toBe(false);
+  });
+
+  it("pre-focused-check predecessor omits Worker local lifecycle denies present on current", () => {
+    // Ticket #212 pure inheritance: authentic pre-focused-check Worker bash
+    // never carried `pnpm poiesis *` / `npm run poiesis -- *`; current does.
+    const config = testConfig();
+    const current = desiredOpenCodePatches(config, "1.4.0");
+    const predecessor = predecessorProjectionPreFocusedCheck(config, "1.4.0");
+    const currentWorker = current.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker");
+    const historicWorker = predecessor.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis-worker");
+    expect(currentWorker).toBeDefined();
+    expect(historicWorker).toBeDefined();
+    const currentBash = (currentWorker!.value as { permission: { bash: Record<string, string> } }).permission.bash;
+    const historicBash = (historicWorker!.value as { permission: { bash: Record<string, string> } }).permission.bash;
+    expect(currentBash["pnpm poiesis *"]).toBe("deny");
+    expect(currentBash["npm run poiesis -- *"]).toBe("deny");
+    expect(historicBash["pnpm poiesis *"]).toBeUndefined();
+    expect(historicBash["npm run poiesis -- *"]).toBeUndefined();
+    expect(historicBash["pnpm dlx poiesis-cli@1.4.0 check *"]).toBeUndefined();
+    expect(currentBash["pnpm dlx poiesis-cli@1.4.0 check *"]).toBe("allow");
   });
 });
