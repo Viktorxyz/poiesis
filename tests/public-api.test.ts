@@ -204,6 +204,8 @@ const forbiddenFunctions = [
   "applyPackageContributionPlan",
   "createNativePackageManagerExecutor",
   "setPackageManagerExecutorForTest",
+  "setPackageManagerRunForTest",
+  "PACKAGE_MANAGER_MUTATION_TIMEOUT_MS",
   "resolvePackageManagerOwnership",
   "INSTALL_MODES",
   "parseInstallMode",

@@ -53,7 +53,7 @@ The handoff's `OPENCODE_CONFIG_PATCH_V2.jsonc` is retained as design intent, not
 
 ### Same-release projection migration (pre-focused-check)
 
-A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.8.0 is the current release and the migration boundary for that install.
+A narrow Worker permission add can land inside a release without bumping the runtime version. v1.4.0 is the published predecessor that carries this shape: the narrow `check *` focused-check allow for the Worker changed the exact OpenCode projection while `manifest.poiesisVersion` stayed `"1.4.0"`. v1.8.1 is the current release and the migration boundary for that install.
 
 ### Same-release projection migration (1.6.0 static skills → native skill wildcard)
 
@@ -73,15 +73,15 @@ A project installed by the earlier `1.4.0` image therefore records `poiesisVersi
 
 ### Release-to-release crossing
 
-An ordinary release bump needs no exceptional migration entry. `assertManifestAuthority` builds the strict projection from the MANIFEST's own `poiesisVersion`, so a project installed by the previously published `1.7.0` image carries the authentic `1.7.0` projection and satisfies the ordinary strict manifest-version check before any predecessor tolerance is consulted. v1.8.0 is the current release. The same ordinary path still admits authentic earlier projections (`1.6.0`, `1.5.0`, `1.2.1`, …) keyed off their own manifest versions.
+An ordinary release bump needs no exceptional migration entry. `assertManifestAuthority` builds the strict projection from the MANIFEST's own `poiesisVersion`, so a project installed by the previously published `1.8.0` image carries the authentic `1.8.0` projection and satisfies the ordinary strict manifest-version check before any predecessor tolerance is consulted. v1.8.1 is the current release. The same ordinary path still admits authentic earlier projections (`1.8.0`, `1.7.0`, `1.6.0`, `1.5.0`, `1.2.1`, …) keyed off their own manifest versions.
 
 - **Admitted:** the exact authentic predecessor projection for the MANIFEST's own `poiesisVersion`, on the ordinary strict path — the same path a 1.2.1 install takes. Every operation accepts it, including the receipt-gated `poiesis update`.
-- **Not admitted as exceptional release entries:** ordinary published predecessors such as `"1.5.0"` and `"1.7.0"` are deliberately NOT added solely for a release bump. The strict path already admits that exact projection, so a predecessor entry would grant an exceptional migration route to a surface that needs no exception and would widen what projection drift can reach. `"1.6.0"` remains in the accepted set only for the static-skill same-release migration above, not as a second ordinary release-crossing exception.
+- **Not admitted as exceptional release entries:** ordinary published predecessors such as `"1.5.0"`, `"1.7.0"`, and `"1.8.0"` are deliberately NOT added solely for a release bump. The strict path already admits that exact projection, so a predecessor entry would grant an exceptional migration route to a surface that needs no exception and would widen what projection drift can reach. `"1.6.0"` remains in the accepted set only for the static-skill same-release migration above, not as a second ordinary release-crossing exception.
 - **Drift still fails closed:** a predecessor-versioned manifest that does not match its own exact projection is drift, and fails closed with `MANIFEST_AUTHORITY_INVALID` on every path — strict, predecessor-tolerant, and the receipt-gated `update`.
-- **The receipt-gated `update` crosses the release:** it advances `manifest.poiesisVersion` to `1.8.0`, re-keys the exact-version launcher onto the supported route for that install (`pnpm poiesis …` / `npm run poiesis -- …` when a local package contribution is owned, otherwise `pnpm dlx poiesis-cli@1.8.0 …`), and advances the ownership receipt by exactly one generation.
+- **The receipt-gated `update` crosses the release:** it advances `manifest.poiesisVersion` to `1.8.1`, re-keys the exact-version launcher onto the supported route for that install (`pnpm poiesis …` / `npm run poiesis -- …` when a local package contribution is owned, otherwise `pnpm dlx poiesis-cli@1.8.1 …`), and advances the ownership receipt by exactly one generation.
 - **No launcher widening:** the crossed projection grants the exact installed canonical route only — never a broad off-version `pnpm dlx poiesis-cli@*` allow, `@latest`, or unversioned route.
-- **Published artifact parity:** the packed artifact for this release is `poiesis-cli-1.8.0.tgz` and its version agrees with `package.json`, so the exact-version launcher and the published tarball always name the same release.
-- **Historical predecessors are unchanged:** the `1.6.0` static-skill migration above, the `1.4.0` pre-focused-check migration, the v1.1.3 / v1.1.4 projection, and the v1.0.0/1.0.1/1.0.2 legacy projection all behave exactly as they did under 1.7.0. Authentic `1.7.0` installs cross on the ordinary strict path with no new exceptional entry.
+- **Published artifact parity:** the packed artifact for this release is `poiesis-cli-1.8.1.tgz` and its version agrees with `package.json`, so the exact-version launcher and the published tarball always name the same release.
+- **Historical predecessors are unchanged:** the `1.6.0` static-skill migration above, the `1.4.0` pre-focused-check migration, the v1.1.3 / v1.1.4 projection, and the v1.0.0/1.0.1/1.0.2 legacy projection all behave exactly as they did under 1.8.0. Authentic `1.8.0` and `1.7.0` installs cross on the ordinary strict path with no new exceptional entry.
 
 ### Subagent visibility
 
@@ -111,37 +111,42 @@ Cleanup is leaf-first, bounded by depth, best-effort, and never blocks correctne
 
 ## Poiesis releases
 
-### The `1.8.0` release
+### The `1.8.1` release
 
-`poiesis-cli@1.8.0` is the current release (Spec #219). It publishes root-aligned pnpm workspace ownership on top of the coherent 1.7.0 package surface:
+`poiesis-cli@1.8.1` is the current release (Spec #227). It publishes reliable native package-manager mutation bounds and concise exact-version update notices on top of the coherent 1.8.0 package surface:
 
-- **Root-aligned pnpm workspace** as one repository-wide installation when eligibility holds: root `package.json`, root `pnpm-workspace.yaml`, sole root `pnpm-lock.yaml`, effective workspace root equal to the installation root, and an intact shared-workspace lockfile contract. Ownership stays root-relative (script + exact `poiesis-cli` pin + root lock); member manifests are never owned. Native pnpm ops use explicit workspace-root scope. The normal isolated linker is supported; hoisting is not required. Doctor includes a read-only package-contribution check. Unsupported layouts stay fail-closed (see [Package contribution and root-aligned pnpm workspaces](#package-contribution-and-root-aligned-pnpm-workspaces-spec-219)).
-- Carries every `1.7.0` capability forward: skills.sh sole catalog with native `skill: { "*": "allow" }`, scoped `AGENTS.md` coverage, exact local package invocation on single-lock ordinary projects, self-host `scripts.poiesis = "node dist/cli.js"` without self-dependence, exact-dlx when there is no package.json, typed lock refusal, and the read-only `poiesis latest` report. Nothing is removed. Ordinary release bump needs no new exceptional predecessor entry beyond the existing `1.6.0` static-skill same-release migration (see above). Published `1.7.0` remains immutable and is absorbed on the ordinary strict path.
+- **Native package-manager mutation bound** of `600000ms` at the real executor-to-run seam for npm/pnpm installs (including workspace-root argv). The shared process default stays `30000ms`. Genuine timeouts preserve typed failure, no manifest advance, allowlisted sanitized diagnostics, and no claim of `node_modules` rollback. One attempt only; no automatic retries. Regression coverage lives in `tests/package-manager-mutation-timeout.test.ts` (Spec #227 / ticket #228).
+- **Concise exact-version update notices:** `poiesis latest` emits `pnpm dlx poiesis-cli@EXACT_VERSION update` with no `dlx-cache-max-age` flag (an immutable exact pin needs none). Primary canon asks for one short localized sentence carrying that command verbatim — never "I did not update" or "reported command" prose. First-reply-only, one read-only lookup, quiet no-newer / unavailable, and no automatic update/restart remain intact. Mutable `@latest` operator forms (init, intentional human upgrade, bootstrap) still use `--config.dlx-cache-max-age=0` where tag caching matters.
+- Carries every `1.8.0` capability forward: root-aligned pnpm workspace ownership (Spec #219), skills.sh sole catalog with native `skill: { "*": "allow" }`, scoped `AGENTS.md` coverage, exact local package invocation, self-host `scripts.poiesis = "node dist/cli.js"` without self-dependence, exact-dlx when there is no package.json, typed lock refusal, and the read-only `poiesis latest` report. Nothing is removed. Ordinary release bump needs no new exceptional predecessor entry beyond the existing `1.6.0` static-skill same-release migration (see above). Published `1.8.0` and `1.7.0` remain immutable and are absorbed on the ordinary strict path.
 
 `poiesis latest` adds no new permission. It is reached by the primary agent through the exact installed canonical route that projection already grants, and no Specialist is granted a `latest` route of any version.
 
+### The `1.8.0` release (predecessor)
+
+`poiesis-cli@1.8.0` published root-aligned pnpm workspace ownership on top of the coherent 1.7.0 package surface (Spec #219): root `package.json`, root `pnpm-workspace.yaml`, sole root `pnpm-lock.yaml`, effective workspace root equal to the installation root, and an intact shared-workspace lockfile contract. Ownership stayed root-relative (script + exact `poiesis-cli` pin + root lock); member manifests were never owned. Native pnpm ops used explicit workspace-root scope. The normal isolated linker was supported; hoisting was not required. Doctor included a read-only package-contribution check. Unsupported layouts stayed fail-closed. It carried every `1.7.0` capability forward (skills.sh sole catalog, scoped `AGENTS.md`, exact local package invocation, self-host script without self-dependence, exact-dlx fallback, typed lock refusal, read-only `poiesis latest`). It is the immediate published predecessor this release absorbs on the ordinary strict path. It does not include the Spec #227 package-mutation bound or the simplified exact-version notice command.
+
 ### The `1.7.0` release (predecessor)
 
-`poiesis-cli@1.7.0` published project knowledge and local invocation as one coherent package (Spec #207: skills.sh sole catalog, scoped `AGENTS.md`, exact local package invocation) and is the published predecessor this release absorbs on the ordinary strict path. It does not include root-aligned pnpm workspace ownership.
+`poiesis-cli@1.7.0` published project knowledge and local invocation as one coherent package (Spec #207: skills.sh sole catalog, scoped `AGENTS.md`, exact local package invocation) and remains an authentic earlier published predecessor absorbed on the ordinary strict path. It does not include root-aligned pnpm workspace ownership.
 
 ### Post-publish dogfood crossing (maintainer obligation)
 
-Publishing `1.8.0` is not the end of the release. The Poiesis source installation must then run the release it just published, and that crossing is recorded here because it is a property of THIS repository's release, not of any consumer installation.
+Publishing `1.8.1` is not the end of the release. The Poiesis source installation must then run the release it just published, and that crossing is recorded here because it is a property of THIS repository's release, not of any consumer installation.
 
-After `npm publish` of `poiesis-cli@1.8.0` succeeds:
+After `npm publish` of `poiesis-cli@1.8.1` succeeds:
 
-1. Bring the Poiesis source installation onto the published release with the fresh-`dlx` form — without `--config.dlx-cache-max-age=0`, pnpm may serve a `dlx` entry up to 1440 minutes old, so the crossing would report having updated while running the release it already had:
+1. Bring the Poiesis source installation onto the published release with the simple exact-version form (an immutable pin needs no `dlx-cache-max-age` flag):
 
    ```bash
-   pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@1.8.0 update
+   pnpm dlx poiesis-cli@1.8.1 update
    ```
 
-   This is the ordinary receipt-gated crossing: it advances `manifest.poiesisVersion` to `1.8.0`, re-keys the exact installed launcher, and advances the ownership receipt by exactly one generation.
+   This is the ordinary receipt-gated crossing: it advances `manifest.poiesisVersion` to `1.8.1`, re-keys the exact installed launcher, and advances the ownership receipt by exactly one generation.
 
 2. If the installation is still mode-less — it was written by a release that predated the sharing mode, which recorded no mode at all — the crossing deliberately leaves it that way. A sharing decision stays an explicit decision, made once, through the only route that can make it:
 
    ```bash
-   pnpm dlx poiesis-cli@1.8.0 migrate install-mode --to team
+   pnpm dlx poiesis-cli@1.8.1 migrate install-mode --to team
    ```
 
    The ordinary crossing cannot fabricate a sharing policy in either direction. An ordinary `update` keeps whatever the manifest records, including recording nothing, and `update --config` still refuses an explicit `mode` against a mode-less manifest (`INSTALL_MODE_TRANSITION_UNSUPPORTED`) — so no release crossing can quietly turn a private/local project into team/shared, and none can create the shareable profile a `team` decision publishes.
@@ -397,7 +402,7 @@ The processor is resolved and validated BEFORE any process exists, so a host wit
 
 ## Package contribution and root-aligned pnpm workspaces (Spec #219)
 
-Poiesis 1.8.0 admits a **root-aligned pnpm workspace** as one repository-wide installation when eligibility holds: root `package.json`, root `pnpm-workspace.yaml`, sole root `pnpm-lock.yaml`, effective workspace root equal to the installation root, and an intact shared-workspace lockfile contract. Ownership stays root-relative (script + exact `poiesis-cli` pin + root lock); member manifests are never owned. Native pnpm ops use explicit workspace-root scope. The normal isolated linker is supported; hoisting is not required.
+Poiesis 1.8.1 admits a **root-aligned pnpm workspace** as one repository-wide installation when eligibility holds: root `package.json`, root `pnpm-workspace.yaml`, sole root `pnpm-lock.yaml`, effective workspace root equal to the installation root, and an intact shared-workspace lockfile contract. Ownership stays root-relative (script + exact `poiesis-cli` pin + root lock); member manifests are never owned. Native pnpm ops use explicit workspace-root scope. The normal isolated linker is supported; hoisting is not required.
 
 **Doctor.** `poiesis doctor` includes a read-only `package-contribution` check that reuses the same eligibility, ownership, and readiness logic as install/update. Failures surface unsupported scope, root ownership drift, missing local installation, exact-version mismatch, and unusable/missing root-local executable with `details.code`, `details.action`, `details.hint`, and `details.repaired: false`. Doctor never repairs.
 

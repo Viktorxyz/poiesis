@@ -7,8 +7,9 @@
  *     lookup }` plus `updateCommand` ONLY when a newer published version
  *     exists;
  *   - `updateCommand` is the one copy-paste form
- *     `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@<latest> update`,
- *     pinned to the exact published version and never to `@latest`;
+ *     `pnpm dlx poiesis-cli@<latest> update`,
+ *     pinned to the exact published version and never to `@latest` (no
+ *     `dlx-cache-max-age` flag: an immutable exact version needs none);
  *   - the compare is NUMERIC X.Y.Z, so `1.10.0` is newer than `1.9.0`, and a
  *     version that is not a plain numeric `X.Y.Z` on EITHER side is not a
  *     version this report can act on at all;
@@ -37,7 +38,7 @@ import { run } from "../src/process.js";
 import { latestReport, type LatestVersionLookup } from "../src/latest.js";
 import { createTestRepository, testConfig, type TestRepository } from "./helpers.js";
 
-const UPDATE_COMMAND = "pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@";
+const UPDATE_COMMAND = "pnpm dlx poiesis-cli@";
 
 let repository: TestRepository;
 let uninstalled: TestRepository;

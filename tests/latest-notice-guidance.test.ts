@@ -51,10 +51,25 @@ describe("Spec #203 / ticket #204 update-notice guidance", () => {
       expect(doc).toMatch(/poiesis latest/);
     });
 
-    it("runs it through the exact installed CLI route, never a bare or @latest launcher", async () => {
+    it("runs it through every exact installed CLI route, never a bare or @latest launcher", async () => {
       const doc = await readRepoFile(relativePath);
-      expect(doc, `${relativePath} must use the exact installed route`).toMatch(
-        /poiesis-cli@<manifest\.poiesisVersion>\s+latest/,
+      expect(
+        doc,
+        `${relativePath} must name the local pnpm package contribution route`,
+      ).toMatch(/pnpm poiesis latest/);
+      expect(
+        doc,
+        `${relativePath} must name the local npm package contribution route`,
+      ).toMatch(/npm run poiesis -- latest/);
+      expect(
+        doc,
+        `${relativePath} must name the exact-version dlx fallback route`,
+      ).toMatch(/poiesis-cli@<manifest\.poiesisVersion>\s+latest/);
+      expect(
+        doc,
+        `${relativePath} must bind local contribution routes before the dlx fallback`,
+      ).toMatch(
+        /pnpm poiesis latest[\s\S]*npm run poiesis -- latest[\s\S]*poiesis-cli@<manifest\.poiesisVersion>\s+latest|local package contribution[\s\S]*poiesis-cli@<manifest\.poiesisVersion>\s+latest/i,
       );
       expect(
         doc,
@@ -78,6 +93,37 @@ describe("Spec #203 / ticket #204 update-notice guidance", () => {
         doc,
         `${relativePath} must say the notice is appended only when newerAvailable is true`,
       ).toMatch(/only when[^.]*`?newerAvailable`?\s+is true|only if[^.]*`?newerAvailable`?\s+is true/i);
+    });
+
+    it("requires a short localized notice with the command verbatim and no disclaimer prose", async () => {
+      const doc = await readRepoFile(relativePath);
+      expect(
+        doc,
+        `${relativePath} must show a short localized notice shape (version + command)`,
+      ).toMatch(/Dostupan je Poiesis/);
+      expect(
+        doc,
+        `${relativePath} must carry updateCommand verbatim`,
+      ).toMatch(/verbatim/i);
+      expect(
+        doc,
+        `${relativePath} must not narrate that the agent did not update`,
+      ).not.toMatch(/I did not update|did not update (?:Poiesis|it)|I have not updated/i);
+      expect(
+        doc,
+        `${relativePath} must not call it a reported command`,
+      ).not.toMatch(/reported command/i);
+    });
+
+    it("stays silent when no newer version exists or lookup is unavailable", async () => {
+      const doc = await readRepoFile(relativePath);
+      expect(doc).toMatch(/`lookup`\s+is\s+`unavailable`/i);
+      expect(
+        doc,
+        `${relativePath} must stay silent when newerAvailable is false or lookup unavailable`,
+      ).toMatch(
+        /(?:append nothing|say nothing about updates|append nothing and say nothing)/i,
+      );
     });
 
     it("never updates automatically and never restarts OpenCode", async () => {

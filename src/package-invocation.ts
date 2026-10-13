@@ -15,6 +15,10 @@
  * Spec #219 / ticket #224 — workspace YAML lock settings use a maintained
  * standards-compliant parser (`yaml`) plus a conservative fail-closed semantic
  * policy shared by planning, doctor, removal, and live pre-mutation validation.
+ * Spec #227 / ticket #228 — native npm/pnpm mutations arm an explicit
+ * {@link PACKAGE_MANAGER_MUTATION_TIMEOUT_MS} (600000) at the executor→`run`
+ * seam so installs are not killed by the shared 30s process default; one
+ * attempt; allowlisted sanitized diagnostics; no process-default raise.
  *
  * Ordinary Node packages get a standard npm/pnpm exact `poiesis-cli`
  * devDependency equal to the installed release and `scripts.poiesis = "poiesis"`
@@ -2320,15 +2324,102 @@ export async function planPackageContributionAtRoot(args: {
 }
 
 /**
+ * Spec #227 / ticket #228 — wall-clock ceiling for every native npm/pnpm
+ * mutation (`add-dev` / `install` / remove reconcile, single-package and
+ * workspace-root). Larger than the shared process default (30s) and npm's own
+ * fetch window, and still finite. Passed explicitly at the executor→`run`
+ * seam so installs are not killed by the generic default. Does **not** raise
+ * `process.ts` defaults and does **not** auto-retry.
+ */
+export const PACKAGE_MANAGER_MUTATION_TIMEOUT_MS = 600_000;
+
+/**
+ * Allowlisted diagnostic keys copied from a settled `run()` refusal into
+ * `PACKAGE_MANAGER_FAILED`. Streams are already bounded and sanitized by the
+ * process runner; this seam never invents env, config, or credential fields.
+ */
+const PACKAGE_MANAGER_RUN_DIAGNOSTIC_KEYS = [
+  "timeoutMs",
+  "exitCode",
+  "signal",
+  "durationMs",
+  "stderr",
+  "stderrTruncated",
+  "stdoutTruncated",
+] as const;
+
+/** Subprocess runner used by the native package-manager executor. */
+export type PackageManagerRun = (
+  command: string,
+  args: string[],
+  options: { cwd: string; timeoutMs?: number },
+) => Promise<unknown>;
+
+/**
+ * Test-only seam: replace the `run` call inside
+ * {@link createNativePackageManagerExecutor}. Production always uses
+ * `./process.js` `run`. Deliberately not a full executor mock — tests that
+ * need the real argv/timeout/diagnostic path inject here.
+ */
+let packageManagerRunOverride: PackageManagerRun | null = null;
+
+export function setPackageManagerRunForTest(run: PackageManagerRun | null): void {
+  packageManagerRunOverride = run;
+}
+
+function packageManagerFailedDetails(args: {
+  manager: SupportedPackageManager;
+  operation: Exclude<LockfileOperation, null>;
+  executionScope: PackageExecutionScope;
+  argv: string[];
+  cwd: string;
+  error: unknown;
+}): Record<string, unknown> {
+  const details: Record<string, unknown> = {
+    manager: args.manager,
+    operation: args.operation,
+    executionScope: args.executionScope,
+    argv: args.argv,
+    cwd: args.cwd,
+    // Always surface the bound this seam armed, even when the child failed
+    // for a non-timeout reason — operators need the deadline that applied.
+    timeoutMs: PACKAGE_MANAGER_MUTATION_TIMEOUT_MS,
+    cause: args.error instanceof Error ? args.error.message : String(args.error),
+  };
+  if (args.error instanceof PoiesisError) {
+    details.causeCode = args.error.code;
+    const source = args.error.details;
+    for (const key of PACKAGE_MANAGER_RUN_DIAGNOSTIC_KEYS) {
+      if (!Object.hasOwn(source, key)) continue;
+      // Prefer the seam's armed bound over a nested copy so the envelope is
+      // honest about what Poiesis requested, not what a mock invented.
+      if (key === "timeoutMs") continue;
+      details[key] = source[key];
+    }
+    // On COMMAND_TIMEOUT the runner's timeoutMs matches the armed bound; keep it.
+    if (args.error.code === "COMMAND_TIMEOUT" && Object.hasOwn(source, "timeoutMs")) {
+      details.timeoutMs = source.timeoutMs;
+    }
+  }
+  return details;
+}
+
+/**
  * Native npm/pnpm executor: full exact install/remove with `--ignore-scripts`
- * under the primary installation root. Tests inject a prepared executor.
- * Does not claim atomic `node_modules` rollback — failure surfaces as
- * {@link PACKAGE_MANAGER_INCOMPLETE} from the apply plan.
+ * under the primary installation root. Tests inject a prepared executor or a
+ * run override. Does not claim atomic `node_modules` rollback — failure
+ * surfaces as {@link PACKAGE_MANAGER_INCOMPLETE} from the apply plan.
+ *
+ * Spec #227 / ticket #228 — every mutation arms
+ * {@link PACKAGE_MANAGER_MUTATION_TIMEOUT_MS} at this `run` call; one attempt
+ * only; allowlisted sanitized diagnostics on `PACKAGE_MANAGER_FAILED`.
  */
 export function createNativePackageManagerExecutor(root: string): PackageManagerExecutor {
   return {
     async apply(request) {
-      const { run } = await import("./process.js");
+      const run =
+        packageManagerRunOverride ??
+        (await import("./process.js")).run;
       const { readFile } = await import("node:fs/promises");
       const { join } = await import("node:path");
       const args = [
@@ -2337,19 +2428,23 @@ export function createNativePackageManagerExecutor(root: string): PackageManager
       try {
         // Spec #219 — always run with the authoritative installation root as cwd.
         // Workspace-root scope is also encoded in argv (`-w`) for pnpm.
-        await run(request.manager, args, { cwd: root });
+        // Spec #227 / ticket #228 — explicit mutation bound (not process default).
+        await run(request.manager, args, {
+          cwd: root,
+          timeoutMs: PACKAGE_MANAGER_MUTATION_TIMEOUT_MS,
+        });
       } catch (error) {
         throw new PoiesisError(
           "PACKAGE_MANAGER_FAILED",
           `${request.manager} ${args.join(" ")} failed`,
-          {
+          packageManagerFailedDetails({
             manager: request.manager,
             operation: request.operation,
             executionScope: request.executionScope,
             argv: args,
             cwd: root,
-            cause: error instanceof Error ? error.message : String(error),
-          },
+            error,
+          }),
         );
       }
       const lockfileName = request.manager === "pnpm" ? "pnpm-lock.yaml" : "package-lock.json";

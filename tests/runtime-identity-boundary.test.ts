@@ -765,7 +765,7 @@ describe("runtime identity boundary — `poiesis latest` exemption (ticket #204)
     expect(envelope.result.installed).toBe(manifest.poiesisVersion);
     expect(envelope.result.newerAvailable).toBe(true);
     expect(envelope.result.updateCommand).toBe(
-      `pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@9.9.9 update`,
+      `pnpm dlx poiesis-cli@9.9.9 update`,
     );
     expect(envelope.result.lookup).toBe("ok");
   }, 60_000);
