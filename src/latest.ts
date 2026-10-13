@@ -54,13 +54,13 @@ export const NPM_LATEST_LOOKUP_TIMEOUT_MS = 3_000;
 /**
  * The single copy-paste update command.
  *
- * `--config.dlx-cache-max-age=0` is required, not cosmetic: without it pnpm
- * may serve a `dlx` entry up to 1440 minutes old, so the command the Author
- * copies would report having updated while running the version they already
- * had. The version is pinned to the exact published version, never `@latest`,
- * so the command the Author runs is the one this report described.
+ * The version is pinned to the exact published version, never `@latest`. An
+ * immutable exact pin needs no `dlx-cache-max-age` flag — that flag exists for
+ * mutable tags such as `@latest` (bootstrap / intentional human upgrade), not
+ * for a version this report already resolved. The command the Author pastes is
+ * therefore the simple exact-version form this report described.
  */
-export const UPDATE_COMMAND_TEMPLATE = "pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@{latest} update";
+export const UPDATE_COMMAND_TEMPLATE = "pnpm dlx poiesis-cli@{latest} update";
 
 /** Whether the registry answered with a comparable `X.Y.Z` version. */
 export type LatestLookupStatus = "ok" | "unavailable";

@@ -1,5 +1,5 @@
 /**
- * Poiesis 1.8.0 release contract (Spec #219 / ticket #226).
+ * Poiesis 1.8.1 release contract (Spec #227 / ticket #229).
  *
  * Filename retained from the 1.7.0 contract suite; expectations pin the
  * current release. Pure only: package metadata, on-disk canonical surface,
@@ -9,41 +9,50 @@
  * consumer projects.
  *
  * Operational native-install checks and consumer `repos/*` updates after
- * `npm publish` of `1.8.0` are Author / managed obligations (see COMPATIBILITY
+ * `npm publish` of `1.8.1` are Author / managed obligations (see COMPATIBILITY
  * post-publish dogfood). This suite does not claim those ran.
  *
  * The former fixture-heavy `release-contract-v1.6.0` suite exercised pack
  * parity plus receipt-gated migration via temporary Git installs. That
  * project-creating shape is deliberately not recreated here; migration
  * predecessor shapes remain covered by pure seams in
- * `skills-sh-catalog.test.ts` and `package-invocation.test.ts`.
+ * `skills-sh-catalog.test.ts` and `package-invocation.test.ts`. Authentic
+ * published `1.8.0` / `1.7.0` predecessor canon stays named as those releases
+ * (ordinary strict path), not relabelled.
  */
 
 import { execFile } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { describe, expect, it } from "vitest";
 import type { PoiesisConfig } from "../src/config.js";
+import { UPDATE_COMMAND_TEMPLATE } from "../src/latest.js";
 import { packageVersion } from "../src/maintenance.js";
 import { canonicalInvocationPrefix, desiredOpenCodePatches } from "../src/opencode.js";
-import { buildPackageContributionRecord } from "../src/package-invocation.js";
+import {
+  buildPackageContributionRecord,
+  PACKAGE_MANAGER_MUTATION_TIMEOUT_MS,
+} from "../src/package-invocation.js";
 import { templateMappings } from "../src/templates.js";
 
 const execFileAsync = promisify(execFile);
 const REPO_ROOT = join(import.meta.dirname, "..");
 
 /** The release this contract pins. `packageVersion()` must agree with it. */
-const RELEASE_VERSION = "1.8.0";
+const RELEASE_VERSION = "1.8.1";
 
-/** Published predecessor the ordinary strict path absorbs (not an exceptional predecessor entry). */
-const PREDECESSOR_VERSION = "1.7.0";
+/** Immediate published predecessor the ordinary strict path absorbs (not an exceptional predecessor entry). */
+const PREDECESSOR_VERSION = "1.8.0";
+
+/** Earlier published predecessor still named authentically in COMPATIBILITY. */
+const EARLIER_PREDECESSOR_VERSION = "1.7.0";
 
 /**
- * Historical accepted-predecessor set used by receipt-gated update. Spec #219
+ * Historical accepted-predecessor set used by receipt-gated update. Spec #227
  * keeps this closed: `"1.6.0"` is only the static-skill same-release migration
  * key already admitted in authority; ordinary release bumps need no new entry
- * for `"1.7.0"`.
+ * for `"1.8.0"` or `"1.7.0"`.
  */
 const PRODUCTION_PREDECESSOR_SET = [
   "1.0.1",
@@ -119,13 +128,13 @@ const CONSUMER_ROLE_AND_AGENT_DOCS = [
   "OPENCODE_AGENT_FINAL_REVIEWER.md",
 ] as const;
 
-describe("Poiesis 1.8.0 release contract (pure)", () => {
-  it("package.json version is the 1.8.0 release", async () => {
+describe("Poiesis 1.8.1 release contract (pure)", () => {
+  it("package.json version is the 1.8.1 release", async () => {
     const pkg = await readPackageJson();
     expect(pkg.version).toBe(RELEASE_VERSION);
   });
 
-  it("packageVersion() runtime seam returns the 1.8.0 release", async () => {
+  it("packageVersion() runtime seam returns the 1.8.1 release", async () => {
     expect(await packageVersion()).toBe(RELEASE_VERSION);
   });
 
@@ -181,7 +190,7 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
   });
 
   it(
-    "pnpm pack --json produces the exact 1.8.0 canonical surface (actual package only)",
+    "pnpm pack --json produces the exact 1.8.1 canonical surface (actual package only)",
     async () => {
       await execFileAsync("pnpm", ["build"], { cwd: REPO_ROOT });
       const { stdout } = await execFileAsync("bash", ["-c", "pnpm pack --json 2>/dev/null"], {
@@ -257,12 +266,16 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
     expect(readme).toMatch(/isolated/);
   });
 
-  it("COMPATIBILITY records 1.8.0 as current release and post-publish dogfood (maintainer only)", async () => {
+  it("COMPATIBILITY records 1.8.1 as current release and post-publish dogfood (maintainer only)", async () => {
     const compatibility = await readFile(join(REPO_ROOT, "COMPATIBILITY.md"), "utf8");
     expect(compatibility).toMatch(/## Poiesis releases/);
-    expect(compatibility).toMatch(/### The `1\.8\.0` release/);
-    expect(compatibility).toMatch(/poiesis-cli@1\.8\.0` is the current release/);
+    expect(compatibility).toMatch(/### The `1\.8\.1` release/);
+    expect(compatibility).toMatch(/poiesis-cli@1\.8\.1` is the current release/);
+    // Exact-version dogfood needs no dlx-cache-max-age (immutable pin).
     expect(compatibility).toMatch(
+      new RegExp(`pnpm dlx poiesis-cli@${RELEASE_VERSION.replace(/\./g, "\\.")} update`),
+    );
+    expect(compatibility).not.toMatch(
       new RegExp(
         `pnpm --config\\.dlx-cache-max-age=0 dlx poiesis-cli@${RELEASE_VERSION.replace(/\./g, "\\.")} update`,
       ),
@@ -272,16 +285,35 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
     );
     expect(compatibility).toMatch(/cannot fabricate a sharing policy/);
     expect(compatibility).toMatch(/This is not consumer canon/);
-    // Spec #219 contracts named at the release boundary.
+    // Spec #227 contracts named at the release boundary.
+    expect(compatibility).toMatch(/Spec #227/);
+    expect(compatibility).toMatch(/600000|600_000|package-manager mutation|native package/);
+    expect(compatibility).toMatch(/pnpm dlx poiesis-cli@/);
     expect(compatibility).toMatch(/root-aligned pnpm workspace/);
     expect(compatibility).toMatch(/Spec #219/);
     expect(compatibility).toMatch(/skills\.sh/);
     expect(compatibility).toMatch(/AGENTS\.md/);
     expect(compatibility).toMatch(/static skills → native skill wildcard|static-skill/);
     expect(compatibility).toMatch(new RegExp(`poiesis-cli-${RELEASE_VERSION.replace(/\./g, "\\.")}\\.tgz`));
-    // Predecessor published release is 1.7.0; ordinary bump adds no exceptional entry for 1.7.0.
-    expect(compatibility).toMatch(new RegExp(PREDECESSOR_VERSION.replace(/\./g, "\\.")));
+    // Authentic published predecessors stay named; ordinary bump adds no exceptional entry.
+    expect(compatibility).toMatch(/### The `1\.8\.0` release \(predecessor\)/);
     expect(compatibility).toMatch(/### The `1\.7\.0` release \(predecessor\)/);
+    expect(compatibility).toMatch(new RegExp(PREDECESSOR_VERSION.replace(/\./g, "\\.")));
+    expect(compatibility).toMatch(new RegExp(EARLIER_PREDECESSOR_VERSION.replace(/\./g, "\\.")));
+  });
+
+  it("latest report emits simple exact-version updateCommand without cache-age", () => {
+    expect(UPDATE_COMMAND_TEMPLATE).toBe("pnpm dlx poiesis-cli@{latest} update");
+    expect(UPDATE_COMMAND_TEMPLATE).not.toMatch(/dlx-cache-max-age/);
+    expect(UPDATE_COMMAND_TEMPLATE).not.toMatch(/@latest/);
+  });
+
+  it("native package-manager mutation timeout regression stays in the release surface", async () => {
+    expect(PACKAGE_MANAGER_MUTATION_TIMEOUT_MS).toBe(600_000);
+    await expect(access(join(REPO_ROOT, "tests/package-manager-mutation-timeout.test.ts"))).resolves.toBeUndefined();
+    const suite = await readFile(join(REPO_ROOT, "tests/package-manager-mutation-timeout.test.ts"), "utf8");
+    expect(suite).toMatch(/Spec #227 \/ ticket #228/);
+    expect(suite).toMatch(/600_000|600000/);
   });
 
   it("no projected role or agent document instructs a maintainer-only dogfood step", async () => {
@@ -309,7 +341,7 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
     expect(product).not.toMatch(/UI\/UX/);
   });
 
-  it("1.8.0 projection uses skill wildcard and exact-version launcher without widening", () => {
+  it("1.8.1 projection uses skill wildcard and exact-version launcher without widening", () => {
     const patches = desiredOpenCodePatches(testConfig(), RELEASE_VERSION);
     const primary = patches.find((p) => p.path[0] === "agent" && p.path[1] === "poiesis");
     expect(primary).toBeDefined();
@@ -364,10 +396,10 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
     expect(bash[`pnpm dlx poiesis-cli@${RELEASE_VERSION} *`]).toBeUndefined();
   });
 
-  it("accepted predecessor set is unchanged for ordinary 1.8.0 release bump", () => {
+  it("accepted predecessor set is unchanged for ordinary 1.8.1 release bump", () => {
     // Compile-time closed set mirrored from authority update path comments /
-    // skills-sh-catalog pure predecessor coverage. Ordinary 1.8.0 does not add
-    // 1.7.0 or invent a second exceptional release-crossing entry.
+    // skills-sh-catalog pure predecessor coverage. Ordinary 1.8.1 does not add
+    // 1.8.0, 1.7.0, or invent a second exceptional release-crossing entry.
     expect([...PRODUCTION_PREDECESSOR_SET]).toEqual([
       "1.0.1",
       "1.0.2",
@@ -379,6 +411,7 @@ describe("Poiesis 1.8.0 release contract (pure)", () => {
     ]);
     expect([...PRODUCTION_PREDECESSOR_SET]).not.toContain("1.5.0");
     expect([...PRODUCTION_PREDECESSOR_SET]).not.toContain(PREDECESSOR_VERSION);
+    expect([...PRODUCTION_PREDECESSOR_SET]).not.toContain(EARLIER_PREDECESSOR_VERSION);
     expect([...PRODUCTION_PREDECESSOR_SET]).not.toContain(RELEASE_VERSION);
     expect([...PRODUCTION_PREDECESSOR_SET]).toContain("1.6.0");
   });
