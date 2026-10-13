@@ -74,11 +74,13 @@ pnpm --config.dlx-cache-max-age=0 dlx poiesis-cli@latest init --config ./poiesis
 
 A non-TTY invocation **without** `--config` fails closed with `NON_TTY_INIT` rather than guessing; the structured path is the supported automation contract. The repository remote and integration branch are still read from the Git repository directly — `repository.remote` and `repository.integrationBranch` keys in the config file are accepted for completeness but the Git repository is the source of truth.
 
-`doctor` runs without mutation and verifies the same set of invariants any time:
+`doctor` runs without mutation and verifies the same set of invariants any time, including a read-only **package-contribution** check that reuses the same eligibility, ownership, and readiness logic as install/update. It reports unsupported scope, root ownership drift, missing local installation, exact-version mismatch, and an unusable or missing root-local executable with actionable remediation details (`action`, `hint`, `code`) — and it **never** repairs package.json, lockfiles, or `node_modules`. Re-run an authenticated `update` (or restore an eligible layout) to repair; doctor only diagnoses.
 
 ```bash
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor
 ```
+
+Invocation from a repository subdirectory resolves to the same Git and installation root as invocation from the root: doctor, lifecycle, and the projected `pnpm poiesis` route always target that authoritative root, not the nearest member package.
 
 `update` re-reads the installed canonical files and re-applies the OpenCode adapter projection only against proven-owned state. As same-version reconciliation, it stays on the exact-version route so the on-disk files match what the receipt proves is installed:
 
@@ -112,7 +114,7 @@ After that command succeeds, later `doctor`, `update`, `uninstall`, and capabili
 
 ### Everyday commands
 
-On an ordinary Node package with a single native lockfile (`pnpm-lock.yaml` or `package-lock.json`), `init` / `update` / `update --config` run a standard npm or pnpm **exact** `poiesis-cli` devDependency install equal to the installed release, set `scripts.poiesis = "poiesis"`, and disable lifecycle scripts (`--ignore-scripts`). After install, Poiesis checks that the resolved `node_modules/poiesis-cli` version equals the target. Everyday commands use that local runtime:
+On an ordinary Node package with a single native lockfile (`pnpm-lock.yaml` or `package-lock.json`), or on an **eligible root-aligned pnpm workspace**, `init` / `update` / `update --config` run a standard npm or pnpm **exact** `poiesis-cli` devDependency install equal to the installed release at the **repository root only**, set root `scripts.poiesis = "poiesis"`, and disable lifecycle scripts (`--ignore-scripts`). After install, Poiesis checks that the resolved root `node_modules/poiesis-cli` version equals the target and that the root-local `node_modules/.bin/poiesis` executable is usable under a normal **isolated** pnpm linker (no hoisting required). Everyday commands use that local runtime from the authoritative root:
 
 ```bash
 pnpm poiesis doctor
@@ -121,7 +123,11 @@ pnpm poiesis model set reasoning openai/gpt-5.6-sol
 pnpm poiesis update
 ```
 
-(npm: `npm run poiesis -- doctor`, and so on.) Foreign scripts and dependencies are preserved; a conflicting `poiesis` script or non-exact `poiesis-cli` dependency fails closed **before** mutation. Workspace / ambiguous multi-lock layouts and a package.json without a supported lockfile are refused with a typed error rather than guessed. A native package-manager failure is an **incomplete** operation: the install manifest does not advance; Poiesis may restore package.json/lock bytes it authored, and it does **not** claim atomic rollback of `node_modules` or other native pm side effects. Self-host `package.name === "poiesis-cli"` never self-depends — it uses `scripts.poiesis = "node dist/cli.js"` and verifies readiness by probing that binary directly (`node dist/cli.js --version`), not by running package scripts; missing or stale `dist` fails closed. Projects with **no** `package.json` are not given fabricated package metadata; they keep the exact-version launcher:
+(npm: `npm run poiesis -- doctor`, and so on.) OpenCode projects the same canonical `pnpm poiesis` (or `npm run poiesis --`) route from the installation root — never a member-package filter, never a per-app grant, and never a dlx/global fallback while a local contribution is owned.
+
+**Root-aligned pnpm workspace eligibility.** A supported workspace needs root `package.json`, root `pnpm-workspace.yaml`, one unambiguous root `pnpm-lock.yaml`, and an effective pnpm workspace root equal to the Poiesis installation root, with the shared workspace lockfile contract intact. Poiesis owns only the root contribution (script + exact `poiesis-cli` pin + root lockfile side effects from native pnpm); child/member `package.json` files are never mutated or owned. Native pnpm add/remove use explicit workspace-root semantics (`pnpm add -w …` / equivalent) with the authoritative root as cwd. Unsupported or ambiguous layouts fail closed with typed errors rather than guessed: npm `package.json` workspaces, outer/non-root effective workspace scope, competing or missing locks, `shared-workspace-lockfile=false`, and `lockfile-dir` that redirects the lockfile away from the root. Poiesis does **not** rewrite `pnpm-workspace.yaml` or project pnpm configuration to gain eligibility.
+
+Foreign scripts and dependencies are preserved; a conflicting `poiesis` script or non-exact `poiesis-cli` dependency fails closed **before** mutation. Ambiguous multi-lock layouts and a package.json without a supported lockfile are refused with a typed error rather than guessed. A native package-manager failure is an **incomplete** operation: the install manifest does not advance; Poiesis may restore package.json/lock bytes it authored, and it does **not** claim atomic rollback of `node_modules` or other native pm side effects. `uninstall` removes only the authenticated root Poiesis contribution and preserves foreign root content and every child manifest byte-for-byte. Self-host `package.name === "poiesis-cli"` never self-depends — it uses `scripts.poiesis = "node dist/cli.js"` and verifies readiness by probing that binary directly (`node dist/cli.js --version`), not by running package scripts; missing or stale `dist` fails closed. Projects with **no** `package.json` are not given fabricated package metadata; they keep the exact-version launcher:
 
 ```bash
 pnpm dlx poiesis-cli@<manifest.poiesisVersion> doctor

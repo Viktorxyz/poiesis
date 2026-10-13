@@ -85,8 +85,11 @@ import {
 } from "./manifest.js";
 import {
   applyPackageContributionWithJournal,
+  assertLivePackageMutationEligibility,
   assertPackageContributionCaptureIdentity,
+  assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
+  inspectPackageContributionHealthAtRoot,
   packagePlanRetainsContribution,
   planPackageContributionAtRoot,
   planPackageContributionRemoval,
@@ -1821,6 +1824,12 @@ export async function init(root: string, config: PoiesisConfig, options: Mainten
           record: packagePlan.record,
           poiesisVersion: installingPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: packagePlan.record.devDependencyVersion ?? installingPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         });
       }
@@ -2626,6 +2635,35 @@ export async function doctor(root: string): Promise<DoctorReport> {
     checks.push({ id: "git-base", status: "fail", message: "Integration branch cannot be checked without valid config" });
     checks.push({ id: "tracker", status: "fail", message: "Tracker configuration is invalid or missing" });
     checks.push({ id: "delivery", status: "fail", message: "Delivery configuration is invalid or missing" });
+  }
+
+  // Spec #219 / ticket #222 — read-only package-contribution diagnosis.
+  // Reuses shared eligibility, ownership, and readiness. Never repairs
+  // package.json, lockfiles, or node_modules from doctor.
+  if (manifest !== undefined) {
+    try {
+      const packageCheck = await inspectPackageContributionHealthAtRoot({
+        root: resolvedRoot,
+        record: manifest.packageContribution,
+        poiesisVersion: manifest.poiesisVersion,
+        run: runProcess,
+      });
+      checks.push(packageCheck);
+    } catch (error) {
+      checks.push({
+        id: "package-contribution",
+        status: "fail",
+        message: "Package contribution could not be inspected",
+        details: { repaired: false, ...errorDetails(error) },
+      });
+    }
+  } else {
+    checks.push({
+      id: "package-contribution",
+      status: "fail",
+      message: "Package contribution cannot be checked without a manifest",
+      details: { repaired: false },
+    });
   }
 
   // Spec #120 / ticket #121: `uv` is a STANDARD Poiesis requirement as
@@ -3718,6 +3756,16 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
         // snapshot. Intervening Author bytes must not become the journal preimage
         // for a stale nextPackageJson overwrite. Fail before write/native pm.
         assertPackageContributionCaptureIdentity(removal, packageJsonEntry);
+        // Spec #219 / ticket #223 — live eligibility/scope immediately before
+        // package write and native executor (`.npmrc` / workspace YAML can drift
+        // after planning). Shared guard with apply.
+        const liveRemovalSnapshot = await loadPackageFsSnapshot(resolvedRoot);
+        assertLivePackageMutationEligibility({
+          liveSnapshot: liveRemovalSnapshot,
+          expectedManager: removal.record.manager,
+          expectedLockfile: removal.record.lockfile,
+          expectedExecutionScope: removal.executionScope,
+        });
         // Removal writes planned package.json through journal.replace (preimage
         // guard). Native pm may rewrite lock/package on disk — validate owned
         // fields are gone; do not re-write reread bytes merely to journal-bind
@@ -3735,6 +3783,11 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
               packageJson: removal.nextPackageJson,
               lockfile: preimageLockfile,
               ignoreScripts: true,
+              // Spec #219 / ticket #221 — removal reuses centralized workspace
+              // eligibility via the plan's validated execution scope (`-w` on the
+              // post-edit lock reconcile install for root-aligned pnpm workspaces).
+              // Never claims node_modules rollback.
+              executionScope: removal.executionScope,
             });
           } catch (error) {
             throw new PoiesisError(
@@ -3743,6 +3796,7 @@ export async function uninstall(root: string, options: UninstallOptions = {}): P
               {
                 manager: removal.record.manager,
                 operation: removal.lockfileOperation,
+                executionScope: removal.executionScope,
                 ownedArtifactsMayRollback: true,
                 nativeSideEffectsNotClaimedRolledBack: true,
                 cause: error instanceof Error ? error.message : String(error),

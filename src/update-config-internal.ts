@@ -78,6 +78,7 @@ import { assertOpenCodeOwnershipAgainstSnapshot, projectOpenCodePayload } from "
 import {
   applyPackageContributionWithJournal,
   assertPackageContributionCaptureIdentity,
+  assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
   gateUpdateConfigEarlyNoopPackage,
   loadPackageFsSnapshot,
@@ -795,6 +796,12 @@ async function runLockedUpdateConfigTransaction(
           record,
           poiesisVersion: nextPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: record.devDependencyVersion ?? nextPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         }),
     });
@@ -1027,6 +1034,12 @@ async function runLockedUpdateConfigTransaction(
           record: packagePlan.record,
           poiesisVersion: nextPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: packagePlan.record.devDependencyVersion ?? nextPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         });
       }

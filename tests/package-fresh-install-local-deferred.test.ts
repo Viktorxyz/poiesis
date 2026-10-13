@@ -511,7 +511,7 @@ beforeAll(async () => {
   // The runtime dependencies resolve from the consumer's own `node_modules`;
   // link the three the published package declares, so the install resolves
   // them exactly as a real one would with no registry access.
-  for (const dependency of ["zod", "jsonc-parser", "@clack/prompts"]) {
+  for (const dependency of ["zod", "jsonc-parser", "@clack/prompts", "yaml"]) {
     const target = join(consumerDir, "node_modules", dependency);
     await mkdir(join(target, ".."), { recursive: true });
     await symlink(join(REPO_ROOT, "node_modules", dependency), target);

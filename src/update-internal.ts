@@ -81,6 +81,7 @@ import { assertManifestAuthorityToleratingPredecessor, nextAdapterFiles, nextAda
 import {
   applyPackageContributionWithJournal,
   assertPackageContributionCaptureIdentity,
+  assertLocalCliExecutableAtRoot,
   assertPackageContributionRuntimeReady,
   packageContributionMode,
   packagePlanRetainsContribution,
@@ -726,6 +727,12 @@ async function runLockedUpdateTransaction(
           record: packagePlan.record,
           poiesisVersion: updatingPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: packagePlan.record.devDependencyVersion ?? updatingPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         });
       }
@@ -1130,6 +1137,12 @@ async function runLockedBootstrapLegacyOwnershipTransaction(
           record: packagePlan.record,
           poiesisVersion: updatingPoiesisVersion,
           readResolvedLocalPackageJson: () => readResolvedLocalCliPackageJson(resolvedRoot),
+          assertLocalCliExecutable: () =>
+            assertLocalCliExecutableAtRoot({
+              root: resolvedRoot,
+              expectedVersion: packagePlan.record.devDependencyVersion ?? updatingPoiesisVersion,
+              run: runProcess,
+            }),
           probeSelfhostDist: () => probeSelfhostDistVersion(resolvedRoot, runProcess),
         });
       }
